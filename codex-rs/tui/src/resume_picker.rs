@@ -139,7 +139,7 @@ impl SessionPickerAction {
 
 #[derive(Clone)]
 struct PageLoadRequest {
-    cursor: Option<PageCursor>,
+    cursor: PageCursor,
     request_token: usize,
     search_token: Option<usize>,
     cwd_filter: Option<PathBuf>,
@@ -255,9 +255,23 @@ enum BackgroundEvent {
     },
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum PageCursor {
-    AppServer(String),
+    /// Fast, indexed pagination used for the normal picker path.
+    StateDb(Option<String>),
+    /// Filesystem reconciliation used only after indexed results are exhausted.
+    ScanAndRepair(Option<String>),
+}
+
+impl PageCursor {
+    fn next(self, cursor: Option<String>) -> Option<Self> {
+        match (self, cursor) {
+            (Self::StateDb(_), Some(cursor)) => Some(Self::StateDb(Some(cursor))),
+            (Self::StateDb(_), None) => Some(Self::ScanAndRepair(None)),
+            (Self::ScanAndRepair(_), Some(cursor)) => Some(Self::ScanAndRepair(Some(cursor))),
+            (Self::ScanAndRepair(_), None) => None,
+        }
+    }
 }
 
 struct PickerPage {
@@ -560,10 +574,9 @@ fn spawn_app_server_page_loader(
         while let Some(request) = request_rx.recv().await {
             match request {
                 PickerLoadRequest::Page(request) => {
-                    let cursor = request.cursor.map(|PageCursor::AppServer(cursor)| cursor);
                     let page = load_app_server_page(
                         &mut app_server,
-                        cursor,
+                        request.cursor,
                         request.cwd_filter.as_deref(),
                         request.provider_filter,
                         request.sort_key,
@@ -732,12 +745,13 @@ impl LoadingState {
 
 async fn load_app_server_page(
     app_server: &mut AppServerSession,
-    cursor: Option<String>,
+    cursor: PageCursor,
     cwd_filter: Option<&Path>,
     provider_filter: ProviderFilter,
     sort_key: ThreadSortKey,
     include_non_interactive: bool,
 ) -> std::io::Result<PickerPage> {
+    let next_cursor_source = cursor.clone();
     let response = app_server
         .thread_list(thread_list_params(
             cursor,
@@ -756,7 +770,7 @@ async fn load_app_server_page(
             .into_iter()
             .filter_map(row_from_app_server_thread)
             .collect(),
-        next_cursor: response.next_cursor.map(PageCursor::AppServer),
+        next_cursor: next_cursor_source.next(response.next_cursor),
         num_scanned_files,
         reached_scan_cap: false,
     })
@@ -1270,7 +1284,7 @@ impl PickerState {
         self.request_frame();
 
         (self.picker_loader)(PickerLoadRequest::Page(PageLoadRequest {
-            cursor: None,
+            cursor: PageCursor::StateDb(None),
             request_token,
             search_token,
             cwd_filter: self.active_cwd_filter(),
@@ -1523,6 +1537,16 @@ impl PickerState {
         if self.pagination.loading.is_pending() || self.pagination.next_cursor.is_none() {
             return;
         }
+        if matches!(
+            self.pagination.next_cursor,
+            Some(PageCursor::ScanAndRepair(_))
+        ) && !self.search_state.is_active()
+        {
+            // Do not turn an empty or short indexed page into an eager filesystem scan. Explicit
+            // navigation and search still call `load_more_if_needed`, preserving access to
+            // unindexed rollouts without delaying the picker's first useful frame.
+            return;
+        }
         let rendered_rows = if self.filtered_rows.is_empty() {
             0
         } else {
@@ -1552,6 +1576,8 @@ impl PickerState {
             return;
         }
         if self.filtered_rows.is_empty() {
+            // Let explicit navigation recover when the state DB is empty or unavailable.
+            self.load_more_if_needed(LoadTrigger::Scroll);
             return;
         }
         let remaining = self.filtered_rows.len().saturating_sub(self.selected + 1);
@@ -1580,7 +1606,7 @@ impl PickerState {
         self.request_frame();
 
         (self.picker_loader)(PickerLoadRequest::Page(PageLoadRequest {
-            cursor: Some(cursor),
+            cursor,
             request_token,
             search_token,
             cwd_filter: self.active_cwd_filter(),
@@ -1804,12 +1830,16 @@ fn row_from_app_server_thread(thread: Thread) -> Option<Row> {
 }
 
 fn thread_list_params(
-    cursor: Option<String>,
+    cursor: PageCursor,
     cwd_filter: Option<&Path>,
     provider_filter: ProviderFilter,
     sort_key: ThreadSortKey,
     include_non_interactive: bool,
 ) -> ThreadListParams {
+    let (cursor, use_state_db_only) = match cursor {
+        PageCursor::StateDb(cursor) => (cursor, true),
+        PageCursor::ScanAndRepair(cursor) => (cursor, false),
+    };
     ThreadListParams {
         cursor,
         limit: Some(PAGE_SIZE as u32),
@@ -1824,7 +1854,7 @@ fn thread_list_params(
         parent_thread_id: None,
         ancestor_thread_id: None,
         cwd: cwd_filter.map(|cwd| ThreadListCwdFilter::One(cwd.to_string_lossy().into_owned())),
-        use_state_db_only: false,
+        use_state_db_only,
         search_term: None,
     }
 }
@@ -3223,7 +3253,7 @@ mod tests {
     ) -> PickerPage {
         PickerPage {
             rows,
-            next_cursor: next_cursor.map(|cursor| PageCursor::AppServer(cursor.to_string())),
+            next_cursor: next_cursor.map(|cursor| PageCursor::StateDb(Some(cursor.to_string()))),
             num_scanned_files,
             reached_scan_cap,
         }
@@ -3308,7 +3338,7 @@ mod tests {
             /*remote_cwd_override*/ None,
         );
         let params = thread_list_params(
-            Some(String::from("cursor-1")),
+            PageCursor::StateDb(Some(String::from("cursor-1"))),
             cwd_filter.as_deref(),
             ProviderFilter::MatchDefault(String::from("openai")),
             ThreadSortKey::UpdatedAt,
@@ -3319,6 +3349,36 @@ mod tests {
             params.cwd,
             Some(ThreadListCwdFilter::One(String::from("/tmp/project")))
         );
+        assert!(params.use_state_db_only);
+    }
+
+    #[test]
+    fn picker_pages_use_state_db_before_falling_back_to_scan_and_repair() {
+        assert_eq!(
+            PageCursor::StateDb(None).next(Some("db-cursor".to_string())),
+            Some(PageCursor::StateDb(Some("db-cursor".to_string())))
+        );
+        assert_eq!(
+            PageCursor::StateDb(Some("db-cursor".to_string())).next(None),
+            Some(PageCursor::ScanAndRepair(None))
+        );
+        assert_eq!(
+            PageCursor::ScanAndRepair(None).next(Some("scan-cursor".to_string())),
+            Some(PageCursor::ScanAndRepair(Some("scan-cursor".to_string())))
+        );
+        assert_eq!(
+            PageCursor::ScanAndRepair(Some("scan-cursor".to_string())).next(None),
+            None
+        );
+
+        let params = thread_list_params(
+            PageCursor::ScanAndRepair(None),
+            /*cwd_filter*/ None,
+            ProviderFilter::Any,
+            ThreadSortKey::UpdatedAt,
+            /*include_non_interactive*/ false,
+        );
+        assert!(!params.use_state_db_only);
     }
 
     #[test]
@@ -3533,7 +3593,7 @@ mod tests {
     #[test]
     fn remote_thread_list_params_omit_provider_filter() {
         let params = thread_list_params(
-            Some(String::from("cursor-1")),
+            PageCursor::StateDb(Some(String::from("cursor-1"))),
             Some(Path::new("repo/on/server")),
             ProviderFilter::Any,
             ThreadSortKey::UpdatedAt,
@@ -3555,7 +3615,7 @@ mod tests {
     #[test]
     fn remote_thread_list_params_can_include_non_interactive_sources() {
         let params = thread_list_params(
-            Some(String::from("cursor-1")),
+            PageCursor::StateDb(Some(String::from("cursor-1"))),
             /*cwd_filter*/ None,
             ProviderFilter::Any,
             ThreadSortKey::UpdatedAt,
@@ -3996,7 +4056,7 @@ mod tests {
             })
             .collect();
         state.selected = 2;
-        state.pagination.next_cursor = Some(PageCursor::AppServer(String::from("cursor-1")));
+        state.pagination.next_cursor = Some(PageCursor::StateDb(Some(String::from("cursor-1"))));
 
         let label = picker_footer_progress_label(&state, /*list_height*/ 6, /*width*/ 80);
 
@@ -4025,7 +4085,7 @@ mod tests {
             .collect();
         state.selected = 9;
         state.scroll_top = 9;
-        state.pagination.next_cursor = Some(PageCursor::AppServer(String::from("cursor-1")));
+        state.pagination.next_cursor = Some(PageCursor::StateDb(Some(String::from("cursor-1"))));
         state.pagination.loading = LoadingState::Pending(PendingLoad {
             request_token: 1,
             search_token: None,
@@ -5226,6 +5286,67 @@ session_picker_view = "dense"
         state.ensure_minimum_rows_for_view(/*minimum_rows*/ 10);
         let guard = recorded_requests.lock().unwrap();
         assert_eq!(guard.len(), 1);
+        assert!(guard[0].search_token.is_none());
+    }
+
+    #[test]
+    fn scan_and_repair_fallback_is_not_prefetched_but_search_loads_it() {
+        let recorded_requests: Arc<Mutex<Vec<PageLoadRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        let request_sink = recorded_requests.clone();
+        let loader = page_only_loader(move |req: PageLoadRequest| {
+            request_sink.lock().unwrap().push(req);
+        });
+        let mut state = PickerState::new(
+            FrameRequester::test_dummy(),
+            loader,
+            ProviderFilter::MatchDefault(String::from("openai")),
+            /*show_all*/ true,
+            /*filter_cwd*/ None,
+            SessionPickerAction::Resume,
+        );
+        state.pagination.next_cursor = Some(PageCursor::ScanAndRepair(None));
+
+        state.ensure_minimum_rows_for_view(/*minimum_rows*/ 10);
+        assert!(recorded_requests.lock().unwrap().is_empty());
+
+        state.search_state = SearchState::Active { token: 7 };
+        state.ensure_minimum_rows_for_view(/*minimum_rows*/ 10);
+        let guard = recorded_requests.lock().unwrap();
+        assert_eq!(guard.len(), 1);
+        assert_eq!(guard[0].search_token, Some(7));
+        assert_eq!(guard[0].cursor, PageCursor::ScanAndRepair(None));
+    }
+
+    #[tokio::test]
+    async fn explicit_navigation_recovers_from_empty_state_db_page() {
+        let recorded_requests: Arc<Mutex<Vec<PageLoadRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        let request_sink = recorded_requests.clone();
+        let loader = page_only_loader(move |req: PageLoadRequest| {
+            request_sink.lock().unwrap().push(req);
+        });
+        let mut state = PickerState::new(
+            FrameRequester::test_dummy(),
+            loader,
+            ProviderFilter::MatchDefault(String::from("openai")),
+            /*show_all*/ true,
+            /*filter_cwd*/ None,
+            SessionPickerAction::Resume,
+        );
+        state.ingest_page(PickerPage {
+            rows: Vec::new(),
+            next_cursor: Some(PageCursor::ScanAndRepair(None)),
+            num_scanned_files: 0,
+            reached_scan_cap: false,
+        });
+
+        state
+            .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        let guard = recorded_requests.lock().unwrap();
+        assert_eq!(guard.len(), 1);
+        assert_eq!(guard[0].cursor, PageCursor::ScanAndRepair(None));
         assert!(guard[0].search_token.is_none());
     }
 

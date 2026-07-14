@@ -1506,6 +1506,7 @@ fn thread_fork_params_from_config(
     thread_params_mode: ThreadParamsMode,
     remote_cwd_override: Option<&std::path::Path>,
 ) -> ThreadForkParams {
+    let ephemeral = config.ephemeral;
     let permissions = permissions_selection_from_config(&config, thread_params_mode);
     let sandbox = permissions
         .is_none()
@@ -1533,7 +1534,8 @@ fn thread_fork_params_from_config(
             &config,
             config.developer_instructions.clone(),
         ),
-        ephemeral: config.ephemeral,
+        ephemeral,
+        exclude_turns: ephemeral,
         thread_source: Some(ThreadSource::User),
         ..ThreadForkParams::default()
     }
@@ -2377,6 +2379,35 @@ mod tests {
         assert_eq!(
             params.developer_instructions.as_deref(),
             Some("Developer override.")
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_fork_params_only_exclude_inherited_turns_for_ephemeral_forks() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut config = build_config(&temp_dir).await;
+        config.ephemeral = true;
+
+        let ephemeral_params = thread_fork_params_from_config(
+            config,
+            ThreadId::new(),
+            ThreadParamsMode::Embedded,
+            /*remote_cwd_override*/ None,
+        );
+        let persistent_params = thread_fork_params_from_config(
+            build_config(&temp_dir).await,
+            ThreadId::new(),
+            ThreadParamsMode::Embedded,
+            /*remote_cwd_override*/ None,
+        );
+
+        assert_eq!(
+            (ephemeral_params.ephemeral, ephemeral_params.exclude_turns),
+            (true, true)
+        );
+        assert_eq!(
+            (persistent_params.ephemeral, persistent_params.exclude_turns),
+            (false, false)
         );
     }
 
