@@ -23,6 +23,13 @@ impl GoalStatusState {
         self.goal.status == AppThreadGoalStatus::Active
     }
 
+    pub(super) fn can_resume_after_capacity_error(&self) -> bool {
+        matches!(
+            self.goal.status,
+            AppThreadGoalStatus::Active | AppThreadGoalStatus::Blocked
+        )
+    }
+
     pub(super) fn indicator(
         &self,
         now: Instant,

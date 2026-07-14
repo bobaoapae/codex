@@ -1104,7 +1104,7 @@ async fn live_app_server_stream_recovery_restores_previous_status_header() {
 
 #[tokio::test]
 async fn live_app_server_server_overloaded_error_renders_warning() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
     chat.handle_server_notification(
         ServerNotification::TurnStarted(TurnStartedNotification {
@@ -1142,6 +1142,64 @@ async fn live_app_server_server_overloaded_error_renders_warning() {
     assert_eq!(cells.len(), 1);
     assert_eq!(lines_to_single_string(&cells[0]), "⚠ server overloaded\n");
     assert!(!chat.bottom_pane.is_task_running());
+    assert_no_submit_op(&mut op_rx);
+}
+
+#[tokio::test]
+async fn server_overloaded_error_auto_continues_without_goal_when_enabled() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.config.tui_auto_continue_on_model_capacity = true;
+    chat.thread_id = Some(ThreadId::new());
+
+    chat.on_server_overloaded_error("server overloaded".to_string());
+
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => assert_eq!(
+            items,
+            vec![UserInput::Text {
+                text: "continue".to_string(),
+                text_elements: Vec::new(),
+            }]
+        ),
+        other => panic!("expected automatic continue user turn, got {other:?}"),
+    }
+    drain_insert_history(&mut rx);
+
+    chat.on_server_overloaded_error("server overloaded again".to_string());
+
+    assert_no_submit_op(&mut op_rx);
+}
+
+#[tokio::test]
+async fn server_overloaded_error_resumes_blocked_goal_when_enabled() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.config.tui_auto_continue_on_model_capacity = true;
+    let thread_id = ThreadId::new();
+    chat.thread_id = Some(thread_id);
+    chat.current_goal_status = Some(GoalStatusState::new(
+        AppThreadGoal {
+            thread_id: thread_id.to_string(),
+            objective: "Finish the task".to_string(),
+            status: AppThreadGoalStatus::Blocked,
+            token_budget: None,
+            tokens_used: 100,
+            time_used_seconds: 10,
+            created_at: 1,
+            updated_at: 2,
+        },
+        Instant::now(),
+    ));
+
+    chat.on_server_overloaded_error("server overloaded".to_string());
+
+    let mut goal_resume = None;
+    while let Ok(event) = rx.try_recv() {
+        if let AppEvent::SetThreadGoalStatus { thread_id, status } = event {
+            goal_resume = Some((thread_id, status));
+        }
+    }
+    assert_eq!(goal_resume, Some((thread_id, AppThreadGoalStatus::Active)));
+    assert_no_submit_op(&mut op_rx);
 }
 
 #[tokio::test]

@@ -908,6 +908,7 @@ fn config_toml_deserializes_model_availability_nux() {
             show_tooltips: true,
             vim_mode_default: false,
             raw_output_mode: false,
+            auto_continue_on_model_capacity: false,
             alternate_screen: AltScreenMode::default(),
             status_line: None,
             status_line_use_colors: true,
@@ -1066,6 +1067,39 @@ async fn runtime_config_uses_tui_raw_output_mode() {
     .expect("load config");
 
     assert!(cfg.tui_raw_output_mode);
+}
+
+#[test]
+fn test_tui_auto_continue_on_model_capacity_defaults_to_false() {
+    let toml = r#"
+        [tui]
+    "#;
+    let parsed: ConfigToml = toml::from_str(toml).expect("deserialize empty [tui] table");
+    assert!(
+        !parsed
+            .tui
+            .expect("config should include tui section")
+            .auto_continue_on_model_capacity
+    );
+}
+
+#[tokio::test]
+async fn runtime_config_uses_tui_auto_continue_on_model_capacity() {
+    let toml = r#"
+        [tui]
+        auto_continue_on_model_capacity = true
+    "#;
+    let cfg_toml: ConfigToml =
+        toml::from_str(toml).expect("deserialize auto_continue_on_model_capacity=true");
+    let cfg = Config::load_from_base_config_with_overrides(
+        cfg_toml,
+        ConfigOverrides::default(),
+        tempdir().expect("tempdir").abs(),
+    )
+    .await
+    .expect("load config");
+
+    assert!(cfg.tui_auto_continue_on_model_capacity);
 }
 
 #[test]
@@ -3757,6 +3791,7 @@ fn tui_config_missing_notifications_field_defaults_to_enabled() {
             show_tooltips: true,
             vim_mode_default: false,
             raw_output_mode: false,
+            auto_continue_on_model_capacity: false,
             alternate_screen: AltScreenMode::Auto,
             status_line: None,
             status_line_use_colors: true,

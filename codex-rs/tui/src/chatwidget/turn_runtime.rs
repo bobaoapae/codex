@@ -95,6 +95,7 @@ impl ChatWidget {
         duration_ms: Option<i64>,
         from_replay: bool,
     ) {
+        self.capacity_auto_continue_attempted = false;
         self.input_queue.submit_pending_steers_after_interrupt = false;
         // Use `last_agent_message` from the turn-complete notification as the copy
         // source only when no earlier item-level event (AgentMessageItem, plan
@@ -350,7 +351,36 @@ impl ChatWidget {
 
         self.add_to_history(history_cell::new_warning_event(message));
         self.request_redraw();
-        self.maybe_send_next_queued_input();
+        let queued_input_started = self.maybe_send_next_queued_input();
+        if !queued_input_started {
+            self.maybe_auto_continue_after_model_capacity_error();
+        }
+    }
+
+    fn maybe_auto_continue_after_model_capacity_error(&mut self) {
+        if !self.config.tui_auto_continue_on_model_capacity || self.capacity_auto_continue_attempted
+        {
+            return;
+        }
+
+        let resumable_goal = self
+            .current_goal_status
+            .as_ref()
+            .is_some_and(GoalStatusState::can_resume_after_capacity_error);
+        if resumable_goal {
+            let Some(thread_id) = self.thread_id else {
+                return;
+            };
+            self.app_event_tx.send(AppEvent::SetThreadGoalStatus {
+                thread_id,
+                status: AppThreadGoalStatus::Active,
+            });
+            self.capacity_auto_continue_attempted = true;
+            return;
+        }
+
+        self.submit_user_message(UserMessage::from("continue"));
+        self.capacity_auto_continue_attempted = true;
     }
 
     pub(super) fn on_error(&mut self, message: String) {

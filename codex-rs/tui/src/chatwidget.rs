@@ -747,6 +747,7 @@ pub(crate) struct ChatWidget {
     external_editor_state: ExternalEditorState,
     last_rendered_user_message_display: Option<UserMessageDisplay>,
     last_non_retry_error: Option<(String, String)>,
+    capacity_auto_continue_attempted: bool,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]

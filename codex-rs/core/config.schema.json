@@ -3048,6 +3048,11 @@
           "description": "Enable animations (welcome screen, shimmer effects, spinners). Defaults to `true`.",
           "type": "boolean"
         },
+        "auto_continue_on_model_capacity": {
+          "default": false,
+          "description": "Automatically continue once when the selected model reports that it is at capacity. Resumes an active goal when present; otherwise submits `continue`. Defaults to `false`.",
+          "type": "boolean"
+        },
         "keymap": {
           "allOf": [
             {

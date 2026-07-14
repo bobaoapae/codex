@@ -805,6 +805,9 @@ pub struct Config {
     /// Start the TUI in raw scrollback mode for copy-friendly transcript output.
     pub tui_raw_output_mode: bool,
 
+    /// Automatically continue once after a selected-model capacity error.
+    pub tui_auto_continue_on_model_capacity: bool,
+
     /// Start the TUI in the specified collaboration mode (plan/default).
 
     /// Controls whether the TUI uses the terminal's alternate screen buffer.
@@ -4101,6 +4104,11 @@ impl Config {
                 .tui
                 .as_ref()
                 .map(|t| t.raw_output_mode)
+                .unwrap_or(false),
+            tui_auto_continue_on_model_capacity: cfg
+                .tui
+                .as_ref()
+                .map(|t| t.auto_continue_on_model_capacity)
                 .unwrap_or(false),
             tui_alternate_screen: cfg
                 .tui

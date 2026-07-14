@@ -708,6 +708,12 @@ pub struct Tui {
     #[serde(default)]
     pub raw_output_mode: bool,
 
+    /// Automatically continue once when the selected model reports that it is at capacity.
+    /// Resumes an active goal when present; otherwise submits `continue`.
+    /// Defaults to `false`.
+    #[serde(default)]
+    pub auto_continue_on_model_capacity: bool,
+
     /// Controls whether the TUI uses the terminal's alternate screen buffer.
     ///
     /// - `auto` (default): Use alternate screen.
