@@ -1,5 +1,7 @@
 use super::session::Session;
 use super::turn_context::TurnContext;
+use codex_local_features::CompactionDecision;
+use codex_local_features::ContextMode;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 
 #[derive(Debug)]
@@ -89,4 +91,46 @@ pub(crate) async fn context_window_token_status(
         full_context_window_limit_reached,
         token_limit_reached,
     }
+}
+
+pub(crate) async fn observe_and_schedule_adaptive_compaction(
+    sess: &Session,
+    turn_context: &TurnContext,
+    active_context_tokens: i64,
+) {
+    if turn_context.config.local_extensions.context != ContextMode::Adaptive {
+        return;
+    }
+    let Some(context_window) = turn_context.model_context_window() else {
+        return;
+    };
+    let mut state = sess.state.lock().await;
+    state
+        .adaptive_context_policy
+        .observe_usage(active_context_tokens);
+    let decision = state.adaptive_context_policy.decide(
+        active_context_tokens,
+        context_window,
+        turn_context.config.model_auto_compact_token_limit,
+    );
+    state.adaptive_compaction_scheduled = matches!(
+        decision,
+        CompactionDecision::Schedule {
+            reason: codex_local_features::CompactionReason::PredictedNextTurnReserve
+        }
+    );
+    if state.adaptive_compaction_scheduled {
+        tracing::debug!(
+            target: "codex_local_features",
+            feature = "adaptive_context",
+            active_context_tokens,
+            context_window,
+            "scheduled compaction at next safe pre-turn boundary"
+        );
+    }
+}
+
+pub(crate) async fn take_adaptive_compaction_schedule(sess: &Session) -> bool {
+    let mut state = sess.state.lock().await;
+    std::mem::take(&mut state.adaptive_compaction_scheduled)
 }

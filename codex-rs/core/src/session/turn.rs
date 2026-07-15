@@ -372,6 +372,12 @@ pub(crate) async fn run_turn(
                 }
 
                 if !needs_follow_up {
+                    super::context_window::observe_and_schedule_adaptive_compaction(
+                        sess.as_ref(),
+                        turn_context.as_ref(),
+                        token_status.active_context_tokens,
+                    )
+                    .await;
                     last_agent_message = sampling_request_last_agent_message;
                     let stop_outcome = run_turn_stop_hooks(
                         &sess,
@@ -807,7 +813,9 @@ async fn run_pre_sampling_compact(
         super::context_window::context_window_token_status(sess.as_ref(), turn_context.as_ref())
             .await;
     // Compact if the configured auto-compaction budget or usable context window is exhausted.
-    if token_status.token_limit_reached {
+    if token_status.token_limit_reached
+        || super::context_window::take_adaptive_compaction_schedule(sess.as_ref()).await
+    {
         // Pre-turn compaction runs before run_turn creates the normal sampling step.
         let step_context = sess.capture_step_context(Arc::clone(turn_context)).await;
         run_auto_compact(
