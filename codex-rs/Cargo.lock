@@ -3326,6 +3326,7 @@ name = "codex-local-features"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "codex-config",
  "serde",
  "serde_json",
