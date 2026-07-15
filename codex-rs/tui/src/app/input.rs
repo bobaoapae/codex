@@ -95,6 +95,27 @@ impl App {
         app_server: &mut AppServerSession,
         key_event: KeyEvent,
     ) {
+        if self.overlay.is_none()
+            && key_event.code == KeyCode::F(6)
+            && matches!(key_event.kind, KeyEventKind::Press)
+            && self.operations_dock.focus()
+        {
+            tui.frame_requester().schedule_frame();
+            return;
+        }
+        if key_event.code == KeyCode::Enter
+            && matches!(key_event.kind, KeyEventKind::Press)
+            && let Some(thread_id) = self.operations_dock.selected_agent_thread_id()
+        {
+            let _ = self
+                .select_agent_thread_and_discard_side(tui, app_server, thread_id)
+                .await;
+            return;
+        }
+        if self.operations_dock.handle_key(key_event) {
+            tui.frame_requester().schedule_frame();
+            return;
+        }
         // Some terminals, especially on macOS, encode Option+Left/Right as Option+b/f unless
         // enhanced keyboard reporting is available. We only treat those word-motion fallbacks as
         // agent-switch shortcuts when the composer is empty so we never steal the expected

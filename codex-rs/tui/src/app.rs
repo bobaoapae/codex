@@ -61,6 +61,8 @@ use crate::multi_agents::format_agent_picker_item_name;
 use crate::multi_agents::next_agent_shortcut_matches;
 use crate::multi_agents::previous_agent_shortcut_matches;
 use crate::multi_agents::sub_agent_activity_display;
+use crate::operations_dock::DockAgentRow;
+use crate::operations_dock::OperationsDockState;
 use crate::pager_overlay::Overlay;
 use crate::render::highlight::highlight_bash_to_lines;
 use crate::render::renderable::Renderable;
@@ -140,6 +142,7 @@ use codex_config::types::WindowsToml;
 use codex_exec_server::EnvironmentManager;
 use codex_features::Feature;
 use codex_features::FeaturesToml;
+use codex_local_features::LocalExtensionsStore;
 use codex_model_provider::create_model_provider;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_models_manager::model_presets::HIDE_GPT_5_1_CODEX_MAX_MIGRATION_PROMPT_CONFIG;
@@ -159,6 +162,9 @@ use codex_protocol::openai_models::ModelUpgrade;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 #[cfg(target_os = "windows")]
 use codex_protocol::permissions::FileSystemSandboxKind;
+use codex_protocol::plan_tool::PlanItemArg;
+use codex_protocol::plan_tool::StepStatus;
+use codex_protocol::plan_tool::UpdatePlanArgs;
 use codex_rollout::StateDbHandle;
 use codex_terminal_detection::user_agent;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -509,6 +515,8 @@ pub(crate) struct App {
     /// Config is stored here so we can recreate ChatWidgets as needed.
     pub(crate) config: Config,
     pub(crate) state_db: Option<StateDbHandle>,
+    operations_dock: OperationsDockState,
+    local_extensions_store: LocalExtensionsStore,
     cli_kv_overrides: Vec<(String, TomlValue)>,
     harness_overrides: ConfigOverrides,
     loader_overrides: LoaderOverrides,
@@ -1017,6 +1025,9 @@ See the Codex keymap documentation for supported actions and examples."
         })?;
         #[cfg(not(debug_assertions))]
         let upgrade_version = crate::updates::get_upgrade_version(&config);
+        let operations_dock = OperationsDockState::new(config.local_extensions.operations_dock);
+        let local_extensions_store =
+            LocalExtensionsStore::new(config.codex_home.as_path(), &config.local_extensions);
 
         let mut app = Self {
             model_catalog,
@@ -1026,6 +1037,8 @@ See the Codex keymap documentation for supported actions and examples."
             workspace_command_runner: Some(workspace_command_runner),
             config,
             state_db,
+            operations_dock,
+            local_extensions_store,
             cli_kv_overrides,
             harness_overrides,
             loader_overrides,
@@ -1075,6 +1088,17 @@ See the Codex keymap documentation for supported actions and examples."
         let initial_session_started_at = Instant::now();
         if let Some(started) = initial_started_thread {
             let thread_id = started.session.thread_id;
+            match app
+                .local_extensions_store
+                .load_latest_plan::<UpdatePlanArgs>(&thread_id.to_string())
+                .await
+            {
+                Ok(Some(plan)) => app.operations_dock.update_plan(plan),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::debug!(%error, feature = "operations_dock", "failed to load local plan snapshot");
+                }
+            }
             app.enqueue_primary_thread_session(started.session, started.turns)
                 .await?;
             if should_prompt_for_paused_goal_after_startup_resume {
@@ -1351,14 +1375,48 @@ See the Codex keymap documentation for supported actions and examples."
     }
 
     fn render_chat_widget_frame(&mut self, tui: &mut tui::Tui) -> Result<Rect> {
-        let desired_height = self.chat_widget.desired_height(tui.terminal.size()?.width);
+        let agent_rows = self
+            .agent_navigation
+            .ordered_threads()
+            .into_iter()
+            .filter(|(thread_id, _)| Some(*thread_id) != self.primary_thread_id)
+            .map(|(thread_id, entry)| DockAgentRow {
+                thread_id,
+                label: format_agent_picker_item_name(
+                    entry.agent_nickname.as_deref(),
+                    entry.agent_role.as_deref(),
+                    /*is_primary*/ false,
+                ),
+                status: if entry.is_closed {
+                    "completed".to_string()
+                } else if entry.is_running {
+                    "running".to_string()
+                } else {
+                    "idle".to_string()
+                },
+            })
+            .collect();
+        self.operations_dock.sync_agents(agent_rows);
+        let terminal_size = tui.terminal.size()?;
+        let chat_height = self.chat_widget.desired_height(terminal_size.width);
+        let dock_height = self.operations_dock.desired_height(terminal_size.height);
+        let desired_height = chat_height.saturating_add(dock_height);
         let mut rendered_area = Rect::default();
         tui.draw_with_resize_reflow(desired_height, |frame| {
             let area = frame.area();
             rendered_area = area;
-            self.chat_widget.render(area, frame.buffer);
-            if let Some((x, y)) = self.chat_widget.cursor_pos(area) {
-                frame.set_cursor_style(self.chat_widget.cursor_style(area));
+            let actual_dock_height = dock_height.min(area.height.saturating_sub(1));
+            let dock_area = Rect::new(area.x, area.y, area.width, actual_dock_height);
+            let chat_area = Rect::new(
+                area.x,
+                area.y.saturating_add(actual_dock_height),
+                area.width,
+                area.height.saturating_sub(actual_dock_height),
+            );
+            self.operations_dock.render(dock_area, frame.buffer);
+            self.chat_widget.render(chat_area, frame.buffer);
+            if let Some((x, y)) = self.chat_widget.cursor_pos(chat_area) {
+                frame.set_cursor_style(self.chat_widget.cursor_style(chat_area));
                 frame.set_cursor_position((x, y));
             }
         })?;
