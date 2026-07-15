@@ -267,7 +267,10 @@ impl PageCursor {
     fn next(self, cursor: Option<String>) -> Option<Self> {
         match (self, cursor) {
             (Self::StateDb(_), Some(cursor)) => Some(Self::StateDb(Some(cursor))),
-            (Self::StateDb(_), None) => Some(Self::ScanAndRepair(None)),
+            // Resume filesystem reconciliation from the page where SQLite ended. The rows from
+            // that final indexed page may be revisited and deduplicated, but older indexed pages
+            // are not scanned again before reaching unmapped rollouts.
+            (Self::StateDb(cursor), None) => Some(Self::ScanAndRepair(cursor)),
             (Self::ScanAndRepair(_), Some(cursor)) => Some(Self::ScanAndRepair(Some(cursor))),
             (Self::ScanAndRepair(_), None) => None,
         }
@@ -3361,7 +3364,7 @@ mod tests {
         );
         assert_eq!(
             PageCursor::StateDb(Some("db-cursor".to_string())).next(None),
-            Some(PageCursor::ScanAndRepair(None))
+            Some(PageCursor::ScanAndRepair(Some("db-cursor".to_string())))
         );
         assert_eq!(
             PageCursor::ScanAndRepair(None).next(Some("scan-cursor".to_string())),

@@ -941,6 +941,21 @@ impl RolloutRecorder {
         path: &Path,
     ) -> std::io::Result<(Vec<RolloutItem>, Option<ThreadId>, usize)> {
         trace!("Resuming rollout from {path:?}");
+        if let Some(physical_path) = compression::existing_rollout_path(path).await
+            && physical_path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                != Some("zst")
+            && tokio::fs::metadata(&physical_path)
+                .await
+                .is_ok_and(|metadata| metadata.len() >= 4 * 1024 * 1024)
+        {
+            return tokio::task::spawn_blocking(move || {
+                load_plain_rollout_items_parallel(physical_path.as_path())
+            })
+            .await
+            .map_err(IoError::other)?;
+        }
         let mut items: Vec<RolloutItem> = Vec::new();
         let mut thread_id: Option<ThreadId> = None;
         let mut parse_errors = 0usize;
@@ -951,41 +966,73 @@ impl RolloutRecorder {
                 continue;
             }
             saw_non_empty_line = true;
-            let mut v: Value = match serde_json::from_str(&line) {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!("failed to parse line as JSON: {line:?}, error: {e}");
-                    parse_errors = parse_errors.saturating_add(1);
+            // `ResponseItem` intentionally accepts removed/unknown variants as `Other`, so a
+            // legacy ghost snapshot can deserialize successfully. Inspect only candidate lines
+            // through a mutable `Value`; ordinary rollout lines keep the single-parse fast path.
+            if line.contains("\"ghost_snapshot\"") {
+                let mut value: Value = match serde_json::from_str(&line) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        warn!("failed to parse line as JSON: {line:?}, error: {error}");
+                        parse_errors = parse_errors.saturating_add(1);
+                        continue;
+                    }
+                };
+                if strip_legacy_ghost_snapshot_rollout_line(&mut value) {
+                    trace!("skipping legacy ghost_snapshot rollout line");
                     continue;
                 }
-            };
-            if strip_legacy_ghost_snapshot_rollout_line(&mut v) {
-                trace!("skipping legacy ghost_snapshot rollout line");
+                match serde_json::from_value::<RolloutLine>(value) {
+                    Ok(rollout_line) => {
+                        record_loaded_rollout_item(&mut items, &mut thread_id, rollout_line.item);
+                    }
+                    Err(error) => {
+                        trace!("failed to parse legacy-normalized rollout line: {error}");
+                        parse_errors = parse_errors.saturating_add(1);
+                    }
+                }
                 continue;
             }
-
-            // Parse the rollout line structure
-            match serde_json::from_value::<RolloutLine>(v.clone()) {
+            match serde_json::from_str::<RolloutLine>(&line) {
                 Ok(rollout_line) => {
-                    let item = rollout_line.item;
-                    // Use the FIRST SessionMeta encountered in the file as the canonical
-                    // thread id and main session information. Keep all items intact.
-                    if thread_id.is_none()
-                        && let RolloutItem::SessionMeta(session_meta_line) = &item
-                    {
-                        thread_id = Some(session_meta_line.meta.id);
-                    }
-                    items.push(item);
+                    record_loaded_rollout_item(&mut items, &mut thread_id, rollout_line.item);
                 }
-                Err(e) => {
-                    if thread_id.is_none() {
-                        // The first SessionMeta belongs to this rollout. Later SessionMeta lines
-                        // can be copied from fork history, so only validate unknown history modes
-                        // before we have parsed the rollout's own SessionMeta.
-                        reject_unknown_thread_history_mode(&v)?;
+                Err(direct_error) => {
+                    // Most lines deserialize directly. Fall back to a mutable Value for the
+                    // precise unknown-history-mode compatibility error and malformed records.
+                    let mut value: Value = match serde_json::from_str(&line) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            warn!("failed to parse line as JSON: {line:?}, error: {error}");
+                            parse_errors = parse_errors.saturating_add(1);
+                            continue;
+                        }
+                    };
+                    if strip_legacy_ghost_snapshot_rollout_line(&mut value) {
+                        trace!("skipping legacy ghost_snapshot rollout line");
+                        continue;
                     }
-                    trace!("failed to parse rollout line: {e}");
-                    parse_errors = parse_errors.saturating_add(1);
+                    match serde_json::from_value::<RolloutLine>(value.clone()) {
+                        Ok(rollout_line) => {
+                            record_loaded_rollout_item(
+                                &mut items,
+                                &mut thread_id,
+                                rollout_line.item,
+                            );
+                        }
+                        Err(error) => {
+                            if thread_id.is_none() {
+                                // The first SessionMeta belongs to this rollout. Later SessionMeta
+                                // lines can be copied from fork history, so only validate unknown
+                                // history modes before parsing the rollout's own SessionMeta.
+                                reject_unknown_thread_history_mode(&value)?;
+                            }
+                            trace!(
+                                "failed to parse rollout line directly ({direct_error}) and after legacy normalization: {error}"
+                            );
+                            parse_errors = parse_errors.saturating_add(1);
+                        }
+                    }
                 }
             }
         }
@@ -1045,6 +1092,129 @@ impl RolloutRecorder {
         };
         Ok(())
     }
+}
+
+enum ParsedRolloutLine {
+    Empty,
+    SkipGhost,
+    Item(RolloutItem),
+    InvalidJson { line: String, error: String },
+    InvalidRollout { value: Value, error: String },
+}
+
+fn load_plain_rollout_items_parallel(
+    path: &Path,
+) -> std::io::Result<(Vec<RolloutItem>, Option<ThreadId>, usize)> {
+    let bytes = fs::read(path)?;
+    let lines = bytes.split(|byte| *byte == b'\n').collect::<Vec<_>>();
+    let worker_count = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(8)
+        .min(lines.len().max(1));
+    let chunk_size = lines.len().div_ceil(worker_count);
+    let parsed = std::thread::scope(|scope| {
+        let mut workers = Vec::with_capacity(worker_count);
+        for chunk in lines.chunks(chunk_size) {
+            workers.push(scope.spawn(move || {
+                chunk
+                    .iter()
+                    .map(|line| parse_rollout_line_bytes(line))
+                    .collect::<Vec<_>>()
+            }));
+        }
+        let mut parsed = Vec::with_capacity(lines.len());
+        for worker in workers {
+            parsed.extend(
+                worker
+                    .join()
+                    .map_err(|_| IoError::other("parallel rollout parser worker panicked"))?,
+            );
+        }
+        Ok::<_, IoError>(parsed)
+    })?;
+
+    let mut items = Vec::with_capacity(parsed.len());
+    let mut thread_id = None;
+    let mut parse_errors = 0usize;
+    let mut saw_non_empty_line = false;
+    for parsed_line in parsed {
+        match parsed_line {
+            ParsedRolloutLine::Empty => {}
+            ParsedRolloutLine::SkipGhost => {
+                saw_non_empty_line = true;
+                trace!("skipping legacy ghost_snapshot rollout line");
+            }
+            ParsedRolloutLine::Item(item) => {
+                saw_non_empty_line = true;
+                record_loaded_rollout_item(&mut items, &mut thread_id, item);
+            }
+            ParsedRolloutLine::InvalidJson { line, error } => {
+                saw_non_empty_line = true;
+                warn!("failed to parse line as JSON: {line:?}, error: {error}");
+                parse_errors = parse_errors.saturating_add(1);
+            }
+            ParsedRolloutLine::InvalidRollout { value, error } => {
+                saw_non_empty_line = true;
+                if thread_id.is_none() {
+                    reject_unknown_thread_history_mode(&value)?;
+                }
+                trace!("failed to parse rollout line: {error}");
+                parse_errors = parse_errors.saturating_add(1);
+            }
+        }
+    }
+    if !saw_non_empty_line {
+        return Err(IoError::other("empty session file"));
+    }
+    tracing::debug!(
+        "Resumed rollout with {} items, thread ID: {:?}, parse errors: {} using {} parser workers",
+        items.len(),
+        thread_id,
+        parse_errors,
+        worker_count,
+    );
+    Ok((items, thread_id, parse_errors))
+}
+
+fn parse_rollout_line_bytes(line: &[u8]) -> ParsedRolloutLine {
+    if line.iter().all(u8::is_ascii_whitespace) {
+        return ParsedRolloutLine::Empty;
+    }
+    let mut value: Value = match serde_json::from_slice(line) {
+        Ok(value) => value,
+        Err(error) => {
+            return ParsedRolloutLine::InvalidJson {
+                line: String::from_utf8_lossy(line).into_owned(),
+                error: error.to_string(),
+            };
+        }
+    };
+    if strip_legacy_ghost_snapshot_rollout_line(&mut value) {
+        return ParsedRolloutLine::SkipGhost;
+    }
+    match serde_json::from_value::<RolloutLine>(value.clone()) {
+        Ok(line) => ParsedRolloutLine::Item(line.item),
+        Err(error) => ParsedRolloutLine::InvalidRollout {
+            value,
+            error: error.to_string(),
+        },
+    }
+}
+
+fn record_loaded_rollout_item(
+    items: &mut Vec<RolloutItem>,
+    thread_id: &mut Option<ThreadId>,
+    item: RolloutItem,
+) {
+    // Use the FIRST SessionMeta encountered in the file as the canonical thread id and main
+    // session information. Later SessionMeta items may be inherited fork history.
+    if thread_id.is_none()
+        && let RolloutItem::SessionMeta(session_meta_line) = &item
+    {
+        *thread_id = Some(session_meta_line.meta.id);
+    }
+    items.push(item);
 }
 
 pub(crate) fn reject_unknown_thread_history_mode(value: &Value) -> std::io::Result<()> {

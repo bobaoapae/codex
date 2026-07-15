@@ -6,7 +6,6 @@ use std::path::PathBuf;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionMetaLine;
-use codex_protocol::protocol::ThreadHistoryMode;
 use codex_rollout::ModelContextScan;
 use codex_rollout::ModelContextScanProgress;
 use codex_rollout::ReverseJsonlScanner;
@@ -25,13 +24,13 @@ mod tests;
 
 /// Loads rollout items needed to reconstruct the latest model-visible context.
 ///
-/// Plain paginated JSONL rollouts use a reverse scan. When it finds both a usable replacement-
+/// Plain JSONL rollouts use a reverse scan. When it finds both a usable replacement-
 /// history checkpoint and the completed user-turn context needed for resume metadata, the returned
 /// replay starts with the canonical head `SessionMeta` followed by that newest suffix. When no
 /// bounded cutoff is available, the scan continues to the beginning and returns the complete
 /// replay it already accumulated.
 ///
-/// Legacy and compressed rollout shapes keep the existing full-history path.
+/// Compressed rollout shapes keep the existing full-history path because they are not seekable.
 pub(super) async fn load_latest_model_context(
     store: &LocalThreadStore,
     params: LoadThreadHistoryParams,
@@ -58,11 +57,10 @@ pub(super) async fn load_latest_model_context(
         });
     }
 
-    let items = if matches!(session_meta.meta.history_mode, ThreadHistoryMode::Paginated)
-        && !path
-            .file_name()
-            .and_then(|file_name| file_name.to_str())
-            .is_some_and(|file_name| file_name.ends_with(".jsonl.zst"))
+    let items = if !path
+        .file_name()
+        .and_then(|file_name| file_name.to_str())
+        .is_some_and(|file_name| file_name.ends_with(".jsonl.zst"))
     {
         scan_model_context_from_end(path, session_meta).await?
     } else {

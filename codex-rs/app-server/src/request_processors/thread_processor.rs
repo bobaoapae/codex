@@ -6,6 +6,7 @@ use codex_protocol::config_types::MultiAgentMode;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_thread_store::LoadThreadHistoryParams;
 
 const THREAD_LIST_DEFAULT_LIMIT: usize = 25;
 const THREAD_LIST_MAX_LIMIT: usize = 100;
@@ -3483,23 +3484,44 @@ impl ThreadRequestProcessor {
         if matches!(source_thread.history_mode, ThreadHistoryMode::Paginated) {
             return Err(method_not_found("paginated_threads is not supported yet"));
         }
-        let mut source_thread = self
-            .read_stored_thread_for_resume(&thread_id, path.as_ref(), /*include_history*/ true)
-            .await?;
         let source_thread_id = source_thread.thread_id;
         let source_thread_name = source_thread
             .name
             .as_deref()
             .and_then(codex_core::util::normalize_thread_name);
-        let history_items = source_thread
-            .history
-            .take()
-            .map(|history| history.items)
-            .ok_or_else(|| {
-                internal_error(format!(
-                    "thread {source_thread_id} did not include persisted history"
-                ))
-            })?;
+        let use_latest_model_context =
+            should_load_bounded_fork_context(exclude_turns, last_turn_id.as_deref(), path.as_ref());
+        let history_items = if use_latest_model_context {
+            match self
+                .thread_store
+                .load_latest_model_context(LoadThreadHistoryParams {
+                    thread_id: source_thread_id,
+                    include_archived: true,
+                })
+                .await
+            {
+                Ok(context) => {
+                    tracing::debug!(
+                        thread_id = %source_thread_id,
+                        item_count = context.items.len(),
+                        "loaded bounded model context for turnless fork"
+                    );
+                    context.items
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        thread_id = %source_thread_id,
+                        %err,
+                        "bounded model context unavailable; falling back to full fork history"
+                    );
+                    self.read_fork_history_items(&thread_id, path.as_ref())
+                        .await?
+                }
+            }
+        } else {
+            self.read_fork_history_items(&thread_id, path.as_ref())
+                .await?
+        };
         let history_items = if let Some(last_turn_id) = last_turn_id.as_deref() {
             Arc::new(
                 truncate_rollout_after_turn_id(&history_items, last_turn_id)
@@ -3726,6 +3748,26 @@ impl ThreadRequestProcessor {
         Ok(())
     }
 
+    async fn read_fork_history_items(
+        &self,
+        thread_id: &str,
+        path: Option<&PathBuf>,
+    ) -> Result<Vec<RolloutItem>, JSONRPCErrorError> {
+        let mut source_thread = self
+            .read_stored_thread_for_resume(thread_id, path, /*include_history*/ true)
+            .await?;
+        source_thread
+            .history
+            .take()
+            .map(|history| history.items)
+            .ok_or_else(|| {
+                internal_error(format!(
+                    "thread {} did not include persisted history",
+                    source_thread.thread_id
+                ))
+            })
+    }
+
     async fn get_thread_summary_response_inner(
         &self,
         params: GetConversationSummaryParams,
@@ -3879,6 +3921,14 @@ impl ThreadRequestProcessor {
 
         Ok((items, next_cursor))
     }
+}
+
+fn should_load_bounded_fork_context(
+    exclude_turns: bool,
+    last_turn_id: Option<&str>,
+    path: Option<&PathBuf>,
+) -> bool {
+    exclude_turns && last_turn_id.is_none() && path.is_none()
 }
 
 fn xcode_26_4_mcp_elicitations_auto_deny(

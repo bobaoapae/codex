@@ -2,6 +2,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::items::TurnItem;
@@ -272,6 +273,89 @@ async fn assert_reverse_scan_matches_full_history(path: &Path) {
         serde_json::to_value(items).expect("serialize scanned items"),
         serde_json::to_value(full_items).expect("serialize full items")
     );
+}
+
+#[tokio::test]
+async fn legacy_rollout_uses_latest_checkpoint_for_model_context() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 1007);
+    let thread_id = codex_protocol::ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let path = write_session_file_with_history_mode(
+        home.path(),
+        "2025-01-03T13-00-06",
+        uuid,
+        ThreadHistoryMode::Legacy,
+    )
+    .expect("write legacy session file");
+    append_items(
+        path.as_path(),
+        [
+            turn_started("turn-1"),
+            user_message("older turn"),
+            completed_user_message("turn-1", "older turn"),
+            turn_context(home.path(), "turn-1"),
+            compacted("older checkpoint", Some(Vec::new())),
+            turn_complete("turn-1"),
+            turn_started("turn-2"),
+            user_message("latest turn"),
+            completed_user_message("turn-2", "latest turn"),
+            turn_context(home.path(), "turn-2"),
+            compacted("latest checkpoint", Some(Vec::new())),
+            turn_complete("turn-2"),
+        ],
+    );
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+
+    let context = store
+        .load_latest_model_context(LoadThreadHistoryParams {
+            thread_id,
+            include_archived: false,
+        })
+        .await
+        .expect("load legacy model context");
+
+    assert!(context.items.iter().any(|item| {
+        matches!(item, RolloutItem::Compacted(compacted) if compacted.message == "latest checkpoint")
+    }));
+    assert!(!context.items.iter().any(|item| {
+        matches!(item, RolloutItem::Compacted(compacted) if compacted.message == "older checkpoint")
+    }));
+}
+
+/// Local benchmark for a real rollout. Run explicitly with
+/// `CODEX_BENCH_ROLLOUT=<path> cargo test -p codex-thread-store
+/// benchmark_external_rollout_context_scan -- --ignored --nocapture`.
+#[tokio::test]
+#[ignore = "requires CODEX_BENCH_ROLLOUT"]
+async fn benchmark_external_rollout_context_scan() {
+    let path = PathBuf::from(
+        std::env::var_os("CODEX_BENCH_ROLLOUT").expect("CODEX_BENCH_ROLLOUT must be set"),
+    );
+    let session_meta = codex_rollout::read_session_meta_line(path.as_path())
+        .await
+        .expect("read session metadata");
+
+    let started = Instant::now();
+    let scanned = scan_model_context_from_end_blocking(path.as_path(), session_meta)
+        .expect("reverse scan model context");
+    let scan_elapsed = started.elapsed();
+
+    let started = Instant::now();
+    let full = read_thread::load_history_items(path.as_path())
+        .await
+        .expect("load full rollout");
+    let full_elapsed = started.elapsed();
+
+    eprintln!(
+        "rollout_bytes={} scan_ms={} scan_items={} full_ms={} full_items={} speedup={:.2}x",
+        std::fs::metadata(path).expect("rollout metadata").len(),
+        scan_elapsed.as_millis(),
+        scanned.len(),
+        full_elapsed.as_millis(),
+        full.len(),
+        full_elapsed.as_secs_f64() / scan_elapsed.as_secs_f64()
+    );
+    assert!(scanned.len() <= full.len());
 }
 
 fn append_items<const N: usize>(path: &Path, items: [RolloutItem; N]) {

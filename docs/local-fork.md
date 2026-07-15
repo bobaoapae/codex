@@ -53,6 +53,7 @@ opened when every local extension is disabled.
 | Runtime checkpoints | Storage and validation are complete. Full materialized reconstruction from checkpoint plus rollout suffix is not connected yet, so `resume = "checkpointed"` currently falls back to the canonical reconstruction path. | `local-features/src/checkpoints`, `local-features/src/store.rs` |
 | Shared evidence cache | The bounded, shared, dependency-validated LRU policy is implemented and tested. It is not yet decorating the canonical tool executor, so runtime tool calls remain uncached. | `local-features/src/evidence` |
 | Adaptive agent admission | Priority, FIFO, aging, pressure, recovery, cancellation, and hard-limit policy are implemented and tested. It is not yet wired into asynchronous spawn/resume admission; the canonical hard limiter remains authoritative. | `local-features/src/admission`, `core/src/agent/control` |
+| Large-session reads | Plain JSONL rollouts of at least 4 MiB are parsed in ordered parallel chunks (up to eight workers), while compressed/small rollouts retain the canonical streaming path. The reverse scanner supports legacy and paginated histories; turnless `/btw` forks use it for the currently supported legacy history. Explicit paths, `lastTurnId`, transcript forks, unsupported checkpoints, and scan failures retain full reconstruction. The resume picker starts filesystem reconciliation at the final SQLite page cursor instead of rescanning every newer indexed page. | `rollout/src/recorder.rs`, `thread-store/src/local/model_context.rs`, `app-server/src/request_processors/thread_processor.rs`, `tui/src/resume_picker.rs` |
 
 The last three rows deliberately retain canonical behavior until their runtime
 integration can preserve cancellation, lifecycle events, and durable rollout
@@ -88,7 +89,15 @@ just test -p codex-goal-extension
 just test -p codex-app-server extensions
 just test -p codex-tui operations_dock
 cargo check -p codex-tui
+cargo test -p codex-rollout load_rollout_items
+cargo test -p codex-thread-store model_context
+cargo test -p codex-app-server thread_fork_can_exclude_turns_and_skip_restored_token_usage
 ```
+
+The ignored local benchmarks accept `CODEX_BENCH_ROLLOUT`. On the 251 MiB AS3
+Godot rollout, full compatible reconstruction improved from 6.47 s to 1.19 s
+(5.44x), while reverse model-context scanning took 83 ms. The app-server
+turnless-fork benchmark improved from a 9.96 s average to 1.03 s (9.63x).
 
 On Windows, `cargo fmt --all` is the fallback when `just fmt` cannot find the
 repository's external `buildifier` executable. Bazel lock regeneration also

@@ -36,6 +36,27 @@ mod thread_list_cwd_filter_tests {
     }
 }
 
+mod bounded_fork_context_tests {
+    use super::super::should_load_bounded_fork_context;
+    use std::path::PathBuf;
+
+    #[test]
+    fn bounded_context_is_only_used_for_latest_turnless_store_forks() {
+        assert!(should_load_bounded_fork_context(true, None, None));
+        assert!(!should_load_bounded_fork_context(false, None, None));
+        assert!(!should_load_bounded_fork_context(
+            true,
+            Some("turn-1"),
+            None
+        ));
+        assert!(!should_load_bounded_fork_context(
+            true,
+            None,
+            Some(&PathBuf::from("explicit.jsonl"))
+        ));
+    }
+}
+
 mod background_terminal_pagination_tests {
     use super::super::paginate_background_terminals;
     use codex_app_server_protocol::ThreadBackgroundTerminal;

@@ -25,6 +25,7 @@ use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
+use std::time::Instant;
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -36,6 +37,138 @@ fn test_config(codex_home: &Path) -> RolloutConfig {
         model_provider_id: "test-provider".to_string(),
         generate_memories: true,
     }
+}
+
+/// Local A/B benchmark for the full-rollout parser. The input is copied first so an active
+/// session cannot change between runs.
+#[tokio::test]
+#[ignore = "requires CODEX_BENCH_ROLLOUT"]
+async fn benchmark_external_rollout_full_parser() -> std::io::Result<()> {
+    let source = PathBuf::from(
+        std::env::var_os("CODEX_BENCH_ROLLOUT").expect("CODEX_BENCH_ROLLOUT must be set"),
+    );
+    let temp = TempDir::new()?;
+    let snapshot = temp.path().join("rollout.jsonl");
+    fs::copy(&source, &snapshot)?;
+
+    let mut fast_samples = Vec::new();
+    let mut legacy_samples = Vec::new();
+    let mut item_count = 0usize;
+    for fast_first in [true, false] {
+        if fast_first {
+            let started = Instant::now();
+            item_count = RolloutRecorder::load_rollout_items(&snapshot)
+                .await?
+                .0
+                .len();
+            fast_samples.push(started.elapsed());
+            let started = Instant::now();
+            assert_eq!(legacy_full_parse(&snapshot).await?, item_count);
+            legacy_samples.push(started.elapsed());
+        } else {
+            let started = Instant::now();
+            assert_eq!(legacy_full_parse(&snapshot).await?, item_count);
+            legacy_samples.push(started.elapsed());
+            let started = Instant::now();
+            assert_eq!(
+                RolloutRecorder::load_rollout_items(&snapshot)
+                    .await?
+                    .0
+                    .len(),
+                item_count
+            );
+            fast_samples.push(started.elapsed());
+        }
+    }
+    let fast = fast_samples.into_iter().min().expect("fast sample");
+    let legacy = legacy_samples.into_iter().min().expect("legacy sample");
+    eprintln!(
+        "rollout_bytes={} items={} legacy_ms={} fast_ms={} speedup={:.2}x",
+        fs::metadata(snapshot)?.len(),
+        item_count,
+        legacy.as_millis(),
+        fast.as_millis(),
+        legacy.as_secs_f64() / fast.as_secs_f64()
+    );
+    Ok(())
+}
+
+async fn legacy_full_parse(path: &Path) -> std::io::Result<usize> {
+    let mut items = Vec::new();
+    let mut reader = compression::open_rollout_line_reader(path).await?;
+    while let Some(line) = reader.next_line().await? {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(mut value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if strip_legacy_ghost_snapshot_rollout_line(&mut value) {
+            continue;
+        }
+        if let Ok(line) = serde_json::from_value::<RolloutLine>(value.clone()) {
+            items.push(line.item);
+        }
+    }
+    Ok(items.len())
+}
+
+#[tokio::test]
+async fn parallel_plain_loader_matches_streaming_loader() -> std::io::Result<()> {
+    let home = TempDir::new()?;
+    let path = home.path().join("rollout.jsonl");
+    let thread_id = ThreadId::new();
+    let lines = [
+        serde_json::json!({
+            "timestamp": "2026-07-15T00:00:00Z",
+            "type": "session_meta",
+            "payload": {
+                "id": thread_id,
+                "timestamp": "2026-07-15T00:00:00Z",
+                "cwd": ".",
+                "originator": "test",
+                "cli_version": "test",
+                "source": "cli",
+                "model_provider": "test"
+            }
+        }),
+        serde_json::json!({
+            "timestamp": "2026-07-15T00:00:01Z",
+            "type": "response_item",
+            "payload": {
+                "type": "ghost_snapshot",
+                "ghost_commit": { "id": "deadbeef" }
+            }
+        }),
+        serde_json::json!({
+            "timestamp": "2026-07-15T00:00:02Z",
+            "type": "compacted",
+            "payload": {
+                "message": "summary",
+                "replacement_history": [
+                    { "type": "ghost_snapshot", "ghost_commit": { "id": "deadbeef" } },
+                    { "type": "message", "role": "assistant", "content": [
+                        { "type": "output_text", "text": "kept" }
+                    ] }
+                ]
+            }
+        }),
+    ];
+    let mut file = File::create(&path)?;
+    for line in lines {
+        writeln!(file, "{line}")?;
+    }
+    drop(file);
+
+    let streaming = RolloutRecorder::load_rollout_items(&path).await?;
+    let parallel = load_plain_rollout_items_parallel(&path)?;
+    assert_eq!(
+        serde_json::to_value(&parallel.0).expect("serialize parallel items"),
+        serde_json::to_value(&streaming.0).expect("serialize streaming items")
+    );
+    assert_eq!(parallel.1, streaming.1);
+    assert_eq!(parallel.2, streaming.2);
+    Ok(())
 }
 
 fn paginated_session_meta_item(thread_id: ThreadId, cwd: &Path) -> RolloutItem {
