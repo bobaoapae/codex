@@ -375,7 +375,10 @@ impl ChatWidget {
         // Preserve deterministic FIFO across queued interrupts: once anything
         // is queued due to an active write cycle, continue queueing until the
         // queue is flushed to avoid reordering (e.g., ExecEnd before ExecBegin).
-        if self.stream_controller.is_some() || !self.interrupts.is_empty() {
+        if self.stream_controller.is_some()
+            || self.pending_stream_consolidations > 0
+            || !self.interrupts.is_empty()
+        {
             push(&mut self.interrupts);
         } else {
             handle(self);
@@ -387,8 +390,12 @@ impl ChatWidget {
             self.bottom_pane.hide_status_indicator();
             self.task_complete_pending = false;
         }
-        // A completed stream indicates non-exec content was just inserted.
-        self.flush_interrupt_queue();
+        // A completed stream indicates non-exec content was just inserted. If
+        // its canonical transcript consolidation is still queued, keep later
+        // command/tool lifecycle events behind that durability barrier.
+        if self.pending_stream_consolidations == 0 {
+            self.flush_interrupt_queue();
+        }
     }
 
     #[inline]
