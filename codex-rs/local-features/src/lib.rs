@@ -1,0 +1,20 @@
+//! Isolated policy and rebuildable state for features maintained by the local fork.
+
+mod config;
+mod store;
+
+pub mod admission;
+pub mod checkpoints;
+pub mod evidence;
+pub mod metrics;
+
+pub use config::AgentAdmissionMode;
+pub use config::AgentDelegationMode;
+pub use config::ContextMode;
+pub use config::EvidenceCacheMode;
+pub use config::GoalSupervisionMode;
+pub use config::LocalExtensionsConfig;
+pub use config::MouseMode;
+pub use config::OperationsDockMode;
+pub use config::ResumeMode;
+pub use store::LocalExtensionsStore;

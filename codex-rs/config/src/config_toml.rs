@@ -152,6 +152,9 @@ pub struct OrchestratorFeatureToml {
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct ConfigToml {
+    /// Opt-in capabilities maintained only by a local Codex fork.
+    pub local_extensions: Option<crate::local_extensions::LocalExtensionsToml>,
+
     /// Optional override of model selection.
     pub model: Option<String>,
     /// Review model override used by the `/review` feature.

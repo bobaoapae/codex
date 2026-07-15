@@ -10,6 +10,7 @@ mod hook_config;
 mod host_name;
 mod key_aliases;
 pub mod loader;
+pub mod local_extensions;
 mod marketplace_edit;
 mod mcp_edit;
 mod mcp_requirements;
