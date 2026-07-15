@@ -46,7 +46,7 @@ fn dock_keyboard_focus_and_scroll_are_self_contained() {
     state.update_plan(plan(20));
     assert!(state.focus());
     assert!(state.handle_key(KeyEvent::from(KeyCode::PageDown)));
-    assert_eq!(state.scroll, 10);
+    assert_eq!(state.task_scroll, 10);
     assert!(state.handle_key(KeyEvent::from(KeyCode::Tab)));
     assert_eq!(state.tab, DockTab::Agents);
     assert!(state.handle_key(KeyEvent::from(KeyCode::Esc)));
@@ -79,6 +79,38 @@ fn focusing_agents_selects_the_active_thread() {
     assert!(state.focus_agents());
     assert_eq!(state.tab, DockTab::Agents);
     assert_eq!(state.selected_agent_thread_id(), Some(agent_id));
+}
+
+#[test]
+fn agent_navigation_does_not_move_task_scroll() {
+    let mut state = OperationsDockState::new(OperationsDockMode::Auto);
+    state.update_plan(plan(20));
+    let main_id = ThreadId::new();
+    let agent_id = ThreadId::new();
+    state.sync_agents(
+        vec![
+            DockAgentRow {
+                thread_id: main_id,
+                label: "Main".into(),
+                status: "idle".into(),
+                is_main: true,
+            },
+            DockAgentRow {
+                thread_id: agent_id,
+                label: "/root/cache_integrity".into(),
+                status: "running".into(),
+                is_main: false,
+            },
+        ],
+        Some(main_id),
+    );
+    state.task_scroll = 4;
+    assert!(state.focus_agents());
+
+    assert!(state.handle_key(KeyEvent::from(KeyCode::Down)));
+
+    assert_eq!(state.agent_selected, 1);
+    assert_eq!(state.task_scroll, 4);
 }
 
 #[test]
@@ -136,7 +168,7 @@ fn dock_marks_viewed_thread_and_main_is_a_selectable_return_target() {
     assert_eq!(state.viewing_label, "worker [explorer]");
     assert_eq!(state.selected_agent_thread_id(), Some(main_id));
     assert_eq!(state.selected_interruptible_agent_thread_id(), None);
-    state.scroll = 1;
+    state.agent_selected = 1;
     assert_eq!(
         state.selected_interruptible_agent_thread_id(),
         Some(agent_id)
@@ -169,7 +201,7 @@ fn dock_agent_view_shows_main_active_agent_and_keyboard_actions() {
     );
     assert!(state.focus());
     state.tab = DockTab::Agents;
-    state.scroll = 0;
+    state.agent_selected = 0;
     let area = Rect::new(0, 0, 100, 7);
     let mut buffer = Buffer::empty(area);
     state.render(area, &mut buffer);

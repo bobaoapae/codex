@@ -62,10 +62,13 @@ pub(super) fn render(state: &mut OperationsDockState, area: Rect, buffer: &mut B
             .split(inner);
         super::mouse::record_section(state, columns[0], DockTab::Tasks);
         super::mouse::record_section(state, columns[1], DockTab::Agents);
-        Paragraph::new(tasks::lines(state.latest_plan(), state.scroll)).render(columns[0], buffer);
+        state.set_agent_view_capacity(usize::from(columns[1].height));
+        Paragraph::new(tasks::lines(state.latest_plan(), state.task_scroll))
+            .render(columns[0], buffer);
         Paragraph::new(agents::lines(
             &state.agents,
-            state.scroll,
+            state.agent_scroll,
+            state.agent_selected,
             state.focused,
             state.active_thread_id,
         ))
@@ -73,13 +76,17 @@ pub(super) fn render(state: &mut OperationsDockState, area: Rect, buffer: &mut B
         super::mouse::record_agent_rows(state, columns[1], /*title_row*/ false);
     } else {
         let lines = match state.tab {
-            DockTab::Tasks => tasks::lines(state.latest_plan(), state.scroll),
-            DockTab::Agents => agents::lines(
-                &state.agents,
-                state.scroll,
-                state.focused,
-                state.active_thread_id,
-            ),
+            DockTab::Tasks => tasks::lines(state.latest_plan(), state.task_scroll),
+            DockTab::Agents => {
+                state.set_agent_view_capacity(usize::from(inner.height.saturating_sub(1)));
+                agents::lines(
+                    &state.agents,
+                    state.agent_scroll,
+                    state.agent_selected,
+                    state.focused,
+                    state.active_thread_id,
+                )
+            }
         };
         let active_tab = state.tab;
         super::mouse::record_section(state, inner, active_tab);

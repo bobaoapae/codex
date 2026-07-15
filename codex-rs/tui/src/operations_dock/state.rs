@@ -34,7 +34,10 @@ pub(crate) struct OperationsDockState {
     pub(super) expanded: bool,
     pub(super) focused: bool,
     pub(super) tab: DockTab,
-    pub(super) scroll: usize,
+    pub(super) task_scroll: usize,
+    pub(super) agent_selected: usize,
+    pub(super) agent_scroll: usize,
+    pub(super) agent_view_capacity: usize,
     pub(super) latest_plan: Option<UpdatePlanArgs>,
     pub(super) agents: Vec<DockAgentRow>,
     pub(super) active_thread_id: Option<ThreadId>,
@@ -58,7 +61,7 @@ impl OperationsDockState {
         }
         self.appeared = true;
         self.expanded = true;
-        self.scroll = 0;
+        self.task_scroll = 0;
         self.latest_plan = Some(plan);
     }
 
@@ -83,7 +86,9 @@ impl OperationsDockState {
             })
             .unwrap_or_else(|| "Main".to_string());
         self.agents = agents;
-        self.scroll = self.scroll.min(self.agents.len().saturating_sub(1));
+        let last_agent = self.agents.len().saturating_sub(1);
+        self.agent_selected = self.agent_selected.min(last_agent);
+        self.agent_scroll = self.agent_scroll.min(last_agent);
     }
 
     pub(crate) fn desired_height(&self, terminal_height: u16) -> u16 {
@@ -108,7 +113,7 @@ impl OperationsDockState {
             return false;
         }
         self.tab = DockTab::Agents;
-        self.scroll = self
+        self.agent_selected = self
             .active_thread_id
             .and_then(|thread_id| {
                 self.agents
@@ -116,7 +121,35 @@ impl OperationsDockState {
                     .position(|agent| agent.thread_id == thread_id)
             })
             .unwrap_or(0);
+        self.ensure_agent_selection_visible();
         true
+    }
+
+    pub(super) fn set_agent_view_capacity(&mut self, capacity: usize) {
+        self.agent_view_capacity = capacity.max(1);
+        self.ensure_agent_selection_visible();
+    }
+
+    pub(super) fn move_agent_selection_by(&mut self, delta: isize) {
+        let last_agent = self.agents.len().saturating_sub(1);
+        self.agent_selected = self
+            .agent_selected
+            .saturating_add_signed(delta)
+            .min(last_agent);
+        self.ensure_agent_selection_visible();
+    }
+
+    fn ensure_agent_selection_visible(&mut self) {
+        if self.agent_selected < self.agent_scroll {
+            self.agent_scroll = self.agent_selected;
+        }
+        let capacity = self.agent_view_capacity.max(1);
+        if self.agent_selected >= self.agent_scroll.saturating_add(capacity) {
+            self.agent_scroll = self
+                .agent_selected
+                .saturating_add(1)
+                .saturating_sub(capacity);
+        }
     }
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> bool {
@@ -141,7 +174,11 @@ impl OperationsDockState {
 
     pub(crate) fn selected_agent_thread_id(&self) -> Option<ThreadId> {
         (self.focused && self.tab == DockTab::Agents)
-            .then(|| self.agents.get(self.scroll).map(|row| row.thread_id))
+            .then(|| {
+                self.agents
+                    .get(self.agent_selected)
+                    .map(|row| row.thread_id)
+            })
             .flatten()
     }
 
@@ -149,7 +186,7 @@ impl OperationsDockState {
         (self.focused && self.tab == DockTab::Agents)
             .then(|| {
                 self.agents
-                    .get(self.scroll)
+                    .get(self.agent_selected)
                     .filter(|row| !row.is_main)
                     .map(|row| row.thread_id)
             })

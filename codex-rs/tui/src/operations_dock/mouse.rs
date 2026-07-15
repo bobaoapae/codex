@@ -59,7 +59,7 @@ pub(super) fn record_agent_rows(state: &mut OperationsDockState, area: Rect, tit
     let rows: Vec<_> = state
         .agents
         .iter()
-        .skip(state.scroll)
+        .skip(state.agent_scroll)
         .take(available)
         .enumerate()
         .map(|(visible_index, agent)| HitRegion {
@@ -93,7 +93,6 @@ pub(super) fn handle_mouse(state: &mut OperationsDockState, event: MouseEvent) -
             match target {
                 HitTarget::Header(tab) => {
                     state.tab = tab;
-                    state.scroll = 0;
                     DockMouseAction::Consumed
                 }
                 HitTarget::Section(tab) => {
@@ -118,11 +117,17 @@ pub(super) fn handle_mouse(state: &mut OperationsDockState, event: MouseEvent) -
                 HitTarget::Header(tab) | HitTarget::Section(tab) => tab,
                 HitTarget::Agent(_) => DockTab::Agents,
             };
-            state.scroll = match event.kind {
-                MouseEventKind::ScrollUp => state.scroll.saturating_sub(3),
-                MouseEventKind::ScrollDown => state.scroll.saturating_add(3),
+            let delta = match event.kind {
+                MouseEventKind::ScrollUp => -3,
+                MouseEventKind::ScrollDown => 3,
                 _ => unreachable!(),
             };
+            match state.tab {
+                DockTab::Tasks => {
+                    state.task_scroll = state.task_scroll.saturating_add_signed(delta);
+                }
+                DockTab::Agents => state.move_agent_selection_by(delta),
+            }
             DockMouseAction::Consumed
         }
         _ => DockMouseAction::Ignored,

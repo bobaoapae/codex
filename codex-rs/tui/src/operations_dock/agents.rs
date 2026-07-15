@@ -5,6 +5,7 @@ use super::state::DockAgentRow;
 
 pub(super) fn lines(
     agents: &[DockAgentRow],
+    scroll: usize,
     selected: usize,
     focused: bool,
     active_thread_id: Option<codex_protocol::ThreadId>,
@@ -15,6 +16,7 @@ pub(super) fn lines(
     agents
         .iter()
         .enumerate()
+        .skip(scroll)
         .map(|(index, agent)| {
             let marker = if focused && index == selected {
                 ">"
