@@ -102,6 +102,37 @@ pub(crate) fn format_agent_picker_item_name(
     }
 }
 
+/// Formats a dock row with the canonical agent path as a fallback identifier.
+///
+/// V2 activity can arrive before (or without) nickname metadata, but it still carries paths such
+/// as `/root/warm_cache_integrity`. Showing that stable, task-oriented path is more useful than a
+/// row of indistinguishable `Agent` labels.
+pub(crate) fn format_agent_dock_item_name(
+    agent_nickname: Option<&str>,
+    agent_role: Option<&str>,
+    agent_path: Option<&str>,
+    is_primary: bool,
+) -> String {
+    if is_primary || agent_nickname.is_some_and(|nickname| !nickname.trim().is_empty()) {
+        return format_agent_picker_item_name(agent_nickname, agent_role, is_primary);
+    }
+
+    if let Some(agent_path) = agent_path
+        .map(str::trim)
+        .filter(|agent_path| !agent_path.is_empty())
+    {
+        return agent_role
+            .map(str::trim)
+            .filter(|role| !role.is_empty())
+            .map_or_else(
+                || agent_path.to_string(),
+                |role| format!("{agent_path} [{role}]"),
+            );
+    }
+
+    format_agent_picker_item_name(agent_nickname, agent_role, is_primary)
+}
+
 pub(crate) fn previous_agent_shortcut() -> crate::key_hint::KeyBinding {
     crate::key_hint::alt(KeyCode::Left)
 }
@@ -673,6 +704,35 @@ mod tests {
     use ratatui::style::Color;
     use ratatui::style::Modifier;
     use std::collections::HashMap;
+
+    #[test]
+    fn dock_agent_name_uses_path_when_nickname_is_missing() {
+        assert_eq!(
+            format_agent_dock_item_name(
+                /*agent_nickname*/ None,
+                Some("worker"),
+                Some("/root/warm_cache_integrity"),
+                /*is_primary*/ false,
+            ),
+            "/root/warm_cache_integrity [worker]"
+        );
+        assert_eq!(
+            format_agent_dock_item_name(
+                Some("Robie"),
+                Some("worker"),
+                Some("/root/warm_cache_integrity"),
+                /*is_primary*/ false,
+            ),
+            "Robie [worker]"
+        );
+        assert_eq!(
+            format_agent_dock_item_name(
+                /*agent_nickname*/ None, /*agent_role*/ None, /*agent_path*/ None,
+                /*is_primary*/ false,
+            ),
+            "Agent"
+        );
+    }
 
     #[test]
     fn collab_events_snapshot() {
