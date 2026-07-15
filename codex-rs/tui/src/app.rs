@@ -1328,6 +1328,8 @@ See the Codex keymap documentation for supported actions and examples."
                             let _ = self
                                 .select_agent_thread_and_discard_side(tui, app_server, thread_id)
                                 .await;
+                            self.operations_dock.blur();
+                            tui.frame_requester().schedule_frame();
                         }
                     }
                 }
@@ -1395,24 +1397,28 @@ See the Codex keymap documentation for supported actions and examples."
             .agent_navigation
             .ordered_threads()
             .into_iter()
-            .filter(|(thread_id, _)| Some(*thread_id) != self.primary_thread_id)
-            .map(|(thread_id, entry)| DockAgentRow {
-                thread_id,
-                label: format_agent_picker_item_name(
-                    entry.agent_nickname.as_deref(),
-                    entry.agent_role.as_deref(),
-                    /*is_primary*/ false,
-                ),
-                status: if entry.is_closed {
-                    "completed".to_string()
-                } else if entry.is_running {
-                    "running".to_string()
-                } else {
-                    "idle".to_string()
-                },
+            .map(|(thread_id, entry)| {
+                let is_main = Some(thread_id) == self.primary_thread_id;
+                DockAgentRow {
+                    thread_id,
+                    label: format_agent_picker_item_name(
+                        entry.agent_nickname.as_deref(),
+                        entry.agent_role.as_deref(),
+                        is_main,
+                    ),
+                    status: if entry.is_closed {
+                        "completed".to_string()
+                    } else if entry.is_running {
+                        "running".to_string()
+                    } else {
+                        "idle".to_string()
+                    },
+                    is_main,
+                }
             })
             .collect();
-        self.operations_dock.sync_agents(agent_rows);
+        self.operations_dock
+            .sync_agents(agent_rows, self.current_displayed_thread_id());
         let terminal_size = tui.terminal.size()?;
         let chat_height = self.chat_widget.desired_height(terminal_size.width);
         let dock_height = self.operations_dock.desired_height(terminal_size.height);

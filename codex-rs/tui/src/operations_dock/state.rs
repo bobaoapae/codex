@@ -24,6 +24,7 @@ pub(crate) struct DockAgentRow {
     pub(crate) thread_id: ThreadId,
     pub(crate) label: String,
     pub(crate) status: String,
+    pub(crate) is_main: bool,
 }
 
 #[derive(Debug, Default)]
@@ -36,6 +37,8 @@ pub(crate) struct OperationsDockState {
     pub(super) scroll: usize,
     pub(super) latest_plan: Option<UpdatePlanArgs>,
     pub(super) agents: Vec<DockAgentRow>,
+    pub(super) active_thread_id: Option<ThreadId>,
+    pub(super) viewing_label: String,
     pub(super) hit_regions: Vec<mouse::HitRegion>,
 }
 
@@ -59,13 +62,26 @@ impl OperationsDockState {
         self.latest_plan = Some(plan);
     }
 
-    pub(crate) fn sync_agents(&mut self, agents: Vec<DockAgentRow>) {
+    pub(crate) fn sync_agents(
+        &mut self,
+        agents: Vec<DockAgentRow>,
+        active_thread_id: Option<ThreadId>,
+    ) {
         if self.mode == OperationsDockMode::Hidden {
             return;
         }
-        if !agents.is_empty() {
+        if agents.iter().any(|agent| !agent.is_main) {
             self.appeared = true;
         }
+        self.active_thread_id = active_thread_id;
+        self.viewing_label = active_thread_id
+            .and_then(|thread_id| {
+                agents
+                    .iter()
+                    .find(|agent| agent.thread_id == thread_id)
+                    .map(|agent| agent.label.clone())
+            })
+            .unwrap_or_else(|| "Main".to_string());
         self.agents = agents;
         self.scroll = self.scroll.min(self.agents.len().saturating_sub(1));
     }
@@ -93,6 +109,14 @@ impl OperationsDockState {
 
     pub(crate) fn handle_mouse(&mut self, event: MouseEvent) -> DockMouseAction {
         mouse::handle_mouse(self, event)
+    }
+
+    pub(crate) fn blur(&mut self) {
+        self.focused = false;
+    }
+
+    pub(crate) fn is_focused(&self) -> bool {
+        self.focused
     }
 
     pub(crate) fn latest_plan(&self) -> Option<&UpdatePlanArgs> {
