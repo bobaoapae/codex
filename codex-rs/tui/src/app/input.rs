@@ -115,7 +115,9 @@ impl App {
             return;
         }
         if dock_interrupt_shortcut_matches(key_event)
-            && let Some(thread_id) = self.operations_dock.selected_agent_thread_id()
+            && let Some(thread_id) = self
+                .operations_dock
+                .selected_interruptible_agent_thread_id()
         {
             if let Err(err) = self
                 .submit_thread_op(app_server, thread_id, AppCommand::interrupt())

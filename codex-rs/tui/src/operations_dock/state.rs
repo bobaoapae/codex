@@ -129,6 +129,17 @@ impl OperationsDockState {
             .flatten()
     }
 
+    pub(crate) fn selected_interruptible_agent_thread_id(&self) -> Option<ThreadId> {
+        (self.focused && self.tab == DockTab::Agents)
+            .then(|| {
+                self.agents
+                    .get(self.scroll)
+                    .filter(|row| !row.is_main)
+                    .map(|row| row.thread_id)
+            })
+            .flatten()
+    }
+
     pub(super) fn visible(&self) -> bool {
         self.appeared && self.mode != OperationsDockMode::Hidden
     }
