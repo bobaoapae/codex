@@ -64,6 +64,7 @@ members = [
     "file-search",
     "file-watcher",
     "linux-sandbox",
+    "local-features",
     "lmstudio",
     "login",
     "codex-mcp",
@@ -167,6 +168,7 @@ codex-code-mode = { path = "code-mode" }
 codex-code-mode-protocol = { path = "code-mode-protocol" }
 codex-home = { path = "codex-home" }
 codex-http-client = { path = "http-client" }
+codex-local-features = { path = "local-features" }
 codex-websocket-client = { path = "websocket-client" }
 codex-config = { path = "config" }
 codex-connectors = { path = "connectors" }

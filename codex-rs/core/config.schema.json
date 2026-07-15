@@ -6,6 +6,20 @@
       "description": "A path that is guaranteed to be absolute and normalized (though it is not guaranteed to be canonicalized or exist on the filesystem).\n\nIMPORTANT: When deserializing an `AbsolutePathBuf`, a base path must be set using [AbsolutePathBufGuard::new]. If no base path is set, the deserialization will fail unless the path being deserialized is already absolute.",
       "type": "string"
     },
+    "AgentAdmissionModeToml": {
+      "enum": [
+        "direct",
+        "adaptive"
+      ],
+      "type": "string"
+    },
+    "AgentDelegationModeToml": {
+      "enum": [
+        "explicit_request_only",
+        "proactive"
+      ],
+      "type": "string"
+    },
     "AgentRoleToml": {
       "additionalProperties": false,
       "properties": {
@@ -814,6 +828,13 @@
       },
       "type": "object"
     },
+    "ContextModeToml": {
+      "enum": [
+        "fixed",
+        "adaptive"
+      ],
+      "type": "string"
+    },
     "CurrentTimeReminderConfigToml": {
       "additionalProperties": false,
       "properties": {
@@ -902,6 +923,13 @@
         }
       },
       "type": "object"
+    },
+    "EvidenceCacheModeToml": {
+      "enum": [
+        "off",
+        "read_only"
+      ],
+      "type": "string"
     },
     "ExperimentalRequestUserInput": {
       "additionalProperties": false,
@@ -1099,6 +1127,13 @@
         }
       },
       "type": "object"
+    },
+    "GoalSupervisionModeToml": {
+      "enum": [
+        "off",
+        "in_process"
+      ],
+      "type": "string"
     },
     "GranularApprovalConfig": {
       "properties": {
@@ -1349,6 +1384,37 @@
     },
     "LegacyAppPathString": {
       "type": "string"
+    },
+    "LocalExtensionsToml": {
+      "additionalProperties": false,
+      "description": "Opt-in settings for capabilities maintained only by the local fork.",
+      "properties": {
+        "agent_admission": {
+          "$ref": "#/definitions/AgentAdmissionModeToml"
+        },
+        "agent_delegation": {
+          "$ref": "#/definitions/AgentDelegationModeToml"
+        },
+        "context": {
+          "$ref": "#/definitions/ContextModeToml"
+        },
+        "evidence_cache": {
+          "$ref": "#/definitions/EvidenceCacheModeToml"
+        },
+        "goal_supervision": {
+          "$ref": "#/definitions/GoalSupervisionModeToml"
+        },
+        "mouse": {
+          "$ref": "#/definitions/MouseModeToml"
+        },
+        "operations_dock": {
+          "$ref": "#/definitions/OperationsDockModeToml"
+        },
+        "resume": {
+          "$ref": "#/definitions/ResumeModeToml"
+        }
+      },
+      "type": "object"
     },
     "MarketplaceConfig": {
       "additionalProperties": false,
@@ -1724,6 +1790,13 @@
         }
       },
       "type": "object"
+    },
+    "MouseModeToml": {
+      "enum": [
+        "off",
+        "dock"
+      ],
+      "type": "string"
     },
     "MultiAgentV2ConfigToml": {
       "additionalProperties": false,
@@ -2158,6 +2231,14 @@
           "type": "string"
         }
       ]
+    },
+    "OperationsDockModeToml": {
+      "enum": [
+        "hidden",
+        "auto",
+        "always"
+      ],
+      "type": "string"
     },
     "OrchestratorFeatureToml": {
       "additionalProperties": false,
@@ -2724,6 +2805,13 @@
           "type": "string"
         }
       ]
+    },
+    "ResumeModeToml": {
+      "enum": [
+        "legacy",
+        "checkpointed"
+      ],
+      "type": "string"
     },
     "RolloutBudgetConfigToml": {
       "additionalProperties": false,
@@ -5199,6 +5287,14 @@
     "instructions": {
       "description": "System instructions.",
       "type": "string"
+    },
+    "local_extensions": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/LocalExtensionsToml"
+        }
+      ],
+      "description": "Opt-in capabilities maintained only by a local Codex fork."
     },
     "log_dir": {
       "allOf": [
