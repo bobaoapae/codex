@@ -239,6 +239,9 @@ impl ChatWidget {
     pub(crate) fn note_stream_consolidation_completed(&mut self) {
         self.pending_stream_consolidations =
             self.pending_stream_consolidations.saturating_sub(/*rhs*/ 1);
+        if self.pending_stream_consolidations == 0 {
+            self.flush_interrupt_queue();
+        }
     }
 
     /// Transfers the completed token activity card into the history insertion path.

@@ -316,6 +316,10 @@ async fn queued_bang_shell_waits_for_user_shell_completion_before_next_input() {
     assert_eq!(next_add_to_history_event(&mut rx), "!echo hi");
     assert_eq!(chat.input_queue.queued_user_messages.len(), 1);
 
+    // The app processes the assistant consolidation event before the later
+    // user-shell lifecycle event reaches the widget.
+    chat.note_stream_consolidation_completed();
+
     let begin = begin_exec_with_source(
         &mut chat,
         "user-shell-echo",

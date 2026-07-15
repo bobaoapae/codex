@@ -364,6 +364,49 @@ async fn flush_answer_stream_requests_scrollback_reflow_for_live_table_tail() {
 }
 
 #[tokio::test]
+async fn command_waits_for_live_table_consolidation_barrier() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let cwd = chat.config.cwd.to_path_buf();
+    let mut controller = crate::streaming::controller::StreamController::new(
+        Some(80),
+        cwd.as_path(),
+        HistoryRenderMode::Rich,
+    );
+    controller.push("| Name | Notes |\n");
+    controller.push("| --- | --- |\n");
+    controller.push("| alpha | durable before command |\n");
+    chat.stream_controller = Some(controller);
+    while rx.try_recv().is_ok() {}
+
+    chat.flush_answer_stream_with_separator();
+    assert_eq!(chat.pending_stream_consolidations, 1);
+    begin_exec_with_source(
+        &mut chat,
+        "call-after-answer",
+        "echo after",
+        ExecCommandSource::Agent,
+    );
+
+    assert!(!chat.interrupts.is_empty());
+    assert!(chat.transcript.active_cell.is_none());
+
+    // Stream shutdown alone must not let the command visually overtake the
+    // pending source-backed transcript consolidation.
+    chat.handle_stream_finished();
+    assert!(!chat.interrupts.is_empty());
+
+    chat.note_stream_consolidation_completed();
+
+    assert!(chat.interrupts.is_empty());
+    assert!(
+        chat.transcript
+            .active_cell
+            .as_ref()
+            .is_some_and(|cell| cell.as_any().is::<ExecCell>())
+    );
+}
+
+#[tokio::test]
 async fn completed_plan_table_tail_skips_provisional_history_insert() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     let cwd = chat.config.cwd.to_path_buf();
@@ -4036,6 +4079,9 @@ async fn chatwidget_exec_and_status_layout_vt100_snapshot() {
         "I’m going to search the repo for where “Change Approved” is rendered to update that view.",
         /*phase*/ None,
     );
+    // Mirror the app event loop: canonical assistant consolidation completes
+    // before the command lifecycle event is dispatched.
+    chat.note_stream_consolidation_completed();
 
     let command = vec!["bash".into(), "-lc".into(), "rg \"Change Approved\"".into()];
     let parsed_cmd = [
