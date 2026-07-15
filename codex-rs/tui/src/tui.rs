@@ -102,12 +102,21 @@ mod tests {
     use std::io::Write as _;
 
     use super::clear_for_viewport_change;
+    #[cfg(windows)]
+    use super::set_mouse_capture;
     use super::should_emit_notification;
     use crate::custom_terminal::Terminal as CustomTerminal;
     use crate::test_backend::VT100Backend;
     use codex_config::types::NotificationCondition;
     use ratatui::layout::Position;
     use ratatui::layout::Rect;
+
+    #[cfg(windows)]
+    #[test]
+    fn disabling_mouse_capture_before_it_was_enabled_is_a_noop() {
+        super::MOUSE_CAPTURE_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+        set_mouse_capture(false).expect("disabled mouse capture should remain disabled");
+    }
 
     #[test]
     fn unfocused_notification_condition_is_suppressed_when_focused() {
@@ -199,12 +208,19 @@ pub fn set_modes() -> Result<()> {
 static MOUSE_CAPTURE_ENABLED: AtomicBool = AtomicBool::new(false);
 
 fn set_mouse_capture(enabled: bool) -> Result<()> {
-    MOUSE_CAPTURE_ENABLED.store(enabled, Ordering::Relaxed);
-    if enabled {
+    let was_enabled = MOUSE_CAPTURE_ENABLED.swap(enabled, Ordering::Relaxed);
+    if was_enabled == enabled {
+        return Ok(());
+    }
+    let result = if enabled {
         execute!(stdout(), EnableMouseCapture)
     } else {
         execute!(stdout(), DisableMouseCapture)
+    };
+    if result.is_err() {
+        MOUSE_CAPTURE_ENABLED.store(was_enabled, Ordering::Relaxed);
     }
+    result
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
