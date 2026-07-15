@@ -69,6 +69,16 @@ where
             thread_manager,
             goal_service,
             |config: &Config| config.features.enabled(codex_features::Feature::Goals),
+            |config: &Config| {
+                (config.local_extensions.goal_supervision
+                    == codex_local_features::GoalSupervisionMode::InProcess)
+                    .then(|| {
+                        codex_local_features::LocalExtensionsStore::new(
+                            config.codex_home.as_path(),
+                            &config.local_extensions,
+                        )
+                    })
+            },
         );
     }
     codex_guardian::install(&mut builder, guardian_agent_spawner);
