@@ -17,6 +17,7 @@ workspace = true
 codex-analytics = { workspace = true }
 codex-core = { workspace = true }
 codex-extension-api = { workspace = true }
+codex-local-features = { workspace = true }
 codex-otel = { workspace = true }
 codex-protocol = { workspace = true }
 codex-state = { workspace = true }
@@ -24,7 +25,7 @@ codex-tools = { workspace = true }
 codex-utils-template = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "time"] }
 tracing = { workspace = true }
 
 [dev-dependencies]

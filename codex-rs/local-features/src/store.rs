@@ -1,3 +1,4 @@
+use crate::GoalSupervisorState;
 use crate::LocalExtensionsConfig;
 use crate::checkpoints::RuntimeCheckpoint;
 use crate::checkpoints::StoredRuntimeCheckpoint;
@@ -159,6 +160,61 @@ impl LocalExtensionsStore {
         stored.validate(rollout_path, session_meta_hash).await
     }
 
+    pub async fn save_goal_supervisor_state(
+        &self,
+        thread_id: &str,
+        state: &GoalSupervisorState,
+    ) -> anyhow::Result<()> {
+        let Some(pool) = self.pool().await? else {
+            return Ok(());
+        };
+        sqlx::query(
+            "INSERT INTO goal_supervisor_state(\
+                thread_id, retry_sequence, error_class, not_before, blocker_count, last_activity\
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT(thread_id) DO UPDATE SET \
+                retry_sequence=excluded.retry_sequence, error_class=excluded.error_class, \
+                not_before=excluded.not_before, blocker_count=excluded.blocker_count, \
+                last_activity=excluded.last_activity",
+        )
+        .bind(thread_id)
+        .bind(i64::try_from(state.retry_sequence).unwrap_or(i64::MAX))
+        .bind(&state.error_class)
+        .bind(state.not_before)
+        .bind(i64::from(state.blocker_count))
+        .bind(state.last_activity)
+        .execute(pool)
+        .await
+        .context("save goal supervisor state")?;
+        Ok(())
+    }
+
+    pub async fn load_goal_supervisor_state(
+        &self,
+        thread_id: &str,
+    ) -> anyhow::Result<GoalSupervisorState> {
+        let Some(pool) = self.pool().await? else {
+            return Ok(GoalSupervisorState::default());
+        };
+        let row = sqlx::query(
+            "SELECT retry_sequence, error_class, not_before, blocker_count, last_activity \
+             FROM goal_supervisor_state WHERE thread_id=?1",
+        )
+        .bind(thread_id)
+        .fetch_optional(pool)
+        .await
+        .context("load goal supervisor state")?;
+        Ok(
+            row.map_or_else(GoalSupervisorState::default, |row| GoalSupervisorState {
+                retry_sequence: u64::try_from(row.get::<i64, _>("retry_sequence")).unwrap_or(0),
+                error_class: row.get("error_class"),
+                not_before: row.get("not_before"),
+                blocker_count: u32::try_from(row.get::<i64, _>("blocker_count")).unwrap_or(0),
+                last_activity: row.get("last_activity"),
+            }),
+        )
+    }
+
     async fn pool(&self) -> anyhow::Result<Option<&SqlitePool>> {
         if !self.enabled {
             return Ok(None);
@@ -220,6 +276,18 @@ async fn initialize_schema(pool: &SqlitePool) -> anyhow::Result<()> {
             boundary_hash TEXT NOT NULL,\
             checkpoint_json TEXT NOT NULL,\
             updated_at INTEGER NOT NULL\
+        )",
+    )
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS goal_supervisor_state(\
+            thread_id TEXT PRIMARY KEY,\
+            retry_sequence INTEGER NOT NULL,\
+            error_class TEXT,\
+            not_before INTEGER NOT NULL,\
+            blocker_count INTEGER NOT NULL,\
+            last_activity INTEGER NOT NULL\
         )",
     )
     .execute(&mut *transaction)

@@ -2,6 +2,7 @@
 
 mod config;
 mod context;
+mod goal;
 mod store;
 
 pub mod admission;
@@ -21,4 +22,7 @@ pub use config::ResumeMode;
 pub use context::AdaptiveContextPolicy;
 pub use context::CompactionDecision;
 pub use context::CompactionReason;
+pub use goal::GoalErrorClass;
+pub use goal::GoalSupervisorDecision;
+pub use goal::GoalSupervisorState;
 pub use store::LocalExtensionsStore;

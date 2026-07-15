@@ -150,3 +150,32 @@ async fn runtime_checkpoint_rejects_truncation_and_session_meta_change() {
             .is_none()
     );
 }
+
+#[tokio::test]
+async fn goal_supervisor_state_is_rebuildable_and_persistent() {
+    let home = tempfile::tempdir().expect("temporary home");
+    let config = LocalExtensionsConfig {
+        goal_supervision: crate::GoalSupervisionMode::InProcess,
+        ..Default::default()
+    };
+    let store = LocalExtensionsStore::new(home.path(), &config);
+    let expected = crate::GoalSupervisorState {
+        retry_sequence: 2,
+        error_class: Some("capacity".into()),
+        not_before: 123,
+        blocker_count: 2,
+        last_activity: 100,
+    };
+    store
+        .save_goal_supervisor_state("thread", &expected)
+        .await
+        .expect("save supervisor state");
+
+    assert_eq!(
+        store
+            .load_goal_supervisor_state("thread")
+            .await
+            .expect("load supervisor state"),
+        expected
+    );
+}

@@ -24,6 +24,8 @@ use codex_extension_api::TurnErrorInput;
 use codex_extension_api::TurnLifecycleContributor;
 use codex_extension_api::TurnStartInput;
 use codex_extension_api::TurnStopInput;
+use codex_local_features::GoalErrorClass;
+use codex_local_features::LocalExtensionsStore;
 use codex_otel::MetricsClient;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::CodexErrorInfo;
@@ -65,6 +67,7 @@ pub struct GoalExtension<C> {
     thread_manager: Weak<ThreadManager>,
     goal_service: Arc<GoalService>,
     goals_enabled: Arc<dyn Fn(&C) -> bool + Send + Sync>,
+    supervision_store: Arc<dyn Fn(&C) -> Option<LocalExtensionsStore> + Send + Sync>,
 }
 
 impl<C> std::fmt::Debug for GoalExtension<C> {
@@ -82,6 +85,7 @@ impl<C> GoalExtension<C> {
         thread_manager: Weak<ThreadManager>,
         goal_service: Arc<GoalService>,
         goals_enabled: impl Fn(&C) -> bool + Send + Sync + 'static,
+        supervision_store: impl Fn(&C) -> Option<LocalExtensionsStore> + Send + Sync + 'static,
     ) -> Self {
         Self {
             state_dbs,
@@ -91,6 +95,7 @@ impl<C> GoalExtension<C> {
             thread_manager,
             goal_service,
             goals_enabled: Arc::new(goals_enabled),
+            supervision_store: Arc::new(supervision_store),
         }
     }
 }
@@ -128,6 +133,7 @@ where
                         analytics: self.analytics.clone(),
                         enabled,
                         tools_available_for_thread,
+                        supervision_store: (self.supervision_store)(input.config),
                     },
                 )
             });
@@ -265,6 +271,7 @@ where
                 return;
             }
             runtime.accounting_state().finish_turn(turn_id);
+            runtime.record_supervised_success().await;
         })
     }
 
@@ -301,6 +308,19 @@ where
             let Some(runtime) = goal_runtime_handle(input.thread_store) else {
                 return;
             };
+
+            let error_class = goal_error_class(&input.error);
+            match runtime
+                .handle_supervised_turn_error(input.turn_id, error_class)
+                .await
+            {
+                Ok(true) => return,
+                Ok(false) => {}
+                Err(err) => tracing::warn!(
+                    error = ?input.error,
+                    "failed supervised goal error handling; using canonical stop behavior: {err}"
+                ),
+            }
 
             let reason = match input.error {
                 CodexErrorInfo::UsageLimitExceeded => ActiveGoalStopReason::UsageLimit,
@@ -456,6 +476,7 @@ pub fn install_with_backend<C>(
     thread_manager: Weak<ThreadManager>,
     goal_service: Arc<GoalService>,
     goals_enabled: impl Fn(&C) -> bool + Send + Sync + 'static,
+    supervision_store: impl Fn(&C) -> Option<LocalExtensionsStore> + Send + Sync + 'static,
 ) where
     C: Send + Sync + 'static,
 {
@@ -467,6 +488,7 @@ pub fn install_with_backend<C>(
         thread_manager,
         Arc::clone(&goal_service),
         goals_enabled,
+        supervision_store,
     ));
     registry.thread_lifecycle_contributor(extension.clone());
     registry.config_contributor(extension.clone());
@@ -474,6 +496,23 @@ pub fn install_with_backend<C>(
     registry.token_usage_contributor(extension.clone());
     registry.tool_lifecycle_contributor(extension.clone());
     registry.tool_contributor(extension);
+}
+
+fn goal_error_class(error: &CodexErrorInfo) -> GoalErrorClass {
+    match error {
+        CodexErrorInfo::ServerOverloaded => GoalErrorClass::Capacity,
+        CodexErrorInfo::HttpConnectionFailed { .. }
+        | CodexErrorInfo::ResponseStreamConnectionFailed { .. }
+        | CodexErrorInfo::ResponseStreamDisconnected { .. }
+        | CodexErrorInfo::ResponseTooManyFailedAttempts { .. }
+        | CodexErrorInfo::InternalServerError => GoalErrorClass::TransientNetwork,
+        CodexErrorInfo::UsageLimitExceeded | CodexErrorInfo::SessionBudgetExceeded => {
+            GoalErrorClass::UsageLimit
+        }
+        CodexErrorInfo::CyberPolicy => GoalErrorClass::Policy,
+        CodexErrorInfo::SandboxError => GoalErrorClass::Sandbox,
+        other => GoalErrorClass::Other(format!("{other:?}")),
+    }
 }
 
 fn goal_runtime_handle(thread_store: &ExtensionData) -> Option<Arc<GoalRuntimeHandle>> {

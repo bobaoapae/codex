@@ -4,6 +4,9 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
 use codex_core::ThreadManager;
+use codex_local_features::GoalErrorClass;
+use codex_local_features::GoalSupervisorDecision;
+use codex_local_features::LocalExtensionsStore;
 use codex_protocol::ThreadId;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::ThreadGoal;
@@ -29,6 +32,7 @@ pub(crate) struct GoalRuntimeConfig {
     pub(crate) analytics: GoalAnalytics,
     pub(crate) enabled: bool,
     pub(crate) tools_available_for_thread: bool,
+    pub(crate) supervision_store: Option<LocalExtensionsStore>,
 }
 
 pub(crate) enum ActiveGoalStopReason {
@@ -47,6 +51,8 @@ struct GoalRuntimeInner {
     enabled: AtomicBool,
     tools_available_for_thread: bool,
     goal_state_lock: Semaphore,
+    supervision_store: Option<LocalExtensionsStore>,
+    supervision_wake_scheduled: AtomicBool,
 }
 
 pub(crate) struct AccountedGoalProgress {
@@ -99,6 +105,8 @@ impl GoalRuntimeHandle {
                 enabled: AtomicBool::new(config.enabled),
                 tools_available_for_thread: config.tools_available_for_thread,
                 goal_state_lock: Semaphore::new(/*permits*/ 1),
+                supervision_store: config.supervision_store,
+                supervision_wake_scheduled: AtomicBool::new(false),
             }),
         }
     }
@@ -332,6 +340,80 @@ impl GoalRuntimeHandle {
         Ok(())
     }
 
+    pub(crate) async fn handle_supervised_turn_error(
+        &self,
+        turn_id: &str,
+        error_class: GoalErrorClass,
+    ) -> Result<bool, String> {
+        let Some(store) = self.inner.supervision_store.as_ref() else {
+            return Ok(false);
+        };
+        let now = unix_now();
+        let mut state = store
+            .load_goal_supervisor_state(&self.thread_id().to_string())
+            .await
+            .map_err(|err| err.to_string())?;
+        let decision = state.record_error(&error_class, now);
+        store
+            .save_goal_supervisor_state(&self.thread_id().to_string(), &state)
+            .await
+            .map_err(|err| err.to_string())?;
+        match decision {
+            GoalSupervisorDecision::Continue { not_before: _ } => {
+                self.account_active_goal_progress(
+                    turn_id,
+                    &format!("{turn_id}:supervised-retry"),
+                    codex_state::GoalAccountingMode::ActiveOnly,
+                    BudgetLimitedGoalDisposition::ClearActive,
+                )
+                .await?;
+                self.inner.accounting_state.finish_turn(turn_id);
+                let runtime = self.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = runtime.continue_if_idle().await {
+                        tracing::warn!(error = %err, "failed supervised goal continuation");
+                    }
+                });
+            }
+            GoalSupervisorDecision::Block => {
+                self.stop_active_goal_for_turn(turn_id, ActiveGoalStopReason::TurnError)
+                    .await?;
+            }
+            GoalSupervisorDecision::StopNonRecoverable => {
+                let reason = if matches!(error_class, GoalErrorClass::UsageLimit) {
+                    ActiveGoalStopReason::UsageLimit
+                } else {
+                    ActiveGoalStopReason::TurnError
+                };
+                self.stop_active_goal_for_turn(turn_id, reason).await?;
+            }
+        }
+        Ok(true)
+    }
+
+    pub(crate) async fn record_supervised_success(&self) {
+        let Some(store) = self.inner.supervision_store.as_ref() else {
+            return;
+        };
+        let mut state = match store
+            .load_goal_supervisor_state(&self.thread_id().to_string())
+            .await
+        {
+            Ok(state) => state,
+            Err(err) => {
+                tracing::debug!(error = %err, "failed to load goal supervisor state");
+                return;
+            }
+        };
+        state.record_success(unix_now());
+        if let Err(err) = store
+            .save_goal_supervisor_state(&self.thread_id().to_string(), &state)
+            .await
+        {
+            tracing::debug!(error = %err, "failed to reset goal supervisor state");
+        }
+    }
+
     pub async fn restore_after_resume(&self) -> Result<(), String> {
         if !self.is_enabled() {
             return Ok(());
@@ -361,6 +443,41 @@ impl GoalRuntimeHandle {
             self.inner.accounting_state.clear_active_goal();
             return Ok(());
         }
+        if let Some(store) = self.inner.supervision_store.as_ref() {
+            let state = store
+                .load_goal_supervisor_state(&self.thread_id().to_string())
+                .await
+                .map_err(|err| err.to_string())?;
+            let delay = state.not_before.saturating_sub(unix_now());
+            if delay > 0 {
+                if self
+                    .inner
+                    .supervision_wake_scheduled
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    let runtime = self.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(
+                            u64::try_from(delay).unwrap_or(u64::MAX),
+                        ))
+                        .await;
+                        runtime
+                            .inner
+                            .supervision_wake_scheduled
+                            .store(false, Ordering::Release);
+                        if let Err(err) = runtime.continue_now_if_idle().await {
+                            tracing::warn!(error = %err, "failed delayed goal continuation");
+                        }
+                    });
+                }
+                return Ok(());
+            }
+        }
+        self.continue_now_if_idle().await
+    }
+
+    async fn continue_now_if_idle(&self) -> Result<(), String> {
         // Hold this through the read/start window so external set/clear cannot
         // change the goal after we read it but before the continuation launches.
         let _goal_state_permit = self.goal_state_permit().await?;
@@ -572,4 +689,11 @@ impl GoalRuntimeHandle {
                 .then_some(goal.status)
         }))
     }
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
 }

@@ -1123,6 +1123,7 @@ async fn installed_tools_with_start(
         Weak::new(),
         goal_service,
         |_| true,
+        |_| None,
     );
     let registry = builder.build();
     let session_store = ExtensionData::new("session-1");
@@ -1175,6 +1176,7 @@ impl GoalExtensionHarness {
             Weak::new(),
             Arc::clone(&goal_service),
             |_| true,
+            |_| None,
         );
         let registry = builder.build();
         let session_store = ExtensionData::new("session-1");
