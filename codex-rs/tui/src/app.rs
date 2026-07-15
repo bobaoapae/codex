@@ -1428,15 +1428,20 @@ See the Codex keymap documentation for supported actions and examples."
             let area = frame.area();
             rendered_area = area;
             let actual_dock_height = dock_height.min(area.height.saturating_sub(1));
-            let dock_area = Rect::new(area.x, area.y, area.width, actual_dock_height);
             let chat_area = Rect::new(
                 area.x,
-                area.y.saturating_add(actual_dock_height),
+                area.y,
                 area.width,
                 area.height.saturating_sub(actual_dock_height),
             );
-            self.operations_dock.render(dock_area, frame.buffer);
+            let dock_area = Rect::new(
+                area.x,
+                chat_area.y.saturating_add(chat_area.height),
+                area.width,
+                actual_dock_height,
+            );
             self.chat_widget.render(chat_area, frame.buffer);
+            self.operations_dock.render(dock_area, frame.buffer);
             if let Some((x, y)) = self.chat_widget.cursor_pos(chat_area) {
                 frame.set_cursor_style(self.chat_widget.cursor_style(chat_area));
                 frame.set_cursor_position((x, y));

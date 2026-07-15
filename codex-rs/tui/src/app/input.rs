@@ -103,6 +103,16 @@ impl App {
             tui.frame_requester().schedule_frame();
             return;
         }
+        if self.overlay.is_none()
+            && matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+            && key_event.code == KeyCode::Down
+            && key_event.modifiers.is_empty()
+            && self.chat_widget.composer_can_move_focus_down()
+            && self.operations_dock.focus_agents()
+        {
+            tui.frame_requester().schedule_frame();
+            return;
+        }
         if dock_main_shortcut_matches(key_event)
             && self.operations_dock.is_focused()
             && let Some(thread_id) = self.primary_thread_id
