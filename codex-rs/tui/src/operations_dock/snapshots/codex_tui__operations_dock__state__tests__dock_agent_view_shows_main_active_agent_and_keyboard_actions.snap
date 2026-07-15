@@ -3,7 +3,7 @@ source: tui/src/operations_dock/state_tests.rs
 expression: buffer_to_string(&buffer)
 ---
 ┌ Operations Tasks | Agents | Viewing: worker [explorer] • focused ────────────────────────────────┐
-│ Agents · Enter open · m main · I interrupt                                                       │
+│ Agents · Enter open · m main · I interrupt selected                                              │
 │>  Main [default]  idle                                                                           │
 │ ● worker [explorer]  running                                                                     │
 │                                                                                                  │

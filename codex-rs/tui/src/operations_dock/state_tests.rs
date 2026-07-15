@@ -107,6 +107,12 @@ fn dock_marks_viewed_thread_and_main_is_a_selectable_return_target() {
     state.tab = DockTab::Agents;
     assert_eq!(state.viewing_label, "worker [explorer]");
     assert_eq!(state.selected_agent_thread_id(), Some(main_id));
+    assert_eq!(state.selected_interruptible_agent_thread_id(), None);
+    state.scroll = 1;
+    assert_eq!(
+        state.selected_interruptible_agent_thread_id(),
+        Some(agent_id)
+    );
     state.blur();
     assert!(!state.is_focused());
 }

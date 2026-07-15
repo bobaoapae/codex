@@ -86,7 +86,7 @@ pub(super) fn render(state: &mut OperationsDockState, area: Rect, buffer: &mut B
         let tab = match state.tab {
             DockTab::Tasks => Line::from(" Tasks ").underlined(),
             DockTab::Agents => {
-                Line::from(" Agents · Enter open · m main · I interrupt ").underlined()
+                Line::from(" Agents · Enter open · m main · I interrupt selected ").underlined()
             }
         };
         Paragraph::new(lines)
