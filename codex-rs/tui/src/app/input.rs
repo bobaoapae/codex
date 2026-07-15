@@ -103,8 +103,18 @@ impl App {
             tui.frame_requester().schedule_frame();
             return;
         }
-        if key_event.code == KeyCode::Char('i')
-            && matches!(key_event.kind, KeyEventKind::Press)
+        if dock_main_shortcut_matches(key_event)
+            && self.operations_dock.is_focused()
+            && let Some(thread_id) = self.primary_thread_id
+        {
+            let _ = self
+                .select_agent_thread_and_discard_side(tui, app_server, thread_id)
+                .await;
+            self.operations_dock.blur();
+            tui.frame_requester().schedule_frame();
+            return;
+        }
+        if dock_interrupt_shortcut_matches(key_event)
             && let Some(thread_id) = self.operations_dock.selected_agent_thread_id()
         {
             if let Err(err) = self
@@ -115,6 +125,7 @@ impl App {
                 self.chat_widget
                     .add_error_message(format!("Failed to interrupt agent: {err}"));
             }
+            self.operations_dock.blur();
             tui.frame_requester().schedule_frame();
             return;
         }
@@ -125,6 +136,8 @@ impl App {
             let _ = self
                 .select_agent_thread_and_discard_side(tui, app_server, thread_id)
                 .await;
+            self.operations_dock.blur();
+            tui.frame_requester().schedule_frame();
             return;
         }
         if self.operations_dock.handle_key(key_event) {
@@ -316,6 +329,29 @@ impl App {
 
     pub(super) fn refresh_status_line(&mut self) {
         self.chat_widget.refresh_status_line();
+    }
+}
+
+fn dock_main_shortcut_matches(key_event: KeyEvent) -> bool {
+    key_event.code == KeyCode::Char('m') && matches!(key_event.kind, KeyEventKind::Press)
+}
+
+fn dock_interrupt_shortcut_matches(key_event: KeyEvent) -> bool {
+    key_event.code == KeyCode::Char('I') && matches!(key_event.kind, KeyEventKind::Press)
+}
+
+#[cfg(test)]
+mod operations_dock_shortcut_tests {
+    use super::*;
+
+    #[test]
+    fn lowercase_i_is_never_an_agent_interrupt_shortcut() {
+        assert!(!dock_interrupt_shortcut_matches(KeyEvent::from(
+            KeyCode::Char('i')
+        )));
+        assert!(dock_interrupt_shortcut_matches(KeyEvent::from(
+            KeyCode::Char('I')
+        )));
     }
 }
 

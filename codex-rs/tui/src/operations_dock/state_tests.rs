@@ -57,11 +57,15 @@ fn dock_keyboard_focus_and_scroll_are_self_contained() {
 fn dock_mouse_uses_hit_regions_from_latest_frame() {
     let mut state = OperationsDockState::new(OperationsDockMode::Always);
     let thread_id = ThreadId::new();
-    state.sync_agents(vec![DockAgentRow {
-        thread_id,
-        label: "worker".into(),
-        status: "running".into(),
-    }]);
+    state.sync_agents(
+        vec![DockAgentRow {
+            thread_id,
+            label: "worker".into(),
+            status: "running".into(),
+            is_main: false,
+        }],
+        Some(thread_id),
+    );
     state.tab = DockTab::Agents;
     let area = Rect::new(0, 0, 80, 6);
     state.render(area, &mut Buffer::empty(area));
@@ -74,6 +78,69 @@ fn dock_mouse_uses_hit_regions_from_latest_frame() {
     });
 
     assert_eq!(action, DockMouseAction::OpenAgent(thread_id));
+}
+
+#[test]
+fn dock_marks_viewed_thread_and_main_is_a_selectable_return_target() {
+    let mut state = OperationsDockState::new(OperationsDockMode::Auto);
+    let main_id = ThreadId::new();
+    let agent_id = ThreadId::new();
+    state.sync_agents(
+        vec![
+            DockAgentRow {
+                thread_id: main_id,
+                label: "Main [default]".into(),
+                status: "idle".into(),
+                is_main: true,
+            },
+            DockAgentRow {
+                thread_id: agent_id,
+                label: "worker [explorer]".into(),
+                status: "running".into(),
+                is_main: false,
+            },
+        ],
+        Some(agent_id),
+    );
+
+    assert!(state.focus());
+    state.tab = DockTab::Agents;
+    assert_eq!(state.viewing_label, "worker [explorer]");
+    assert_eq!(state.selected_agent_thread_id(), Some(main_id));
+    state.blur();
+    assert!(!state.is_focused());
+}
+
+#[test]
+fn dock_agent_view_shows_main_active_agent_and_keyboard_actions() {
+    let mut state = OperationsDockState::new(OperationsDockMode::Auto);
+    let main_id = ThreadId::new();
+    let agent_id = ThreadId::new();
+    state.sync_agents(
+        vec![
+            DockAgentRow {
+                thread_id: main_id,
+                label: "Main [default]".into(),
+                status: "idle".into(),
+                is_main: true,
+            },
+            DockAgentRow {
+                thread_id: agent_id,
+                label: "worker [explorer]".into(),
+                status: "running".into(),
+                is_main: false,
+            },
+        ],
+        Some(agent_id),
+    );
+    assert!(state.focus());
+    state.tab = DockTab::Agents;
+    state.scroll = 0;
+    let area = Rect::new(0, 0, 100, 7);
+    let mut buffer = Buffer::empty(area);
+    state.render(area, &mut buffer);
+
+    insta::assert_snapshot!(buffer_to_string(&buffer));
 }
 
 #[test]

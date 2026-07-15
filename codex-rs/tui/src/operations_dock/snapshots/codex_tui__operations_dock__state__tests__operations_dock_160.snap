@@ -2,7 +2,7 @@
 source: tui/src/operations_dock/state_tests.rs
 expression: buffer_to_string(&buffer)
 ---
-┌ Operations Tasks 0/20 | Agents ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+┌ Operations Tasks 0/20 | Agents | Viewing: Main ──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ ● task 0                                                                        No subagents yet                                                             │
 │ ○ task 1                                                                                                                                                     │
 │ ○ task 2                                                                                                                                                     │
