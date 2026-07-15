@@ -11,11 +11,12 @@ doctest = false
 
 [dependencies]
 anyhow = { workspace = true }
+blake3 = { workspace = true }
 codex-config = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sqlx = { workspace = true }
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["fs", "io-util", "sync"] }
 tracing = { workspace = true }
 
 [dev-dependencies]

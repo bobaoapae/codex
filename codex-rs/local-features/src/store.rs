@@ -1,4 +1,6 @@
 use crate::LocalExtensionsConfig;
+use crate::checkpoints::RuntimeCheckpoint;
+use crate::checkpoints::StoredRuntimeCheckpoint;
 use anyhow::Context;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -88,6 +90,75 @@ impl LocalExtensionsStore {
         .transpose()
     }
 
+    pub async fn save_runtime_checkpoint<T: Serialize>(
+        &self,
+        checkpoint: RuntimeCheckpoint<T>,
+    ) -> anyhow::Result<()> {
+        let Some(pool) = self.pool().await? else {
+            return Ok(());
+        };
+        let checkpoint = checkpoint.into_stored()?;
+        sqlx::query(
+            "INSERT INTO thread_runtime_checkpoints(\
+                thread_id, schema_version, rollout_path, next_rollout_byte_offset, \
+                next_rollout_ordinal, session_meta_hash, boundary_hash, checkpoint_json, updated_at\
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, unixepoch()) \
+             ON CONFLICT(thread_id) DO UPDATE SET \
+                schema_version=excluded.schema_version, rollout_path=excluded.rollout_path, \
+                next_rollout_byte_offset=excluded.next_rollout_byte_offset, \
+                next_rollout_ordinal=excluded.next_rollout_ordinal, \
+                session_meta_hash=excluded.session_meta_hash, boundary_hash=excluded.boundary_hash, \
+                checkpoint_json=excluded.checkpoint_json, updated_at=excluded.updated_at",
+        )
+        .bind(&checkpoint.thread_id)
+        .bind(checkpoint.schema_version)
+        .bind(&checkpoint.rollout_path)
+        .bind(checkpoint.next_rollout_byte_offset)
+        .bind(checkpoint.next_rollout_ordinal)
+        .bind(&checkpoint.session_meta_hash)
+        .bind(&checkpoint.boundary_hash)
+        .bind(&checkpoint.checkpoint_json)
+        .execute(pool)
+        .await
+        .context("save runtime checkpoint")?;
+        tracing::debug!(target: "codex_local_features", feature = "resume_checkpoint", "saved runtime checkpoint");
+        Ok(())
+    }
+
+    pub async fn load_runtime_checkpoint<T: DeserializeOwned>(
+        &self,
+        thread_id: &str,
+        rollout_path: &Path,
+        session_meta_hash: &str,
+    ) -> anyhow::Result<Option<RuntimeCheckpoint<T>>> {
+        let Some(pool) = self.pool().await? else {
+            return Ok(None);
+        };
+        let row = sqlx::query(
+            "SELECT thread_id, schema_version, rollout_path, next_rollout_byte_offset, \
+                    next_rollout_ordinal, session_meta_hash, boundary_hash, checkpoint_json \
+             FROM thread_runtime_checkpoints WHERE thread_id=?1",
+        )
+        .bind(thread_id)
+        .fetch_optional(pool)
+        .await
+        .context("load runtime checkpoint")?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let stored = StoredRuntimeCheckpoint {
+            thread_id: row.get("thread_id"),
+            schema_version: row.get("schema_version"),
+            rollout_path: row.get("rollout_path"),
+            next_rollout_byte_offset: row.get("next_rollout_byte_offset"),
+            next_rollout_ordinal: row.get("next_rollout_ordinal"),
+            session_meta_hash: row.get("session_meta_hash"),
+            boundary_hash: row.get("boundary_hash"),
+            checkpoint_json: row.get("checkpoint_json"),
+        };
+        stored.validate(rollout_path, session_meta_hash).await
+    }
+
     async fn pool(&self) -> anyhow::Result<Option<&SqlitePool>> {
         if !self.enabled {
             return Ok(None);
@@ -133,6 +204,21 @@ async fn initialize_schema(pool: &SqlitePool) -> anyhow::Result<()> {
         "CREATE TABLE IF NOT EXISTS latest_plans(\
             thread_id TEXT PRIMARY KEY,\
             plan_json TEXT NOT NULL,\
+            updated_at INTEGER NOT NULL\
+        )",
+    )
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS thread_runtime_checkpoints(\
+            thread_id TEXT PRIMARY KEY,\
+            schema_version INTEGER NOT NULL,\
+            rollout_path TEXT NOT NULL,\
+            next_rollout_byte_offset INTEGER NOT NULL,\
+            next_rollout_ordinal INTEGER NOT NULL,\
+            session_meta_hash TEXT NOT NULL,\
+            boundary_hash TEXT NOT NULL,\
+            checkpoint_json TEXT NOT NULL,\
             updated_at INTEGER NOT NULL\
         )",
     )
