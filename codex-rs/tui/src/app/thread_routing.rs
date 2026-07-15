@@ -1469,6 +1469,7 @@ impl App {
         );
         match event {
             ThreadBufferedEvent::Notification(notification) => {
+                self.project_operations_dock_notification(&notification);
                 self.cache_collab_receiver_threads_for_notification(&notification);
                 self.chat_widget
                     .handle_server_notification(notification, /*replay_kind*/ None);
@@ -1492,6 +1493,41 @@ impl App {
         if needs_refresh {
             self.refresh_status_line();
         }
+    }
+
+    fn project_operations_dock_notification(&mut self, notification: &ServerNotification) {
+        let ServerNotification::TurnPlanUpdated(notification) = notification else {
+            return;
+        };
+        let plan = UpdatePlanArgs {
+            explanation: notification.explanation.clone(),
+            plan: notification
+                .plan
+                .iter()
+                .map(|item| PlanItemArg {
+                    step: item.step.clone(),
+                    status: match item.status {
+                        codex_app_server_protocol::TurnPlanStepStatus::Pending => {
+                            StepStatus::Pending
+                        }
+                        codex_app_server_protocol::TurnPlanStepStatus::InProgress => {
+                            StepStatus::InProgress
+                        }
+                        codex_app_server_protocol::TurnPlanStepStatus::Completed => {
+                            StepStatus::Completed
+                        }
+                    },
+                })
+                .collect(),
+        };
+        self.operations_dock.update_plan(plan.clone());
+        let store = self.local_extensions_store.clone();
+        let thread_id = notification.thread_id.clone();
+        tokio::spawn(async move {
+            if let Err(error) = store.save_latest_plan(&thread_id, &plan).await {
+                tracing::debug!(%error, feature = "operations_dock", "failed to save local plan snapshot");
+            }
+        });
     }
 
     pub(super) fn handle_thread_event_replay(&mut self, event: ThreadBufferedEvent) {

@@ -808,6 +808,9 @@ pub struct Config {
     /// Automatically continue once after a selected-model capacity error.
     pub tui_auto_continue_on_model_capacity: bool,
 
+    /// Resolved capabilities maintained only by the local fork.
+    pub local_extensions: codex_local_features::LocalExtensionsConfig,
+
     /// Start the TUI in the specified collaboration mode (plan/default).
 
     /// Controls whether the TUI uses the terminal's alternate screen buffer.
@@ -4110,6 +4113,11 @@ impl Config {
                 .as_ref()
                 .map(|t| t.auto_continue_on_model_capacity)
                 .unwrap_or(false),
+            local_extensions: cfg
+                .local_extensions
+                .as_ref()
+                .map(codex_local_features::LocalExtensionsConfig::from)
+                .unwrap_or_default(),
             tui_alternate_screen: cfg
                 .tui
                 .as_ref()
