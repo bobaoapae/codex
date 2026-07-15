@@ -6,4 +6,5 @@ mod state;
 mod tasks;
 
 pub(crate) use state::DockAgentRow;
+pub(crate) use state::DockMouseAction;
 pub(crate) use state::OperationsDockState;

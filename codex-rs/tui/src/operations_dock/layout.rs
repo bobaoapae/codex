@@ -31,7 +31,8 @@ pub(super) fn desired_height(state: &OperationsDockState, terminal_height: u16) 
         .clamp(3, (terminal_height / 3).max(3))
 }
 
-pub(super) fn render(state: &OperationsDockState, area: Rect, buffer: &mut Buffer) {
+pub(super) fn render(state: &mut OperationsDockState, area: Rect, buffer: &mut Buffer) {
+    state.hit_regions.clear();
     if !state.visible() || area.is_empty() {
         return;
     }
@@ -43,6 +44,7 @@ pub(super) fn render(state: &OperationsDockState, area: Rect, buffer: &mut Buffe
     let block = Block::default().borders(Borders::ALL).title(title.bold());
     let inner = block.inner(area);
     block.render(area, buffer);
+    super::mouse::record_header_regions(state, area);
     if !state.expanded || inner.is_empty() {
         return;
     }
@@ -52,14 +54,19 @@ pub(super) fn render(state: &OperationsDockState, area: Rect, buffer: &mut Buffe
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(inner);
+        super::mouse::record_section(state, columns[0], DockTab::Tasks);
+        super::mouse::record_section(state, columns[1], DockTab::Agents);
         Paragraph::new(tasks::lines(state.latest_plan(), state.scroll)).render(columns[0], buffer);
         Paragraph::new(agents::lines(&state.agents, state.scroll, state.focused))
             .render(columns[1], buffer);
+        super::mouse::record_agent_rows(state, columns[1], /*title_row*/ false);
     } else {
         let lines = match state.tab {
             DockTab::Tasks => tasks::lines(state.latest_plan(), state.scroll),
             DockTab::Agents => agents::lines(&state.agents, state.scroll, state.focused),
         };
+        let active_tab = state.tab;
+        super::mouse::record_section(state, inner, active_tab);
         let tab = match state.tab {
             DockTab::Tasks => Line::from(" Tasks ").underlined(),
             DockTab::Agents => Line::from(" Agents ").underlined(),
@@ -67,5 +74,8 @@ pub(super) fn render(state: &OperationsDockState, area: Rect, buffer: &mut Buffe
         Paragraph::new(lines)
             .block(Block::default().title(tab))
             .render(inner, buffer);
+        if state.tab == DockTab::Agents {
+            super::mouse::record_agent_rows(state, inner, /*title_row*/ true);
+        }
     }
 }

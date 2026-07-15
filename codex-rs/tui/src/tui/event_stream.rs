@@ -255,6 +255,7 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
             }
             Event::Resize(_, _) => Some(TuiEvent::Resize),
             Event::Paste(pasted) => Some(TuiEvent::Paste(pasted)),
+            Event::Mouse(mouse_event) => Some(TuiEvent::Mouse(mouse_event)),
             Event::FocusGained => {
                 self.terminal_focused.store(true, Ordering::Relaxed);
                 crate::terminal_palette::requery_default_colors();
@@ -264,7 +265,6 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
                 self.terminal_focused.store(false, Ordering::Relaxed);
                 None
             }
-            _ => None,
         }
     }
 }

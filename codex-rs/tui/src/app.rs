@@ -62,6 +62,7 @@ use crate::multi_agents::next_agent_shortcut_matches;
 use crate::multi_agents::previous_agent_shortcut_matches;
 use crate::multi_agents::sub_agent_activity_display;
 use crate::operations_dock::DockAgentRow;
+use crate::operations_dock::DockMouseAction;
 use crate::operations_dock::OperationsDockState;
 use crate::pager_overlay::Overlay;
 use crate::render::highlight::highlight_bash_to_lines;
@@ -143,6 +144,7 @@ use codex_exec_server::EnvironmentManager;
 use codex_features::Feature;
 use codex_features::FeaturesToml;
 use codex_local_features::LocalExtensionsStore;
+use codex_local_features::MouseMode;
 use codex_model_provider::create_model_provider;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_models_manager::model_presets::HIDE_GPT_5_1_CODEX_MAX_MIGRATION_PROMPT_CONFIG;
@@ -795,6 +797,7 @@ impl App {
             config.tui_notifications.method,
             config.tui_notifications.condition,
         );
+        tui.set_mouse_capture_enabled(config.local_extensions.mouse == MouseMode::Dock)?;
 
         let harness_overrides =
             normalize_harness_overrides_for_cwd(harness_overrides, &config.cwd)?;
@@ -1314,6 +1317,19 @@ See the Codex keymap documentation for supported actions and examples."
                     // [iTerm2]: https://github.com/gnachman/iTerm2/blob/5d0c0d9f68523cbd0494dad5422998964a2ecd8d/sources/iTermPasteHelper.m#L206-L216
                     let pasted = pasted.replace("\r", "\n");
                     self.chat_widget.handle_paste(pasted);
+                }
+                TuiEvent::Mouse(mouse_event) => {
+                    match self.operations_dock.handle_mouse(mouse_event) {
+                        DockMouseAction::Ignored => {}
+                        DockMouseAction::Consumed => {
+                            tui.frame_requester().schedule_frame();
+                        }
+                        DockMouseAction::OpenAgent(thread_id) => {
+                            let _ = self
+                                .select_agent_thread_and_discard_side(tui, app_server, thread_id)
+                                .await;
+                        }
+                    }
                 }
                 TuiEvent::Draw | TuiEvent::Resize => {
                     if self.backtrack_render_pending {

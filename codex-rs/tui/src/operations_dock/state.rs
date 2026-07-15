@@ -2,11 +2,15 @@ use codex_local_features::OperationsDockMode;
 use codex_protocol::ThreadId;
 use codex_protocol::plan_tool::UpdatePlanArgs;
 use crossterm::event::KeyEvent;
+use crossterm::event::MouseEvent;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
 use super::input;
 use super::layout;
+use super::mouse;
+
+pub(crate) use super::mouse::DockMouseAction;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum DockTab {
@@ -32,6 +36,7 @@ pub(crate) struct OperationsDockState {
     pub(super) scroll: usize,
     pub(super) latest_plan: Option<UpdatePlanArgs>,
     pub(super) agents: Vec<DockAgentRow>,
+    pub(super) hit_regions: Vec<mouse::HitRegion>,
 }
 
 impl OperationsDockState {
@@ -69,7 +74,7 @@ impl OperationsDockState {
         layout::desired_height(self, terminal_height)
     }
 
-    pub(crate) fn render(&self, area: Rect, buffer: &mut Buffer) {
+    pub(crate) fn render(&mut self, area: Rect, buffer: &mut Buffer) {
         layout::render(self, area, buffer);
     }
 
@@ -84,6 +89,10 @@ impl OperationsDockState {
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> bool {
         input::handle_key(self, key)
+    }
+
+    pub(crate) fn handle_mouse(&mut self, event: MouseEvent) -> DockMouseAction {
+        mouse::handle_mouse(self, event)
     }
 
     pub(crate) fn latest_plan(&self) -> Option<&UpdatePlanArgs> {
