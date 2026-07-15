@@ -18,9 +18,12 @@ use crossterm::SynchronizedUpdate;
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::DisableBracketedPaste;
 use crossterm::event::DisableFocusChange;
+use crossterm::event::DisableMouseCapture;
 use crossterm::event::EnableBracketedPaste;
 use crossterm::event::EnableFocusChange;
+use crossterm::event::EnableMouseCapture;
 use crossterm::event::KeyEvent;
+use crossterm::event::MouseEvent;
 use crossterm::terminal::EnterAlternateScreen;
 use crossterm::terminal::LeaveAlternateScreen;
 #[cfg(not(unix))]
@@ -187,7 +190,21 @@ pub fn set_modes() -> Result<()> {
     keyboard_modes::enable_keyboard_enhancement();
 
     let _ = execute!(stdout(), EnableFocusChange);
+    if MOUSE_CAPTURE_ENABLED.load(Ordering::Relaxed) {
+        execute!(stdout(), EnableMouseCapture)?;
+    }
     Ok(())
+}
+
+static MOUSE_CAPTURE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+fn set_mouse_capture(enabled: bool) -> Result<()> {
+    MOUSE_CAPTURE_ENABLED.store(enabled, Ordering::Relaxed);
+    if enabled {
+        execute!(stdout(), EnableMouseCapture)
+    } else {
+        execute!(stdout(), DisableMouseCapture)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -259,6 +276,7 @@ fn restore_common(
         first_error.get_or_insert(err);
     }
     let _ = execute!(stdout(), DisableFocusChange);
+    let _ = execute!(stdout(), DisableMouseCapture);
     if matches!(raw_mode_restore, RawModeRestore::Disable)
         && let Err(err) = disable_raw_mode()
     {
@@ -515,6 +533,8 @@ pub enum TuiEvent {
     Key(KeyEvent),
     /// A bracketed paste payload normalized by the app layer before it reaches the composer.
     Paste(String),
+    /// A mouse event captured only when a local opt-in feature enabled capture.
+    Mouse(MouseEvent),
     /// A terminal size notification that should be handled as resize-sensitive draw work.
     ///
     /// Resize is separate from `Draw` so the app can run feature-gated pre-render logic without
@@ -606,6 +626,10 @@ impl Tui {
     /// Set whether alternate screen is enabled. When false, enter_alt_screen() becomes a no-op.
     pub fn set_alt_screen_enabled(&mut self, enabled: bool) {
         self.alt_screen_enabled = enabled;
+    }
+
+    pub(crate) fn set_mouse_capture_enabled(&mut self, enabled: bool) -> Result<()> {
+        set_mouse_capture(enabled)
     }
 
     pub fn set_notification_settings(
