@@ -11,8 +11,9 @@
 //! from the finalized source.
 //!
 //! The row cap is enforced while rendering from `HistoryCell` source, not after writing to the
-//! terminal. Initial resume replay uses the same display-line buffering contract so large sessions
-//! do not write more retained rows than resize replay would later be willing to rebuild.
+//! terminal. Initial resume replay rebuilds the retained tail from that canonical source after all
+//! replay-time stream consolidation has finished, so provisional rows cannot overtake the latest
+//! assistant response.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -111,12 +112,16 @@ impl App {
     /// Start retaining initial resume replay rows before they are written to scrollback.
     ///
     /// Resume replay can insert thousands of already-finalized history cells before the first draw.
-    /// Buffering here lets the same row cap used by resize rebuilds apply to the startup write.
+    /// When a row cap exists, render only after replay-time consolidation so the terminal receives
+    /// the canonical transcript tail instead of provisional rows accumulated in event order.
     /// Starting this buffer while an overlay owns rendering would split transcript ownership, so
     /// overlay replay continues through the normal deferred-history path.
     pub(super) fn begin_initial_history_replay_buffer(&mut self) {
         if self.overlay.is_none() {
-            self.initial_history_replay_buffer = Some(Default::default());
+            self.initial_history_replay_buffer = Some(InitialHistoryReplayBuffer {
+                retained_lines: VecDeque::new(),
+                render_from_transcript_tail: self.resize_reflow_max_rows().is_some(),
+            });
         }
     }
 

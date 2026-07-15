@@ -1,0 +1,10 @@
+---
+source: tui/src/app/tests.rs
+expression: "rendered.lines.iter().map(rendered_line_text).collect::<Vec<_>>().join(\"\\n\")"
+---
+
+old tool output that must not follow the final answer
+
+latest user question
+
+• Final answer preserved at the transcript tail.

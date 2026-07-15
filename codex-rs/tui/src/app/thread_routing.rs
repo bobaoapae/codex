@@ -1532,9 +1532,15 @@ impl App {
 
     pub(super) fn handle_thread_event_replay(&mut self, event: ThreadBufferedEvent) {
         match event {
-            ThreadBufferedEvent::Notification(notification) => self
-                .chat_widget
-                .handle_server_notification(notification, Some(ReplayKind::ThreadSnapshot)),
+            ThreadBufferedEvent::Notification(notification) => {
+                // A resumed thread can already have spawned agents before the TUI finishes
+                // attaching to it. Those activity items arrive through snapshot replay rather
+                // than the live path, but they still define the dock/navigation projection.
+                self.project_operations_dock_notification(&notification);
+                self.cache_collab_receiver_threads_for_notification(&notification);
+                self.chat_widget
+                    .handle_server_notification(notification, Some(ReplayKind::ThreadSnapshot));
+            }
             ThreadBufferedEvent::Request(request) => self
                 .chat_widget
                 .handle_server_request(request, Some(ReplayKind::ThreadSnapshot)),

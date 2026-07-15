@@ -64,6 +64,7 @@ use codex_app_server_protocol::RequestId as AppServerRequestId;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::SessionSource;
+use codex_app_server_protocol::SubAgentActivityKind;
 use codex_app_server_protocol::Thread;
 use codex_app_server_protocol::ThreadClosedNotification;
 use codex_app_server_protocol::ThreadItem;
@@ -77,6 +78,9 @@ use codex_app_server_protocol::ToolRequestUserInputParams;
 use codex_app_server_protocol::Turn;
 use codex_app_server_protocol::TurnCompletedNotification;
 use codex_app_server_protocol::TurnError as AppServerTurnError;
+use codex_app_server_protocol::TurnPlanStep;
+use codex_app_server_protocol::TurnPlanStepStatus;
+use codex_app_server_protocol::TurnPlanUpdatedNotification;
 use codex_app_server_protocol::TurnStartedNotification;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput;
@@ -3235,6 +3239,13 @@ async fn side_start_block_message_tracks_open_side_conversation() {
     app.primary_thread_id = Some(ThreadId::new());
     assert_eq!(app.side_start_block_message(), None);
 
+    app.side_start_in_progress = true;
+    assert_eq!(
+        app.side_start_block_message(),
+        Some("A side conversation is already being prepared.")
+    );
+    app.side_start_in_progress = false;
+
     let parent_thread_id = ThreadId::new();
     let side_thread_id = ThreadId::new();
     app.side_threads
@@ -4101,6 +4112,7 @@ async fn make_test_app() -> App {
         thread_event_listener_tasks: HashMap::new(),
         agent_navigation: AgentNavigationState::default(),
         side_threads: HashMap::new(),
+        side_start_in_progress: false,
         active_thread_id: None,
         active_thread_rx: None,
         primary_thread_id: None,
@@ -4171,6 +4183,7 @@ async fn make_test_app_with_channels() -> (
             thread_event_listener_tasks: HashMap::new(),
             agent_navigation: AgentNavigationState::default(),
             side_threads: HashMap::new(),
+            side_start_in_progress: false,
             active_thread_id: None,
             active_thread_rx: None,
             primary_thread_id: None,
@@ -4570,6 +4583,134 @@ async fn initial_replay_buffer_keeps_recent_rows_when_row_cap_present() {
             "line 4".to_string(),
         ]
     );
+}
+
+#[tokio::test]
+async fn replayed_sub_agent_activity_populates_operations_dock_navigation() {
+    let mut app = make_test_app().await;
+    let agent_thread_id = ThreadId::new();
+
+    app.handle_thread_event_replay(ThreadBufferedEvent::Notification(
+        ServerNotification::ItemStarted(ItemStartedNotification {
+            thread_id: ThreadId::new().to_string(),
+            turn_id: "turn-1".to_string(),
+            started_at_ms: 0,
+            item: ThreadItem::SubAgentActivity {
+                id: "spawn-1".to_string(),
+                kind: SubAgentActivityKind::Started,
+                agent_thread_id: agent_thread_id.to_string(),
+                agent_path: "/root/godot_symbol_render".to_string(),
+            },
+        }),
+    ));
+
+    assert_eq!(
+        app.agent_navigation.get(&agent_thread_id),
+        Some(&AgentPickerThreadEntry {
+            agent_nickname: None,
+            agent_role: None,
+            agent_path: Some("/root/godot_symbol_render".to_string()),
+            is_running: true,
+            is_closed: false,
+        })
+    );
+}
+
+#[tokio::test]
+async fn replayed_plan_update_populates_operations_dock() {
+    let mut app = make_test_app().await;
+    app.operations_dock = OperationsDockState::new(codex_local_features::OperationsDockMode::Auto);
+
+    app.handle_thread_event_replay(ThreadBufferedEvent::Notification(
+        ServerNotification::TurnPlanUpdated(TurnPlanUpdatedNotification {
+            thread_id: ThreadId::new().to_string(),
+            turn_id: "turn-1".to_string(),
+            explanation: Some("restored plan".to_string()),
+            plan: vec![TurnPlanStep {
+                step: "Inspect resumed session".to_string(),
+                status: TurnPlanStepStatus::InProgress,
+            }],
+        }),
+    ));
+
+    let plan = app
+        .operations_dock
+        .latest_plan()
+        .expect("replayed plan should populate the dock");
+    assert_eq!(plan.explanation.as_deref(), Some("restored plan"));
+    assert_eq!(plan.plan.len(), 1);
+    assert_eq!(plan.plan[0].step, "Inspect resumed session");
+    assert!(matches!(plan.plan[0].status, StepStatus::InProgress));
+}
+
+#[tokio::test]
+async fn capped_initial_resume_replay_renders_canonical_transcript_tail() -> Result<()> {
+    let (mut app, _rx, _op_rx) = make_test_app_with_channels().await;
+    app.config.terminal_resize_reflow.max_rows = TerminalResizeReflowMaxRows::Limit(6);
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+
+    app.begin_initial_history_replay_buffer();
+    app.insert_history_cell(
+        &mut tui,
+        Box::new(PlainHistoryCell::new(vec![Line::from(
+            "Called lemma.session_start with old session payload",
+        )])),
+    );
+    app.insert_history_cell(
+        &mut tui,
+        Box::new(PlainHistoryCell::new(vec![Line::from(
+            "old tool output that must not follow the final answer",
+        )])),
+    );
+    app.insert_history_cell(
+        &mut tui,
+        Box::new(PlainHistoryCell::new(vec![Line::from(
+            "latest user question",
+        )])),
+    );
+    app.insert_history_cell(
+        &mut tui,
+        Box::new(AgentMarkdownCell::new(
+            "Final answer preserved at the transcript tail.".to_string(),
+            Path::new("/tmp"),
+        )),
+    );
+
+    let buffer = app
+        .initial_history_replay_buffer
+        .as_ref()
+        .expect("initial replay buffer should remain active");
+    assert!(buffer.render_from_transcript_tail);
+    assert!(buffer.retained_lines.is_empty());
+
+    app.finish_initial_history_replay_buffer(&mut tui);
+    assert!(app.transcript_reflow.has_pending_reflow());
+
+    let rendered = app.render_transcript_lines_for_reflow(/*width*/ 80);
+    assert_snapshot!(
+        "capped_initial_resume_replay_renders_canonical_transcript_tail",
+        rendered
+            .lines
+            .iter()
+            .map(rendered_line_text)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn uncapped_initial_resume_replay_keeps_incremental_buffering() {
+    let (mut app, _rx, _op_rx) = make_test_app_with_channels().await;
+    app.config.terminal_resize_reflow.max_rows = TerminalResizeReflowMaxRows::Disabled;
+
+    app.begin_initial_history_replay_buffer();
+
+    let buffer = app
+        .initial_history_replay_buffer
+        .as_ref()
+        .expect("initial replay buffer should remain active");
+    assert!(!buffer.render_from_transcript_tail);
 }
 
 #[tokio::test]

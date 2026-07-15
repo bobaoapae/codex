@@ -1935,6 +1935,21 @@ impl App {
                     .handle_start_side(tui, app_server, parent_thread_id, user_message)
                     .await;
             }
+            AppEvent::SideThreadForked {
+                parent_thread_id,
+                user_message,
+                result,
+            } => {
+                return self
+                    .handle_side_thread_forked(
+                        tui,
+                        app_server,
+                        parent_thread_id,
+                        user_message,
+                        result,
+                    )
+                    .await;
+            }
             AppEvent::OpenSkillsList => {
                 self.chat_widget.open_skills_list();
             }

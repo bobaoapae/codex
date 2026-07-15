@@ -21,6 +21,7 @@ const SIDE_NO_STARTED_CONVERSATION_MESSAGE: &str = concat!(
 );
 const SIDE_ALREADY_OPEN_MESSAGE: &str =
     "A side conversation is already open. Press Ctrl+C to return before starting another.";
+const SIDE_START_IN_PROGRESS_MESSAGE: &str = "A side conversation is already being prepared.";
 const SIDE_BOUNDARY_PROMPT: &str = r#"Side conversation boundary.
 
 Everything before this boundary is inherited history from the parent thread. It is reference context only. It is not your current task.
@@ -484,6 +485,8 @@ impl App {
     pub(super) fn side_start_block_message(&self) -> Option<&'static str> {
         if self.primary_thread_id.is_none() {
             Some(SIDE_MAIN_THREAD_UNAVAILABLE_MESSAGE)
+        } else if self.side_start_in_progress {
+            Some(SIDE_START_IN_PROGRESS_MESSAGE)
         } else if !self.side_threads.is_empty() {
             Some(SIDE_ALREADY_OPEN_MESSAGE)
         } else {
@@ -491,12 +494,11 @@ impl App {
         }
     }
 
-    pub(super) fn side_start_error_message(err: &color_eyre::Report) -> String {
-        if err.chain().any(|cause| {
-            let message = cause.to_string();
-            message.contains("no rollout found for thread id")
-                || message.contains("includeTurns is unavailable before first user message")
-        }) {
+    pub(super) fn side_start_error_message(err: &impl std::fmt::Display) -> String {
+        let message = err.to_string();
+        if message.contains("no rollout found for thread id")
+            || message.contains("includeTurns is unavailable before first user message")
+        {
             SIDE_NO_STARTED_CONVERSATION_MESSAGE.to_string()
         } else {
             format!("Failed to start side conversation: {err}")
@@ -553,7 +555,7 @@ impl App {
 
     pub(super) async fn handle_start_side(
         &mut self,
-        tui: &mut tui::Tui,
+        _tui: &mut tui::Tui,
         app_server: &mut AppServerSession,
         parent_thread_id: ThreadId,
         mut user_message: Option<crate::chatwidget::UserMessage>,
@@ -574,7 +576,31 @@ impl App {
             .await;
 
         let fork_config = self.side_fork_config();
-        match app_server.fork_thread(fork_config, parent_thread_id).await {
+        let fork = app_server.fork_thread_in_background(fork_config, parent_thread_id);
+        let app_event_tx = self.app_event_tx.clone();
+        self.side_start_in_progress = true;
+        tokio::spawn(async move {
+            let result = fork.await.map_err(|err| format!("{err:#}"));
+            app_event_tx.send(AppEvent::SideThreadForked {
+                parent_thread_id,
+                user_message,
+                result,
+            });
+        });
+
+        Ok(AppRunControl::Continue)
+    }
+
+    pub(super) async fn handle_side_thread_forked(
+        &mut self,
+        tui: &mut tui::Tui,
+        app_server: &mut AppServerSession,
+        parent_thread_id: ThreadId,
+        mut user_message: Option<crate::chatwidget::UserMessage>,
+        result: Result<AppServerStartedThread, String>,
+    ) -> Result<AppRunControl> {
+        self.side_start_in_progress = false;
+        match result {
             Ok(forked) => {
                 let child_thread_id = forked.session.thread_id;
                 let channel = self.ensure_thread_channel(child_thread_id);

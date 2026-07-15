@@ -158,6 +158,13 @@ pub(crate) enum AppEvent {
         user_message: Option<UserMessage>,
     },
 
+    /// Result of a transient side-thread fork performed away from the TUI event loop.
+    SideThreadForked {
+        parent_thread_id: ThreadId,
+        user_message: Option<UserMessage>,
+        result: Result<AppServerStartedThread, String>,
+    },
+
     /// Submit an op to the specified thread, regardless of current focus.
     SubmitThreadOp {
         thread_id: ThreadId,

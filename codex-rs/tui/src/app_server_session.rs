@@ -127,7 +127,9 @@ use color_eyre::eyre::ContextCompat;
 use color_eyre::eyre::Result;
 use color_eyre::eyre::WrapErr;
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -556,6 +558,60 @@ impl AppServerSession {
             started_thread_from_fork_response(response, &config, self.thread_params_mode()).await?;
         started.session.fork_parent_title = fork_parent_title;
         Ok(started)
+    }
+
+    /// Builds an owned fork request future so expensive rollout reconstruction does not have to
+    /// run on the TUI event-dispatch task.
+    pub(crate) fn fork_thread_in_background(
+        &self,
+        config: Config,
+        thread_id: ThreadId,
+    ) -> Pin<Box<dyn Future<Output = Result<AppServerStartedThread>> + Send>> {
+        let request_handle = self.request_handle();
+        let thread_params_mode = self.thread_params_mode();
+        let remote_cwd_override = self.remote_cwd_override.clone();
+        let session_config = self.session_config_with_effective_service_tier(&config);
+        Box::pin(async move {
+            let response: ThreadForkResponse = request_handle
+                .request_typed(ClientRequest::ThreadFork {
+                    request_id: RequestId::String(format!(
+                        "background-thread-fork-{}",
+                        Uuid::new_v4()
+                    )),
+                    params: thread_fork_params_from_config(
+                        session_config,
+                        thread_id,
+                        thread_params_mode,
+                        remote_cwd_override.as_deref(),
+                    ),
+                })
+                .await
+                .map_err(|err| {
+                    bootstrap_request_error("thread/fork failed during TUI bootstrap", err)
+                })?;
+            let forked_from_id = response.thread.forked_from_id.clone();
+            let mut started =
+                started_thread_from_fork_response(response, &config, thread_params_mode).await?;
+            if let Some(forked_from_id) = forked_from_id {
+                let parent: std::result::Result<ThreadReadResponse, _> = request_handle
+                    .request_typed(ClientRequest::ThreadRead {
+                        request_id: RequestId::String(format!(
+                            "background-fork-parent-read-{}",
+                            Uuid::new_v4()
+                        )),
+                        params: ThreadReadParams {
+                            thread_id: forked_from_id,
+                            include_turns: false,
+                        },
+                    })
+                    .await;
+                match parent {
+                    Ok(parent) => started.session.fork_parent_title = parent.thread.name,
+                    Err(err) => tracing::warn!(%err, "failed to read background fork parent title"),
+                }
+            }
+            Ok(started)
+        })
     }
 
     pub(crate) fn thread_params_mode(&self) -> ThreadParamsMode {
