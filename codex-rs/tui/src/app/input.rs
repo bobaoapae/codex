@@ -103,6 +103,21 @@ impl App {
             tui.frame_requester().schedule_frame();
             return;
         }
+        if key_event.code == KeyCode::Char('i')
+            && matches!(key_event.kind, KeyEventKind::Press)
+            && let Some(thread_id) = self.operations_dock.selected_agent_thread_id()
+        {
+            if let Err(err) = self
+                .submit_thread_op(app_server, thread_id, AppCommand::interrupt())
+                .await
+            {
+                tracing::warn!(%thread_id, error = %err, "failed to interrupt agent from operations dock");
+                self.chat_widget
+                    .add_error_message(format!("Failed to interrupt agent: {err}"));
+            }
+            tui.frame_requester().schedule_frame();
+            return;
+        }
         if key_event.code == KeyCode::Enter
             && matches!(key_event.kind, KeyEventKind::Press)
             && let Some(thread_id) = self.operations_dock.selected_agent_thread_id()
