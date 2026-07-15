@@ -1679,6 +1679,15 @@ impl ChatComposer {
         self.history_search.is_some() || self.popups.active()
     }
 
+    /// True when Down has no newer composer content to reach and may move focus below the input.
+    pub(crate) fn can_move_focus_down(&self) -> bool {
+        self.draft.input_enabled
+            && !self.popup_active()
+            && !self.draft.textarea.is_vim_normal_mode()
+            && !self.history.is_navigating()
+            && self.history_navigation_cursor() == self.current_text().len()
+    }
+
     #[inline]
     fn clamp_to_char_boundary(text: &str, pos: usize) -> usize {
         let mut p = pos.min(text.len());
@@ -4486,6 +4495,28 @@ mod tests {
             ),
             rx,
         )
+    }
+
+    #[test]
+    fn down_can_leave_composer_only_at_newest_lower_boundary() {
+        let (mut composer, _rx) = new_test_composer();
+        assert!(composer.can_move_focus_down());
+
+        composer.insert_str("draft");
+        assert!(composer.can_move_focus_down());
+
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert!(!composer.can_move_focus_down());
+
+        composer.move_cursor_to_end();
+        composer
+            .history
+            .record_local_submission(HistoryEntry::new("older".into()));
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert!(!composer.can_move_focus_down());
+
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert!(composer.can_move_focus_down());
     }
 
     #[test]

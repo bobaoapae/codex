@@ -1284,6 +1284,10 @@ impl BottomPane {
         self.composer.is_empty()
     }
 
+    pub(crate) fn composer_can_move_focus_down(&self) -> bool {
+        self.view_stack.is_empty() && self.composer.can_move_focus_down()
+    }
+
     #[cfg(test)]
     pub(crate) fn composer_is_vim_enabled(&self) -> bool {
         self.composer.is_vim_enabled()

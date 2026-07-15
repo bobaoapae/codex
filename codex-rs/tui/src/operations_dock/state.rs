@@ -103,6 +103,22 @@ impl OperationsDockState {
         true
     }
 
+    pub(crate) fn focus_agents(&mut self) -> bool {
+        if !self.focus() {
+            return false;
+        }
+        self.tab = DockTab::Agents;
+        self.scroll = self
+            .active_thread_id
+            .and_then(|thread_id| {
+                self.agents
+                    .iter()
+                    .position(|agent| agent.thread_id == thread_id)
+            })
+            .unwrap_or(0);
+        true
+    }
+
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> bool {
         input::handle_key(self, key)
     }

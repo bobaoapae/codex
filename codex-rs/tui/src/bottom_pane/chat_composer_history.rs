@@ -321,6 +321,11 @@ impl ChatComposerHistory {
         self.search = None;
     }
 
+    /// Whether Up/Down is currently traversing a recalled history entry.
+    pub(crate) fn is_navigating(&self) -> bool {
+        self.history_cursor.is_some() || self.pending_navigation_direction.is_some()
+    }
+
     /// Clears only the active incremental search state.
     ///
     /// The normal Up/Down navigation cursor and cached persistent entries are left intact. Composer

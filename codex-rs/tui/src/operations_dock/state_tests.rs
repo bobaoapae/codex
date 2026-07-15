@@ -54,6 +54,34 @@ fn dock_keyboard_focus_and_scroll_are_self_contained() {
 }
 
 #[test]
+fn focusing_agents_selects_the_active_thread() {
+    let mut state = OperationsDockState::new(OperationsDockMode::Auto);
+    let main_id = ThreadId::new();
+    let agent_id = ThreadId::new();
+    state.sync_agents(
+        vec![
+            DockAgentRow {
+                thread_id: main_id,
+                label: "Main".into(),
+                status: "idle".into(),
+                is_main: true,
+            },
+            DockAgentRow {
+                thread_id: agent_id,
+                label: "worker".into(),
+                status: "running".into(),
+                is_main: false,
+            },
+        ],
+        Some(agent_id),
+    );
+
+    assert!(state.focus_agents());
+    assert_eq!(state.tab, DockTab::Agents);
+    assert_eq!(state.selected_agent_thread_id(), Some(agent_id));
+}
+
+#[test]
 fn dock_mouse_uses_hit_regions_from_latest_frame() {
     let mut state = OperationsDockState::new(OperationsDockMode::Always);
     let thread_id = ThreadId::new();
