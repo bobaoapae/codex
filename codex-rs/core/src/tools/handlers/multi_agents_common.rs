@@ -31,6 +31,7 @@ pub(crate) const MIN_WAIT_TIMEOUT_MS: i64 = DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIME
 pub(crate) const DEFAULT_WAIT_TIMEOUT_MS: i64 = 30_000;
 pub(crate) const MAX_WAIT_TIMEOUT_MS: i64 = HARD_MAX_MULTI_AGENT_V2_TIMEOUT_MS;
 pub(crate) const MAX_SPAWN_AGENT_MODEL_OVERRIDES: usize = 5;
+const GPT_5_6_LUNA_MODEL: &str = "gpt-5.6-luna";
 
 pub(crate) fn model_supports_multi_agent_backend(
     model: &ModelPreset,
@@ -38,6 +39,12 @@ pub(crate) fn model_supports_multi_agent_backend(
 ) -> bool {
     multi_agent_version != MultiAgentVersion::V2
         || model.multi_agent_version == Some(multi_agent_version)
+        // Luna is currently advertised by the model catalog as V1, but it is
+        // compatible with the V2 child-thread protocol when spawned by a V2
+        // parent. Keep this compatibility explicit instead of broadening V2
+        // to every model that lacks V2 metadata.
+        || (multi_agent_version == MultiAgentVersion::V2
+            && model.model == GPT_5_6_LUNA_MODEL)
 }
 
 pub(crate) fn function_arguments(payload: ToolPayload) -> Result<String, FunctionCallError> {
