@@ -3,9 +3,14 @@ mod baseline;
 mod branch;
 mod errors;
 mod fsmonitor;
+mod git_process;
 mod info;
 mod operations;
 mod platform;
+
+/// Git configuration that rejects implicitly discovered bare repositories while
+/// preserving repositories selected explicitly through `GIT_DIR` or `--git-dir`.
+pub const SAFE_BARE_REPOSITORY_CONFIG: &str = "safe.bareRepository=explicit";
 
 pub use apply::ApplyGitRequest;
 pub use apply::ApplyGitResult;

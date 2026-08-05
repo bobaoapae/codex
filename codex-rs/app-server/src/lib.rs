@@ -4,7 +4,6 @@
 use codex_arg0::Arg0DispatchPaths;
 use codex_code_mode::CodeModeSessionProvider;
 use codex_code_mode::WebSocketCodeModeSessionProvider;
-use codex_config::ConfigLayerStackOrdering;
 use codex_config::LoaderOverrides;
 use codex_config::NoopThreadConfigLoader;
 use codex_config::RemoteThreadConfigLoader;
@@ -355,10 +354,7 @@ fn app_text_range(range: &CoreTextRange) -> AppTextRange {
 fn project_config_warning(config: &Config) -> Option<ConfigWarningNotification> {
     let mut disabled_folders = Vec::new();
 
-    for layer in config.config_layer_stack.get_layers(
-        ConfigLayerStackOrdering::LowestPrecedenceFirst,
-        /*include_disabled*/ true,
-    ) {
+    for layer in config.config_layer_stack.all_layers_low_to_high() {
         let ConfigLayerSource::Project { dot_codex_folder } = &layer.name else {
             continue;
         };
@@ -441,6 +437,7 @@ pub struct AppServerRuntimeOptions {
     pub plugin_startup_tasks: PluginStartupTasks,
     pub remote_control_startup_mode: RemoteControlStartupMode,
     pub install_shutdown_signal_handler: bool,
+    pub psp: bool,
 }
 
 impl Default for AppServerRuntimeOptions {
@@ -450,6 +447,7 @@ impl Default for AppServerRuntimeOptions {
             plugin_startup_tasks: PluginStartupTasks::Start,
             remote_control_startup_mode: RemoteControlStartupMode::ResolvePersisted,
             install_shutdown_signal_handler: true,
+            psp: false,
         }
     }
 }
@@ -490,7 +488,7 @@ pub async fn run_main_with_transport_options(
         arg0_paths.codex_linux_sandbox_exe.clone(),
     )?;
     let ignore_user_config = loader_overrides.ignore_user_config;
-    let config_manager = ConfigManager::new(
+    let mut config_manager = ConfigManager::new(
         codex_home.to_path_buf(),
         cli_kv_overrides.clone(),
         loader_overrides,
@@ -499,6 +497,7 @@ pub async fn run_main_with_transport_options(
         arg0_paths.clone(),
         Arc::new(NoopThreadConfigLoader),
     );
+    config_manager.psp = runtime_options.psp;
     match config_manager
         .load_latest_config(/*fallback_cwd*/ None)
         .await

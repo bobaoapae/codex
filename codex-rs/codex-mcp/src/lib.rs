@@ -1,5 +1,6 @@
 pub use binding::McpBinding;
 pub use binding::PreparedMcpCall;
+pub use client_capabilities::client_mcp_extensions;
 pub use codex_rmcp_client::McpProtocolMode;
 pub use connection_manager::tool_is_model_visible;
 pub use elicitation::ElicitationLifecycle;
@@ -57,6 +58,7 @@ pub use mcp::hosted_plugin_runtime_mcp_server_config;
 pub use mcp::tool_plugin_provenance;
 pub use plugin_config::PluginMcpConfigParseOutcome;
 pub use plugin_config::PluginMcpServerParseError;
+pub use plugin_config::parse_agent_plugin_mcp_config;
 pub use plugin_config::parse_executor_plugin_mcp_config;
 pub use plugin_config::parse_plugin_mcp_config;
 
@@ -85,6 +87,7 @@ pub(crate) mod auth_elicitation;
 mod binding;
 pub(crate) mod binding_clients;
 mod catalog;
+mod client_capabilities;
 pub(crate) mod codex_apps;
 pub(crate) mod connection_manager;
 pub(crate) mod elicitation;

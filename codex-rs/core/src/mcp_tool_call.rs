@@ -1361,7 +1361,7 @@ async fn maybe_request_mcp_tool_approval(
             turn_context,
             review_id.clone(),
             build_guardian_mcp_tool_review_request(call_id, invocation, Some(metadata)),
-            /*retry_reason*/ None,
+            Default::default(),
         )
         .await;
         let decision = mcp_tool_approval_decision_from_guardian(decision);
@@ -2136,7 +2136,6 @@ fn project_mcp_tool_approval_config_folder(
     config
         .config_layer_stack
         .layers_high_to_low()
-        .into_iter()
         .find_map(|layer| {
             if !matches!(layer.name, ConfigLayerSource::Project { .. }) {
                 return None;

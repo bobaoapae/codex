@@ -1,7 +1,9 @@
 use std::collections::HashMap;
-use std::collections::HashSet;
+use std::hash::Hash;
+use std::hash::Hasher;
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::sync::Weak;
 
 use codex_config::ConfigLayerStack;
 use codex_exec_server::ExecutorFileSystem;
@@ -10,28 +12,28 @@ use codex_protocol::protocol::SkillScope;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_plugins::PluginIdentity;
 use codex_utils_plugins::PluginSkillRoot;
+use tokio::sync::OnceCell;
 use tokio::sync::Semaphore;
 use tracing::info;
 use tracing::instrument;
 use tracing::warn;
 
-use crate::HostSkillsSnapshot;
-use crate::PluginSkillSnapshots;
-use crate::SkillLoadOutcome;
-use crate::build_implicit_skill_path_indexes;
-use crate::config_rules::SkillConfigRules;
-use crate::config_rules::resolve_disabled_skill_paths;
-use crate::config_rules::skill_config_rules_from_stack;
-use crate::loader::MAX_CONCURRENT_ROOT_SCANS;
-use crate::loader::SkillRoot;
-use crate::loader::load_skills_from_roots;
-use crate::loader::skill_roots;
-use crate::system::install_system_skills;
-use crate::system::uninstall_system_skills;
 use codex_config::SkillsConfig;
+use codex_core_skills::HostSkillsSnapshot;
+use codex_core_skills::PluginSkillSnapshots;
+use codex_core_skills::SkillLoadOutcome;
+use codex_core_skills::config_rules::SkillConfigRules;
+use codex_core_skills::config_rules::resolve_disabled_skill_paths;
+use codex_core_skills::config_rules::skill_config_rules_from_stack;
+use codex_core_skills::loader::MAX_CONCURRENT_ROOT_SCANS;
+use codex_core_skills::loader::SkillRoot;
+use codex_core_skills::loader::load_skills_from_roots;
+use codex_skills::install_system_skills;
+
+use crate::host_roots::resolve_skill_roots;
 
 #[derive(Debug, Clone)]
-pub struct SkillsLoadInput {
+pub struct HostSkillsLoadInput {
     pub cwd: AbsolutePathBuf,
     pub effective_skill_roots: Vec<PluginSkillRoot>,
     pub config_layer_stack: ConfigLayerStack,
@@ -39,7 +41,7 @@ pub struct SkillsLoadInput {
     plugin_skill_snapshots: Option<PluginSkillSnapshots>,
 }
 
-impl SkillsLoadInput {
+impl HostSkillsLoadInput {
     pub fn new(
         cwd: AbsolutePathBuf,
         effective_skill_roots: Vec<PluginSkillRoot>,
@@ -68,17 +70,17 @@ impl SkillsLoadInput {
 /// Owns host skill discovery, immutable snapshots, cache invalidation, and extra roots.
 ///
 /// Source-specific model exposure remains the responsibility of the skills extension.
-pub struct SkillsService {
+pub struct HostSkillsService {
     codex_home: AbsolutePathBuf,
     restriction_product: Option<Product>,
     extra_roots: RwLock<Vec<AbsolutePathBuf>>,
     cache_by_cwd: RwLock<HashMap<AbsolutePathBuf, HostSkillsSnapshot>>,
-    cache_by_config: RwLock<HashMap<ConfigSkillsCacheKey, HostSkillsSnapshot>>,
+    cache_by_config: RwLock<HashMap<ConfigSkillsCacheKey, Arc<OnceCell<HostSkillsSnapshot>>>>,
     // Shared across cwds so root scheduling cannot multiply per-root I/O fanout.
     root_scan_slots: Arc<Semaphore>,
 }
 
-impl SkillsService {
+impl HostSkillsService {
     pub fn new(codex_home: AbsolutePathBuf, bundled_skills_enabled: bool) -> Self {
         Self::new_with_restriction_product(codex_home, bundled_skills_enabled, Some(Product::Codex))
     }
@@ -96,12 +98,10 @@ impl SkillsService {
             cache_by_config: RwLock::new(HashMap::new()),
             root_scan_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_ROOT_SCANS)),
         };
-        if !bundled_skills_enabled {
-            // The loader caches bundled skills under `skills/.system`. Clearing that directory is
-            // best-effort cleanup; root selection still enforces the config even if removal fails.
-            uninstall_system_skills(&service.codex_home);
-        } else if let Err(err) = install_system_skills(&service.codex_home) {
-            tracing::error!("failed to install system skills: {err}");
+        // The cache is shared by every process using this CODEX_HOME. Disabled services filter
+        // system roots when loading rather than mutating shared state.
+        if bundled_skills_enabled {
+            service.ensure_system_skills_installed();
         }
         service
     }
@@ -131,34 +131,39 @@ impl SkillsService {
     )]
     pub async fn snapshot_for_config(
         &self,
-        input: &SkillsLoadInput,
+        input: &HostSkillsLoadInput,
         fs: Option<Arc<dyn ExecutorFileSystem>>,
     ) -> HostSkillsSnapshot {
         let roots = self.skill_roots_for_config(input, fs).await;
         let skill_config_rules = skill_config_rules_from_stack(&input.config_layer_stack);
-        let cache_key = config_skills_cache_key(&roots, &skill_config_rules);
+        let cache_key = config_skills_cache_key(
+            &roots,
+            &skill_config_rules,
+            input.plugin_skill_snapshots.as_ref(),
+        );
         if let Some(snapshot) = self.cached_snapshot_for_config(&cache_key) {
             return snapshot;
         }
 
-        let snapshot = HostSkillsSnapshot::new(Arc::new(
-            self.build_skill_outcome(input, roots, &skill_config_rules)
-                .await,
-        ));
-        let mut cache = self
-            .cache_by_config
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        cache.insert(cache_key, snapshot.clone());
-        snapshot
+        self.snapshot_for_skill_roots(
+            input,
+            roots,
+            &skill_config_rules,
+            cache_key,
+            /*force_reload*/ false,
+        )
+        .await
     }
 
     pub async fn skill_roots_for_config(
         &self,
-        input: &SkillsLoadInput,
+        input: &HostSkillsLoadInput,
         fs: Option<Arc<dyn ExecutorFileSystem>>,
     ) -> Vec<SkillRoot> {
-        let mut roots = skill_roots(
+        if input.bundled_skills_enabled {
+            self.ensure_system_skills_installed();
+        }
+        let mut roots = resolve_skill_roots(
             fs,
             &input.config_layer_stack,
             &input.cwd,
@@ -174,19 +179,24 @@ impl SkillsService {
 
     pub async fn snapshot_for_cwd(
         &self,
-        input: &SkillsLoadInput,
+        input: &HostSkillsLoadInput,
         force_reload: bool,
         fs: Option<Arc<dyn ExecutorFileSystem>>,
     ) -> HostSkillsSnapshot {
+        let bundled_skills_enabled = bundled_skills_enabled_from_stack(&input.config_layer_stack);
+        if bundled_skills_enabled {
+            self.ensure_system_skills_installed();
+        }
         let use_cwd_cache = fs.is_some();
-        if use_cwd_cache
+        let cache_snapshot_by_cwd = use_cwd_cache && input.effective_skill_roots.is_empty();
+        if cache_snapshot_by_cwd
             && !force_reload
             && let Some(snapshot) = self.cached_snapshot_for_cwd(&input.cwd)
         {
             return snapshot;
         }
 
-        let mut roots = skill_roots(
+        let mut roots = resolve_skill_roots(
             fs.clone(),
             &input.config_layer_stack,
             &input.cwd,
@@ -194,15 +204,31 @@ impl SkillsService {
             self.extra_roots(),
         )
         .await;
-        if !bundled_skills_enabled_from_stack(&input.config_layer_stack) {
+        if !bundled_skills_enabled {
             roots.retain(|root| root.scope != SkillScope::System);
         }
         let skill_config_rules = skill_config_rules_from_stack(&input.config_layer_stack);
-        let snapshot = HostSkillsSnapshot::new(Arc::new(
-            self.build_skill_outcome(input, roots, &skill_config_rules)
-                .await,
-        ));
-        if use_cwd_cache {
+        let snapshot = if use_cwd_cache {
+            let cache_key = config_skills_cache_key(
+                &roots,
+                &skill_config_rules,
+                input.plugin_skill_snapshots.as_ref(),
+            );
+            self.snapshot_for_skill_roots(
+                input,
+                roots,
+                &skill_config_rules,
+                cache_key,
+                force_reload,
+            )
+            .await
+        } else {
+            HostSkillsSnapshot::new(Arc::new(
+                self.build_skill_outcome(input, roots, &skill_config_rules)
+                    .await,
+            ))
+        };
+        if cache_snapshot_by_cwd {
             let mut cache = self
                 .cache_by_cwd
                 .write()
@@ -212,10 +238,47 @@ impl SkillsService {
         snapshot
     }
 
+    async fn snapshot_for_skill_roots(
+        &self,
+        input: &HostSkillsLoadInput,
+        roots: Vec<SkillRoot>,
+        skill_config_rules: &SkillConfigRules,
+        cache_key: ConfigSkillsCacheKey,
+        force_reload: bool,
+    ) -> HostSkillsSnapshot {
+        let snapshot_cell = {
+            let mut cache = self
+                .cache_by_config
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if force_reload {
+                let snapshot_cell = Arc::new(OnceCell::new());
+                cache.insert(cache_key, Arc::clone(&snapshot_cell));
+                snapshot_cell
+            } else {
+                Arc::clone(
+                    cache
+                        .entry(cache_key)
+                        .or_insert_with(|| Arc::new(OnceCell::new())),
+                )
+            }
+        };
+
+        snapshot_cell
+            .get_or_init(|| async {
+                HostSkillsSnapshot::new(Arc::new(
+                    self.build_skill_outcome(input, roots, skill_config_rules)
+                        .await,
+                ))
+            })
+            .await
+            .clone()
+    }
+
     #[instrument(level = "trace", skip_all)]
     async fn build_skill_outcome(
         &self,
-        input: &SkillsLoadInput,
+        input: &HostSkillsLoadInput,
         roots: Vec<SkillRoot>,
         skill_config_rules: &SkillConfigRules,
     ) -> SkillLoadOutcome {
@@ -225,10 +288,12 @@ impl SkillsService {
             Arc::clone(&self.root_scan_slots),
         )
         .await;
-        let outcome =
-            crate::filter_skill_load_outcome_for_product(outcome, self.restriction_product);
+        let outcome = codex_core_skills::filter_skill_load_outcome_for_product(
+            outcome,
+            self.restriction_product,
+        );
         let disabled_paths = resolve_disabled_skill_paths(&outcome.skills, skill_config_rules);
-        finalize_skill_outcome(outcome, disabled_paths)
+        outcome.with_disabled_paths(disabled_paths)
     }
 
     pub fn clear_cache(&self) {
@@ -266,8 +331,15 @@ impl SkillsService {
         cache_key: &ConfigSkillsCacheKey,
     ) -> Option<HostSkillsSnapshot> {
         match self.cache_by_config.read() {
-            Ok(cache) => cache.get(cache_key).cloned(),
-            Err(err) => err.into_inner().get(cache_key).cloned(),
+            Ok(cache) => cache
+                .get(cache_key)
+                .and_then(|snapshot| snapshot.get())
+                .cloned(),
+            Err(err) => err
+                .into_inner()
+                .get(cache_key)
+                .and_then(|snapshot| snapshot.get())
+                .cloned(),
         }
     }
 
@@ -277,12 +349,19 @@ impl SkillsService {
             Err(err) => err.into_inner().clone(),
         }
     }
+
+    fn ensure_system_skills_installed(&self) {
+        if let Err(err) = install_system_skills(&self.codex_home) {
+            tracing::error!("failed to install system skills: {err}");
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ConfigSkillsCacheKey {
     roots: Vec<ConfigSkillRootCacheKey>,
     skill_config_rules: SkillConfigRules,
+    plugin_skill_snapshots: Option<PluginSkillSnapshots>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -291,6 +370,24 @@ struct ConfigSkillRootCacheKey {
     scope_rank: u8,
     plugin_identity: Option<PluginIdentity>,
     plugin_namespace: Option<String>,
+    file_system: FileSystemIdentity,
+}
+
+#[derive(Debug, Clone)]
+struct FileSystemIdentity(Weak<dyn ExecutorFileSystem>);
+
+impl PartialEq for FileSystemIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        Weak::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for FileSystemIdentity {}
+
+impl Hash for FileSystemIdentity {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (self.0.as_ptr() as *const ()).hash(state);
+    }
 }
 
 pub fn bundled_skills_enabled_from_stack(
@@ -318,6 +415,7 @@ pub fn bundled_skills_enabled_from_stack(
 fn config_skills_cache_key(
     roots: &[SkillRoot],
     skill_config_rules: &SkillConfigRules,
+    plugin_skill_snapshots: Option<&PluginSkillSnapshots>,
 ) -> ConfigSkillsCacheKey {
     ConfigSkillsCacheKey {
         roots: roots
@@ -334,33 +432,17 @@ fn config_skills_cache_key(
                     scope_rank,
                     plugin_identity: root.plugin_identity.clone(),
                     plugin_namespace: root.plugin_namespace.clone(),
+                    file_system: FileSystemIdentity(Arc::downgrade(&root.file_system)),
                 }
             })
             .collect(),
         skill_config_rules: skill_config_rules.clone(),
+        plugin_skill_snapshots: plugin_skill_snapshots
+            .filter(|_| roots.iter().any(|root| root.plugin_identity.is_some()))
+            .cloned(),
     }
 }
 
-fn finalize_skill_outcome(
-    mut outcome: SkillLoadOutcome,
-    disabled_paths: HashSet<AbsolutePathBuf>,
-) -> SkillLoadOutcome {
-    outcome.disabled_paths = disabled_paths;
-    // Usage-event detection should see any enabled skill file/script read, even when the
-    // skill is not model-routable through implicit invocation.
-    let (by_scripts_dir, by_doc_path) = build_implicit_skill_path_indexes(
-        outcome
-            .skills
-            .iter()
-            .filter(|skill| outcome.is_skill_enabled(skill))
-            .cloned()
-            .collect(),
-    );
-    outcome.implicit_skills_by_scripts_dir = Arc::new(by_scripts_dir);
-    outcome.implicit_skills_by_doc_path = Arc::new(by_doc_path);
-    outcome
-}
-
 #[cfg(test)]
-#[path = "service_tests.rs"]
+#[path = "host_service_tests.rs"]
 mod tests;

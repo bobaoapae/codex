@@ -185,8 +185,10 @@ impl Approvable<UnifiedExecRequest> for UnifiedExecRuntime<'_> {
         let command = req.command.clone();
         let environment_id = Some(req.turn_environment.environment_id.clone());
         let reason = ctx
-            .retry_reason
+            .reasons
+            .retry
             .clone()
+            .or_else(|| ctx.reasons.approval.clone())
             .or_else(|| req.justification.clone());
         Box::pin(async move {
             let native_cwd = match req.cwd.to_abs_path() {
@@ -263,8 +265,8 @@ impl Approvable<UnifiedExecRequest> for UnifiedExecRuntime<'_> {
 }
 
 impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecProcess> for UnifiedExecRuntime<'a> {
-    fn workspace_roots<'b>(&self, req: &'b UnifiedExecRequest) -> &'b [PathUri] {
-        req.turn_environment.workspace_roots()
+    fn turn_environment<'b>(&self, req: &'b UnifiedExecRequest) -> &'b TurnEnvironment {
+        &req.turn_environment
     }
 
     fn sandbox_cwd<'b>(&self, req: &'b UnifiedExecRequest) -> Option<&'b PathUri> {
@@ -276,7 +278,10 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecProcess> for UnifiedExecRunt
         req: &UnifiedExecRequest,
         ctx: &ToolCtx,
     ) -> Option<NetworkApprovalSpec> {
-        let file_system_sandbox_policy = ctx.turn.file_system_sandbox_policy();
+        let file_system_sandbox_policy = req
+            .turn_environment
+            .permission_profile()
+            .file_system_sandbox_policy();
         let sandbox_permissions = sandbox_permissions_preserving_denied_reads(
             req.sandbox_permissions,
             &file_system_sandbox_policy,
@@ -298,6 +303,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecProcess> for UnifiedExecRunt
             },
             command: req.hook_command.clone(),
             environment_id: req.turn_environment.environment_id.clone(),
+            permission_profile: req.turn_environment.permission_profile().clone(),
         })
     }
 
@@ -548,10 +554,13 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecProcess> for UnifiedExecRunt
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::PermissionProfileSnapshot;
     use crate::exec::DEFAULT_EXEC_COMMAND_TIMEOUT_MS;
+    use crate::session::turn_context::EnvironmentConfig;
     use crate::tools::sandboxing::ToolRuntime;
     use codex_exec_server::Environment;
     use codex_exec_server::LOCAL_ENVIRONMENT_ID;
+    use codex_protocol::models::PermissionProfile;
     use codex_tools::ZshForkConfig;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use codex_utils_path_uri::PathUri;
@@ -566,6 +575,12 @@ mod tests {
             cwd,
             Vec::new(),
             /*shell*/ None,
+            EnvironmentConfig {
+                allow_login_shell: true,
+                permission_profile: PermissionProfileSnapshot::legacy(
+                    PermissionProfile::read_only(),
+                ),
+            },
         )
     }
 

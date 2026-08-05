@@ -3,7 +3,6 @@ use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::Stdio;
 
 use codex_file_system::ExecutorFileSystem;
 use codex_file_system::FindUpErrorPolicy;
@@ -16,10 +15,10 @@ use serde::Deserialize;
 use serde::Serialize;
 use tokio::process::Command;
 use tokio::time::Duration as TokioDuration;
-use tokio::time::timeout;
 use ts_rs::TS;
 
 use crate::GitSha;
+use crate::git_process::run_git_command_with_timeout_output;
 
 /// Return `true` if the project folder specified by the `Config` is inside a
 /// Git repository.
@@ -402,12 +401,11 @@ impl crate::FsmonitorProbeRunner for LocalFsmonitorProbeRunner<'_> {
         // worktree or index, so do not reduce the requested command's timeout.
         let mut command = Command::new(self.git);
         command
+            .args(["-c", crate::SAFE_BARE_REPOSITORY_CONFIG])
             .args(args)
-            .current_dir(self.cwd)
-            .stdin(Stdio::null())
-            .kill_on_drop(true);
-        match timeout(GIT_COMMAND_TIMEOUT, command.output()).await {
-            Ok(Ok(output)) if output.status.success() => Some(output.stdout),
+            .current_dir(self.cwd);
+        match run_git_command_with_timeout_output(&mut command, GIT_COMMAND_TIMEOUT).await {
+            Some(output) if output.status.success() => Some(output.stdout),
             _ => None,
         }
     }
@@ -427,20 +425,14 @@ async fn run_git_command_with_timeout_from(
     let mut command = Command::new(git);
     command
         .env("GIT_OPTIONAL_LOCKS", "0")
+        .args(["-c", crate::SAFE_BARE_REPOSITORY_CONFIG])
         // Keep internal Git commands independent of repository-selected hooks
         // and fsmonitor helpers while preserving built-in fsmonitor acceleration.
         .args(["-c", &format!("core.hooksPath={DISABLED_HOOKS_PATH}")])
         .args(["-c", fsmonitor.git_config_arg()])
         .args(args)
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .kill_on_drop(true);
-    let result = timeout(GIT_COMMAND_TIMEOUT, command.output()).await;
-
-    match result {
-        Ok(Ok(output)) => Some(output),
-        _ => None, // Timeout or error
-    }
+        .current_dir(cwd);
+    run_git_command_with_timeout_output(&mut command, GIT_COMMAND_TIMEOUT).await
 }
 
 async fn get_git_remotes(cwd: &Path) -> Option<Vec<String>> {
@@ -905,6 +897,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    use std::process::Stdio;
 
     #[tokio::test]
     async fn git_metadata_commands_do_not_inherit_stdin() {
@@ -1043,6 +1036,7 @@ mod tests {
         std::fs::write(
             &git,
             "#!/bin/sh\n\
+             if [ \"$1\" = \"-c\" ] && [ \"$2\" = \"safe.bareRepository=explicit\" ]; then shift 2; fi\n\
              printf '%s\\n' \"$*\" >>\"$0.log\"\n\
              case \"$1\" in\n\
              config) printf '/tmp/fsmonitor-helper\\000' ;;\n\
@@ -1108,6 +1102,7 @@ mod tests {
         std::fs::write(
             &git,
             "#!/bin/sh\n\
+             if [ \"$1\" = \"-c\" ] && [ \"$2\" = \"safe.bareRepository=explicit\" ]; then shift 2; fi\n\
              printf '%s\\n' \"$*\" >>\"$0.log\"\n\
              case \"$1\" in\n\
              config)\n\
