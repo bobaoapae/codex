@@ -123,7 +123,7 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
     );
     assert_eq!(
         parameters.required.as_ref(),
-        Some(&vec!["task_name".to_string(), "message".to_string()])
+        Some(&vec!["task_name".to_string()])
     );
     assert_eq!(
         output_schema.expect("spawn_agent output schema")["required"],
@@ -343,7 +343,7 @@ fn send_message_tool_requires_message_and_has_no_output_schema() {
     );
     assert_eq!(
         parameters.required.as_ref(),
-        Some(&vec!["target".to_string(), "message".to_string()])
+        Some(&vec!["target".to_string()])
     );
     assert_eq!(output_schema, None);
 }
@@ -384,7 +384,7 @@ fn followup_task_tool_requires_message_and_has_no_output_schema() {
     assert!(!properties.contains_key("items"));
     assert_eq!(
         parameters.required.as_ref(),
-        Some(&vec!["target".to_string(), "message".to_string()])
+        Some(&vec!["target".to_string()])
     );
     assert_eq!(output_schema, None);
 }

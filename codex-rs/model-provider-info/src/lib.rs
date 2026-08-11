@@ -37,6 +37,8 @@ pub const OPENAI_PROVIDER_ID: &str = "openai";
 pub const CHATGPT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const AMAZON_BEDROCK_PROVIDER_NAME: &str = "Amazon Bedrock";
 pub const AMAZON_BEDROCK_PROVIDER_ID: &str = "amazon-bedrock";
+const CLAUDE_CODE_PROVIDER_NAME: &str = "Claude Code";
+pub const CLAUDE_CODE_PROVIDER_ID: &str = "claude_code";
 pub const AMAZON_BEDROCK_GPT_5_5_MODEL_ID: &str = "openai.gpt-5.5";
 pub const AMAZON_BEDROCK_GPT_5_4_MODEL_ID: &str = "openai.gpt-5.4";
 pub const AMAZON_BEDROCK_GPT_5_6_SOL_MODEL_ID: &str = "openai.gpt-5.6-sol";
@@ -57,12 +59,20 @@ pub enum WireApi {
     /// The Responses API exposed by OpenAI at `/v1/responses`.
     #[default]
     Responses,
+    /// The local Claude Code CLI, driven as a subprocess over its stream-json
+    /// protocol. There is no HTTP endpoint: the provider owns a `claude` process
+    /// per thread and authenticates with the user's Claude Code login.
+    // Spelled out so the serialized form matches the hand-written `Deserialize`
+    // below; `rename_all = "lowercase"` alone would emit `claudecode`.
+    #[serde(rename = "claude_code")]
+    ClaudeCode,
 }
 
 impl fmt::Display for WireApi {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let value = match self {
             Self::Responses => "responses",
+            Self::ClaudeCode => "claude_code",
         };
         f.write_str(value)
     }
@@ -76,8 +86,12 @@ impl<'de> Deserialize<'de> for WireApi {
         let value = String::deserialize(deserializer)?;
         match value.as_str() {
             "responses" => Ok(Self::Responses),
+            "claude_code" => Ok(Self::ClaudeCode),
             "chat" => Err(serde::de::Error::custom(CHAT_WIRE_API_REMOVED_ERROR)),
-            _ => Err(serde::de::Error::unknown_variant(&value, &["responses"])),
+            _ => Err(serde::de::Error::unknown_variant(
+                &value,
+                &["responses", "claude_code"],
+            )),
         }
     }
 }
@@ -366,6 +380,34 @@ impl ModelProviderInfo {
         }
     }
 
+    /// Provider backed by the locally installed Claude Code CLI.
+    ///
+    /// It has no endpoint and no key: requests are served by a `claude` child
+    /// process that authenticates with the user's own Claude Code login, so all
+    /// HTTP-shaped fields stay unset.
+    pub fn create_claude_code_provider() -> ModelProviderInfo {
+        ModelProviderInfo {
+            name: CLAUDE_CODE_PROVIDER_NAME.into(),
+            base_url: None,
+            env_key: None,
+            env_key_instructions: None,
+            experimental_bearer_token: None,
+            auth: None,
+            aws: None,
+            wire_api: WireApi::ClaudeCode,
+            query_params: None,
+            http_headers: None,
+            env_http_headers: None,
+            request_max_retries: None,
+            stream_max_retries: None,
+            stream_idle_timeout_ms: None,
+            websocket_connect_timeout_ms: None,
+            requires_openai_auth: false,
+            supports_websockets: false,
+            supports_standalone_web_search: false,
+        }
+    }
+
     pub fn create_amazon_bedrock_provider(
         aws: Option<ModelProviderAwsAuthInfo>,
     ) -> ModelProviderInfo {
@@ -452,6 +494,7 @@ pub fn built_in_model_providers(
             LMSTUDIO_OSS_PROVIDER_ID,
             create_oss_provider(DEFAULT_LMSTUDIO_PORT, WireApi::Responses),
         ),
+        (CLAUDE_CODE_PROVIDER_ID, P::create_claude_code_provider()),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))

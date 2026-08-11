@@ -7,7 +7,6 @@ use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
 use crate::tools::handlers::multi_agents_spec::SpawnAgentToolOptions;
 use crate::tools::handlers::multi_agents_spec::create_spawn_agent_tool_v2;
-use crate::tools::handlers::multi_agents_v2::message_tool::message_content;
 use codex_protocol::AgentPath;
 use codex_tools::ToolSpec;
 
@@ -51,7 +50,11 @@ async fn handle_spawn_agent(
     let arguments = function_arguments(payload)?;
     let args: SpawnAgentArgs = parse_arguments(&arguments)?;
     let fork_mode = args.fork_mode()?;
-    let message = message_content(args.message)?;
+    let (message, message_form) = tool_message_argument(
+        args.message.clone(),
+        args.plaintext_message.clone(),
+        "spawn_agent",
+    )?;
     let role_name = args
         .agent_type
         .as_deref()
@@ -114,11 +117,13 @@ async fn handle_spawn_agent(
         .session_source
         .get_agent_path()
         .unwrap_or_else(AgentPath::root);
+    require_readable_message_form(&config, message_form, "spawn_agent")?;
     let communication = communication_from_tool_message(
         author,
         new_agent_path.clone(),
         message,
         &source,
+        message_form,
         /*trigger_turn*/ true,
     );
     let context = AgentCommunicationContext::new(AgentCommunicationKind::Spawn, session.thread_id);
@@ -191,7 +196,9 @@ impl CoreToolRuntime for Handler {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SpawnAgentArgs {
-    message: String,
+    message: Option<String>,
+    /// Task text for agents whose backend cannot read the encrypted `message`.
+    plaintext_message: Option<String>,
     task_name: String,
     agent_type: Option<String>,
     model: Option<String>,

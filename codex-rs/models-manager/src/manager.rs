@@ -315,6 +315,47 @@ impl ModelsManager for OpenAiModelsManager {
         Ok(self.remote_models.try_read()?.clone())
     }
 
+    /// Lists the remote catalog together with the models served by a local
+    /// process.
+    ///
+    /// The merge happens here rather than in `remote_models` because a
+    /// successful `/models` refresh replaces that catalog wholesale: anything
+    /// stored in it disappears the first time the endpoint answers.
+    fn list_models(
+        &self,
+        refresh_strategy: RefreshStrategy,
+        http_client_factory: HttpClientFactory,
+    ) -> ModelsManagerFuture<'_, Vec<ModelPreset>> {
+        Box::pin(async move {
+            let catalog = self
+                .raw_model_catalog(refresh_strategy, http_client_factory)
+                .await;
+            let mut models = catalog.models;
+            crate::local_models::merge_locally_served_models(&mut models);
+            self.build_available_models(models)
+        })
+    }
+
+    fn try_list_models(&self) -> Result<Vec<ModelPreset>, TryLockError> {
+        let mut models = self.try_get_remote_models()?;
+        crate::local_models::merge_locally_served_models(&mut models);
+        Ok(self.build_available_models(models))
+    }
+
+    /// Resolves metadata for locally served models as well as remote ones, so a
+    /// Claude model gets its real context window instead of fallback defaults.
+    fn get_model_info<'a>(
+        &'a self,
+        model: &'a str,
+        config: &'a ModelsManagerConfig,
+    ) -> ModelsManagerFuture<'a, ModelInfo> {
+        Box::pin(async move {
+            let mut models = self.get_remote_models().await;
+            crate::local_models::merge_locally_served_models(&mut models);
+            construct_model_info_from_candidates(model, &models, config)
+        })
+    }
+
     fn auth_manager(&self) -> Option<&AuthManager> {
         self.auth_manager.as_deref()
     }

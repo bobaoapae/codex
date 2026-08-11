@@ -28,7 +28,9 @@ impl MessageDeliveryMode {
 /// Input for the MultiAgentV2 `send_message` tool.
 pub(crate) struct SendMessageArgs {
     pub(crate) target: String,
-    pub(crate) message: String,
+    pub(crate) message: Option<String>,
+    /// Message text for agents whose backend cannot read the encrypted `message`.
+    pub(crate) plaintext_message: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -36,16 +38,9 @@ pub(crate) struct SendMessageArgs {
 /// Input for the MultiAgentV2 `followup_task` tool.
 pub(crate) struct FollowupTaskArgs {
     pub(crate) target: String,
-    pub(crate) message: String,
-}
-
-pub(super) fn message_content(message: String) -> Result<String, FunctionCallError> {
-    if message.trim().is_empty() {
-        return Err(FunctionCallError::RespondToModel(
-            "Empty message can't be sent to an agent".to_string(),
-        ));
-    }
-    Ok(message)
+    pub(crate) message: Option<String>,
+    /// Message text for agents whose backend cannot read the encrypted `message`.
+    pub(crate) plaintext_message: Option<String>,
 }
 
 /// Handles the shared MultiAgentV2 message flow for both `send_message` and `followup_task`.
@@ -53,9 +48,11 @@ pub(crate) async fn handle_message_string_tool(
     invocation: ToolInvocation,
     mode: MessageDeliveryMode,
     target: String,
-    message: String,
+    message: Option<String>,
+    plaintext_message: Option<String>,
+    tool_name: &str,
 ) -> Result<FunctionToolOutput, FunctionCallError> {
-    let message = message_content(message)?;
+    let (message, message_form) = tool_message_argument(message, plaintext_message, tool_name)?;
     let ToolInvocation {
         session,
         turn,
@@ -100,6 +97,7 @@ pub(crate) async fn handle_message_string_tool(
         receiver_agent_path.clone(),
         message,
         &source,
+        message_form,
         mode.trigger_turn(),
     );
     let kind = match mode {

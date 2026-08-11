@@ -12,6 +12,15 @@ use serde_json::json;
 use std::collections::BTreeMap;
 
 pub const MULTI_AGENT_V1_NAMESPACE: &str = "multi_agent_v1";
+
+/// Description shared by the plaintext message argument of the agent tools.
+///
+/// `message` is encrypted for the model backend, which an agent served by a
+/// local process cannot decrypt. Those agents need the task in the clear.
+const LOCAL_AGENT_PLAINTEXT_MESSAGE_DESCRIPTION: &str =
+    "Use this instead of `message` when the target agent runs on a local backend \
+that cannot decrypt an encrypted payload (any Claude agent type). Exactly one of \
+`message` or `plaintext_message` must be set.";
 const MULTI_AGENT_V1_NAMESPACE_DESCRIPTION: &str = "Tools for spawning and managing sub-agents.";
 
 const SPAWN_AGENT_INHERITED_MODEL_GUIDANCE: &str = "Spawned agents inherit your current model by default. Omit `model` to use that preferred default; set `model` only when an explicit override is needed.";
@@ -136,7 +145,10 @@ pub fn create_spawn_agent_tool_v2(options: SpawnAgentToolOptions) -> ToolSpec {
         defer_loading: None,
         parameters: JsonSchema::object(
             properties,
-            Some(vec!["task_name".to_string(), "message".to_string()]),
+            // `message` is no longer required on its own: a local-backend agent
+            // takes its task through `plaintext_message`. The handler enforces
+            // that exactly one of the two is present.
+            Some(vec!["task_name".to_string()]),
             Some(false.into()),
         ),
         output_schema: Some(spawn_agent_output_schema_v2(
@@ -198,6 +210,10 @@ pub fn create_send_message_tool() -> ToolSpec {
             ))
             .with_encrypted(),
         ),
+        (
+            "plaintext_message".to_string(),
+            JsonSchema::string(Some(LOCAL_AGENT_PLAINTEXT_MESSAGE_DESCRIPTION.to_string())),
+        ),
     ]);
 
     ToolSpec::Function(ResponsesApiTool {
@@ -208,7 +224,7 @@ pub fn create_send_message_tool() -> ToolSpec {
         defer_loading: None,
         parameters: JsonSchema::object(
             properties,
-            Some(vec!["target".to_string(), "message".to_string()]),
+            Some(vec!["target".to_string()]),
             Some(false.into()),
         ),
         output_schema: None,
@@ -231,6 +247,10 @@ pub fn create_followup_task_tool() -> ToolSpec {
             ))
             .with_encrypted(),
         ),
+        (
+            "plaintext_message".to_string(),
+            JsonSchema::string(Some(LOCAL_AGENT_PLAINTEXT_MESSAGE_DESCRIPTION.to_string())),
+        ),
     ]);
 
     ToolSpec::Function(ResponsesApiTool {
@@ -239,7 +259,7 @@ pub fn create_followup_task_tool() -> ToolSpec {
             .to_string(),
         strict: false,
         defer_loading: None,
-        parameters: JsonSchema::object(properties, Some(vec!["target".to_string(), "message".to_string()]), Some(false.into())),
+        parameters: JsonSchema::object(properties, Some(vec!["target".to_string()]), Some(false.into())),
         output_schema: None,
     })
 }
@@ -636,6 +656,10 @@ fn spawn_agent_common_properties_v2(agent_type_description: &str) -> BTreeMap<St
                 "Initial plain-text task for the new agent.".to_string(),
             ))
             .with_encrypted(),
+        ),
+        (
+            "plaintext_message".to_string(),
+            JsonSchema::string(Some(LOCAL_AGENT_PLAINTEXT_MESSAGE_DESCRIPTION.to_string())),
         ),
         (
             "agent_type".to_string(),

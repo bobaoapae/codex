@@ -4898,6 +4898,13 @@
             "responses"
           ],
           "type": "string"
+        },
+        {
+          "description": "The local Claude Code CLI, driven as a subprocess over its stream-json protocol. There is no HTTP endpoint: the provider owns a `claude` process per thread and authenticates with the user's Claude Code login.",
+          "enum": [
+            "claude_code"
+          ],
+          "type": "string"
         }
       ]
     },

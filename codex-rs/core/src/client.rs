@@ -112,6 +112,9 @@ use tracing::warn;
 use crate::attestation::AttestationContext;
 use crate::attestation::AttestationProvider;
 use crate::attestation::X_OAI_ATTESTATION_HEADER;
+use crate::claude_code;
+use crate::claude_code::ClaudeCodeThreadState;
+use crate::claude_code::ClaudeCodeWorkspace;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
@@ -215,6 +218,10 @@ struct ModelClientState {
     disable_websockets: AtomicBool,
     agent_identity_session_fallback: AgentIdentitySessionFallback,
     cached_websocket_session: StdMutex<WebsocketSession>,
+    /// Claude session continuity for the `claude_code` provider. Kept on the
+    /// shared state (not the turn-scoped session) so consecutive turns resume the
+    /// same Claude session instead of replaying the conversation each time.
+    claude_code: Arc<ClaudeCodeThreadState>,
 }
 
 /// Resolved API client setup for a single request attempt.
@@ -255,6 +262,8 @@ pub struct ModelClient {
     state: Arc<ModelClientState>,
     agent_identity_policy: AgentIdentityAuthPolicy,
     prompt_cache_key_override: Option<String>,
+    /// Workspace for the `claude_code` provider; unused by every other wire API.
+    claude_code_workspace: Option<ClaudeCodeWorkspace>,
     http_client_factory: HttpClientFactory,
 }
 
@@ -285,6 +294,10 @@ pub struct ModelClientSession {
     /// keep sending it unchanged between turn requests (e.g., for retries, incremental
     /// appends, or continuation requests), and must not send it between different turns.
     turn_state: Arc<OnceLock<String>>,
+    /// Workspace layout for this turn, used only by the `claude_code` provider.
+    /// Overrides the client-level fallback because roots and approval policy are
+    /// materialized per turn.
+    claude_code_workspace: Option<ClaudeCodeWorkspace>,
 }
 
 #[derive(Debug, Clone)]
@@ -466,9 +479,11 @@ impl ModelClient {
                 disable_websockets: AtomicBool::new(false),
                 agent_identity_session_fallback: AgentIdentitySessionFallback::default(),
                 cached_websocket_session: StdMutex::new(WebsocketSession::default()),
+                claude_code: Arc::new(ClaudeCodeThreadState::default()),
             }),
             agent_identity_policy,
             prompt_cache_key_override: None,
+            claude_code_workspace: None,
             http_client_factory,
         }
     }
@@ -478,6 +493,15 @@ impl ModelClient {
         prompt_cache_key_override: Option<String>,
     ) -> Self {
         self.prompt_cache_key_override = prompt_cache_key_override;
+        self
+    }
+
+    /// Directory the `claude_code` provider runs its CLI in.
+    ///
+    /// Only that provider reads this; every other wire API resolves its target
+    /// from the provider endpoint instead of the filesystem.
+    pub(crate) fn with_claude_code_workspace(mut self, workspace: ClaudeCodeWorkspace) -> Self {
+        self.claude_code_workspace = Some(workspace);
         self
     }
 
@@ -496,6 +520,7 @@ impl ModelClient {
             client: self.clone(),
             websocket_session: self.take_cached_websocket_session(),
             turn_state: Arc::new(OnceLock::new()),
+            claude_code_workspace: None,
         }
     }
 
@@ -1903,7 +1928,24 @@ impl ModelClientSession {
                 )
                 .await
             }
+            WireApi::ClaudeCode => {
+                claude_code::stream(
+                    prompt,
+                    model_info,
+                    effort,
+                    self.claude_code_workspace
+                        .as_ref()
+                        .or(self.client.claude_code_workspace.as_ref()),
+                    Arc::clone(&self.client.state.claude_code),
+                )
+                .await
+            }
         }
+    }
+
+    /// Records the workspace layout of the turn this session serves.
+    pub(crate) fn set_claude_code_workspace(&mut self, workspace: ClaudeCodeWorkspace) {
+        self.claude_code_workspace = Some(workspace);
     }
 
     /// Permanently disables WebSockets for this Codex session and resets WebSocket state.

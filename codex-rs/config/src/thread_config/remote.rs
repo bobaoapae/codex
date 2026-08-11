@@ -292,6 +292,9 @@ fn proto_string_map(values: HashMap<String, String>) -> proto::StringMap {
 fn proto_wire_api(wire_api: WireApi) -> proto::WireApi {
     match wire_api {
         WireApi::Responses => proto::WireApi::Responses,
+        WireApi::ClaudeCode => {
+            unreachable!("claude_code providers are local-only and never appear in remote thread config")
+        }
     }
 }
 

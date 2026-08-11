@@ -33,6 +33,8 @@ impl Handler {
             MessageDeliveryMode::TriggerTurn,
             args.target,
             args.message,
+            args.plaintext_message,
+            "followup_task",
         )
         .await
         .map(boxed_tool_output)
