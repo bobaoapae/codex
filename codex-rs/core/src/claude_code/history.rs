@@ -111,12 +111,12 @@ fn render_item(item: &ResponseItem) -> String {
         ResponseItem::Message { role, content, .. } => {
             let text = content
                 .iter()
-                .filter_map(|content_item| match content_item {
+                .map(|content_item| match content_item {
                     ContentItem::InputText { text } | ContentItem::OutputText { text } => {
-                        Some(text.as_str())
+                        text.as_str()
                     }
-                    ContentItem::InputImage { .. } => Some("[image omitted]"),
-                    ContentItem::InputAudio { .. } => Some("[audio omitted]"),
+                    ContentItem::InputImage { .. } => "[image omitted]",
+                    ContentItem::InputAudio { .. } => "[audio omitted]",
                 })
                 .collect::<Vec<_>>()
                 .join("\n");

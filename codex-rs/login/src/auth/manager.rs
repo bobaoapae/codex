@@ -2865,6 +2865,68 @@ impl AuthManager {
     }
 }
 
+// ---------------------------------------------------------------------------
+// FORK: multi-account vault support (auth/vault.rs).
+//
+// Vault entries must refresh with the exact same request/classification/
+// persistence semantics as the active account, but every piece involved
+// (`ChatgptAuthState`, `request_chatgpt_token_refresh`, `persist_tokens`,
+// `RefreshResponse`) is private to this module. These two thin wrappers exist
+// so the vault can reuse them instead of duplicating the logic. Keep this
+// block additive-only and below all upstream code to minimize merge friction.
+// ---------------------------------------------------------------------------
+
+/// FORK: build a ChatGPT `CodexAuth` whose refresh persistence targets the
+/// given storage (the vault points this at one of its entry files).
+pub(super) fn chatgpt_auth_from_parts(
+    auth_dot_json: AuthDotJson,
+    storage: Arc<dyn AuthStorageBackend>,
+    auth_route_config: &AuthRouteConfig,
+) -> std::io::Result<CodexAuth> {
+    let client = create_default_auth_client(&refresh_token_endpoint(), auth_route_config)?;
+    let state = ChatgptAuthState {
+        auth_dot_json: Arc::new(Mutex::new(Some(auth_dot_json))),
+        client,
+    };
+    Ok(CodexAuth::Chatgpt(ChatgptAuth { state, storage }))
+}
+
+/// FORK: refresh the ChatGPT tokens held in `storage` and persist the rotated
+/// tokens back into it, returning the updated payload.
+pub(super) async fn refresh_chatgpt_tokens_in_storage(
+    storage: &Arc<dyn AuthStorageBackend>,
+    auth_route_config: &AuthRouteConfig,
+) -> Result<AuthDotJson, RefreshTokenError> {
+    let auth_dot_json = storage
+        .load()
+        .map_err(RefreshTokenError::Transient)?
+        .ok_or_else(|| {
+            RefreshTokenError::Transient(std::io::Error::other(
+                "auth storage holds no credentials to refresh",
+            ))
+        })?;
+    let refresh_token = auth_dot_json
+        .tokens
+        .as_ref()
+        .map(|tokens| tokens.refresh_token.clone())
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| {
+            RefreshTokenError::Transient(std::io::Error::other(
+                "stored credentials have no ChatGPT refresh token",
+            ))
+        })?;
+    let client = create_default_auth_client(&refresh_token_endpoint(), auth_route_config)
+        .map_err(|err| RefreshTokenError::Transient(err.into()))?;
+    let refresh_response = request_chatgpt_token_refresh(refresh_token, &client).await?;
+    persist_tokens(
+        storage,
+        refresh_response.id_token,
+        refresh_response.access_token,
+        refresh_response.refresh_token,
+    )
+    .map_err(RefreshTokenError::Transient)
+}
+
 #[cfg(test)]
 #[path = "auth_tests.rs"]
 mod tests;

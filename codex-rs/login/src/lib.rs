@@ -63,3 +63,6 @@ pub use auth_env_telemetry::AuthEnvTelemetry;
 pub use auth_env_telemetry::collect_auth_env_telemetry;
 pub use outbound_proxy::AuthRouteConfig;
 pub use token_data::TokenData;
+
+// FORK: multi-account vault (`codex account`).
+pub use auth::vault;

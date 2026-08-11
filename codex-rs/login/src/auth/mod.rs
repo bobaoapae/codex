@@ -11,6 +11,8 @@ mod util;
 mod external_bearer;
 mod manager;
 mod revoke;
+// FORK: multi-account vault (`codex account`).
+pub mod vault;
 
 pub use auth_headers::AuthHeaders;
 pub use bedrock_api_key::BedrockApiKeyAuth;

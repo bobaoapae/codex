@@ -157,7 +157,7 @@ pub(crate) async fn stream(
     let resume_session_id = if plan.restart_session {
         None
     } else {
-        continuity.session_id.clone()
+        continuity.session_id
     };
 
     let workspace = match workspace {
