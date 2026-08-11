@@ -1,20 +1,22 @@
 use super::*;
 use crate::environment_selection::TurnEnvironmentSnapshot;
+use crate::exec_policy::AllowPrefixRules;
 use crate::shell_snapshot::ShellSnapshotFile;
 use codex_core_plugins::PluginCommandAttribution;
 use codex_core_plugins::TrustedPluginRoots;
-use codex_core_skills::HostSkillsSnapshot;
 use codex_file_system::FileSystemSandboxContext;
 use codex_model_provider::SharedModelProvider;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
 use codex_protocol::models::AdditionalPermissionProfile;
+use codex_protocol::openai_models::MODEL_SPECIALTY_CYBER;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_sandboxing::policy_transforms::effective_permission_profile;
+use codex_skills_extension::HostSkillsSnapshot;
 use codex_utils_path_uri::PathUri;
 use futures::FutureExt;
 use futures::future::BoxFuture;
@@ -27,7 +29,7 @@ pub(crate) type ShellSnapshotTask = Shared<BoxFuture<'static, Option<Arc<ShellSn
 
 /// Effective per-environment config; fields move here as executor config is migrated.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct EnvironmentConfig {
+pub(crate) struct TurnEnvironmentConfig {
     pub(crate) allow_login_shell: bool,
     pub(crate) permission_profile: PermissionProfileSnapshot,
 }
@@ -39,7 +41,7 @@ pub(crate) struct TurnEnvironment {
     cwd: PathUri,
     workspace_roots: Vec<PathUri>,
     pub(crate) shell: Option<shell::Shell>,
-    pub(crate) config: EnvironmentConfig,
+    pub(crate) config: TurnEnvironmentConfig,
     pub(crate) shell_snapshot: ShellSnapshotTask,
 }
 
@@ -50,7 +52,7 @@ impl TurnEnvironment {
         cwd: PathUri,
         workspace_roots: Vec<PathUri>,
         shell: Option<shell::Shell>,
-        config: EnvironmentConfig,
+        config: TurnEnvironmentConfig,
     ) -> Self {
         Self {
             environment_id,
@@ -204,6 +206,23 @@ impl TurnContext {
 
     pub(crate) fn approval_policy(&self) -> AskForApproval {
         self.config.permissions.approval_policy.value()
+    }
+
+    pub(crate) fn allow_prefix_rules(&self) -> AllowPrefixRules {
+        let ignore_rules = self
+            .config
+            .config_layer_stack
+            .requirements_toml()
+            .auto_review
+            .as_ref()
+            .and_then(|auto_review| auto_review.ignore_rules.as_ref())
+            .is_some_and(|models| models.contains(&self.model_info.slug));
+        if self.model_info.model_specialty.as_deref() == Some(MODEL_SPECIALTY_CYBER) || ignore_rules
+        {
+            AllowPrefixRules::IgnoreForCyberModel
+        } else {
+            AllowPrefixRules::Honor
+        }
     }
 
     pub(crate) fn permission_profile(&self) -> PermissionProfile {
@@ -562,6 +581,8 @@ impl Session {
             session_configuration.windows_sandbox_level,
             network.is_some(),
         ));
+        turn_metadata_state
+            .set_responses_api_metadata(per_turn_config.responses_api_metadata.clone());
         let (current_date, timezone) = local_time_context();
         let extension_data = Arc::new(codex_extension_api::ExtensionData::new(sub_id.clone()));
         extension_data.insert(skills_snapshot);
@@ -631,12 +652,13 @@ impl Session {
                     });
                     let new_config = notify_config_contributors
                         .then(|| Self::build_effective_session_config(&next));
-                    let environment_config = next.environment_config();
+                    let environment_config = next.turn_environment_config();
                     if updates.environments.is_some() {
                         self.services
                             .turn_environments
                             .update_selections(next.environment_selections(), &environment_config);
-                    } else if state.session_configuration.environment_config() != environment_config
+                    } else if state.session_configuration.turn_environment_config()
+                        != environment_config
                     {
                         self.services
                             .turn_environments

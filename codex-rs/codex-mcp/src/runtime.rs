@@ -48,8 +48,18 @@ use crate::server::EffectiveMcpServer;
 use crate::tool_catalog_cache::McpToolCatalogCache;
 use crate::tools::ToolInfo;
 
+/// Controls when one task starts its optional MCP servers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum McpStartupPolicy {
+    /// Start configured servers when their task's MCP runtime is published.
+    Eager,
+    /// Start optional servers with cached tool definitions on first use.
+    LazyWhenCached,
+}
+
 /// Everything needed to materialize one exact MCP configuration.
 pub struct McpRuntimeInput {
+    pub startup_policy: McpStartupPolicy,
     pub config: Arc<McpConfig>,
     pub plugins_available: bool,
     pub ready_selected_capability_roots: Vec<SelectedCapabilityRoot>,
@@ -295,6 +305,29 @@ impl McpRuntime {
         }
     }
 
+    /// Detects newly saved credentials for servers whose startup failed authentication.
+    pub async fn updated_oauth_credentials_after_auth_failure(&self) -> Vec<String> {
+        let current = self.current.load_full();
+        let Some(config) = current.config.as_ref() else {
+            return Vec::new();
+        };
+        current
+            .connections
+            .updated_oauth_credentials_after_auth_failure(config)
+            .await
+    }
+
+    /// Checks the current generation before retrying servers detected outside the refresh gate.
+    pub async fn has_authentication_failed_servers(&self, server_names: &[String]) -> bool {
+        self.current
+            .load_full()
+            .connections
+            .authentication_failed_servers()
+            .await
+            .into_iter()
+            .any(|server_name| server_names.contains(&server_name))
+    }
+
     /// Waits for the selected server without capturing an execution binding.
     pub async fn wait_for_server_startup(&self, server: &str) {
         self.current
@@ -329,6 +362,10 @@ impl McpRuntime {
 
     pub fn set_elicitations_auto_deny(&self, auto_deny: bool) {
         self.elicitation_router.set_auto_deny(auto_deny);
+    }
+
+    pub fn enable_full_access_form_input(&self) {
+        self.elicitation_router.enable_full_access_form_input();
     }
 
     pub async fn resolve_elicitation(

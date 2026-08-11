@@ -30,7 +30,6 @@ pub use feature_configs::NonPrefixedMcpToolNamesConfigToml;
 use feature_configs::RemovedAppsMcpPathOverrideConfigToml;
 pub use feature_configs::RolloutBudgetConfigToml;
 pub use feature_configs::TokenBudgetConfigToml;
-pub use feature_configs::TokenBudgetMode;
 pub use feature_configs::ToolRegistryConfigToml;
 use legacy::LegacyFeatureToggles;
 pub use legacy::legacy_feature_keys;
@@ -100,10 +99,12 @@ pub enum Feature {
     ExecutedToolCallMetadata,
     /// Enable JavaScript code mode backed by the standalone host process.
     CodeMode,
-    /// Use a 30-second default yield timeout for code mode exec calls.
+    /// Removed compatibility flag for the configurable code-mode exec yield timeout.
     CodeModeBufferedExec,
     /// Run JavaScript code mode in the standalone host process.
     CodeModeHost,
+    /// Terminate active code mode cells when their turn is interrupted.
+    CodeModeInterrupt,
     /// Restrict model-visible tools to code mode entrypoints (`exec`, `wait`).
     CodeModeOnly,
     /// Use the single unified PTY-backed exec tool.
@@ -122,6 +123,8 @@ pub enum Feature {
     TerminalVisualizationInstructions,
     /// Stream structured progress while apply_patch input is being generated.
     ApplyPatchStreamingEvents,
+    /// Preserve existing line endings when apply_patch updates files.
+    ApplyPatchPreserveLineEndings,
     /// Allow exec tools to request additional permissions while staying sandboxed.
     ExecPermissionApprovals,
     /// Expose the built-in request_permissions tool.
@@ -148,6 +151,8 @@ pub enum Feature {
     ExternalAgentMemoryImport,
     /// Compress cold local thread-store rollout files.
     LocalThreadStoreCompression,
+    /// Migrate legacy local rollout files to paginated history in the background.
+    BackgroundPaginatedRolloutMigration,
     /// Enable the Chronicle sidecar for passive screen-context memories.
     Chronicle,
     /// Compress request bodies (zstd) when sending streaming requests to codex-backend.
@@ -222,6 +227,10 @@ pub enum Feature {
     ExternalMigration,
     /// Enable extension-backed image generation.
     ImageGeneration,
+    /// Tell the model when a prompt image was resized and include its dimensions.
+    ImageResizeNotice,
+    /// Apply one shared pixel and token budget to every image, regardless of legacy detail hints.
+    UnifiedImageBudget,
     /// Removed compatibility flag for always-on centralized image preparation.
     ResizeAllImages,
     /// Removed compatibility flag for always-on response item IDs.
@@ -240,6 +249,8 @@ pub enum Feature {
     DefaultModeRequestUserInput,
     /// Enable automatic review for approval prompts.
     GuardianApproval,
+    /// Reuse encrypted parent compaction when restarting Guardian review sessions.
+    GuardianReuseParentCompaction,
     /// Enable Guardian V2 automatic approval reviews.
     GuardianV2,
     /// Enable persisted thread goals and automatic goal continuation.
@@ -695,13 +706,6 @@ impl Features {
 }
 
 impl FeaturesToml {
-    /// Removes compatibility-only inputs that no longer affect runtime
-    /// behavior or belong in newly materialized config.
-    pub fn clear_removed_compatibility_entries(&mut self) {
-        self.removed_apps_mcp_path_override = None;
-        self.entries.remove("apps_mcp_path_override");
-    }
-
     pub fn entries(&self) -> BTreeMap<String, bool> {
         let mut entries = self.entries.clone();
         if let Some(enabled) = self.code_mode.as_ref().and_then(FeatureToml::enabled) {
@@ -738,58 +742,6 @@ impl FeaturesToml {
         }
         entries
     }
-
-    pub fn materialize_resolved_enabled(&mut self, features: &Features) {
-        self.clear_removed_compatibility_entries();
-        let Self {
-            tool_registry: _,
-            code_mode,
-            code_mode_host,
-            non_prefixed_mcp_tool_names,
-            multi_agent_v2,
-            token_budget,
-            rollout_budget,
-            current_time_reminder,
-            removed_apps_mcp_path_override: _,
-            network_proxy,
-            entries,
-        } = self;
-        for key in legacy::legacy_feature_keys() {
-            entries.remove(key);
-        }
-        for spec in FEATURES {
-            let enabled = features.enabled(spec.id);
-            if spec.id == Feature::CodeMode {
-                materialize_resolved_feature_enabled(code_mode, enabled);
-            } else if spec.id == Feature::CodeModeHost {
-                materialize_resolved_feature_enabled(code_mode_host, enabled);
-            } else if spec.id == Feature::NonPrefixedMcpToolNames {
-                materialize_resolved_feature_enabled(non_prefixed_mcp_tool_names, enabled);
-            } else if spec.id == Feature::MultiAgentV2 {
-                materialize_resolved_feature_enabled(multi_agent_v2, enabled);
-            } else if spec.id == Feature::TokenBudget {
-                materialize_resolved_feature_enabled(token_budget, enabled);
-            } else if spec.id == Feature::RolloutBudget {
-                materialize_resolved_feature_enabled(rollout_budget, enabled);
-            } else if spec.id == Feature::CurrentTimeReminder {
-                materialize_resolved_feature_enabled(current_time_reminder, enabled);
-            } else if spec.id == Feature::NetworkProxy {
-                materialize_resolved_feature_enabled(network_proxy, enabled);
-            } else {
-                entries.insert(spec.key.to_string(), enabled);
-            }
-        }
-    }
-}
-
-fn materialize_resolved_feature_enabled<T: FeatureConfig>(
-    feature: &mut Option<FeatureToml<T>>,
-    enabled: bool,
-) {
-    match feature {
-        Some(feature) => feature.set_enabled(enabled),
-        None => *feature = Some(FeatureToml::Enabled(enabled)),
-    }
 }
 
 impl From<BTreeMap<String, bool>> for FeaturesToml {
@@ -817,20 +769,12 @@ impl<T: FeatureConfig> FeatureToml<T> {
             Self::Config(config) => config.enabled(),
         }
     }
-
-    pub fn set_enabled(&mut self, enabled: bool) {
-        match self {
-            Self::Enabled(value) => *value = enabled,
-            Self::Config(config) => config.set_enabled(enabled),
-        }
-    }
 }
 
 // A trait to be implemented by custom feature config structs when defining a feature that needs more configuration than
 // just enabled/disabled.
 pub trait FeatureConfig {
     fn enabled(&self) -> Option<bool>;
-    fn set_enabled(&mut self, enabled: bool);
 }
 
 /// Single, easy-to-read registry of all feature definitions.
@@ -919,7 +863,7 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::CodeModeBufferedExec,
         key: "code_mode_buffered_exec",
-        stage: Stage::UnderDevelopment,
+        stage: Stage::Removed,
         default_enabled: false,
     },
     FeatureSpec {
@@ -927,6 +871,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         key: "code_mode_host",
         stage: Stage::Stable,
         default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::CodeModeInterrupt,
+        key: "code_mode_interrupt",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::CodeModeOnly,
@@ -1007,6 +957,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
+        id: Feature::BackgroundPaginatedRolloutMigration,
+        key: "background_paginated_rollout_migration",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::Chronicle,
         key: "chronicle",
         stage: Stage::UnderDevelopment,
@@ -1021,6 +977,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::ApplyPatchStreamingEvents,
         key: "apply_patch_streaming_events",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::ApplyPatchPreserveLineEndings,
+        key: "apply_patch_preserve_line_endings",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
@@ -1269,6 +1231,18 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: true,
     },
     FeatureSpec {
+        id: Feature::ImageResizeNotice,
+        key: "image_resize_notice",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::UnifiedImageBudget,
+        key: "unified_image_budget",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::ResizeAllImages,
         key: "resize_all_images",
         stage: Stage::Removed,
@@ -1333,6 +1307,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         key: "guardian_approval",
         stage: Stage::Stable,
         default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::GuardianReuseParentCompaction,
+        key: "guardian_reuse_parent_compaction",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::GuardianV2,

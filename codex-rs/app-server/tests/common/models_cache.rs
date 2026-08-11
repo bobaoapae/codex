@@ -44,6 +44,7 @@ fn preset_to_info(preset: &ModelPreset, priority: i32) -> ModelInfo {
         }),
         include_skills_usage_instructions: false,
         include_plugin_usage_instructions: false,
+        include_apps_usage_instructions: false,
         supports_reasoning_summary_parameter: true,
         default_reasoning_summary: ReasoningSummary::Auto,
         support_verbosity: false,
@@ -67,7 +68,7 @@ fn preset_to_info(preset: &ModelPreset, priority: i32) -> ModelInfo {
         auto_review_model_override: None,
         model_specialty: None,
         tool_mode: None,
-        multi_agent_version: None,
+        multi_agent_version: preset.multi_agent_version,
     }
 }
 

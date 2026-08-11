@@ -32,6 +32,8 @@ use crate::config_types::Verbosity;
 use crate::protocol::MultiAgentVersion;
 
 const PERSONALITY_PLACEHOLDER: &str = "{{ personality }}";
+/// Backend model-catalog specialty identifying cybersecurity-focused models.
+pub const MODEL_SPECIALTY_CYBER: &str = "cyber";
 pub const SPEED_TIER_FAST: &str = "fast";
 
 /// See https://platform.openai.com/docs/guides/reasoning?api-mode=responses#get-started-with-reasoning
@@ -394,6 +396,8 @@ pub struct ModelInfo {
     pub include_skills_usage_instructions: bool,
     #[serde(default)]
     pub include_plugin_usage_instructions: bool,
+    #[serde(default = "default_true")]
+    pub include_apps_usage_instructions: bool,
     /// Whether the model accepts the Responses API `reasoning.summary` parameter.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub supports_reasoning_summary_parameter: bool,
@@ -831,6 +835,7 @@ mod tests {
             model_messages: spec,
             include_skills_usage_instructions: false,
             include_plugin_usage_instructions: false,
+            include_apps_usage_instructions: false,
             supports_reasoning_summary_parameter: true,
             default_reasoning_summary: ReasoningSummary::Auto,
             support_verbosity: false,
@@ -1424,6 +1429,7 @@ mod tests {
         );
         assert!(!model.include_skills_usage_instructions);
         assert!(!model.include_plugin_usage_instructions);
+        assert!(model.include_apps_usage_instructions);
         assert!(model.supports_reasoning_summary_parameter);
         assert!(!model.supports_image_detail_original);
         assert_eq!(model.web_search_tool_type, WebSearchToolType::Text);
@@ -1432,6 +1438,16 @@ mod tests {
         assert_eq!(model.comp_hash, None);
         assert_eq!(model.auto_review_model_override, None);
         assert_eq!(model.tool_mode, None);
+    }
+
+    #[test]
+    fn model_info_preserves_explicit_apps_guidance_opt_out() {
+        let value = serde_json::to_value(test_model(/*spec*/ None))
+            .expect("serialize model info with explicit apps guidance opt-out");
+        assert_eq!(value["include_apps_usage_instructions"], false);
+
+        let model = serde_json::from_value::<ModelInfo>(value).expect("deserialize model info");
+        assert!(!model.include_apps_usage_instructions);
     }
 
     #[test]

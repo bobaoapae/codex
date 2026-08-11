@@ -95,12 +95,13 @@ impl Session {
         config: &Config,
     ) -> (McpConfig, McpRuntimeContext) {
         let originator = self.originator().await;
-        let windows_sandbox_level = self
-            .state
-            .lock()
-            .await
-            .session_configuration
-            .windows_sandbox_level;
+        let (windows_sandbox_level, session_source) = {
+            let state = self.state.lock().await;
+            (
+                state.session_configuration.windows_sandbox_level,
+                state.session_configuration.session_source.clone(),
+            )
+        };
         let environments = self.services.turn_environments.snapshot().await;
         let selected_capability_roots = self
             .resolve_selected_capability_roots_for_step(&environments)
@@ -122,7 +123,10 @@ impl Session {
                 config,
                 &self.services.mcp_thread_init,
                 &self.services.thread_extension_data,
-                &originator,
+                McpThreadIdentity {
+                    session_source: &session_source,
+                    originator: &originator,
+                },
                 &ready_selected_capability_roots,
                 executor_capability_discovery.as_deref(),
             )
@@ -199,7 +203,10 @@ impl Session {
                     &desired.config,
                     &self.services.mcp_thread_init,
                     &self.services.thread_extension_data,
-                    &desired.originator,
+                    McpThreadIdentity {
+                        session_source: &desired.session_source,
+                        originator: &desired.originator,
+                    },
                     &ready_selected_capability_roots,
                     executor_capability_discovery.as_deref(),
                 )
@@ -253,7 +260,10 @@ impl Session {
                 &desired.config,
                 &self.services.mcp_thread_init,
                 &self.services.thread_extension_data,
-                &desired.originator,
+                McpThreadIdentity {
+                    session_source: &desired.session_source,
+                    originator: &desired.originator,
+                },
                 &ready_selected_capability_roots,
                 executor_capability_discovery.as_deref(),
             )
@@ -292,11 +302,32 @@ impl Session {
         {
             self.mark_mcp_runtime_dirty();
         }
+
+        let recovered_oauth_servers = self
+            .services
+            .mcp_runtime
+            .updated_oauth_credentials_after_auth_failure()
+            .await;
+        if !recovered_oauth_servers.is_empty()
+            && let Ok(_refresh) = self.mcp_refresh.acquire().await
+            && self
+                .services
+                .mcp_runtime
+                .has_authentication_failed_servers(&recovered_oauth_servers)
+                .await
+        {
+            self.mark_mcp_runtime_dirty();
+        }
         self.refresh_mcp_if_dirty().await;
+        let required_servers = required_servers
+            .iter()
+            .chain(&recovered_oauth_servers)
+            .cloned()
+            .collect::<Vec<_>>();
         if let Some(binding) = self
             .services
             .mcp_runtime
-            .current_binding_with_required_servers(required_servers)
+            .current_binding_with_required_servers(&required_servers)
             .await
         {
             return binding;
@@ -616,7 +647,10 @@ impl Session {
                 refresh_config,
                 &self.services.mcp_thread_init,
                 &self.services.thread_extension_data,
-                &turn_context.originator,
+                McpThreadIdentity {
+                    session_source: &turn_context.session_source,
+                    originator: &turn_context.originator,
+                },
                 &ready_selected_capability_roots,
                 executor_capability_discovery.as_deref(),
             )
@@ -718,6 +752,7 @@ async fn review_guardian_mcp_elicitation(
             || crate::connectors::mcp_approvals_reviewer_from_layers(
                 &mcp_config.config_layer_stack,
                 ApprovalsReviewer::AutoReview,
+                Some(turn_context.model_info.slug.as_str()),
                 request.server_name.as_str(),
                 connector_id,
             ) != ApprovalsReviewer::AutoReview
@@ -787,6 +822,7 @@ async fn review_guardian_mcp_elicitation(
     let approvals_reviewer = crate::connectors::mcp_approvals_reviewer_from_layers(
         &mcp_config.config_layer_stack,
         mcp_config.approvals_reviewer,
+        Some(turn_context.model_info.slug.as_str()),
         request.server_name.as_str(),
         elicitation_connector_id(&request.elicitation),
     );
