@@ -17,6 +17,7 @@ struct SpawnAgentThreadInheritance {
 /// submission and lifecycle logging cannot receive one without the other. Other spawn sources
 /// provide user input directly, making an uncontextualized inter-agent communication
 /// unrepresentable.
+#[allow(clippy::large_enum_variant)]
 enum SpawnInitialInput {
     UserInput(Vec<UserInput>),
     InterAgentCommunication(InterAgentCommunication, AgentCommunicationContext),
@@ -46,13 +47,12 @@ pub(super) fn agent_nickname_candidates(config: &Config, role_name: Option<&str>
 
 fn keep_forked_rollout_item(item: &RolloutItem, preserve_reference_context_item: bool) -> bool {
     match item {
-        RolloutItem::ResponseItem(ResponseItem::Message { role, phase, .. }) => match role.as_str()
-        {
-            "system" | "developer" | "user" => true,
-            "assistant" => *phase == Some(MessagePhase::FinalAnswer),
-            _ => false,
-        },
-        RolloutItem::ResponseItem(
+        RolloutItem::ResponseItem(envelope) => match &envelope.item {
+            ResponseItem::Message { role, phase, .. } => match role.as_str() {
+                "system" | "developer" | "user" => true,
+                "assistant" => *phase == Some(MessagePhase::FinalAnswer),
+                _ => false,
+            },
             ResponseItem::AdditionalTools { .. }
             | ResponseItem::AgentMessage { .. }
             | ResponseItem::Reasoning { .. }
@@ -68,8 +68,8 @@ fn keep_forked_rollout_item(item: &RolloutItem, preserve_reference_context_item:
             | ResponseItem::Compaction { .. }
             | ResponseItem::CompactionTrigger { .. }
             | ResponseItem::ContextCompaction { .. }
-            | ResponseItem::Other,
-        ) => false,
+            | ResponseItem::Other => false,
+        },
         RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. } => false,
         // Full-history forks preserve the cached prompt prefix and can keep diffing
@@ -544,11 +544,11 @@ impl AgentControl {
 
         match initial_input {
             SpawnInitialInput::UserInput(input) => {
-                self.send_input_after_capacity_check(
+                self.send_input(
                     new_thread.thread_id,
-                    &state,
                     input,
                     options.parent_turn_id,
+                    options.root_turn_id,
                 )
                 .await?;
             }
@@ -559,6 +559,7 @@ impl AgentControl {
                     communication,
                     context,
                     options.parent_turn_id,
+                    options.root_turn_id,
                 )
                 .await?;
             }
@@ -812,7 +813,7 @@ impl AgentControl {
                     subagent_developer_instructions.clone(),
                 ])
         {
-            forked_rollout_items.push(RolloutItem::ResponseItem(developer_message));
+            forked_rollout_items.push(RolloutItem::ResponseItem(developer_message.into()));
         }
         if preserve_reference_context_item
             && multi_agent_version == MultiAgentVersion::V2
@@ -823,7 +824,9 @@ impl AgentControl {
                     subagent_usage_hint_text,
                 ])
         {
-            forked_rollout_items.push(RolloutItem::ResponseItem(subagent_usage_hint_message));
+            forked_rollout_items.push(RolloutItem::ResponseItem(
+                subagent_usage_hint_message.into(),
+            ));
         }
         let mut thread_extension_init = ExtensionDataInit::new();
         thread_extension_init.insert(selected_capability_roots);

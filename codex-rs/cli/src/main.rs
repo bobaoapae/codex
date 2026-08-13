@@ -108,10 +108,6 @@ use codex_terminal_detection::TerminalName;
     override_usage = "codex [OPTIONS] [PROMPT]\n       codex [OPTIONS] <COMMAND> [ARGS]"
 )]
 struct MultitoolCli {
-    /// Enable process-only PSP routing for first-party ChatGPT requests.
-    #[arg(long, global = true, hide = true)]
-    psp: bool,
-
     #[clap(flatten)]
     pub config_overrides: CliConfigOverrides,
 
@@ -999,15 +995,12 @@ async fn cli_main(
     remote_control_disabled: bool,
 ) -> anyhow::Result<()> {
     let MultitoolCli {
-        psp,
         config_overrides: mut root_config_overrides,
         feature_toggles,
         remote,
         mut interactive,
         subcommand,
     } = MultitoolCli::parse();
-    interactive.psp = psp;
-
     // Fold --enable/--disable into config overrides so they flow to all subcommands.
     let toggle_overrides = feature_toggles.to_overrides()?;
     root_config_overrides.raw_overrides.extend(toggle_overrides);
@@ -1046,7 +1039,6 @@ async fn cli_main(
             exec_cli
                 .shared
                 .inherit_exec_root_options(&interactive.shared);
-            exec_cli.psp = psp;
             exec_cli.strict_config |= root_strict_config;
             prepend_config_flags(
                 &mut exec_cli.config_overrides,
@@ -1067,7 +1059,6 @@ async fn cli_main(
             exec_cli
                 .shared
                 .inherit_exec_root_options(&interactive.shared);
-            exec_cli.psp = psp;
             exec_cli.command = Some(ExecCommand::Review(review_args));
             exec_cli.strict_config = strict_config || root_strict_config;
             prepend_config_flags(
@@ -1177,7 +1168,6 @@ async fn cli_main(
                                 codex_app_server::RemoteControlStartupMode::ResolvePersisted
                             }
                         },
-                        psp,
                         ..Default::default()
                     };
                     codex_app_server::run_main_with_transport_options(
@@ -1280,7 +1270,6 @@ async fn cli_main(
                 remote_control_cli,
                 arg0_paths.clone(),
                 root_config_overrides,
-                psp,
             )
             .await?;
         }
@@ -2762,7 +2751,6 @@ mod tests {
     fn finalize_resume_from_args(args: &[&str]) -> TuiCli {
         let cli = MultitoolCli::try_parse_from(args).expect("parse");
         let MultitoolCli {
-            psp: _,
             mut interactive,
             config_overrides: mut root_overrides,
             subcommand,
@@ -2800,7 +2788,6 @@ mod tests {
     fn finalize_fork_from_args(args: &[&str]) -> TuiCli {
         let cli = MultitoolCli::try_parse_from(args).expect("parse");
         let MultitoolCli {
-            psp: _,
             mut interactive,
             config_overrides: mut root_overrides,
             subcommand,
@@ -2845,7 +2832,6 @@ mod tests {
     fn finalize_archive_from_args(args: &[&str]) -> (String, TuiCli, InteractiveRemoteOptions) {
         let cli = MultitoolCli::try_parse_from(args).expect("parse");
         let MultitoolCli {
-            psp: _,
             interactive,
             config_overrides: root_overrides,
             subcommand,
@@ -4075,19 +4061,6 @@ mod tests {
     }
 
     #[test]
-    fn psp_is_a_global_runtime_argument() {
-        for args in [
-            ["codex", "--psp"].as_slice(),
-            ["codex", "app-server", "--psp"].as_slice(),
-            ["codex", "remote-control", "--psp"].as_slice(),
-        ] {
-            let cli = MultitoolCli::try_parse_from(args).expect("parse runtime PSP flag");
-            assert!(cli.psp);
-            assert!(cli.config_overrides.raw_overrides.is_empty());
-        }
-    }
-
-    #[test]
     fn app_server_code_mode_host_url_parses_independently_of_listen_transport() {
         let app_server = app_server_from_args(
             [
@@ -4117,17 +4090,44 @@ mod tests {
     }
 
     #[test]
+    fn app_server_grpc_code_mode_host_url_parses_independently_of_listen_transport() {
+        let app_server = app_server_from_args(
+            [
+                "codex",
+                "app-server",
+                "--code-mode-host",
+                "https://example.test",
+                "--listen",
+                "ws://127.0.0.1:4500",
+            ]
+            .as_ref(),
+        );
+
+        assert_eq!(
+            app_server.code_mode_host.code_mode_host,
+            Some(url::Url::parse("https://example.test").expect("test endpoint should parse"))
+        );
+    }
+
+    #[test]
     fn app_server_rejects_invalid_code_mode_host_urls() {
         for endpoint in [
-            "http://127.0.0.1:8765",
+            "ftp://127.0.0.1:8765",
             "ws://",
             "wss://example.test/code-mode#fragment",
+            "https://example.test/code-mode",
+            "http://alice:secret@example.test",
+            "https://alice:secret@example.test",
+            "http://example.test/?token=secret",
         ] {
             let error =
                 MultitoolCli::try_parse_from(["codex", "app-server", "--code-mode-host", endpoint])
                     .expect_err("invalid code-mode host endpoint should fail argument parsing");
 
             assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+            let rendered_error = error.to_string();
+            assert!(!rendered_error.contains("alice"));
+            assert!(!rendered_error.contains("secret"));
         }
     }
 

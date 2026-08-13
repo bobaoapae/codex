@@ -943,7 +943,7 @@ pub async fn run_main(
         &cli_kv_overrides,
         &launch_loader_overrides,
         strict_config,
-        cli.bypass_hook_trust || cli.psp,
+        cli.bypass_hook_trust,
     );
     let default_daemon = if explicit_remote_endpoint.is_none() && reuse_implicit_local_daemon {
         maybe_probe_default_daemon_socket(&codex_home).await
@@ -1077,7 +1077,6 @@ pub async fn run_main(
         main_execve_wrapper_exe: arg0_paths.main_execve_wrapper_exe.clone(),
         show_raw_agent_reasoning: cli.oss.then_some(true),
         bypass_hook_trust: cli.bypass_hook_trust.then_some(true),
-        psp: Some(cli.psp),
         additional_writable_roots: additional_dirs,
         ..Default::default()
     };
@@ -3165,7 +3164,7 @@ mod tests {
                 let preview = crate::resume_picker::load_transcript_preview(
                     &mut app_server,
                     thread_id,
-                    /*codex_home*/ None,
+                    /*config*/ None,
                 )
                 .await?;
                 assert!(!preview.is_empty());
@@ -3174,7 +3173,7 @@ mod tests {
                 &mut app_server,
                 thread_id,
                 crate::thread_transcript::RawReasoningVisibility::Hidden,
-                /*codex_home*/ None,
+                /*config*/ None,
             )
             .await?;
             assert!(cells.len() > 100);

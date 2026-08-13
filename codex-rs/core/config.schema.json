@@ -654,6 +654,9 @@
             "prevent_idle_sleep": {
               "type": "boolean"
             },
+            "psp": {
+              "type": "boolean"
+            },
             "realtime_conversation": {
               "type": "boolean"
             },
@@ -691,6 +694,9 @@
               "type": "boolean"
             },
             "responses_websockets_v2": {
+              "type": "boolean"
+            },
+            "retain_client_developer_messages": {
               "type": "boolean"
             },
             "rollout_budget": {
@@ -2714,6 +2720,9 @@
             "type": "string"
           },
           "type": "object"
+        },
+        "http_headers_helper": {
+          "type": "string"
         },
         "name": {
           "default": null,
@@ -5297,6 +5306,9 @@
         "prevent_idle_sleep": {
           "type": "boolean"
         },
+        "psp": {
+          "type": "boolean"
+        },
         "realtime_conversation": {
           "type": "boolean"
         },
@@ -5334,6 +5346,9 @@
           "type": "boolean"
         },
         "responses_websockets_v2": {
+          "type": "boolean"
+        },
+        "retain_client_developer_messages": {
           "type": "boolean"
         },
         "rollout_budget": {

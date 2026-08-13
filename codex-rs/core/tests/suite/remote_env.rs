@@ -4,6 +4,9 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_api::AuthProvider;
 use codex_config::types::ApprovalsReviewer;
+use codex_core::EnvironmentConfig;
+use codex_core::StartThreadOptions;
+use codex_core::TurnInputRequest;
 use codex_core::WaitForEnvironmentToolConfig;
 use codex_core::compact::SUMMARIZATION_PROMPT;
 use codex_core::config::Config;
@@ -22,6 +25,7 @@ use codex_exec_server::REMOTE_ENVIRONMENT_ID;
 use codex_exec_server::RemoteEnvironmentConfig;
 use codex_exec_server::RemoveOptions;
 use codex_extension_api::ContextContributor;
+use codex_extension_api::ExtensionDataInit;
 use codex_extension_api::ExtensionFuture;
 use codex_extension_api::ExtensionRegistryBuilder;
 use codex_extension_api::RenderedWorldStateFragment;
@@ -36,6 +40,9 @@ use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
+use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::Settings;
 use codex_protocol::models::FileSystemPermissions;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::SandboxPermissions;
@@ -203,30 +210,27 @@ async fn submit_turn_with_approval_and_environments(
         environments,
     );
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: prompt.into(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
                 environments: Some(turn_environment_selections),
                 approval_policy: Some(approval_policy),
                 approvals_reviewer: Some(ApprovalsReviewer::User),
                 sandbox_policy: Some(SandboxPolicy::new_read_only_policy()),
-                collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
-                    mode: codex_protocol::config_types::ModeKind::Default,
-                    settings: codex_protocol::config_types::Settings {
+                collaboration_mode: Some(CollaborationMode {
+                    mode: ModeKind::Default,
+                    settings: Settings {
                         model: test.session_configured.model.clone(),
                         reasoning_effort: None,
                         developer_instructions: None,
                     },
                 }),
                 ..Default::default()
-            },
-        })
+            }),
+        )
         .await?;
 
     Ok(())
@@ -537,16 +541,10 @@ async fn settings_update_does_not_retarget_active_turn_environment() -> Result<(
     let next_cwd = next_workspace.path().abs();
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "pause before continuing".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "pause before continuing".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     let request = wait_for_event_match(&test.codex, |event| match event {
         EventMsg::RequestUserInput(request) => Some(request.clone()),
@@ -673,22 +671,19 @@ async fn deferred_executor_promotes_primary_environment_when_startup_completes()
     )
     .await?;
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: "wait for the primary environment".into(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: ThreadSettingsOverrides {
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
                 environments: Some(TurnEnvironmentSelections::new(
                     test.config.cwd.clone(),
                     vec![remote_selection, local_selection],
                 )),
                 ..Default::default()
-            },
-        })
+            }),
+        )
         .await?;
     let request = wait_for_event_match(&test.codex, |event| match event {
         EventMsg::RequestUserInput(request) => Some(request.clone()),
@@ -744,7 +739,7 @@ async fn deferred_executor_promotes_primary_environment_when_startup_completes()
         .collect::<serde_json::Result<Vec<_>>>()?
         .into_iter()
         .filter_map(|line| match line.item {
-            RolloutItem::WorldState(item) if !item.full => Some(item.state),
+            RolloutItem::WorldState(item) if !item.full => Some(Value::Object(item.state)),
             _ => None,
         })
         .find(|patch| {
@@ -951,6 +946,161 @@ async fn wait_for_response_request_count(response_mock: &ResponseMock, expected_
     })
     .await
     .expect("timed out waiting for Responses API request");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_executor_keeps_ready_capability_roots_scoped_to_each_attachment() -> Result<()> {
+    let server = start_mock_server().await;
+    let mut extensions = ExtensionRegistryBuilder::new();
+    extensions.prompt_contributor(Arc::new(ReadyCapabilityRootsTestExtension));
+    let mut builder = test_codex()
+        .with_extensions(Arc::new(extensions.build()))
+        .with_config(|config| {
+            config.use_experimental_unified_exec_tool = true;
+            assert!(config.features.enable(Feature::UnifiedExec).is_ok());
+        });
+    let test = builder.build_with_auto_env(&server).await?;
+    let selection = test
+        .codex
+        .environment_selections()
+        .await
+        .into_iter()
+        .next()
+        .context("thread should select its executor environment")?;
+    let root = |id: &str| SelectedCapabilityRoot {
+        id: id.to_string(),
+        location: CapabilityRootLocation::Environment {
+            environment_id: selection.environment_id.clone(),
+            path: selection.cwd.clone(),
+        },
+    };
+
+    let mut second_thread_init = ExtensionDataInit::new();
+    second_thread_init.insert(vec![root("startup-root")]);
+    let second = test
+        .thread_manager
+        .start_thread(StartThreadOptions {
+            environments: Some(vec![selection.clone()]),
+            thread_extension_init: second_thread_init,
+            ..StartThreadOptions::new(test.config.clone())
+        })
+        .await?;
+
+    test.codex
+        .environment_ready(
+            &selection,
+            EnvironmentConfig {
+                allow_login_shell: false,
+                selected_capability_roots: vec![root("first-root")],
+            },
+        )
+        .await?;
+    second
+        .thread
+        .environment_ready(
+            &selection,
+            EnvironmentConfig {
+                allow_login_shell: true,
+                selected_capability_roots: vec![root("startup-root"), root("second-root")],
+            },
+        )
+        .await?;
+
+    assert_eq!(
+        test.codex.inspect_selected_capability_roots().ready_roots,
+        vec![root("first-root")]
+    );
+    assert_eq!(
+        second
+            .thread
+            .inspect_selected_capability_roots()
+            .ready_roots,
+        vec![root("startup-root"), root("second-root")]
+    );
+
+    let response_mock = mount_sse_sequence(
+        &server,
+        ["first", "second", "first-updated", "second-again"]
+            .into_iter()
+            .map(|response_id| {
+                sse(vec![
+                    ev_response_created(response_id),
+                    ev_completed(response_id),
+                ])
+            })
+            .collect(),
+    )
+    .await;
+
+    for (index, (thread, prompt)) in [
+        (&test.codex, "first"),
+        (&second.thread, "second"),
+        (&test.codex, "first-updated"),
+        (&second.thread, "second-again"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if index == 2 {
+            test.codex
+                .environment_ready(
+                    &selection,
+                    EnvironmentConfig {
+                        allow_login_shell: false,
+                        selected_capability_roots: vec![root("first-updated-root")],
+                    },
+                )
+                .await?;
+        }
+
+        thread
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: prompt.to_string(),
+                text_elements: Vec::new(),
+            }]))
+            .await?;
+        wait_for_event(thread, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    }
+
+    let requests = response_mock.requests();
+    let root_fragments = requests
+        .iter()
+        .map(|request| {
+            request
+                .message_input_texts("user")
+                .into_iter()
+                .rfind(|text| text.contains("<ready_capability_roots>"))
+                .context("ready capability roots should be model-visible")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    assert_eq!(
+        root_fragments,
+        vec![
+            "<ready_capability_roots>first-root</ready_capability_roots>",
+            "<ready_capability_roots>startup-root,second-root</ready_capability_roots>",
+            "<ready_capability_roots>first-updated-root</ready_capability_roots>",
+            "<ready_capability_roots>startup-root,second-root</ready_capability_roots>",
+        ]
+    );
+
+    let login_shells = requests
+        .iter()
+        .map(|request| {
+            let body = request.body_json();
+            let exec_command = body["tools"]
+                .as_array()
+                .context("tools should be an array")?
+                .iter()
+                .find(|tool| tool["name"] == "exec_command")
+                .context("exec_command should be available")?;
+            Ok(exec_command["parameters"]["properties"]
+                .get("login")
+                .is_some())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    assert_eq!(login_shells, vec![false, true, false, true]);
+
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1198,15 +1348,12 @@ async fn deferred_executor_stays_pending_after_materialization() -> Result<()> {
     )?;
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: "wait for the environment".into(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: ThreadSettingsOverrides {
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
                 environments: Some(TurnEnvironmentSelections::new(
                     test.config.cwd.clone(),
                     vec![TurnEnvironmentSelection {
@@ -1216,8 +1363,8 @@ async fn deferred_executor_stays_pending_after_materialization() -> Result<()> {
                     }],
                 )),
                 ..Default::default()
-            },
-        })
+            }),
+        )
         .await?;
     wait_for_response_request_count(&response_mock, /*expected_count*/ 1).await;
     assert_eq!(provider.calls.load(Ordering::Relaxed), 0);
@@ -1342,22 +1489,19 @@ async fn deferred_executor_spawn_agent_inherits_ready_step_environments(
     let mut created_threads = test.thread_manager.subscribe_thread_created();
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: "spawn after the environment becomes ready".into(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: ThreadSettingsOverrides {
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
                 environments: Some(TurnEnvironmentSelections::new(
                     test.config.cwd.clone(),
                     expected_environments.clone(),
                 )),
                 ..Default::default()
-            },
-        })
+            }),
+        )
         .await?;
     wait_for_response_request_count(&response_mock, /*expected_count*/ 1).await;
     attach_tx.send(()).expect("attach remote environment");
@@ -1494,15 +1638,12 @@ async fn deferred_executor_guardian_uses_newly_ready_step_environment() -> Resul
         turn_permission_fields(permission_profile, test.config.cwd.as_path());
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: "review a command after the remote environment becomes ready".into(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: ThreadSettingsOverrides {
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
                 environments: Some(TurnEnvironmentSelections::new(
                     test.config.cwd.clone(),
                     vec![remote_selection, local(local_cwd.clone())],
@@ -1510,8 +1651,8 @@ async fn deferred_executor_guardian_uses_newly_ready_step_environment() -> Resul
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
                 ..Default::default()
-            },
-        })
+            }),
+        )
         .await?;
     wait_for_response_request_count(&responses, /*expected_count*/ 1).await;
     attach_tx.send(()).expect("attach remote environment");
@@ -1615,16 +1756,10 @@ async fn deferred_executor_loads_agents_md_when_environment_becomes_ready() -> R
         .context("thread startup should not wait for the remote environment")??;
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "load the environment instructions".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "load the environment instructions".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_response_request_count(&response_mock, /*expected_count*/ 1).await;
     let agents_path = PathUri::from_abs_path(&test.config.cwd).join("AGENTS.md")?;
@@ -1729,16 +1864,10 @@ async fn deferred_executor_compaction_preserves_then_updates_environment_once() 
         .context("thread startup should not wait for the remote environment")??;
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "wait for the environment".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "wait for the environment".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     let request = wait_for_event_match(&test.codex, |event| match event {
         EventMsg::RequestUserInput(request) => Some(request.clone()),
@@ -1821,21 +1950,15 @@ async fn deferred_executor_compaction_preserves_then_updates_environment_once() 
         vec![true, true, false]
     );
     assert_eq!(
-        world_state_items[0]
-            .state
-            .pointer("/environments/environments/remote/status"),
+        world_state_items[0].state["environments"].pointer("/environments/remote/status"),
         Some(&json!("starting"))
     );
     assert_eq!(
-        world_state_items[2]
-            .state
-            .pointer("/environments/environments/remote/status"),
+        world_state_items[2].state["environments"].pointer("/environments/remote/status"),
         Some(&json!("available"))
     );
     assert_eq!(
-        world_state_items[2]
-            .state
-            .pointer("/environments/environments/remote/shell"),
+        world_state_items[2].state["environments"].pointer("/environments/remote/shell"),
         Some(&json!("zsh"))
     );
 
@@ -2114,15 +2237,12 @@ async fn remote_exec_materializes_target_roots_before_sandbox_selection() -> Res
     let (sandbox_policy, permission_profile) =
         turn_permission_fields(permission_profile, test.config.cwd.as_path());
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: "try to read the denied remote workspace root".into(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: ThreadSettingsOverrides {
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
                 environments: Some(TurnEnvironmentSelections::new(
                     test.config.cwd.clone(),
                     vec![
@@ -2141,17 +2261,17 @@ async fn remote_exec_materializes_target_roots_before_sandbox_selection() -> Res
                 approval_policy: Some(AskForApproval::Never),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
-                collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
-                    mode: codex_protocol::config_types::ModeKind::Default,
-                    settings: codex_protocol::config_types::Settings {
+                collaboration_mode: Some(CollaborationMode {
+                    mode: ModeKind::Default,
+                    settings: Settings {
                         model: test.session_configured.model.clone(),
                         reasoning_effort: None,
                         developer_instructions: None,
                     },
                 }),
                 ..Default::default()
-            },
-        })
+            }),
+        )
         .await?;
     wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))

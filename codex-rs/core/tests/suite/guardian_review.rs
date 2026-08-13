@@ -8,6 +8,7 @@ use chrono::Utc;
 use codex_core::SleepFuture;
 use codex_core::TimeFuture;
 use codex_core::TimeProvider;
+use codex_core::TurnInputRequest;
 use codex_core::config::Constrained;
 use codex_core::config::CurrentTimeReminderConfig;
 use codex_core::sandboxing::SandboxPermissions;
@@ -24,11 +25,15 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SandboxPolicy;
+use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::user_input::UserInput;
 use core_test_support::fs_wait;
+use core_test_support::responses::assert_parent_turn;
+use core_test_support::responses::assert_root_turn;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
+use core_test_support::responses::ev_custom_tool_call;
 use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_response_once_match;
@@ -208,6 +213,9 @@ async fn guardian_session_prewarms_and_is_reused_for_first_review(
         "startup prewarm must not request the external clock"
     );
     let prewarm_requests = [first.body_json(), second.body_json()];
+    for prewarm in &prewarm_requests {
+        assert_root_turn(prewarm, /*expected*/ None)?;
+    }
     let guardian_prewarm = prewarm_requests
         .iter()
         .find(|request| {
@@ -252,13 +260,10 @@ async fn guardian_session_prewarms_and_is_reused_for_first_review(
         .expect("guardian thread id");
 
     test.codex
-        .submit(
-            vec![UserInput::Text {
-                text: "run a command that requires Guardian review".into(),
-                text_elements: Vec::new(),
-            }]
-            .into(),
-        )
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "run a command that requires Guardian review".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     let guardian_review = tokio::time::timeout(
         Duration::from_secs(5),
@@ -266,6 +271,15 @@ async fn guardian_session_prewarms_and_is_reused_for_first_review(
     )
     .await?
     .body_json();
+    let parent_request = server.connections()[2][0].body_json();
+    let parent_turn_id = parent_request["client_metadata"]["turn_id"]
+        .as_str()
+        .expect("reviewed parent turn id");
+    assert_parent_turn(&parent_request, /*expected*/ None)?;
+    assert_parent_turn(&guardian_review, Some(parent_turn_id))?;
+    for request in [&parent_request, &guardian_review] {
+        assert_root_turn(request, Some(parent_turn_id))?;
+    }
     assert_eq!(
         guardian_review["client_metadata"]["x-openai-subagent"].as_str(),
         Some("guardian")
@@ -433,22 +447,19 @@ async fn guardian_session_is_reused_for_consecutive_tool_reviews_without_prewarm
     .await;
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: "run two commands that require Guardian review".into(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
                 environments: Some(local_selections(test.config.cwd.clone())),
                 approval_policy: Some(approval_policy),
                 approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
                 sandbox_policy: Some(sandbox_policy),
                 ..Default::default()
-            },
-        })
+            }),
+        )
         .await?;
     wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))
@@ -465,6 +476,14 @@ async fn guardian_session_is_reused_for_consecutive_tool_reviews_without_prewarm
     assert_eq!(guardian_requests.len(), 2);
     let first_guardian_request = guardian_requests[0].body_json();
     let second_guardian_request = guardian_requests[1].body_json();
+    let parent_request = responses.requests()[0].body_json();
+    let parent_turn_id = parent_request["client_metadata"]["turn_id"]
+        .as_str()
+        .expect("reviewed parent turn id");
+    for request in [&first_guardian_request, &second_guardian_request] {
+        assert_parent_turn(request, Some(parent_turn_id))?;
+        assert_root_turn(request, Some(parent_turn_id))?;
+    }
     let first_guardian_thread_id = first_guardian_request["client_metadata"]["thread_id"]
         .as_str()
         .expect("first Guardian review should have a thread id");
@@ -474,6 +493,61 @@ async fn guardian_session_is_reused_for_consecutive_tool_reviews_without_prewarm
     assert_eq!(first_guardian_thread_id, second_guardian_thread_id);
     assert_eq!(fs::read_to_string(first_output_file)?, "first");
     assert_eq!(fs::read_to_string(second_output_file)?, "second");
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guardian_review_of_code_mode_exec_command_includes_outer_source() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    skip_if_sandbox!(Ok(()));
+    skip_if_wine_exec!(
+        Ok(()),
+        "Guardian approval actions require host-native paths"
+    );
+
+    let server = start_mock_server().await;
+    let mut builder = test_codex()
+        .with_model("test-gpt-5.1-codex")
+        .with_config(|config| {
+            config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+            config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+            let _ = config.features.enable(Feature::CodeMode);
+        });
+    let test = builder.build_with_auto_env(&server).await?;
+
+    let code = r#"const outerContext = "guardian-code-mode-outer-context";
+await tools.exec_command({cmd: "true", sandbox_permissions: "require_escalated", justification: "test"});"#;
+    let responses = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_custom_tool_call("code-mode-call", "exec", code),
+                ev_completed("resp-parent"),
+            ]),
+            sse(vec![
+                ev_assistant_message("guardian", r#"{"outcome":"allow"}"#),
+                ev_completed("resp-guardian"),
+            ]),
+            sse(vec![ev_completed("resp-done")]),
+        ],
+    )
+    .await;
+
+    let prompt = "run a nested command that requires Guardian review";
+    test.submit_text_turn(prompt).await?;
+
+    let transcript = responses.requests()[1].message_input_texts("user")[2..6].concat();
+    assert_eq!(
+        transcript,
+        format!(
+            ">>> TRANSCRIPT START\n\
+             [1] user: {prompt}\n\
+             \n\
+             [2] tool exec call: {code}\n\
+             >>> TRANSCRIPT END\n"
+        )
+    );
 
     Ok(())
 }
@@ -559,22 +633,19 @@ async fn interrupted_guardian_tool_review_aborts_without_executing_the_command()
     .await;
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: "interrupt a Guardian-reviewed command".into(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
                 environments: Some(local_selections(test.config.cwd.clone())),
                 approval_policy: Some(approval_policy),
                 approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
                 sandbox_policy: Some(sandbox_policy),
                 ..Default::default()
-            },
-        })
+            }),
+        )
         .await?;
 
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -606,13 +677,10 @@ async fn interrupted_guardian_tool_review_aborts_without_executing_the_command()
     )
     .await;
     test.codex
-        .submit(
-            vec![UserInput::Text {
-                text: "verify Guardian cancellation left the next turn clean".into(),
-                text_elements: Vec::new(),
-            }]
-            .into(),
-        )
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "verify Guardian cancellation left the next turn clean".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))
@@ -706,21 +774,18 @@ async fn guardian_denial_rejects_tool_call_with_rationale() -> Result<()> {
     .await;
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: "run a command that Guardian should deny".into(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
                 approval_policy: Some(approval_policy),
                 approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
                 sandbox_policy: Some(sandbox_policy),
                 ..Default::default()
-            },
-        })
+            }),
+        )
         .await?;
     wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))
@@ -820,21 +885,18 @@ async fn cyber_model_guardian_denial_interrupts_turn_immediately() -> Result<()>
     .await;
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: "run a command that Guardian should deny for a cyber model".into(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
                 approval_policy: Some(approval_policy),
                 approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
                 sandbox_policy: Some(sandbox_policy),
                 ..Default::default()
-            },
-        })
+            }),
+        )
         .await?;
 
     let warning = wait_for_event(&test.codex, |event| {
@@ -952,22 +1014,19 @@ printf '%s\n' "${@: -1}" >> "${payload_path}""#,
     .await;
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: "run a command that requires Guardian review".into(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
                 environments: Some(local_selections(test.config.cwd.clone())),
                 approval_policy: Some(approval_policy),
                 approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
                 sandbox_policy: Some(sandbox_policy),
                 ..Default::default()
-            },
-        })
+            }),
+        )
         .await?;
     wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))

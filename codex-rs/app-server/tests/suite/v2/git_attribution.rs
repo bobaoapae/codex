@@ -333,8 +333,8 @@ fn replace_attribution_fragment_with_legacy(
         .filter(|line| !line.trim().is_empty())
         .map(|line| {
             let mut line = serde_json::from_str::<RolloutLine>(line)?;
-            if let RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. }) =
-                &mut line.item
+            if let RolloutItem::ResponseItem(response_item) = &mut line.item
+                && let ResponseItem::Message { role, content, .. } = &mut response_item.item
                 && role == "developer"
             {
                 for item in content {
@@ -354,8 +354,7 @@ fn replace_attribution_fragment_with_legacy(
                 }
             }
             if let RolloutItem::WorldState(world_state) = &mut line.item
-                && let Some(state) = world_state.state.as_object_mut()
-                && state.remove("git_attribution").is_some()
+                && world_state.state.remove("git_attribution").is_some()
             {
                 removed_saved_attribution = true;
             }
