@@ -353,6 +353,15 @@ fn rollout_item_variants_preserve_existing_payload_shapes() -> Result<()> {
             "payload": { "full": true, "state": { "cwd": "/tmp" } },
         }),
         json!({
+            "type": "security_risk_score",
+            "payload": {
+                "scores": {
+                    "action_risk": 0.92,
+                    "data_exfiltration": 0.31,
+                },
+            },
+        }),
+        json!({
             "type": "event_msg",
             "payload": { "type": "warning", "message": "heads up" },
         }),
@@ -370,7 +379,7 @@ fn rollout_item_variants_preserve_existing_payload_shapes() -> Result<()> {
 fn rollout_item_schema_matches_tagged_payload_and_sibling_metadata() -> Result<()> {
     let schema = serde_json::to_value(schemars::schema_for!(RolloutItem))?;
     let variants = schema["oneOf"].as_array().expect("rollout variants");
-    assert_eq!(variants.len(), 8);
+    assert_eq!(variants.len(), 9);
 
     for variant in variants {
         let required = variant["required"].as_array().expect("required fields");
