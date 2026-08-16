@@ -843,6 +843,10 @@ pub struct Config {
     /// overridden by the `CODEX_HOME` environment variable).
     pub codex_home: AbsolutePathBuf,
 
+    /// FORK: ordered Claude Code config directories (one per account) for the
+    /// `claude_code` provider. Empty means "inherit the ambient environment".
+    pub claude_code_account_dirs: Vec<PathBuf>,
+
     /// Resolved configuration shared by all Codex SQLite databases.
     pub sqlite: codex_state::SqliteConfig,
 
@@ -3991,6 +3995,12 @@ impl Config {
             custom_permission_profiles,
             approvals_reviewer: constrained_approvals_reviewer.value(),
             enforce_residency: enforce_residency.value,
+            // FORK: account directories for the `claude_code` provider.
+            claude_code_account_dirs: cfg
+                .claude_code
+                .as_ref()
+                .and_then(|claude_code| claude_code.account_dirs.clone())
+                .unwrap_or_default(),
             notify: cfg.notify,
             base_instructions,
             base_instructions_provenance,

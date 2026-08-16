@@ -16,6 +16,7 @@
 //! Authentication is whatever the `claude` binary is logged in as, so this path
 //! spends the user's Claude Code subscription rather than an API key.
 
+mod accounts;
 mod history;
 
 use crate::client_common::Prompt;
@@ -72,6 +73,11 @@ pub(crate) struct ClaudeCodeWorkspace {
     pub(crate) extra_roots: Vec<PathBuf>,
     /// Permission mode passed to the CLI, derived from the Codex approval policy.
     pub(crate) permission_mode: &'static str,
+    /// FORK: ordered Claude account config dirs; empty = inherit the ambient
+    /// environment (the pre-fork behavior).
+    pub(crate) account_dirs: Vec<PathBuf>,
+    /// FORK: shared account-health state file under `CODEX_HOME`.
+    pub(crate) accounts_state_path: Option<PathBuf>,
 }
 
 impl ClaudeCodeWorkspace {
@@ -90,6 +96,13 @@ impl ClaudeCodeWorkspace {
                 .map(codex_utils_absolute_path::AbsolutePathBuf::to_path_buf)
                 .collect(),
             permission_mode: permission_mode_for(config.permissions.approval_policy.value()),
+            account_dirs: config.claude_code_account_dirs.clone(),
+            accounts_state_path: Some(
+                config
+                    .codex_home
+                    .to_path_buf()
+                    .join(accounts::ACCOUNTS_STATE_FILE_NAME),
+            ),
         }
     }
 }
@@ -123,7 +136,13 @@ impl ClaudeCodeThreadState {
             .clone()
     }
 
-    fn record(&self, session_id: String, delivered_items: usize, delivered_fingerprint: u64) {
+    fn record(
+        &self,
+        session_id: String,
+        delivered_items: usize,
+        delivered_fingerprint: u64,
+        account_dir: Option<PathBuf>,
+    ) {
         let mut continuity = self
             .continuity
             .lock()
@@ -131,6 +150,7 @@ impl ClaudeCodeThreadState {
         continuity.session_id = Some(session_id);
         continuity.delivered_items = delivered_items;
         continuity.delivered_fingerprint = delivered_fingerprint;
+        continuity.account_dir = account_dir;
     }
 
     /// Forgets the resume point after a failed turn, so the next request replays
@@ -152,14 +172,6 @@ pub(crate) async fn stream(
     workspace: Option<&ClaudeCodeWorkspace>,
     state: Arc<ClaudeCodeThreadState>,
 ) -> Result<ResponseStream> {
-    let continuity = state.snapshot();
-    let plan = history::plan_request(&prompt.input, &continuity);
-    let resume_session_id = if plan.restart_session {
-        None
-    } else {
-        continuity.session_id
-    };
-
     let workspace = match workspace {
         Some(workspace) => workspace.clone(),
         None => ClaudeCodeWorkspace {
@@ -170,64 +182,35 @@ pub(crate) async fn stream(
             })?,
             extra_roots: Vec::new(),
             permission_mode: permission_mode_for(AskForApproval::OnRequest),
+            account_dirs: Vec::new(),
+            accounts_state_path: None,
         },
     };
 
-    let mut child = spawn_claude(
-        &model_info.slug,
-        effort.as_ref(),
-        resume_session_id.as_deref(),
-        &workspace,
-    )?;
+    // FORK: decide which account dirs to try, in order, before the turn runs.
+    let turn_accounts = accounts::TurnAccounts::resolve(
+        &workspace.account_dirs,
+        workspace.accounts_state_path.as_deref(),
+    );
 
-    let mut stdin = child.stdin.take().ok_or_else(|| {
-        CodexErr::UnsupportedOperation(
-            "claude_code provider could not open the CLI stdin".to_string(),
-        )
-    })?;
-    let turn_line = serde_json::json!({
-        "type": "user",
-        "message": { "role": "user", "content": plan.turn_text },
-    })
-    .to_string();
-    // Written concurrently with reading stdout: a replayed transcript easily
-    // exceeds the pipe buffer, and the CLI starts emitting events immediately, so
-    // writing to completion first would deadlock both sides on a full pipe.
-    // Closing stdin afterwards makes the CLI exit once it finishes this turn; the
-    // session is resumed by id on the next request rather than held open.
-    tokio::spawn(async move {
-        if let Err(err) = stdin.write_all(format!("{turn_line}\n").as_bytes()).await {
-            warn!("claude_code: failed to write the turn to the CLI: {err}");
-        }
-        let _ = stdin.shutdown().await;
-    });
-
+    let input = prompt.input.clone();
+    let model_slug = model_info.slug.clone();
     let (tx_event, rx_event) = mpsc::channel(EVENT_CHANNEL_SIZE);
     let consumer_dropped = CancellationToken::new();
     let consumer_dropped_for_task = consumer_dropped.clone();
 
     tokio::spawn(async move {
-        let outcome = translate_stream(
-            &mut child,
-            &tx_event,
-            &consumer_dropped_for_task,
-            plan.delivered_items,
-            plan.delivered_fingerprint,
-            &state,
+        run_turn(
+            input,
+            model_slug,
+            effort,
+            workspace,
+            state,
+            turn_accounts,
+            tx_event,
+            consumer_dropped_for_task,
         )
         .await;
-
-        if let Err(err) = outcome {
-            state.invalidate();
-            let _ = tx_event.send(Err(err)).await;
-        }
-
-        // The consumer stopped polling (an interrupt, or an error upstream):
-        // the CLI would otherwise keep running its tool loop unattended.
-        if consumer_dropped_for_task.is_cancelled() {
-            let _ = child.start_kill();
-        }
-        let _ = child.wait().await;
     });
 
     Ok(ResponseStream {
@@ -236,11 +219,204 @@ pub(crate) async fn stream(
     })
 }
 
+/// How one attempt against one account ended.
+enum AttemptOutcome {
+    /// The turn completed and its `Completed` event was delivered.
+    Completed,
+    /// The consumer stopped listening; the turn is over regardless.
+    ConsumerGone,
+    /// The CLI failed.
+    Failed {
+        detail: String,
+        /// Whether any user-visible event already reached the consumer.
+        emitted_output: bool,
+        /// True when the CLI itself reported the failure through an error
+        /// `result` — a deliberate end of turn. The CLI streams limit/auth
+        /// notices as assistant text first, so such attempts may fail over even
+        /// though output was emitted; a mid-stream death may not, because a
+        /// retry would duplicate a half-delivered answer.
+        turn_reported: bool,
+    },
+}
+
+/// Runs one Codex turn, failing over across configured accounts.
+///
+/// Each attempt replans the request: a Claude session id only resumes on the
+/// account that produced it, so switching accounts replays the conversation
+/// into a fresh session (`plan_request` with default continuity).
+#[allow(clippy::too_many_arguments)]
+async fn run_turn(
+    input: Vec<ResponseItem>,
+    model_slug: String,
+    effort: Option<ReasoningEffortConfig>,
+    workspace: ClaudeCodeWorkspace,
+    state: Arc<ClaudeCodeThreadState>,
+    turn_accounts: accounts::TurnAccounts,
+    tx_event: mpsc::Sender<Result<ResponseEvent>>,
+    consumer_dropped: CancellationToken,
+) {
+    if tx_event.send(Ok(ResponseEvent::Created)).await.is_err() {
+        return;
+    }
+
+    let candidates = turn_accounts.candidates.clone();
+    let total = candidates.len();
+    let mut failures: Vec<String> = Vec::new();
+
+    for (index, account_dir) in candidates.into_iter().enumerate() {
+        let continuity = state.snapshot();
+        let continuity = if continuity_matches_account(&continuity, account_dir.as_deref()) {
+            continuity
+        } else {
+            // The recorded Claude session lives in another account's history;
+            // replay the conversation into a fresh session instead.
+            ClaudeSessionContinuity::default()
+        };
+        let plan = history::plan_request(&input, &continuity);
+        let resume_session_id = if plan.restart_session {
+            None
+        } else {
+            continuity.session_id.clone()
+        };
+
+        let mut child = match spawn_claude(
+            &model_slug,
+            effort.as_ref(),
+            resume_session_id.as_deref(),
+            &workspace,
+            account_dir.as_deref(),
+        ) {
+            Ok(child) => child,
+            Err(err) => {
+                // Startup failures (missing binary) are account-independent:
+                // retrying elsewhere would fail identically.
+                let _ = tx_event.send(Err(err)).await;
+                return;
+            }
+        };
+
+        let Some(mut stdin) = child.stdin.take() else {
+            let _ = tx_event
+                .send(Err(CodexErr::UnsupportedOperation(
+                    "claude_code provider could not open the CLI stdin".to_string(),
+                )))
+                .await;
+            return;
+        };
+        let turn_line = serde_json::json!({
+            "type": "user",
+            "message": { "role": "user", "content": plan.turn_text },
+        })
+        .to_string();
+        // Written concurrently with reading stdout: a replayed transcript easily
+        // exceeds the pipe buffer, and the CLI starts emitting events immediately,
+        // so writing to completion first would deadlock both sides on a full pipe.
+        // Closing stdin afterwards makes the CLI exit once it finishes this turn;
+        // the session is resumed by id on the next request rather than held open.
+        tokio::spawn(async move {
+            if let Err(err) = stdin.write_all(format!("{turn_line}\n").as_bytes()).await {
+                warn!("claude_code: failed to write the turn to the CLI: {err}");
+            }
+            let _ = stdin.shutdown().await;
+        });
+
+        let outcome = translate_stream(
+            &mut child,
+            &tx_event,
+            &consumer_dropped,
+            &plan,
+            account_dir.clone(),
+            &state,
+        )
+        .await;
+
+        // The consumer stopped polling (an interrupt, or an error upstream):
+        // the CLI would otherwise keep running its tool loop unattended.
+        if consumer_dropped.is_cancelled() {
+            let _ = child.start_kill();
+        }
+        let _ = child.wait().await;
+
+        match outcome {
+            AttemptOutcome::Completed => {
+                turn_accounts.mark_success(account_dir.as_deref());
+                return;
+            }
+            AttemptOutcome::ConsumerGone => return,
+            AttemptOutcome::Failed {
+                detail,
+                emitted_output,
+                turn_reported,
+            } => {
+                state.invalidate();
+                let class = accounts::classify_failure(&detail);
+                let label = accounts::account_label(account_dir.as_deref());
+                if let Some(dir) = account_dir.as_deref() {
+                    turn_accounts.record_failure(dir, &class, &detail);
+                }
+                let detail_line = detail.lines().next().unwrap_or(&detail).trim();
+                failures.push(format!("{label}: {detail_line}"));
+
+                let can_fail_over = class.is_account_level()
+                    && (turn_reported || !emitted_output)
+                    && account_dir.is_some()
+                    && index + 1 < total;
+                if can_fail_over {
+                    warn!(
+                        "claude_code: account {label} failed ({detail_line}); trying the next account"
+                    );
+                    continue;
+                }
+
+                let message = if failures.len() > 1 {
+                    format!(
+                        "claude_code turn failed on every configured account: {}",
+                        failures.join("; ")
+                    )
+                } else {
+                    format!("claude_code turn failed [{label}]: {detail}")
+                };
+                let _ = tx_event
+                    .send(Err(CodexErr::UnsupportedOperation(message)))
+                    .await;
+                return;
+            }
+        }
+    }
+
+    // Every candidate failed with an account-level error.
+    let _ = tx_event
+        .send(Err(CodexErr::UnsupportedOperation(format!(
+            "claude_code turn failed on every configured account: {}",
+            failures.join("; ")
+        ))))
+        .await;
+}
+
+/// True when the recorded Claude session belongs to the account we are about to
+/// spawn, so `--resume` will find it.
+fn continuity_matches_account(
+    continuity: &ClaudeSessionContinuity,
+    account_dir: Option<&std::path::Path>,
+) -> bool {
+    if continuity.session_id.is_none() {
+        return true;
+    }
+    match (continuity.account_dir.as_deref(), account_dir) {
+        (None, None) => true,
+        (Some(recorded), Some(selected)) => {
+            accounts::dir_key(recorded) == accounts::dir_key(selected)
+        }
+        _ => false,
+    }
+}
+
 fn spawn_claude(
     model_slug: &str,
     effort: Option<&ReasoningEffortConfig>,
     resume_session_id: Option<&str>,
     workspace: &ClaudeCodeWorkspace,
+    config_dir: Option<&std::path::Path>,
 ) -> Result<Child> {
     let bin = std::env::var(CLAUDE_BIN_ENV)
         .ok()
@@ -258,6 +434,11 @@ fn spawn_claude(
         .args(["--permission-mode", workspace.permission_mode])
         // The agent's MCP surface is Codex's business, not the CLI's user config.
         .arg("--strict-mcp-config");
+
+    // FORK: pin the CLI to one account instead of inheriting the environment.
+    if let Some(config_dir) = config_dir {
+        command.env("CLAUDE_CONFIG_DIR", config_dir);
+    }
 
     // Every root the Codex session can reach, so a task spanning sibling
     // repositories is not confined to the thread's cwd.
@@ -296,40 +477,47 @@ Install Claude Code and log in, or set {CLAUDE_BIN_ENV} to its path."
 }
 
 /// Reads the CLI's stream-json output and republishes it as Codex events.
+///
+/// `Created` is emitted by the caller (once per turn, not per attempt); this
+/// reports how the attempt ended so the caller can decide whether another
+/// account may retry it.
 async fn translate_stream(
     child: &mut Child,
     tx_event: &mpsc::Sender<Result<ResponseEvent>>,
     consumer_dropped: &CancellationToken,
-    delivered_items: usize,
-    delivered_fingerprint: u64,
+    plan: &history::RequestPlan,
+    account_dir: Option<PathBuf>,
     state: &ClaudeCodeThreadState,
-) -> Result<()> {
-    let stdout = child.stdout.take().ok_or_else(|| {
-        CodexErr::UnsupportedOperation(
-            "claude_code provider could not open the CLI stdout".to_string(),
-        )
-    })?;
+) -> AttemptOutcome {
+    let mut emitted_output = false;
+    let Some(stdout) = child.stdout.take() else {
+        return AttemptOutcome::Failed {
+            detail: "claude_code provider could not open the CLI stdout".to_string(),
+            emitted_output,
+            turn_reported: false,
+        };
+    };
     let stderr = child.stderr.take();
     let mut lines = BufReader::new(stdout).lines();
 
-    if tx_event.send(Ok(ResponseEvent::Created)).await.is_err() {
-        return Ok(());
-    }
-
     let mut session_id: Option<String> = None;
     let mut assembler = StreamAssembler::new(tx_event);
-    let mut completed = false;
 
     loop {
         let line = tokio::select! {
-            _ = consumer_dropped.cancelled() => return Ok(()),
+            _ = consumer_dropped.cancelled() => return AttemptOutcome::ConsumerGone,
             line = lines.next_line() => line,
         };
-        let Some(line) = line.map_err(|err| {
-            CodexErr::UnsupportedOperation(format!("claude_code provider read failed: {err}"))
-        })?
-        else {
-            break;
+        let line = match line {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            Err(err) => {
+                return AttemptOutcome::Failed {
+                    detail: format!("claude_code provider read failed: {err}"),
+                    emitted_output,
+                    turn_reported: false,
+                };
+            }
         };
         let line = line.trim();
         if line.is_empty() {
@@ -354,36 +542,44 @@ async fn translate_stream(
                     .cloned()
                     .unwrap_or_default();
                 for block in blocks {
-                    let delivered = match block.get("type").and_then(JsonValue::as_str) {
-                        Some("text") => {
-                            let text = block
-                                .get("text")
-                                .and_then(JsonValue::as_str)
-                                .unwrap_or_default();
-                            if text.is_empty() {
-                                continue;
+                    let (consumer_alive, pushed) =
+                        match block.get("type").and_then(JsonValue::as_str) {
+                            Some("text") => {
+                                let text = block
+                                    .get("text")
+                                    .and_then(JsonValue::as_str)
+                                    .unwrap_or_default();
+                                if text.is_empty() {
+                                    continue;
+                                }
+                                (assembler.push_text(text).await, true)
                             }
-                            assembler.push_text(text).await
-                        }
-                        Some("thinking") => {
-                            let text = block
-                                .get("thinking")
-                                .and_then(JsonValue::as_str)
-                                .unwrap_or_default();
-                            if text.is_empty() {
-                                continue;
+                            Some("thinking") => {
+                                let text = block
+                                    .get("thinking")
+                                    .and_then(JsonValue::as_str)
+                                    .unwrap_or_default();
+                                if text.is_empty() {
+                                    continue;
+                                }
+                                (assembler.push_reasoning(text).await, true)
                             }
-                            assembler.push_reasoning(text).await
-                        }
-                        Some("tool_use") => {
-                            // Claude executes its own tools; surface the activity
-                            // as reasoning so the turn is not a silent black box.
-                            assembler.push_reasoning(&describe_tool_use(&block)).await
-                        }
-                        _ => true,
-                    };
-                    if !delivered {
-                        return Ok(());
+                            Some("tool_use") => {
+                                // Claude executes its own tools; surface the
+                                // activity as reasoning so the turn is not a
+                                // silent black box.
+                                (
+                                    assembler.push_reasoning(&describe_tool_use(&block)).await,
+                                    true,
+                                )
+                            }
+                            _ => (true, false),
+                        };
+                    if pushed {
+                        emitted_output = true;
+                    }
+                    if !consumer_alive {
+                        return AttemptOutcome::ConsumerGone;
                     }
                 }
             }
@@ -400,23 +596,32 @@ async fn translate_stream(
                     .and_then(JsonValue::as_str)
                     .unwrap_or_default();
                 if is_error {
-                    return Err(CodexErr::UnsupportedOperation(format!(
-                        "claude_code turn failed: {}",
-                        if result_text.is_empty() {
-                            event
-                                .get("subtype")
-                                .and_then(JsonValue::as_str)
-                                .unwrap_or("unknown error")
-                        } else {
-                            result_text
-                        }
-                    )));
+                    // Close whatever item the error prelude opened (the CLI
+                    // streams "hit your limit" style notices as assistant text)
+                    // so a failover attempt starts from a clean stream.
+                    if !assembler.close(MessagePhase::Commentary).await {
+                        return AttemptOutcome::ConsumerGone;
+                    }
+                    let detail = if result_text.is_empty() {
+                        event
+                            .get("subtype")
+                            .and_then(JsonValue::as_str)
+                            .unwrap_or("unknown error")
+                            .to_string()
+                    } else {
+                        result_text.to_string()
+                    };
+                    return AttemptOutcome::Failed {
+                        detail,
+                        emitted_output,
+                        turn_reported: true,
+                    };
                 }
 
                 // Close whatever block run was in flight; a trailing answer is the
                 // turn's final answer.
                 if !assembler.close(MessagePhase::FinalAnswer).await {
-                    return Ok(());
+                    return AttemptOutcome::ConsumerGone;
                 }
                 // The CLI reports the answer once more on `result`. If nothing was
                 // streamed (a turn that only ran tools, or output we could not
@@ -427,11 +632,16 @@ async fn translate_stream(
                         .emit_message(result_text.to_string(), MessagePhase::FinalAnswer)
                         .await
                 {
-                    return Ok(());
+                    return AttemptOutcome::ConsumerGone;
                 }
 
                 if let Some(session_id) = session_id.clone() {
-                    state.record(session_id, delivered_items, delivered_fingerprint);
+                    state.record(
+                        session_id,
+                        plan.delivered_items,
+                        plan.delivered_fingerprint,
+                        account_dir,
+                    );
                 } else {
                     state.invalidate();
                 }
@@ -447,17 +657,12 @@ async fn translate_stream(
                     .await
                     .is_err()
                 {
-                    return Ok(());
+                    return AttemptOutcome::ConsumerGone;
                 }
-                completed = true;
-                break;
+                return AttemptOutcome::Completed;
             }
             _ => {}
         }
-    }
-
-    if completed {
-        return Ok(());
     }
 
     // The CLI exited without a terminal `result`: surface whatever it said on
@@ -478,14 +683,15 @@ async fn translate_stream(
         None => String::new(),
     };
     warn!("claude_code: CLI ended without a result event");
-    Err(CodexErr::UnsupportedOperation(format!(
-        "claude_code turn ended without a result{}",
-        if detail.is_empty() {
-            String::new()
+    AttemptOutcome::Failed {
+        detail: if detail.is_empty() {
+            "claude_code turn ended without a result".to_string()
         } else {
-            format!(": {detail}")
-        }
-    )))
+            format!("claude_code turn ended without a result: {detail}")
+        },
+        emitted_output,
+        turn_reported: false,
+    }
 }
 
 /// Turns Claude's block stream into Codex items.

@@ -30,6 +30,7 @@ fn established(input: &[ResponseItem]) -> ClaudeSessionContinuity {
         session_id: Some("session-1".to_string()),
         delivered_items: input.len(),
         delivered_fingerprint: fingerprint(input),
+        account_dir: None,
     }
 }
 
@@ -49,7 +50,7 @@ fn first_request_replays_the_whole_conversation() {
 fn follow_up_sends_only_the_new_items() {
     let delivered = vec![user("build the thing"), assistant("done")];
     let continuity = established(&delivered);
-    let mut input = delivered.clone();
+    let mut input = delivered;
     input.push(user("now add tests"));
 
     let plan = plan_request(&input, &continuity);

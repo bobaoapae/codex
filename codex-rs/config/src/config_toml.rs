@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::path::Path;
+use std::path::PathBuf;
 
 use crate::HooksToml;
 use crate::permissions_toml::PermissionsToml;
@@ -147,6 +148,18 @@ pub struct OrchestratorFeatureToml {
     pub enabled: Option<bool>,
 }
 
+/// FORK: settings for the `claude_code` local provider (`[claude_code]`).
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct ClaudeCodeToml {
+    /// Ordered list of Claude Code config directories (one per account). When
+    /// set, every spawned `claude` CLI is pinned to one of these via
+    /// `CLAUDE_CONFIG_DIR`, and account-level failures (usage limit, expired
+    /// login) fail over to the next directory. When unset, the CLI inherits the
+    /// ambient environment, as before.
+    pub account_dirs: Option<Vec<PathBuf>>,
+}
+
 /// Base config deserialized from ~/.codex/config.toml.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
@@ -158,6 +171,10 @@ pub struct ConfigToml {
 
     /// Provider to use from the model_providers map.
     pub model_provider: Option<String>,
+
+    /// FORK: settings for the `claude_code` local provider.
+    #[serde(default)]
+    pub claude_code: Option<ClaudeCodeToml>,
 
     /// Size of the context window for the model, in tokens.
     pub model_context_window: Option<i64>,

@@ -44,6 +44,10 @@ pub(crate) struct ClaudeSessionContinuity {
     pub(super) delivered_items: usize,
     /// Fingerprint of those leading items.
     pub(super) delivered_fingerprint: u64,
+    /// FORK: account config dir that owns the recorded session. `--resume` only
+    /// works against the history store the session was created in, so a turn
+    /// served by a different account must replay instead of resuming.
+    pub(super) account_dir: Option<std::path::PathBuf>,
 }
 
 /// Decides between extending the recorded Claude session and replaying history.
