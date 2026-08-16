@@ -96,6 +96,8 @@ libc = { workspace = true }
 once_cell = { workspace = true }
 rand = { workspace = true }
 regex-lite = { workspace = true }
+# FORK: read-only account usage lookups for claude_code account selection.
+reqwest = { workspace = true }
 rmcp = { workspace = true, default-features = false, features = [
     "base64",
     "macros",

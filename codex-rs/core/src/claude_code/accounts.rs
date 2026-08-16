@@ -31,6 +31,19 @@ const USAGE_LIMIT_COOLDOWN_MS: u64 = 15 * 60 * 1000;
 /// early when `.credentials.json` changes, i.e. when the user logs in again.
 const AUTH_COOLDOWN_MS: u64 = 5 * 60 * 1000;
 
+/// How long a fetched usage snapshot stays fresh.
+const USAGE_TTL_MS: u64 = 5 * 60 * 1000;
+
+/// Minimum gap between usage-fetch attempts for one account, so a dead network
+/// cannot stall every turn on the fetch timeout.
+const USAGE_RETRY_MS: u64 = 60 * 1000;
+
+const USAGE_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// The endpoint behind the CLI's `/usage` screen. Read-only; the account's
+/// OAuth token is used for nothing but this lookup.
+const USAGE_ENDPOINT: &str = "https://api.anthropic.com/api/oauth/usage";
+
 /// Why an attempt against one account failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FailureClass {
@@ -167,6 +180,133 @@ pub(crate) struct AccountsFile {
     pub(crate) preferred_dir: Option<String>,
     #[serde(default)]
     pub(crate) accounts: BTreeMap<String, AccountHealth>,
+    /// Cached usage per account, refreshed lazily; also written by the MCP
+    /// bridge whenever it fetches usage for display.
+    #[serde(default)]
+    pub(crate) usage: BTreeMap<String, UsageSnapshot>,
+}
+
+/// Point-in-time account usage from the OAuth usage endpoint.
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+pub(crate) struct UsageSnapshot {
+    #[serde(default)]
+    pub(crate) five_hour_pct: Option<f64>,
+    #[serde(default)]
+    pub(crate) weekly_pct: Option<f64>,
+    /// The binding constraint: max of the window utilizations. `None` = usage
+    /// unknown (never fetched successfully).
+    #[serde(default)]
+    pub(crate) binding_pct: Option<f64>,
+    #[serde(default)]
+    pub(crate) five_hour_resets_at: Option<String>,
+    #[serde(default)]
+    pub(crate) weekly_resets_at: Option<String>,
+    #[serde(default)]
+    pub(crate) fetched_at_ms: u64,
+    #[serde(default)]
+    pub(crate) last_attempt_ms: u64,
+}
+
+impl UsageSnapshot {
+    /// Remaining headroom before the tightest window closes. `None` = unknown.
+    fn remaining_pct(&self) -> Option<f64> {
+        self.binding_pct.map(|pct| 100.0 - pct)
+    }
+}
+
+fn oauth_access_token(dir: &Path) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Credentials {
+        #[serde(rename = "claudeAiOauth")]
+        claude_ai_oauth: Option<Oauth>,
+    }
+    #[derive(Deserialize)]
+    struct Oauth {
+        #[serde(rename = "accessToken")]
+        access_token: Option<String>,
+    }
+    let raw = std::fs::read(dir.join(".credentials.json")).ok()?;
+    serde_json::from_slice::<Credentials>(&raw)
+        .ok()?
+        .claude_ai_oauth?
+        .access_token
+        .filter(|token| !token.is_empty())
+}
+
+/// Fetches the account's usage. `None` on any failure (no token, network,
+/// non-200, unparseable) — the caller keeps the previous snapshot.
+async fn fetch_usage(dir: &Path) -> Option<UsageSnapshot> {
+    let token = oauth_access_token(dir)?;
+    let client = reqwest::Client::builder()
+        .timeout(USAGE_FETCH_TIMEOUT)
+        .build()
+        .ok()?;
+    let response = client
+        .get(USAGE_ENDPOINT)
+        .bearer_auth(token)
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let body = response.text().await.ok()?;
+    let raw: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let window = |name: &str| {
+        let window = raw.get(name)?;
+        Some((
+            window.get("utilization").and_then(serde_json::Value::as_f64),
+            window
+                .get("resets_at")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+        ))
+    };
+    let (five_hour_pct, five_hour_resets_at) = window("five_hour").unwrap_or((None, None));
+    let (weekly_pct, weekly_resets_at) = window("seven_day").unwrap_or((None, None));
+    let binding_pct = match (five_hour_pct, weekly_pct) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
+    Some(UsageSnapshot {
+        five_hour_pct,
+        weekly_pct,
+        binding_pct,
+        five_hour_resets_at,
+        weekly_resets_at,
+        fetched_at_ms: now_ms(),
+        last_attempt_ms: now_ms(),
+    })
+}
+
+/// Refreshes stale usage snapshots for the given dirs. Returns true when the
+/// state changed and should be persisted.
+async fn refresh_usage(state: &mut AccountsFile, dirs: &[&PathBuf], now: u64) -> bool {
+    let mut changed = false;
+    for dir in dirs {
+        let key = dir_key(dir);
+        let snapshot = state.usage.get(&key);
+        let fresh =
+            snapshot.is_some_and(|snapshot| now.saturating_sub(snapshot.fetched_at_ms) < USAGE_TTL_MS);
+        let attempted_recently = snapshot
+            .is_some_and(|snapshot| now.saturating_sub(snapshot.last_attempt_ms) < USAGE_RETRY_MS);
+        if fresh || attempted_recently {
+            continue;
+        }
+        changed = true;
+        match fetch_usage(dir).await {
+            Some(snapshot) => {
+                state.usage.insert(key, snapshot);
+            }
+            None => {
+                state.usage.entry(key).or_default().last_attempt_ms = now;
+            }
+        }
+    }
+    changed
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
@@ -242,10 +382,22 @@ pub(crate) struct TurnAccounts {
 impl TurnAccounts {
     /// Resolves the attempt order from config + shared state.
     ///
-    /// Order: preferred account first (if configured and usable), then the
-    /// config order; accounts on an active cooldown go to the back rather than
-    /// being skipped, so a stale cooldown can never dead-lock the provider.
-    pub(crate) fn resolve(account_dirs: &[PathBuf], state_path: Option<&Path>) -> Self {
+    /// Policy, in priority order:
+    /// 1. The user-selected preferred account (a deliberate choice).
+    /// 2. `sticky` — the account already serving this thread, so an ongoing
+    ///    conversation keeps its Claude session until the account is spent.
+    /// 3. Remaining accounts with known usage, **least remaining headroom
+    ///    first**: the protocol drains the account closest to its limit and
+    ///    keeps the fresher ones in reserve.
+    /// 4. Accounts with unknown usage, in config order.
+    /// 5. Accounts that look spent (no headroom) or are on a failure cooldown —
+    ///    still attempted last rather than skipped, so stale local state can
+    ///    never dead-lock the provider; hitting their limit fails over anyway.
+    pub(crate) async fn resolve(
+        account_dirs: &[PathBuf],
+        state_path: Option<&Path>,
+        sticky: Option<&Path>,
+    ) -> Self {
         if account_dirs.is_empty() {
             return Self {
                 candidates: vec![None],
@@ -264,31 +416,16 @@ impl TurnAccounts {
             .iter()
             .map(|dir| dir.to_string_lossy().into_owned())
             .collect();
-        if let Some(path) = state_path.as_deref()
-            && (state.dirs != dirs_mirror || state.version == 0)
-        {
-            state.version = 1;
-            state.dirs = dirs_mirror;
-            state.save(path);
-        }
+        let mut dirty = state.dirs != dirs_mirror || state.version == 0;
+        state.version = 1;
+        state.dirs = dirs_mirror;
 
-        let mut ordered: Vec<&PathBuf> = Vec::new();
-        if let Some(preferred) = state.preferred_dir.as_deref() {
-            let preferred_key = dir_key(Path::new(preferred));
-            if let Some(dir) = account_dirs.iter().find(|dir| dir_key(dir) == preferred_key) {
-                ordered.push(dir);
-            }
-        }
+        // Deduplicated usable dirs in config order.
+        let mut usable: Vec<&PathBuf> = Vec::new();
         for dir in account_dirs {
-            if !ordered.iter().any(|seen| dir_key(seen) == dir_key(dir)) {
-                ordered.push(dir);
+            if usable.iter().any(|seen| dir_key(seen) == dir_key(dir)) {
+                continue;
             }
-        }
-
-        let now = now_ms();
-        let mut ready: Vec<PathBuf> = Vec::new();
-        let mut cooling: Vec<PathBuf> = Vec::new();
-        for dir in ordered {
             if !dir.join(".credentials.json").is_file() {
                 // Not logged in / overlay not mounted: unusable, skip entirely.
                 warn!(
@@ -297,24 +434,78 @@ impl TurnAccounts {
                 );
                 continue;
             }
-            if state.is_cooling(dir, now) {
-                cooling.push(dir.clone());
-            } else {
-                ready.push(dir.clone());
-            }
+            usable.push(dir);
         }
-        ready.extend(cooling);
 
-        if ready.is_empty() {
+        if usable.is_empty() {
             warn!("claude_code: no configured account dir is usable; using ambient environment");
+            if dirty && let Some(path) = state_path.as_deref() {
+                state.save(path);
+            }
             return Self {
                 candidates: vec![None],
                 state_path,
             };
         }
 
+        let now = now_ms();
+        // Usage only matters when there is a choice to make.
+        if usable.len() > 1 {
+            dirty |= refresh_usage(&mut state, &usable, now).await;
+        }
+        if dirty && let Some(path) = state_path.as_deref() {
+            state.save(path);
+        }
+
+        let preferred_key = state
+            .preferred_dir
+            .as_deref()
+            .map(|preferred| dir_key(Path::new(preferred)));
+        let sticky_key = sticky.map(dir_key);
+
+        let mut pinned: Vec<PathBuf> = Vec::new();
+        let mut drain: Vec<(f64, usize, PathBuf)> = Vec::new();
+        let mut unknown: Vec<PathBuf> = Vec::new();
+        let mut spent: Vec<PathBuf> = Vec::new();
+        let mut cooling: Vec<PathBuf> = Vec::new();
+        for (index, dir) in usable.iter().enumerate() {
+            let key = dir_key(dir);
+            if state.is_cooling(dir, now) {
+                cooling.push((*dir).clone());
+                continue;
+            }
+            let is_preferred = preferred_key.as_deref() == Some(key.as_str());
+            let is_sticky = sticky_key.as_deref() == Some(key.as_str());
+            if is_preferred || is_sticky {
+                // Preferred outranks sticky when both exist.
+                if is_preferred {
+                    pinned.insert(0, (*dir).clone());
+                } else {
+                    pinned.push((*dir).clone());
+                }
+                continue;
+            }
+            match state.usage.get(&key).and_then(UsageSnapshot::remaining_pct) {
+                Some(remaining) if remaining <= 0.0 => spent.push((*dir).clone()),
+                Some(remaining) => drain.push((remaining, index, (*dir).clone())),
+                None => unknown.push((*dir).clone()),
+            }
+        }
+        drain.sort_by(|a, b| {
+            a.0.partial_cmp(&b.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.1.cmp(&b.1))
+        });
+
+        let mut candidates: Vec<Option<PathBuf>> = Vec::new();
+        candidates.extend(pinned.into_iter().map(Some));
+        candidates.extend(drain.into_iter().map(|(_, _, dir)| Some(dir)));
+        candidates.extend(unknown.into_iter().map(Some));
+        candidates.extend(spent.into_iter().map(Some));
+        candidates.extend(cooling.into_iter().map(Some));
+
         Self {
-            candidates: ready.into_iter().map(Some).collect(),
+            candidates,
             state_path,
         }
     }
@@ -405,27 +596,41 @@ mod tests {
         assert!(!class.is_account_level());
     }
 
-    #[test]
-    fn resolve_orders_preferred_first_and_cooling_last() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let dir_a = temp.path().join("a");
-        let dir_b = temp.path().join("b");
-        for dir in [&dir_a, &dir_b] {
-            std::fs::create_dir_all(dir).expect("mkdir");
-            std::fs::write(dir.join(".credentials.json"), "{}").expect("creds");
+    fn account_fixture(temp: &tempfile::TempDir, names: &[&str]) -> Vec<PathBuf> {
+        names
+            .iter()
+            .map(|name| {
+                let dir = temp.path().join(name);
+                std::fs::create_dir_all(&dir).expect("mkdir");
+                std::fs::write(dir.join(".credentials.json"), "{}").expect("creds");
+                dir
+            })
+            .collect()
+    }
+
+    fn fresh_snapshot(binding_pct: f64) -> UsageSnapshot {
+        UsageSnapshot {
+            binding_pct: Some(binding_pct),
+            weekly_pct: Some(binding_pct),
+            fetched_at_ms: now_ms(),
+            ..UsageSnapshot::default()
         }
+    }
+
+    #[tokio::test]
+    async fn resolve_orders_preferred_first_and_cooling_last() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dirs = account_fixture(&temp, &["a", "b"]);
+        let (dir_a, dir_b) = (dirs[0].clone(), dirs[1].clone());
         let state_path = temp.path().join(ACCOUNTS_STATE_FILE_NAME);
 
         // Preferred account jumps the config order.
         let state = AccountsFile {
-            version: 1,
-            dirs: Vec::new(),
             preferred_dir: Some(dir_b.to_string_lossy().into_owned()),
-            accounts: BTreeMap::new(),
+            ..AccountsFile::default()
         };
         state.save(&state_path);
-        let dirs = vec![dir_a.clone(), dir_b.clone()];
-        let plan = TurnAccounts::resolve(&dirs, Some(&state_path));
+        let plan = TurnAccounts::resolve(&dirs, Some(&state_path), None).await;
         assert_eq!(
             plan.candidates,
             vec![Some(dir_b.clone()), Some(dir_a.clone())]
@@ -437,7 +642,7 @@ mod tests {
             &FailureClass::UsageLimit { reset_hint: None },
             "You've hit your weekly limit",
         );
-        let plan = TurnAccounts::resolve(&dirs, Some(&state_path));
+        let plan = TurnAccounts::resolve(&dirs, Some(&state_path), None).await;
         assert_eq!(plan.candidates, vec![Some(dir_a), Some(dir_b.clone())]);
 
         // Success clears the record.
@@ -446,18 +651,80 @@ mod tests {
         assert!(reloaded.accounts.is_empty());
     }
 
-    #[test]
-    fn resolve_skips_dirs_without_credentials_and_falls_back_to_ambient() {
+    #[tokio::test]
+    async fn resolve_skips_dirs_without_credentials_and_falls_back_to_ambient() {
         let temp = tempfile::tempdir().expect("tempdir");
         let dir_a = temp.path().join("a");
         std::fs::create_dir_all(&dir_a).expect("mkdir");
         let dirs = vec![dir_a];
-        let plan = TurnAccounts::resolve(&dirs, None);
+        let plan = TurnAccounts::resolve(&dirs, None, None).await;
         assert_eq!(plan.candidates, vec![None]);
     }
 
-    #[test]
-    fn auth_cooldown_lifts_when_credentials_change() {
+    #[tokio::test]
+    async fn drain_prefers_least_remaining_and_puts_spent_last() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dirs = account_fixture(&temp, &["a", "b", "c"]);
+        let state_path = temp.path().join(ACCOUNTS_STATE_FILE_NAME);
+
+        // a: 90% headroom, b: 20% headroom, c: spent.
+        let mut usage = BTreeMap::new();
+        usage.insert(dir_key(&dirs[0]), fresh_snapshot(10.0));
+        usage.insert(dir_key(&dirs[1]), fresh_snapshot(80.0));
+        usage.insert(dir_key(&dirs[2]), fresh_snapshot(100.0));
+        let state = AccountsFile {
+            usage,
+            ..AccountsFile::default()
+        };
+        state.save(&state_path);
+
+        let plan = TurnAccounts::resolve(&dirs, Some(&state_path), None).await;
+        assert_eq!(
+            plan.candidates,
+            vec![
+                Some(dirs[1].clone()),
+                Some(dirs[0].clone()),
+                Some(dirs[2].clone()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn sticky_thread_account_ranks_ahead_of_drain_but_behind_preferred() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dirs = account_fixture(&temp, &["a", "b", "c"]);
+        let state_path = temp.path().join(ACCOUNTS_STATE_FILE_NAME);
+
+        // b would win the drain order, but the thread already runs on a.
+        let mut usage = BTreeMap::new();
+        usage.insert(dir_key(&dirs[0]), fresh_snapshot(10.0));
+        usage.insert(dir_key(&dirs[1]), fresh_snapshot(80.0));
+        let state = AccountsFile {
+            usage,
+            ..AccountsFile::default()
+        };
+        state.save(&state_path);
+
+        let plan = TurnAccounts::resolve(&dirs, Some(&state_path), Some(&dirs[0])).await;
+        assert_eq!(plan.candidates.first(), Some(&Some(dirs[0].clone())));
+
+        // A deliberate selection outranks the sticky account.
+        let mut state = AccountsFile::load(&state_path);
+        state.preferred_dir = Some(dirs[2].to_string_lossy().into_owned());
+        state.save(&state_path);
+        let plan = TurnAccounts::resolve(&dirs, Some(&state_path), Some(&dirs[0])).await;
+        assert_eq!(
+            plan.candidates,
+            vec![
+                Some(dirs[2].clone()),
+                Some(dirs[0].clone()),
+                Some(dirs[1].clone()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_cooldown_lifts_when_credentials_change() {
         let temp = tempfile::tempdir().expect("tempdir");
         let dir = temp.path().join("a");
         std::fs::create_dir_all(&dir).expect("mkdir");
@@ -465,7 +732,7 @@ mod tests {
         let state_path = temp.path().join(ACCOUNTS_STATE_FILE_NAME);
         let dirs = vec![dir.clone()];
 
-        let plan = TurnAccounts::resolve(&dirs, Some(&state_path));
+        let plan = TurnAccounts::resolve(&dirs, Some(&state_path), None).await;
         plan.record_failure(&dir, &FailureClass::Auth, "OAuth token has expired");
         let state = AccountsFile::load(&state_path);
         assert!(state.is_cooling(&dir, now_ms()));

@@ -187,12 +187,6 @@ pub(crate) async fn stream(
         },
     };
 
-    // FORK: decide which account dirs to try, in order, before the turn runs.
-    let turn_accounts = accounts::TurnAccounts::resolve(
-        &workspace.account_dirs,
-        workspace.accounts_state_path.as_deref(),
-    );
-
     let input = prompt.input.clone();
     let model_slug = model_info.slug.clone();
     let (tx_event, rx_event) = mpsc::channel(EVENT_CHANNEL_SIZE);
@@ -206,7 +200,6 @@ pub(crate) async fn stream(
             effort,
             workspace,
             state,
-            turn_accounts,
             tx_event,
             consumer_dropped_for_task,
         )
@@ -251,13 +244,24 @@ async fn run_turn(
     effort: Option<ReasoningEffortConfig>,
     workspace: ClaudeCodeWorkspace,
     state: Arc<ClaudeCodeThreadState>,
-    turn_accounts: accounts::TurnAccounts,
     tx_event: mpsc::Sender<Result<ResponseEvent>>,
     consumer_dropped: CancellationToken,
 ) {
     if tx_event.send(Ok(ResponseEvent::Created)).await.is_err() {
         return;
     }
+
+    // FORK: decide the attempt order. The account already serving this thread
+    // is sticky, so an ongoing conversation stays on its Claude session until
+    // that account is spent (usage refresh may hit the network; it runs after
+    // `Created` so stream startup never blocks on it).
+    let sticky = state.snapshot().account_dir;
+    let turn_accounts = accounts::TurnAccounts::resolve(
+        &workspace.account_dirs,
+        workspace.accounts_state_path.as_deref(),
+        sticky.as_deref(),
+    )
+    .await;
 
     let candidates = turn_accounts.candidates.clone();
     let total = candidates.len();
