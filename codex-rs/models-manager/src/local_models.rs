@@ -41,6 +41,7 @@ pub fn merge_locally_served_models(models: &mut Vec<ModelInfo>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_protocol::openai_models::ModelVisibility;
 
     #[test]
     fn bundled_claude_models_parse() {
@@ -52,6 +53,12 @@ mod tests {
         let slugs: Vec<&str> = models.iter().map(|model| model.slug.as_str()).collect();
         assert!(slugs.contains(&"claude-opus-5"), "got {slugs:?}");
         assert!(slugs.contains(&"claude-sonnet-5"), "got {slugs:?}");
+        assert!(
+            models
+                .iter()
+                .all(|model| model.visibility == ModelVisibility::Hide),
+            "Claude models must be agent-only and hidden from the /model picker"
+        );
     }
 
     #[test]

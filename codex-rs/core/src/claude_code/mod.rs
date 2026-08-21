@@ -115,7 +115,7 @@ impl ClaudeCodeWorkspace {
 pub(crate) fn permission_mode_for(approval_policy: AskForApproval) -> &'static str {
     match approval_policy {
         AskForApproval::Never => "bypassPermissions",
-        _ => "acceptEdits",
+        _ => "auto",
     }
 }
 
@@ -763,7 +763,9 @@ impl<'a> StreamAssembler<'a> {
                 return false;
             }
             if !self
-                .send(ResponseEvent::OutputItemAdded(reasoning_item(String::new())))
+                .send(ResponseEvent::OutputItemAdded(
+                    reasoning_item(String::new()),
+                ))
                 .await
             {
                 return false;
@@ -882,4 +884,19 @@ fn parse_token_usage(usage: Option<&JsonValue>) -> Option<TokenUsage> {
         total_tokens: input_tokens + cached_input_tokens + cache_write_input_tokens + output_tokens,
         codex_rollout_budget_units: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn headless_claude_uses_auto_for_interactive_codex_policies() {
+        assert_eq!(permission_mode_for(AskForApproval::OnRequest), "auto");
+        assert_eq!(permission_mode_for(AskForApproval::UnlessTrusted), "auto");
+        assert_eq!(
+            permission_mode_for(AskForApproval::Never),
+            "bypassPermissions"
+        );
+    }
 }

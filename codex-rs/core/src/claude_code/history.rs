@@ -12,6 +12,7 @@
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::models::plaintext_agent_message_content;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hash;
 use std::hash::Hasher;
@@ -130,6 +131,25 @@ fn render_item(item: &ResponseItem) -> String {
             } else {
                 format!("<{role}>\n{text}\n</{role}>")
             }
+        }
+        ResponseItem::AgentMessage {
+            author,
+            recipient,
+            content,
+            ..
+        } => {
+            // A generic fallback renders this as `<codex_item>{JSON}</codex_item>`.
+            // Claude then treats the delegated task as quoted, untrusted transcript
+            // content instead of the current instruction from its parent agent.
+            let Some(payload) = plaintext_agent_message_content(content) else {
+                // Encrypted collaboration payloads are intentionally opaque to a
+                // local Claude backend. The tool handler rejects new ones, but old
+                // history must not leak or present the ciphertext as a task.
+                return String::new();
+            };
+            format!(
+                "<user>\nThis is a delegated instruction from the parent Codex agent {author} to {recipient}. Execute it in the assigned workspace and report the result to the parent.\n\n{payload}\n</user>"
+            )
         }
         ResponseItem::Reasoning { .. } => {
             // Claude reasons for itself; replaying another model's reasoning is

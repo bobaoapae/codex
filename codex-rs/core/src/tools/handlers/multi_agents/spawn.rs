@@ -121,6 +121,13 @@ async fn handle_spawn_agent(
         step_context.environments.primary(),
     )?;
 
+    // Claude children receive a complete plaintext brief and must not inherit
+    // the parent's Codex conversation through the legacy fork flag.
+    let fork_mode = task_fork_mode_for_wire_api(
+        config.model_provider.wire_api,
+        args.fork_context.then_some(SpawnAgentForkMode::FullHistory),
+    );
+
     let result = Box::pin(session.services.agent_control.spawn_agent_with_metadata(
         config,
         input_items,
@@ -132,8 +139,8 @@ async fn handle_spawn_agent(
             /*task_name*/ None,
         )?),
         SpawnAgentOptions {
-            fork_parent_spawn_call_id: args.fork_context.then(|| call_id.clone()),
-            fork_mode: args.fork_context.then_some(SpawnAgentForkMode::FullHistory),
+            fork_parent_spawn_call_id: fork_mode.as_ref().map(|_| call_id.clone()),
+            fork_mode,
             parent_thread_id: Some(session.thread_id),
             parent_turn_id: Some(turn.sub_id.clone()),
             root_turn_id: turn.turn_metadata_state.root_turn_id(),

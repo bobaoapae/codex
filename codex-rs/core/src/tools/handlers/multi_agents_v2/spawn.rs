@@ -51,7 +51,7 @@ async fn handle_spawn_agent(
     let turn = &step_context.turn;
     let arguments = function_arguments(payload)?;
     let args: SpawnAgentArgs = parse_arguments(&arguments)?;
-    let fork_mode = args.fork_mode()?;
+    let requested_fork_mode = args.fork_mode()?;
     let (message, message_form) = tool_message_argument(
         args.message.clone(),
         args.plaintext_message.clone(),
@@ -73,7 +73,10 @@ async fn handle_spawn_agent(
     if let Some(service_tier) = args.service_tier.as_ref() {
         config.service_tier = Some(service_tier.clone());
     }
-    let is_full_history_fork = matches!(fork_mode, Some(SpawnAgentForkMode::FullHistory));
+    let requested_full_history_fork = matches!(
+        requested_fork_mode.as_ref(),
+        Some(SpawnAgentForkMode::FullHistory)
+    );
     apply_requested_spawn_agent_model_overrides(
         &session,
         turn.as_ref(),
@@ -82,9 +85,9 @@ async fn handle_spawn_agent(
         args.reasoning_effort.clone(),
     )
     .await?;
-    if !is_full_history_fork || role_name.is_some() {
+    if !requested_full_history_fork || role_name.is_some() {
         apply_spawn_agent_role(&session, &mut config, role_name).await?;
-        if is_full_history_fork && config.developer_instructions.is_none() {
+        if requested_full_history_fork && config.developer_instructions.is_none() {
             config
                 .developer_instructions
                 .clone_from(&turn.developer_instructions);
@@ -102,6 +105,14 @@ async fn handle_spawn_agent(
         turn.as_ref(),
         step_context.environments.primary(),
     )?;
+
+    // Claude children receive a complete, self-contained plaintext brief through
+    // the inter-agent message. Inheriting parent turns makes the local Claude
+    // session reprocess stale work and Codex-only instructions, so Claude must
+    // always start from task-only context.
+    let fork_mode =
+        task_fork_mode_for_wire_api(config.model_provider.wire_api, requested_fork_mode);
+    let is_full_history_fork = matches!(fork_mode, Some(SpawnAgentForkMode::FullHistory));
 
     let spawn_source = thread_spawn_source(
         session.thread_id,

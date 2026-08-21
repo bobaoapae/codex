@@ -1,3 +1,4 @@
+use crate::agent::control::SpawnAgentForkMode;
 use crate::agent::role::apply_role_to_config;
 use crate::agent::role::apply_role_to_config_for_multi_agent_v2;
 use crate::config::Config;
@@ -10,6 +11,7 @@ use crate::session::turn_context::TurnEnvironment;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
+use codex_model_provider_info::WireApi;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
@@ -32,6 +34,19 @@ pub(crate) const MIN_WAIT_TIMEOUT_MS: i64 = DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIME
 pub(crate) const DEFAULT_WAIT_TIMEOUT_MS: i64 = 30_000;
 pub(crate) const MAX_WAIT_TIMEOUT_MS: i64 = HARD_MAX_MULTI_AGENT_V2_TIMEOUT_MS;
 pub(crate) const MAX_SPAWN_AGENT_MODEL_OVERRIDES: usize = 5;
+
+/// Native Claude children receive their task through the inter-agent brief and must not inherit
+/// the parent's Codex conversation. Other child providers retain the requested fork semantics.
+pub(crate) fn task_fork_mode_for_wire_api(
+    wire_api: WireApi,
+    requested_fork_mode: Option<SpawnAgentForkMode>,
+) -> Option<SpawnAgentForkMode> {
+    if wire_api == WireApi::ClaudeCode {
+        None
+    } else {
+        requested_fork_mode
+    }
+}
 
 pub(crate) fn model_supports_multi_agent_backend(
     model: &ModelPreset,
@@ -475,4 +490,35 @@ fn validate_spawn_agent_reasoning_effort(
     Err(FunctionCallError::RespondToModel(format!(
         "Reasoning effort `{requested_reasoning_effort}` is not supported for model `{model}`. Supported reasoning efforts: {supported}"
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_claude_fork_is_always_task_only() {
+        assert_eq!(
+            task_fork_mode_for_wire_api(
+                WireApi::ClaudeCode,
+                Some(SpawnAgentForkMode::LastNTurns(10)),
+            ),
+            None
+        );
+        assert_eq!(
+            task_fork_mode_for_wire_api(WireApi::ClaudeCode, Some(SpawnAgentForkMode::FullHistory),),
+            None
+        );
+    }
+
+    #[test]
+    fn non_claude_fork_keeps_requested_history_mode() {
+        assert_eq!(
+            task_fork_mode_for_wire_api(
+                WireApi::Responses,
+                Some(SpawnAgentForkMode::LastNTurns(10)),
+            ),
+            Some(SpawnAgentForkMode::LastNTurns(10))
+        );
+    }
 }

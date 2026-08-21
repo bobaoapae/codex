@@ -1,4 +1,5 @@
 use super::*;
+use codex_protocol::models::AgentMessageInputContent;
 use codex_protocol::models::FunctionCallOutputPayload;
 
 fn user(text: &str) -> ResponseItem {
@@ -21,6 +22,18 @@ fn assistant(text: &str) -> ResponseItem {
             text: text.to_string(),
         }],
         phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    }
+}
+
+fn agent_message(text: &str) -> ResponseItem {
+    ResponseItem::AgentMessage {
+        id: None,
+        author: "/root".to_string(),
+        recipient: "/root/worker".to_string(),
+        content: vec![AgentMessageInputContent::InputText {
+            text: text.to_string(),
+        }],
         internal_chat_message_metadata_passthrough: None,
     }
 }
@@ -60,6 +73,40 @@ fn follow_up_sends_only_the_new_items() {
     assert!(plan.turn_text.contains("now add tests"));
     assert!(!plan.turn_text.contains("build the thing"));
     assert_eq!(plan.delivered_items, 3);
+}
+
+#[test]
+fn delegated_agent_message_is_rendered_as_the_current_user_instruction() {
+    let plan = plan_request(
+        &[agent_message(
+            "Message Type: NEW_TASK\nTask name: /root/worker\nPayload:\nImplement the fix",
+        )],
+        &ClaudeSessionContinuity::default(),
+    );
+
+    assert!(plan.turn_text.contains("<user>"));
+    assert!(plan.turn_text.contains("Implement the fix"));
+    assert!(plan.turn_text.contains("parent Codex agent /root"));
+    assert!(!plan.turn_text.contains("<codex_item>"));
+    assert!(!plan.turn_text.contains("\"author\""));
+}
+
+#[test]
+fn encrypted_agent_message_is_not_rendered_for_local_claude() {
+    let encrypted = ResponseItem::AgentMessage {
+        id: None,
+        author: "/root".to_string(),
+        recipient: "/root/worker".to_string(),
+        content: vec![AgentMessageInputContent::EncryptedContent {
+            encrypted_content: "ciphertext".to_string(),
+        }],
+        internal_chat_message_metadata_passthrough: None,
+    };
+
+    let plan = plan_request(&[encrypted], &ClaudeSessionContinuity::default());
+
+    assert!(!plan.turn_text.contains("ciphertext"));
+    assert!(!plan.turn_text.contains("<codex_item>"));
 }
 
 #[test]

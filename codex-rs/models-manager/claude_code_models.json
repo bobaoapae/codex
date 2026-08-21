@@ -34,7 +34,7 @@
         { "effort": "max", "description": "Maximum reasoning depth for the hardest problems" }
       ],
       "shell_type": "shell_command",
-      "visibility": "list",
+      "visibility": "hide",
       "minimal_client_version": "0.0.0",
       "supported_in_api": true,
       "availability_nux": null,
@@ -87,7 +87,7 @@
         { "effort": "max", "description": "Maximum reasoning depth for the hardest problems" }
       ],
       "shell_type": "shell_command",
-      "visibility": "list",
+      "visibility": "hide",
       "minimal_client_version": "0.0.0",
       "supported_in_api": true,
       "availability_nux": null,
