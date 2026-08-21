@@ -28,6 +28,7 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EnvironmentConfig;
+use codex_protocol::protocol::EnvironmentConfigState;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::Op;
@@ -102,45 +103,23 @@ impl ThreadConfigSnapshot {
         &self.environments.environments
     }
 
+    /// Whether the primary environment has resolved configuration, if one is selected.
+    pub fn is_primary_environment_configured(&self) -> bool {
+        self.environment_selections()
+            .first()
+            .is_none_or(|selection| {
+                matches!(
+                    selection.config,
+                    EnvironmentConfigState::FromThread | EnvironmentConfigState::Ready(_)
+                )
+            })
+    }
+
     pub fn sandbox_policy(&self) -> SandboxPolicy {
         codex_sandboxing::compatibility_sandbox_policy_for_permission_profile(
             &self.permission_profile,
             self.cwd().as_path(),
         )
-    }
-
-    pub fn into_thread_settings_snapshot(self) -> ThreadSettingsSnapshot {
-        let cwd = self.cwd().clone();
-        ThreadSettingsSnapshot {
-            model: self.model,
-            model_provider_id: self.model_provider_id,
-            service_tier: self.service_tier,
-            approval_policy: self.approval_policy,
-            approvals_reviewer: self.approvals_reviewer,
-            permission_profile: self.permission_profile,
-            active_permission_profile: self.active_permission_profile,
-            cwd,
-            reasoning_effort: self.reasoning_effort,
-            reasoning_summary: self.reasoning_summary,
-            personality: self.personality,
-            collaboration_mode: self.collaboration_mode,
-        }
-    }
-
-    fn into_thread_settings_overrides(self) -> CodexThreadSettingsOverrides {
-        CodexThreadSettingsOverrides {
-            environments: Some(self.environments),
-            profile_workspace_roots: Some(self.profile_workspace_roots),
-            approval_policy: Some(self.approval_policy),
-            approvals_reviewer: Some(self.approvals_reviewer),
-            permission_profile: Some(self.permission_profile),
-            active_permission_profile: self.active_permission_profile,
-            summary: self.reasoning_summary,
-            service_tier: Some(self.service_tier),
-            collaboration_mode: Some(self.collaboration_mode),
-            personality: self.personality,
-            ..Default::default()
-        }
     }
 }
 
@@ -161,6 +140,28 @@ pub struct CodexThreadSettingsOverrides {
     pub service_tier: Option<Option<String>>,
     pub collaboration_mode: Option<CollaborationMode>,
     pub personality: Option<Personality>,
+}
+
+/// One root conversation message exposed only to a worker's Guardian reviewers.
+#[derive(Debug, Eq, PartialEq)]
+pub enum GuardianRootMessage {
+    /// Genuine root-user input that can establish or revoke authorization.
+    User(String),
+    /// Root assistant final output that provides untrusted conversational context.
+    Assistant(String),
+}
+
+impl GuardianRootMessage {
+    /// Renders every line with its original role so message content cannot impersonate another role.
+    pub fn render(self) -> String {
+        let (role, text) = match self {
+            Self::User(text) => ("user", text),
+            Self::Assistant(text) => ("assistant", text),
+        };
+        text.lines()
+            .map(|line| format!("{role}: {line}\n"))
+            .collect()
+    }
 }
 
 pub struct CodexThread {
@@ -229,6 +230,25 @@ impl CodexThread {
     /// Wait until the underlying session loop has terminated.
     pub async fn wait_until_terminated(&self) {
         self.io.session_loop_termination.clone().await;
+    }
+
+    pub(crate) async fn emit_thread_ready_lifecycle(&self) {
+        let config = self.config().await;
+        for contributor in self
+            .session
+            .services
+            .extensions
+            .thread_lifecycle_contributors()
+        {
+            contributor
+                .on_thread_ready(codex_extension_api::ThreadReadyInput {
+                    config: config.as_ref(),
+                    session_source: &self.session_source,
+                    session_store: &self.session.services.session_extension_data,
+                    thread_store: &self.session.services.thread_extension_data,
+                })
+                .await;
+        }
     }
 
     pub(crate) async fn emit_thread_resume_lifecycle(&self) {
@@ -423,17 +443,15 @@ impl CodexThread {
         self.session.preview_settings(&updates).await
     }
 
-    /// Restores effective mutable settings captured from another loaded runtime.
+    /// Restores thread-owned mutable settings captured from another loaded runtime.
     ///
     /// Runtime replacement uses this after resume so clients keep their current thread settings
     /// rather than reverting to the original layer-backed config.
     pub async fn restore_thread_settings(
         &self,
-        snapshot: ThreadConfigSnapshot,
+        settings: CodexThreadSettingsOverrides,
     ) -> ConstraintResult<()> {
-        let updates = self
-            .thread_settings_update(snapshot.into_thread_settings_overrides())
-            .await;
+        let updates = self.thread_settings_update(settings).await;
         self.session.update_settings(updates).await
     }
 
@@ -648,6 +666,16 @@ impl CodexThread {
         self.session.thread_config_snapshot().await
     }
 
+    /// Returns thread-owned settings suitable for rollout persistence and resume.
+    pub async fn thread_settings_snapshot(&self) -> ThreadSettingsSnapshot {
+        self.session.thread_settings_snapshot().await
+    }
+
+    /// Captures thread-owned settings and environment selections for runtime restoration.
+    pub async fn restorable_thread_settings(&self) -> CodexThreadSettingsOverrides {
+        self.session.restorable_thread_settings().await
+    }
+
     /// Returns the MCP extensions declared by the client that created this runtime.
     pub fn client_mcp_extensions(&self) -> ClientMcpExtensions {
         self.session.services.client_mcp_extensions.clone()
@@ -692,6 +720,15 @@ impl CodexThread {
         self.session.multi_agent_version()
     }
 
+    /// Returns bounded root conversation evidence only for a MultiAgent V2 worker's Guardian review.
+    pub async fn guardian_root_conversation(&self) -> Option<Vec<GuardianRootMessage>> {
+        self.session
+            .services
+            .agent_control
+            .root_user_authorization(self.session.thread_id)
+            .await
+    }
+
     /// Refresh the thread's layer-backed user config state from a caller-supplied
     /// config snapshot. Thread-scoped layers and session-static settings remain
     /// unchanged.
@@ -734,6 +771,23 @@ impl CodexThread {
     pub async fn read_mcp_resource(
         &self,
         server: &str,
+        params: ReadResourceRequestParams,
+    ) -> anyhow::Result<serde_json::Value> {
+        self.session.refresh_mcp_if_dirty().await;
+        let result = self
+            .session
+            .services
+            .mcp_runtime
+            .latest_read_resource(server, params)
+            .await?;
+
+        Ok(serde_json::to_value(result)?)
+    }
+
+    /// Reads an app resource using the current authority of its originating tool call.
+    pub async fn read_mcp_resource_for_call(
+        &self,
+        call_id: &str,
         uri: &str,
     ) -> anyhow::Result<serde_json::Value> {
         self.session.refresh_mcp_if_dirty().await;
@@ -741,10 +795,30 @@ impl CodexThread {
             .session
             .services
             .mcp_runtime
-            .latest_read_resource(server, ReadResourceRequestParams::new(uri))
+            .read_resource_for_call(self.session.thread_id, call_id, uri)
             .await?;
 
         Ok(serde_json::to_value(result)?)
+    }
+
+    pub async fn start_mcp_event_stream(
+        &self,
+        name: &str,
+        arguments: serde_json::Value,
+        meta: Option<serde_json::Value>,
+    ) -> anyhow::Result<codex_mcp::McpEventStream> {
+        let meta = match meta.as_ref() {
+            Some(serde_json::Value::Object(meta)) => Some(meta),
+            Some(other) => {
+                anyhow::bail!("MCP event request _meta must be a JSON object, got {other}")
+            }
+            None => None,
+        };
+        let _ = self.session.services.auth_manager.auth().await;
+        self.session.refresh_mcp_if_dirty().await;
+        codex_mcp::McpResourceClient::new(Arc::clone(&self.session.services.mcp_runtime))
+            .open_event_stream(name, &arguments, meta)
+            .await
     }
 
     pub async fn call_mcp_tool(
@@ -758,7 +832,10 @@ impl CodexThread {
         self.session
             .services
             .mcp_runtime
-            .latest_call_tool(server, tool, arguments, meta)
+            .latest_call_tool(
+                server, tool, arguments, meta, /*requested_timeout*/ None,
+                /*wait_for_server*/ true,
+            )
             .await
     }
 

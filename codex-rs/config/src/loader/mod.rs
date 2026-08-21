@@ -2,6 +2,7 @@ mod layer_io;
 mod local;
 #[cfg(target_os = "macos")]
 mod macos;
+mod project_discovery;
 #[cfg(test)]
 mod tests;
 
@@ -364,6 +365,13 @@ pub async fn load_config_layers_state(
         if let Some(cli_overrides_layer) = cli_overrides_layer.as_ref() {
             merge_toml_values(&mut merged_so_far, cli_overrides_layer);
         }
+        // Managed config wins over CLI config. Apply it before choosing the
+        // project root and trust, but keep its final layers above project config.
+        project_discovery::merge_managed_config_for_discovery(
+            &mut merged_so_far,
+            &loaded_config_layers,
+            codex_home,
+        )?;
 
         let project_root_markers = match project_root_markers_from_config(&merged_so_far) {
             Ok(markers) => markers.unwrap_or_else(default_project_root_markers),
@@ -586,7 +594,10 @@ async fn load_config_toml_for_required_layer_raw(
     })?;
     let base_dir = AbsolutePathBuf::from_absolute_path(config_parent)?;
     let toml_file_uri = PathUri::from_abs_path(toml_file);
-    let toml_value = match fs.read_file_text(&toml_file_uri, /*sandbox*/ None).await {
+    let toml_value = match fs
+        .read_file_text(&toml_file_uri, Default::default(), /*sandbox*/ None)
+        .await
+    {
         Ok(contents) => {
             let config: TomlValue = toml::from_str(&contents).map_err(|err| {
                 let config_error =
@@ -677,7 +688,11 @@ pub async fn load_requirements_toml(
 ) -> io::Result<Option<RequirementsLayerEntry>> {
     let requirements_toml_file_uri = PathUri::from_abs_path(requirements_toml_file);
     match fs
-        .read_file_text(&requirements_toml_file_uri, /*sandbox*/ None)
+        .read_file_text(
+            &requirements_toml_file_uri,
+            Default::default(),
+            /*sandbox*/ None,
+        )
         .await
     {
         Ok(contents) => {
@@ -1053,9 +1068,11 @@ impl ProjectTrustContext {
         let gated_features = "project-local config, hooks, and exec policies";
         let trust_key = decision.trust_key.as_str();
         let user_config_file = self.user_config_file.as_path().display();
+        // Trust may come from managed config. Keep the explicit-untrusted prefix
+        // stable because the remote TUI uses it to recognize existing decisions.
         match decision.trust_level {
             Some(TrustLevel::Untrusted) => Some(format!(
-                "{trust_key} is marked as untrusted in {user_config_file}. To load {gated_features}, mark it trusted."
+                "{trust_key} is marked as untrusted in the effective configuration. To load {gated_features}, update its trust setting. If that setting is managed by your organization, contact your administrator."
             )),
             _ => Some(format!(
                 "To load {gated_features}, add {trust_key} as a trusted project in {user_config_file}."
@@ -1109,6 +1126,19 @@ fn sanitize_project_config(config: &mut TomlValue) -> Vec<String> {
         && features.remove("respect_system_proxy").is_some()
     {
         ignored_keys.push("features.respect_system_proxy".to_string());
+    }
+    // Repository contents must not turn an ordinary key into a permission increase.
+    if let Some(chat) = table
+        .get_mut("tui")
+        .and_then(|tui| tui.get_mut("keymap"))
+        .and_then(|keymap| keymap.get_mut("chat"))
+        .and_then(TomlValue::as_table_mut)
+    {
+        for key in ["previous_permission_mode", "next_permission_mode"] {
+            if chat.remove(key).is_some() {
+                ignored_keys.push(format!("tui.keymap.chat.{key}"));
+            }
+        }
     }
 
     ignored_keys
@@ -1305,13 +1335,26 @@ async fn find_project_root(
         for marker in project_root_markers {
             let marker_path = ancestor.join(marker);
             let marker_path_uri = PathUri::from_abs_path(&marker_path);
-            if fs
-                .get_metadata(&marker_path_uri, /*sandbox*/ None)
+            let Ok(metadata) = fs
+                .get_metadata(&marker_path_uri, Default::default(), /*sandbox*/ None)
                 .await
-                .is_ok()
+            else {
+                continue;
+            };
+            if marker == ".git"
+                && metadata.is_directory
+                && fs
+                    .get_metadata(
+                        &PathUri::from_abs_path(&marker_path.join("HEAD")),
+                        Default::default(),
+                        /*sandbox*/ None,
+                    )
+                    .await
+                    .is_err()
             {
-                return Ok(ancestor);
+                continue;
             }
+            return Ok(ancestor);
         }
     }
     Ok(cwd.clone())
@@ -1322,7 +1365,10 @@ async fn find_git_checkout_root(
     cwd: &AbsolutePathBuf,
 ) -> Option<AbsolutePathBuf> {
     let cwd_uri = PathUri::from_abs_path(cwd);
-    let base = match fs.get_metadata(&cwd_uri, /*sandbox*/ None).await {
+    let base = match fs
+        .get_metadata(&cwd_uri, Default::default(), /*sandbox*/ None)
+        .await
+    {
         Ok(metadata) if metadata.is_directory => cwd.clone(),
         _ => cwd.parent()?,
     };
@@ -1330,13 +1376,25 @@ async fn find_git_checkout_root(
     for dir in base.ancestors() {
         let dot_git = dir.join(".git");
         let dot_git_uri = PathUri::from_abs_path(&dot_git);
-        if fs
-            .get_metadata(&dot_git_uri, /*sandbox*/ None)
+        let Ok(metadata) = fs
+            .get_metadata(&dot_git_uri, Default::default(), /*sandbox*/ None)
             .await
-            .is_ok()
+        else {
+            continue;
+        };
+        if metadata.is_directory
+            && fs
+                .get_metadata(
+                    &PathUri::from_abs_path(&dot_git.join("HEAD")),
+                    Default::default(),
+                    /*sandbox*/ None,
+                )
+                .await
+                .is_err()
         {
-            return Some(dir);
+            continue;
         }
+        return Some(dir);
     }
     None
 }
@@ -1444,7 +1502,7 @@ async fn discover_project_layers(
         let dot_codex_abs = dir.join(".codex");
         let dot_codex_uri = PathUri::from_abs_path(&dot_codex_abs);
         if !fs
-            .get_metadata(&dot_codex_uri, /*sandbox*/ None)
+            .get_metadata(&dot_codex_uri, Default::default(), /*sandbox*/ None)
             .await
             .map(|metadata| metadata.is_directory)
             .unwrap_or(false)
@@ -1462,7 +1520,10 @@ async fn discover_project_layers(
         }
         let config_file = dot_codex_abs.join(CONFIG_TOML_FILE);
         let config_file_uri = PathUri::from_abs_path(&config_file);
-        match fs.read_file_text(&config_file_uri, /*sandbox*/ None).await {
+        match fs
+            .read_file_text(&config_file_uri, Default::default(), /*sandbox*/ None)
+            .await
+        {
             Ok(contents) => {
                 let config: TomlValue = match toml::from_str(&contents) {
                     Ok(config) => config,
@@ -1574,7 +1635,11 @@ async fn load_root_checkout_project_config(
     let hooks_config_file_uri = PathUri::from_abs_path(&hooks_config_file);
     Ok(
         match fs
-            .read_file_text(&hooks_config_file_uri, /*sandbox*/ None)
+            .read_file_text(
+                &hooks_config_file_uri,
+                Default::default(),
+                /*sandbox*/ None,
+            )
             .await
         {
             Ok(contents) => {

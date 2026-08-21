@@ -40,6 +40,7 @@ mod agent_execution;
 mod agent_websocket;
 mod agents_md;
 mod apply_patch_cli;
+mod apply_patch_serialization;
 #[cfg(not(target_os = "windows"))]
 mod approvals;
 mod audio_truncation;
@@ -69,6 +70,8 @@ mod fork_thread;
 mod git_enrichment;
 #[cfg(not(target_os = "windows"))]
 mod guardian_review;
+#[cfg(not(target_os = "windows"))]
+mod guardian_subagent_authorization;
 #[cfg(not(target_os = "windows"))]
 mod hooks;
 #[cfg(not(target_os = "windows"))]
@@ -133,8 +136,7 @@ mod rollout_list_find;
 mod safety_buffering;
 mod safety_check_downgrade;
 mod search_tool;
-mod shell_command;
-mod shell_serialization;
+mod send_user_message_async;
 mod shell_snapshot;
 mod skill_approval;
 mod skills;
@@ -166,3 +168,4 @@ mod window_headers;
 #[cfg(target_os = "windows")]
 mod windows_sandbox;
 mod workspace_roots;
+mod worktree_trust;

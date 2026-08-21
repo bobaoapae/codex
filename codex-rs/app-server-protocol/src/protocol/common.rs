@@ -1144,6 +1144,20 @@ client_request_definitions! {
         response: v2::McpResourceReadResponse,
     },
 
+    #[experimental("mcpServer/event/stream/start")]
+    McpServerEventStreamStart => "mcpServer/event/stream/start" {
+        params: v2::McpServerEventStreamStartParams,
+        serialization: None,
+        response: v2::McpServerEventStreamStartResponse,
+    },
+
+    #[experimental("mcpServer/event/stream/stop")]
+    McpServerEventStreamStop => "mcpServer/event/stream/stop" {
+        params: v2::McpServerEventStreamStopParams,
+        serialization: None,
+        response: v2::McpServerEventStreamStopResponse,
+    },
+
     McpServerToolCall => "mcpServer/tool/call" {
         params: v2::McpServerToolCallParams,
         serialization: thread_id(params.thread_id),
@@ -1166,6 +1180,20 @@ client_request_definitions! {
         inspect_params: true,
         serialization: global("account-auth"),
         response: v2::LoginAccountResponse,
+    },
+
+    #[experimental("account/bedrock/discover")]
+    BedrockDiscover => "account/bedrock/discover" {
+        params: v2::BedrockDiscoverParams,
+        serialization: global_shared_read("account-auth"),
+        response: v2::BedrockDiscoverResponse,
+    },
+
+    #[experimental("account/bedrock/setup")]
+    BedrockSetup => "account/bedrock/setup" {
+        params: v2::BedrockSetupParams,
+        serialization: global("account-auth"),
+        response: v2::BedrockSetupResponse,
     },
 
     CancelLoginAccount => "account/login/cancel" {
@@ -1824,6 +1852,8 @@ server_notification_definitions! {
     ItemStarted => "item/started" (v2::ItemStartedNotification),
     ItemGuardianApprovalReviewStarted => "item/autoApprovalReview/started" (v2::ItemGuardianApprovalReviewStartedNotification),
     ItemGuardianApprovalReviewCompleted => "item/autoApprovalReview/completed" (v2::ItemGuardianApprovalReviewCompletedNotification),
+    #[experimental("autoApprovalReview/strictReviewRequired")]
+    StrictReviewRequired => "autoApprovalReview/strictReviewRequired" (v2::StrictReviewRequiredNotification),
     ItemCompleted => "item/completed" (v2::ItemCompletedNotification),
     /// This event is internal-only. Used by Codex Cloud.
     RawResponseItemCompleted => "rawResponseItem/completed" (v2::RawResponseItemCompletedNotification),
@@ -1849,6 +1879,8 @@ server_notification_definitions! {
     McpToolCallProgress => "item/mcpToolCall/progress" (v2::McpToolCallProgressNotification),
     McpServerOauthLoginCompleted => "mcpServer/oauthLogin/completed" (v2::McpServerOauthLoginCompletedNotification),
     McpServerStatusUpdated => "mcpServer/startupStatus/updated" (v2::McpServerStatusUpdatedNotification),
+    #[experimental("mcpServer/event/stream/notification")]
+    McpServerEventStream => "mcpServer/event/stream/notification" (v2::McpServerEventStreamNotification),
     AccountUpdated => "account/updated" (v2::AccountUpdatedNotification),
     AccountRateLimitsUpdated => "account/rateLimits/updated" (v2::AccountRateLimitsUpdatedNotification),
     AppListUpdated => "app/list/updated" (v2::AppListUpdatedNotification),
@@ -2326,8 +2358,10 @@ mod tests {
             request_id: request_id(),
             params: v2::McpResourceReadParams {
                 thread_id: Some("thread-1".to_string()),
+                origin_call_id: None,
                 server: "server-a".to_string(),
                 uri: "file:///tmp/resource".to_string(),
+                connector_id: None,
             },
         };
         assert_eq!(
@@ -2513,8 +2547,10 @@ mod tests {
             request_id: request_id(),
             params: v2::McpResourceReadParams {
                 thread_id: None,
+                origin_call_id: None,
                 server: "server-a".to_string(),
                 uri: "file:///tmp/resource".to_string(),
+                connector_id: None,
             },
         };
         assert_eq!(mcp_resource_read.serialization_scope(), None);
@@ -2899,7 +2935,9 @@ mod tests {
             turn_id: Some("turn_123".to_string()),
             server_name: "codex_apps".to_string(),
             request: v2::McpServerElicitationRequest::Form {
-                meta: None,
+                meta: Some(json!({
+                    "suggestion_id": "request_plugin_install_install-github"
+                })),
                 message: "Allow this request?".to_string(),
                 requested_schema,
             },
@@ -2918,7 +2956,9 @@ mod tests {
                     "turnId": "turn_123",
                     "serverName": "codex_apps",
                     "mode": "form",
-                    "_meta": null,
+                    "_meta": {
+                        "suggestion_id": "request_plugin_install_install-github"
+                    },
                     "message": "Allow this request?",
                     "requestedSchema": {
                         "type": "object",

@@ -120,6 +120,7 @@ impl SessionTarget {
 #[derive(Debug, Clone)]
 pub enum SessionSelection {
     StartFresh,
+    AgentsOverview,
     Resume(SessionTarget),
     Fork(SessionTarget),
     Exit,
@@ -6331,6 +6332,7 @@ session_picker_view = "dense"
                         text: String::from("hello from assistant"),
                         phase: None,
                         memory_citation: None,
+                        delivery: None,
                     },
                     ThreadItem::Plan {
                         id: String::from("plan-1"),

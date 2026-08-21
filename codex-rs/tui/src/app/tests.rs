@@ -11,6 +11,8 @@ mod key_chords;
 #[path = "tests/mcp_startup.rs"]
 mod mcp_startup;
 mod model_catalog;
+#[path = "tests/permission_shortcuts_tests.rs"]
+mod permission_shortcuts_tests;
 mod plugin_catalog;
 mod rate_limits;
 mod safety_buffering;
@@ -377,7 +379,30 @@ async fn enqueue_primary_thread_session_replays_buffered_approval_after_attach()
             .note_server_request(&approval_request),
         None
     );
-    app.enqueue_primary_thread_request(approval_request).await?;
+    app.agents_overview
+        .dispatched_requests
+        .insert(thread_id, vec![approval_request.clone()]);
+    app.enqueue_primary_thread_request(approval_request.clone())
+        .await?;
+    let (mut app_server, requests, proxy) = session_lifecycle_requests::start_recording_app_server(
+        &app.config,
+        /*blocked_thread_list*/ None,
+        /*failed_thread_name*/ None,
+    )
+    .await?;
+    app.handle_app_server_event(
+        &app_server,
+        codex_app_server_client::AppServerEvent::ServerNotification(Box::new(
+            ServerNotification::ServerRequestResolved(
+                codex_app_server_protocol::ServerRequestResolvedNotification {
+                    thread_id: ThreadId::new().to_string(),
+                    request_id: AppServerRequestId::Integer(1),
+                },
+            ),
+        )),
+    )
+    .await;
+    assert_eq!(app.agents_overview.dispatched_requests[&thread_id].len(), 1);
     app.enqueue_primary_thread_session(
         test_thread_session(thread_id, test_path_buf("/tmp/project")),
         Vec::new(),
@@ -404,21 +429,49 @@ async fn enqueue_primary_thread_session_replays_buffered_approval_after_attach()
     ));
 
     app.handle_thread_event_now(event);
-    app.chat_widget
-        .handle_key_event(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    let background_thread_id = ThreadId::new();
+    let mut background_request = approval_request;
+    let ServerRequest::CommandExecutionRequestApproval { request_id, params } =
+        &mut background_request
+    else {
+        unreachable!("expected a command approval request");
+    };
+    *request_id = AppServerRequestId::Integer(2);
+    params.thread_id = background_thread_id.to_string();
+    app.pending_app_server_requests
+        .note_server_request(&background_request);
+    app.enqueue_thread_request(background_thread_id, background_request)
+        .await?;
 
-    while let Ok(app_event) = app_event_rx.try_recv() {
-        if let AppEvent::SubmitThreadOp {
-            thread_id: op_thread_id,
-            ..
-        } = app_event
-        {
-            assert_eq!(op_thread_id, thread_id);
-            return Ok(());
-        }
+    for expected_thread_id in [thread_id, background_thread_id] {
+        assert!(app.chat_widget.has_active_view());
+        app.chat_widget
+            .handle_key_event(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        let (actual_thread_id, op) = std::iter::from_fn(|| app_event_rx.try_recv().ok())
+            .find_map(|event| match event {
+                AppEvent::SubmitThreadOp { thread_id, op } => Some((thread_id, op)),
+                _ => None,
+            })
+            .expect("approval should submit a thread-scoped operation");
+        assert_eq!(actual_thread_id, expected_thread_id);
+        app.submit_thread_op(&mut app_server, expected_thread_id, op)
+            .await?;
     }
+    assert!(!app.chat_widget.has_active_view());
 
-    panic!("expected approval action to submit a thread-scoped op");
+    app_server.shutdown().await?;
+    proxy.await??;
+    assert_eq!(
+        requests
+            .lock()
+            .expect("request recorder lock")
+            .iter()
+            .filter(|request| request.method == "server/request/response")
+            .map(|request| request.id.clone())
+            .collect::<Vec<_>>(),
+        (1..=2).map(AppServerRequestId::Integer).collect::<Vec<_>>()
+    );
+    Ok(())
 }
 
 #[tokio::test]
@@ -445,7 +498,7 @@ async fn resolved_buffered_approval_does_not_become_actionable_after_drain() -> 
 
     let resolved = app
         .pending_app_server_requests
-        .resolve_notification(&AppServerRequestId::Integer(1))
+        .resolve_notification(&thread_id.to_string(), &AppServerRequestId::Integer(1))
         .expect("matching app-server request should resolve");
     app.chat_widget.dismiss_app_server_request(&resolved);
     while app_event_rx.try_recv().is_ok() {}
@@ -703,6 +756,117 @@ async fn enqueue_thread_event_does_not_block_when_channel_full() -> Result<()> {
 }
 
 #[tokio::test]
+async fn active_thread_drain_yields_after_frame_deadline_without_dropping_events() -> Result<()> {
+    let mut app = make_test_app().await;
+    app.startup_protected_input_boundary = true;
+    let thread_id = ThreadId::new();
+    app.thread_event_channels
+        .insert(thread_id, ThreadEventChannel::new(/*capacity*/ 2));
+    app.activate_thread_channel(thread_id).await;
+
+    let first_event = token_usage_notification(thread_id, "turn-1", Some(100));
+    let mut second_event = token_usage_notification(thread_id, "turn-1", Some(100));
+    if let ServerNotification::ThreadTokenUsageUpdated(notification) = &mut second_event {
+        notification.token_usage.total.output_tokens = 10;
+        notification.token_usage.total.total_tokens = 15;
+    }
+    for event in [first_event, second_event] {
+        app.enqueue_thread_notification(thread_id, event).await?;
+    }
+
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    app.drain_active_thread_events_until(&mut tui, Instant::now())
+        .await?;
+    assert_eq!(
+        app.chat_widget.token_usage(),
+        crate::token_usage::TokenUsage {
+            input_tokens: 4,
+            cached_input_tokens: 1,
+            output_tokens: 5,
+            reasoning_output_tokens: 0,
+            total_tokens: 10,
+        }
+    );
+    assert!(
+        app.active_thread_rx
+            .as_ref()
+            .is_some_and(|receiver| !receiver.is_empty()),
+        "an expired frame deadline should preserve queued notifications"
+    );
+    assert!(
+        !app.has_queued_startup_protected_request(),
+        "ordinary notifications left by the frame deadline must not block terminal input"
+    );
+
+    app.drain_active_thread_events(&mut tui).await?;
+    assert!(
+        app.active_thread_rx
+            .as_ref()
+            .is_some_and(tokio::sync::mpsc::Receiver::is_empty),
+        "the next foreground frame should deliver the preserved notification"
+    );
+    assert_eq!(
+        app.chat_widget.token_usage(),
+        crate::token_usage::TokenUsage {
+            input_tokens: 4,
+            cached_input_tokens: 1,
+            output_tokens: 10,
+            reasoning_output_tokens: 0,
+            total_tokens: 15,
+        }
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn selected_side_thread_close_is_handled_by_foreground_event_owner() -> Result<()> {
+    let mut app = make_test_app().await;
+    let mut app_server = crate::start_embedded_app_server_for_picker(&app.config).await?;
+    let primary = app_server.start_thread(&app.config).await?;
+    let primary_thread_id = primary.session.thread_id;
+    app.enqueue_primary_thread_session(primary.session, primary.turns)
+        .await?;
+
+    let side_thread_id = ThreadId::new();
+    let side_channel = ThreadEventChannel::new(/*capacity*/ 1);
+    side_channel.store.lock().await.set_session(
+        test_thread_session(side_thread_id, app.config.cwd.to_path_buf()),
+        Vec::new(),
+    );
+    side_channel
+        .sender
+        .try_send(ThreadBufferedEvent::Notification(Box::new(
+            thread_closed_notification(side_thread_id),
+        )))
+        .expect("closed side-thread notification should fit in its saved receiver");
+    app.thread_event_channels
+        .insert(side_thread_id, side_channel);
+    app.side_threads
+        .insert(side_thread_id, SideThreadState::new(primary_thread_id));
+
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    app.select_agent_thread(&mut tui, &mut app_server, side_thread_id)
+        .await?;
+    assert_eq!(app.active_thread_id, Some(side_thread_id));
+    let event = app
+        .active_thread_rx
+        .as_mut()
+        .expect("selected side thread should retain its receiver")
+        .try_recv()
+        .expect("thread closure should remain queued for the foreground loop");
+    app.handle_active_thread_event(&mut tui, &mut app_server, event)
+        .await?;
+
+    assert_eq!(app.active_thread_id, Some(primary_thread_id));
+    assert!(!app.side_threads.contains_key(&side_thread_id));
+    assert!(!app.thread_event_channels.contains_key(&side_thread_id));
+    assert!(app.active_thread_rx.is_some());
+    app_server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn active_history_batch_is_delivered_without_replay_buffering() -> Result<()> {
     let mut app = make_test_app().await;
     let thread_id = ThreadId::new();
@@ -866,6 +1030,27 @@ async fn replay_thread_snapshot_restores_draft_and_queued_input() {
     let (chat_widget, _app_event_tx, _rx, mut new_op_rx) =
         make_chatwidget_manual_with_sender().await;
     app.chat_widget = chat_widget;
+    let outgoing_thread_id = ThreadId::new();
+    app.chat_widget.handle_thread_session(test_thread_session(
+        outgoing_thread_id,
+        test_path_buf("/tmp/outgoing-project"),
+    ));
+    app.chat_widget.handle_server_notification(
+        turn_started_notification(outgoing_thread_id, "outgoing-turn"),
+        /*replay_kind*/ None,
+    );
+    app.chat_widget
+        .apply_external_edit("outgoing queued input".to_string());
+    app.chat_widget
+        .handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    app.chat_widget
+        .set_queue_autosend_suppressed(/*suppressed*/ true);
+    app.chat_widget.handle_server_notification(
+        turn_completed_notification(outgoing_thread_id, "outgoing-turn", TurnStatus::Completed),
+        /*replay_kind*/ None,
+    );
+    app.chat_widget
+        .set_queue_autosend_suppressed(/*suppressed*/ false);
 
     app.replay_thread_snapshot(snapshot, /*resume_restored_queue*/ true);
 
@@ -3436,6 +3621,126 @@ async fn inactive_thread_file_change_approval_recovers_buffered_changes() {
 }
 
 #[tokio::test]
+async fn active_thread_file_change_approval_recovers_buffered_changes() {
+    let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    let thread_id = ThreadId::new();
+    app.active_thread_id = Some(thread_id);
+    app.startup_protected_input_boundary = true;
+    app.enqueue_thread_notification(
+        thread_id,
+        ServerNotification::ItemStarted(ItemStartedNotification {
+            thread_id: thread_id.to_string(),
+            turn_id: "turn-active-approval".to_string(),
+            started_at_ms: 0,
+            item: ThreadItem::FileChange {
+                id: "patch-active-approval".to_string(),
+                changes: vec![FileUpdateChange {
+                    path: "visible-target.md".to_string(),
+                    kind: PatchChangeKind::Add,
+                    diff: "hello\n".to_string(),
+                }],
+                status: codex_app_server_protocol::PatchApplyStatus::InProgress,
+            },
+        }),
+    )
+    .await
+    .expect("enqueue file change item");
+
+    let request = ServerRequest::FileChangeRequestApproval {
+        request_id: AppServerRequestId::Integer(10),
+        params: FileChangeRequestApprovalParams {
+            thread_id: thread_id.to_string(),
+            turn_id: "turn-active-approval".to_string(),
+            item_id: "patch-active-approval".to_string(),
+            started_at_ms: 0,
+            reason: None,
+            grant_root: None,
+        },
+    };
+    assert_eq!(
+        app.pending_app_server_requests
+            .note_server_request(&request),
+        None
+    );
+    app.chat_widget.handle_server_notification(
+        agent_message_delta_notification(thread_id, "turn-active-approval", "agent-1", "streaming"),
+        /*replay_kind*/ None,
+    );
+    let event = ThreadBufferedEvent::Request(Box::new(request));
+    app.handle_thread_event_now_recovering_file_changes(event)
+        .await;
+
+    assert!(!app.chat_widget.has_active_view());
+    assert!(app.startup_pending_protected_request);
+    app.chat_widget.handle_server_notification(
+        ServerNotification::ItemCompleted(codex_app_server_protocol::ItemCompletedNotification {
+            thread_id: thread_id.to_string(),
+            turn_id: "turn-active-approval".to_string(),
+            completed_at_ms: 0,
+            item: ThreadItem::AgentMessage {
+                id: "agent-1".to_string(),
+                text: "streaming".to_string(),
+                phase: None,
+                memory_citation: None,
+                delivery: None,
+            },
+        }),
+        /*replay_kind*/ None,
+    );
+
+    let rendered = render_bottom_popup(&app.chat_widget, /*width*/ 100);
+    let destination = app.chat_widget.config_ref().cwd.join("visible-target.md");
+    assert!(rendered.contains("Description: Apply proposed file edits"));
+    assert!(rendered.contains(&format!("Destination: {}", destination.display())));
+}
+
+#[tokio::test]
+async fn replayed_file_change_approval_recovers_snapshot_changes() {
+    let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    let thread_id = ThreadId::new();
+    let cwd = test_path_buf("/tmp/project").abs();
+    app.replay_thread_snapshot(
+        ThreadEventSnapshot {
+            session: Some(test_thread_session(thread_id, cwd.clone().into_path_buf())),
+            turns: vec![test_turn(
+                "turn-replayed-approval",
+                TurnStatus::InProgress,
+                vec![ThreadItem::FileChange {
+                    id: "patch-replayed-approval".to_string(),
+                    changes: vec![FileUpdateChange {
+                        path: "visible-target.md".to_string(),
+                        kind: PatchChangeKind::Add,
+                        diff: "hello\n".to_string(),
+                    }],
+                    status: codex_app_server_protocol::PatchApplyStatus::InProgress,
+                }],
+            )],
+            events: vec![ThreadBufferedEvent::Request(Box::new(
+                ServerRequest::FileChangeRequestApproval {
+                    request_id: AppServerRequestId::Integer(11),
+                    params: FileChangeRequestApprovalParams {
+                        thread_id: thread_id.to_string(),
+                        turn_id: "turn-replayed-approval".to_string(),
+                        item_id: "patch-replayed-approval".to_string(),
+                        started_at_ms: 0,
+                        reason: None,
+                        grant_root: None,
+                    },
+                },
+            ))],
+            input_state: None,
+        },
+        /*resume_restored_queue*/ false,
+    );
+
+    let rendered = render_bottom_popup(&app.chat_widget, /*width*/ 100).replace(
+        &cwd.join("visible-target.md").display().to_string(),
+        "/tmp/project/visible-target.md",
+    );
+    assert_app_snapshot!("replayed_file_change_approval", rendered);
+}
+
+#[tokio::test]
 async fn inactive_thread_permissions_approval_preserves_file_system_permissions() {
     let app = make_test_app().await;
     let thread_id = ThreadId::new();
@@ -4754,11 +5059,14 @@ async fn background_side_cleanup_removes_local_state_and_ignores_late_events() -
     .await;
     let resolution = app
         .pending_app_server_requests
-        .take_resolution(Op::ExecApproval {
-            id: "approval-1".to_string(),
-            turn_id: None,
-            decision: codex_app_server_protocol::CommandExecutionApprovalDecision::Accept,
-        })
+        .take_resolution(
+            &side_thread_id.to_string(),
+            Op::ExecApproval {
+                id: "approval-1".to_string(),
+                turn_id: None,
+                decision: codex_app_server_protocol::CommandExecutionApprovalDecision::Accept,
+            },
+        )
         .expect("approval resolution should serialize");
     assert_eq!(resolution, None);
     Ok(())
@@ -5518,6 +5826,77 @@ async fn resize_reflow_wraps_transcript_early_when_pet_is_enabled() {
 }
 
 #[tokio::test]
+async fn copy_picker_opening_preserves_terminal_scrollback_without_reflow() {
+    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    let response = "Existing response\n\n```rust\nkeep_scrollback();\n```";
+    app.chat_widget.handle_server_notification(
+        ServerNotification::ItemCompleted(codex_app_server_protocol::ItemCompletedNotification {
+            thread_id: String::new(),
+            turn_id: "turn-1".to_string(),
+            completed_at_ms: 0,
+            item: serde_json::from_value(serde_json::json!({
+                "type": "agentMessage",
+                "id": "message-1",
+                "text": response,
+            }))
+            .expect("valid completed agent message"),
+        }),
+        /*replay_kind*/ None,
+    );
+    while app_event_rx.try_recv().is_ok() {}
+
+    app.transcript_cells = vec![
+        plain_line_cell("Older terminal scrollback"),
+        Arc::new(AgentMarkdownCell::new(
+            response.to_string(),
+            Path::new("/tmp"),
+        )),
+    ];
+    app.deferred_history_lines = vec![Line::from("Buffered scrollback").into()];
+    app.has_emitted_history_lines = true;
+    app.scrollback_has_older_history = true;
+    app.transcript_reflow.note_width(/*width*/ 80);
+    let before = app
+        .render_transcript_lines_for_reflow(/*width*/ 80)
+        .lines
+        .iter()
+        .map(rendered_line_text)
+        .collect::<Vec<_>>();
+
+    app.chat_widget.apply_external_edit("/copy".to_string());
+    assert!(!render_bottom_popup(&app.chat_widget, /*width*/ 80).contains("Whole response"));
+    app.chat_widget
+        .handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert!(render_bottom_popup(&app.chat_widget, /*width*/ 80).contains("Whole response"));
+    assert_eq!(
+        app.render_transcript_lines_for_reflow(/*width*/ 80)
+            .lines
+            .iter()
+            .map(rendered_line_text)
+            .collect::<Vec<_>>(),
+        before
+    );
+    assert_eq!(app.transcript_cells.len(), 2);
+    assert_eq!(app.deferred_history_lines.len(), 1);
+    assert!(app.has_emitted_history_lines);
+    assert!(app.scrollback_has_older_history);
+    assert!(!app.transcript_reflow.has_pending_reflow());
+    while let Ok(event) = app_event_rx.try_recv() {
+        assert!(
+            !matches!(
+                event,
+                AppEvent::ClearUi { .. }
+                    | AppEvent::ClearUiAndSubmitUserMessage { .. }
+                    | AppEvent::InsertHistoryCell(_)
+                    | AppEvent::ConsolidateAgentMessage { .. }
+            ),
+            "opening a picker must not modify terminal scrollback: {event:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn uncapped_resize_reflow_renders_all_cells_under_row_limit() {
     let (mut app, _rx, _op_rx) = make_test_app_with_channels().await;
     app.config.terminal_resize_reflow.max_rows = TerminalResizeReflowMaxRows::Limit(100);
@@ -6075,33 +6454,6 @@ fn active_turn_not_steerable_turn_error_extracts_structured_server_error() {
         active_turn_not_steerable_turn_error(&error),
         Some(turn_error)
     );
-}
-
-#[test]
-fn session_start_error_surfaces_archived_guidance_without_rollout_path() {
-    let thread_id =
-        ThreadId::from_string("019e72f4-e09a-70f2-b2c2-a153a57b8cc0").expect("thread id");
-    let target_session = SessionTarget {
-        path: Some(std::path::PathBuf::from(
-            "/Users/me/.codex/archived_sessions/rollout.jsonl",
-        )),
-        thread_id,
-        history_mode: None,
-    };
-    let expected = format!(
-        "session {thread_id} is archived. Run `codex unarchive {thread_id}` to unarchive it first."
-    );
-
-    for action in ["resume", "fork"] {
-        let err = color_eyre::eyre::eyre!(
-            "thread/{action} failed during TUI bootstrap: thread/{action} failed: {expected} (code -32600)"
-        );
-
-        assert_eq!(
-            session_start_error(action, &target_session, err).to_string(),
-            expected
-        );
-    }
 }
 
 #[test]
@@ -7116,6 +7468,7 @@ async fn replay_thread_snapshot_replays_turn_history_in_order() {
                             text: "done".to_string(),
                             phase: None,
                             memory_citation: None,
+                            delivery: None,
                         },
                     ],
                     status: TurnStatus::Completed,

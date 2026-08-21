@@ -7,8 +7,10 @@ use codex_analytics::GuardianReviewTrackContext;
 use codex_analytics::GuardianReviewedAction;
 use codex_core_plugins::PluginCommandAttribution;
 use codex_extension_api::ThreadIdleCause;
+use codex_features::Feature;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::openai_models::MODEL_SPECIALTY_CYBER;
+use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::EventMsg;
@@ -75,8 +77,7 @@ fn plugin_attribution_for_guardian_request(
     request: &GuardianApprovalRequest,
 ) -> Option<PluginCommandAttribution> {
     match request {
-        GuardianApprovalRequest::Shell { command, cwd, .. }
-        | GuardianApprovalRequest::ExecCommand { command, cwd, .. } => {
+        GuardianApprovalRequest::ExecCommand { command, cwd, .. } => {
             turn.plugin_attribution_for_command(command, cwd)
         }
         #[cfg(unix)]
@@ -100,8 +101,14 @@ pub(crate) fn new_guardian_review_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-pub(crate) fn guardian_timeout_message() -> String {
-    GUARDIAN_TIMEOUT_INSTRUCTIONS.to_string()
+pub(crate) fn guardian_timeout_message(model_info: &ModelInfo) -> String {
+    model_info
+        .model_messages
+        .as_ref()
+        .and_then(|messages| messages.auto_review.as_ref())
+        .and_then(|messages| messages.timeout_instructions.as_deref())
+        .unwrap_or(GUARDIAN_TIMEOUT_INSTRUCTIONS)
+        .to_string()
 }
 
 #[derive(Debug)]
@@ -312,11 +319,13 @@ async fn run_guardian_review(
     options: GuardianReviewOptions,
 ) -> ReviewDecision {
     let turn = Arc::clone(context.turn());
-    if !turn
+    // Required models must use Guardian, but an enabled V2 monitor can satisfy the review.
+    if (!turn
         .config
         .config_layer_stack
         .requirements()
         .auto_review_required_for_model(&turn.model_info.slug)
+        || turn.config.features.enabled(Feature::GuardianV2))
         && reasons.retry.is_none()
         && options
             .external_cancel
@@ -330,6 +339,9 @@ async fn run_guardian_review(
                 &session.services.session_extension_data,
                 &session.services.thread_extension_data,
                 &action.to_string(),
+                Some(crate::session::extension_metrics::from_session_telemetry(
+                    turn.session_telemetry.clone(),
+                )),
             )
             .await
     {
@@ -659,8 +671,15 @@ async fn run_guardian_review(
         } else {
             assessment.rationale.trim()
         };
+        let rejection_instructions = turn
+            .model_info
+            .model_messages
+            .as_ref()
+            .and_then(|messages| messages.auto_review.as_ref())
+            .and_then(|messages| messages.rejection_instructions.as_deref())
+            .unwrap_or(GUARDIAN_REJECTION_INSTRUCTIONS);
         ReviewDecision::denied(format!(
-            "This action was rejected due to unacceptable risk.\nReason: {rationale}\n{GUARDIAN_REJECTION_INSTRUCTIONS}"
+            "This action was rejected due to unacceptable risk.\nReason: {rationale}\n{rejection_instructions}"
         ))
     }
 }
@@ -835,6 +854,16 @@ pub(super) async fn guardian_review_session_config(
         guardian_reasoning_effort.clone(),
         guardian_model_info.model_messages.as_ref(),
     )?;
+    if turn.model_info.node_repl_auto_review_required {
+        spawn_config
+            .features
+            .enable(Feature::RetainClientDeveloperMessages)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "guardian review session could not preserve Node REPL developer policy: {error}"
+                )
+            })?;
+    }
     if guardian_model != turn.model_info.slug {
         spawn_config.model_context_window = None;
         spawn_config.model_auto_compact_token_limit = None;

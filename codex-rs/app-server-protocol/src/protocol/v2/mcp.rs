@@ -85,8 +85,13 @@ pub struct ListMcpServerStatusResponse {
 pub struct McpResourceReadParams {
     #[ts(optional = nullable)]
     pub thread_id: Option<String>,
+    /// Originating MCP tool call used to select the resource's app.
+    #[ts(optional = nullable)]
+    pub origin_call_id: Option<String>,
     pub server: String,
     pub uri: String,
+    #[ts(optional = nullable)]
+    pub connector_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -94,6 +99,55 @@ pub struct McpResourceReadParams {
 #[ts(export_to = "v2/")]
 pub struct McpResourceReadResponse {
     pub contents: Vec<McpResourceContent>,
+    /// Originating call when the server applied app-specific resource scoping.
+    pub origin_call_id: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct McpServerEventStreamStartParams {
+    pub thread_id: String,
+    pub server: String,
+    pub subscription_id: String,
+    pub name: String,
+    pub arguments: JsonValue,
+    #[serde(rename = "_meta")]
+    #[ts(rename = "_meta", optional = nullable)]
+    pub meta: Option<JsonValue>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct McpServerEventStreamStartResponse {}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct McpServerEventStreamStopParams {
+    pub subscription_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct McpServerEventStreamStopResponse {}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct McpServerEventNotification {
+    pub method: String,
+    pub params: JsonValue,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct McpServerEventStreamNotification {
+    pub subscription_id: String,
+    pub notification: McpServerEventNotification,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

@@ -154,7 +154,9 @@ fn reasoning_is_not_replayed_but_tool_traffic_is() {
         },
         ResponseItem::FunctionCallOutput {
             id: None,
-            call_id: "call-1".to_string(),
+            call_id: Some("call-1".to_string()),
+            name: None,
+            namespace: None,
             output: FunctionCallOutputPayload::from_text("2 passed".to_string()),
             internal_chat_message_metadata_passthrough: None,
         },
@@ -172,7 +174,9 @@ fn oversized_tool_output_is_elided_in_the_middle() {
     let output = format!("HEAD{}TAIL", "x".repeat(MAX_TOOL_OUTPUT_CHARS * 2));
     let input = vec![ResponseItem::FunctionCallOutput {
         id: None,
-        call_id: "call-1".to_string(),
+        call_id: Some("call-1".to_string()),
+        name: None,
+        namespace: None,
         output: FunctionCallOutputPayload::from_text(output),
         internal_chat_message_metadata_passthrough: None,
     }];

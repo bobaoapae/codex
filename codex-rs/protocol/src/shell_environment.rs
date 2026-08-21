@@ -13,6 +13,7 @@ pub const OPENAI_WORKLOAD_IDENTITY_CONTEXT_ENV_VAR: &str = "OPENAI_WORKLOAD_IDEN
 /// Environment variables that model-reachable child processes must not inherit.
 pub const NON_INHERITABLE_ENV_VARS: &[&str] = &[
     CODEX_EXEC_SERVER_NOISE_AUTH_TOKEN_ENV_VAR,
+    "NODE_REPL_AUTH_TOKEN",
     OPENAI_FEDERATION_RULE_ID_ENV_VAR,
     OPENAI_IDENTITY_TOKEN_FILE_ENV_VAR,
     OPENAI_WORKLOAD_IDENTITY_CONTEXT_ENV_VAR,
@@ -171,6 +172,7 @@ pub const WINDOWS_CORE_ENV_VARS: &[&str] = &[
     "SHELL",
     "COMSPEC",
     "SYSTEMROOT",
+    "WINDIR",
     "SYSTEMDRIVE",
     // User context and profiles
     "USERNAME",
@@ -217,6 +219,7 @@ mod windows_tests {
         let vars = make_vars(&[
             ("Shell", "C:\\Program Files\\Git\\bin\\bash.exe"),
             ("SystemRoot", "C:\\Windows"),
+            ("WinDir", "C:\\Windows"),
             ("AppData", "C:\\Users\\codex\\AppData\\Roaming"),
             ("TmpDir", "C:\\Temp\\custom"),
             ("OPENAI_API_KEY", "secret"),
@@ -236,6 +239,7 @@ mod windows_tests {
                 "C:\\Program Files\\Git\\bin\\bash.exe".to_string(),
             ),
             ("SystemRoot".to_string(), "C:\\Windows".to_string()),
+            ("WinDir".to_string(), "C:\\Windows".to_string()),
             (
                 "AppData".to_string(),
                 "C:\\Users\\codex\\AppData\\Roaming".to_string(),

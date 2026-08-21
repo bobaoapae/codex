@@ -99,6 +99,7 @@ use crate::UpdatedProject;
 use crate::local::writer_lock::WriterLockCoordinator;
 use crate::local::writer_lock::WriterLockGuard;
 
+pub use rollout_migration::RolloutMigrationFailureReason;
 pub use rollout_migration::RolloutMigrationMode;
 pub use rollout_migration::RolloutMigrationOptions;
 pub use rollout_migration::RolloutMigrationOutcome;
@@ -926,6 +927,7 @@ mod tests {
                 approvals_reviewer: None,
                 sandbox_policy: SandboxPolicy::DangerFullAccess,
                 permission_profile: None,
+                active_permission_profile: None,
                 network: None,
                 file_system_sandbox_policy: None,
                 model: model.to_string(),
@@ -1024,11 +1026,14 @@ mod tests {
                     message: "commentary".to_string(),
                     phase: Some(MessagePhase::Commentary),
                     memory_citation: None,
+                    delivery: None,
                 })),
                 RolloutItem::ResponseItem(
                     ResponseItem::FunctionCallOutput {
                         id: None,
-                        call_id: "call-1".to_string(),
+                        call_id: Some("call-1".to_string()),
+                        name: None,
+                        namespace: None,
                         output: FunctionCallOutputPayload::from_text("tool output".to_string()),
                         internal_chat_message_metadata_passthrough: None,
                     }

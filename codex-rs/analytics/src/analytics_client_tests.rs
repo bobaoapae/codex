@@ -140,11 +140,13 @@ use codex_app_server_protocol::SubAgentActivityKind;
 use codex_app_server_protocol::Thread;
 use codex_app_server_protocol::ThreadArchiveParams;
 use codex_app_server_protocol::ThreadArchiveResponse;
+use codex_app_server_protocol::ThreadArchivedNotification;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadSource as AppServerThreadSource;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadStatus as AppServerThreadStatus;
+use codex_app_server_protocol::ThreadUnarchivedNotification;
 use codex_app_server_protocol::Turn;
 use codex_app_server_protocol::TurnCompletedNotification;
 use codex_app_server_protocol::TurnDiffUpdatedNotification;
@@ -171,6 +173,8 @@ use codex_protocol::models::NetworkPermissions as CoreNetworkPermissions;
 use codex_protocol::models::PermissionProfile as CorePermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::HookEventName;
+use codex_protocol::protocol::HookExecutionMode;
+use codex_protocol::protocol::HookHandlerType;
 use codex_protocol::protocol::HookRunStatus;
 use codex_protocol::protocol::HookSource;
 use codex_protocol::protocol::SessionSource;
@@ -2125,6 +2129,101 @@ async fn thread_originator_overrides_shared_connection_across_thread_events() {
             }),
         ]
     );
+
+    reducer
+        .ingest(
+            AnalyticsFact::ClientResponse {
+                connection_id: 7,
+                request_id: RequestId::Integer(4),
+                response: Box::new(sample_thread_resume_response_with_source(
+                    "thread-private-source",
+                    /*ephemeral*/ false,
+                    "gpt-5",
+                    AppServerSessionSource::Exec,
+                    Some(AppServerThreadSource::Feature(
+                        "private customer feature label".to_string(),
+                    )),
+                    Some("019ee5cf-4d15-77a2-8023-01a9f79b6e7d".to_string()),
+                )),
+                thread_originator: Some(TEST_PRODUCT_CLIENT_ID.to_string()),
+            },
+            &mut events,
+        )
+        .await;
+    events.clear();
+
+    for notification in [
+        ServerNotification::ThreadArchived(ThreadArchivedNotification {
+            thread_id: "thread-work".to_string(),
+        }),
+        ServerNotification::ThreadUnarchived(ThreadUnarchivedNotification {
+            thread_id: "thread-default".to_string(),
+        }),
+        ServerNotification::ThreadArchived(ThreadArchivedNotification {
+            thread_id: "thread-private-source".to_string(),
+        }),
+        ServerNotification::ThreadUnarchived(ThreadUnarchivedNotification {
+            thread_id: "thread-without-context".to_string(),
+        }),
+    ] {
+        reducer
+            .ingest(
+                AnalyticsFact::Notification(Box::new(notification)),
+                &mut events,
+            )
+            .await;
+    }
+
+    let mut archives = serde_json::to_value(&events).expect("serialize archive events");
+    for event in archives.as_array_mut().expect("archive events") {
+        assert!(event["event_params"]["occurred_at_ms"].is_u64());
+        event["event_params"]
+            .as_object_mut()
+            .expect("archive event params")
+            .remove("occurred_at_ms");
+    }
+    assert_eq!(
+        archives,
+        json!([
+            {
+                "event_type": "codex_thread_archive_event",
+                "event_params": {
+                    "thread_id": "thread-work",
+                    "action": "archived",
+                    "app_server_client": initialized[0]["event_params"]["app_server_client"],
+                    "runtime": initialized[0]["event_params"]["runtime"],
+                    "thread_source": "user",
+                },
+            },
+            {
+                "event_type": "codex_thread_archive_event",
+                "event_params": {
+                    "thread_id": "thread-default",
+                    "action": "unarchived",
+                    "app_server_client": initialized[1]["event_params"]["app_server_client"],
+                    "runtime": initialized[1]["event_params"]["runtime"],
+                    "thread_source": "user",
+                },
+            },
+            {
+                "event_type": "codex_thread_archive_event",
+                "event_params": {
+                    "thread_id": "thread-private-source",
+                    "action": "archived",
+                    "app_server_client": initialized[0]["event_params"]["app_server_client"],
+                    "runtime": initialized[0]["event_params"]["runtime"],
+                    "parent_thread_id": "019ee5cf-4d15-77a2-8023-01a9f79b6e7d",
+                },
+            },
+            {
+                "event_type": "codex_thread_archive_event",
+                "event_params": {
+                    "thread_id": "thread-without-context",
+                    "action": "unarchived",
+                },
+            }
+        ])
+    );
 }
 
 #[tokio::test]
@@ -3745,6 +3844,8 @@ fn hook_run_event_serializes_expected_shape() {
             HookRunFact {
                 event_name: HookEventName::PreToolUse,
                 hook_source: HookSource::User,
+                handler_type: HookHandlerType::McpTool,
+                execution_mode: HookExecutionMode::Sync,
                 status: HookRunStatus::Completed,
             },
         ),
@@ -3763,6 +3864,8 @@ fn hook_run_event_serializes_expected_shape() {
                 "model_slug": "gpt-5",
                 "hook_name": "PreToolUse",
                 "hook_source": "user",
+                "handler_type": "mcp_tool",
+                "execution_mode": "sync",
                 "status": "completed"
             }
         })
@@ -3778,6 +3881,8 @@ fn hook_run_metadata_maps_sources_and_statuses() {
         HookRunFact {
             event_name: HookEventName::SessionStart,
             hook_source: HookSource::System,
+            handler_type: HookHandlerType::Command,
+            execution_mode: HookExecutionMode::Sync,
             status: HookRunStatus::Completed,
         },
     ))
@@ -3787,6 +3892,8 @@ fn hook_run_metadata_maps_sources_and_statuses() {
         HookRunFact {
             event_name: HookEventName::Stop,
             hook_source: HookSource::Project,
+            handler_type: HookHandlerType::Prompt,
+            execution_mode: HookExecutionMode::Async,
             status: HookRunStatus::Blocked,
         },
     ))
@@ -3796,6 +3903,8 @@ fn hook_run_metadata_maps_sources_and_statuses() {
         HookRunFact {
             event_name: HookEventName::Stop,
             hook_source: HookSource::CloudRequirements,
+            handler_type: HookHandlerType::Agent,
+            execution_mode: HookExecutionMode::Sync,
             status: HookRunStatus::Blocked,
         },
     ))
@@ -3805,6 +3914,8 @@ fn hook_run_metadata_maps_sources_and_statuses() {
         HookRunFact {
             event_name: HookEventName::UserPromptSubmit,
             hook_source: HookSource::Unknown,
+            handler_type: HookHandlerType::Command,
+            execution_mode: HookExecutionMode::Async,
             status: HookRunStatus::Failed,
         },
     ))
@@ -3829,6 +3940,8 @@ fn hook_run_metadata_maps_stopped_status() {
         HookRunFact {
             event_name: HookEventName::Stop,
             hook_source: HookSource::User,
+            handler_type: HookHandlerType::Command,
+            execution_mode: HookExecutionMode::Sync,
             status: HookRunStatus::Stopped,
         },
     ))
@@ -4015,6 +4128,8 @@ async fn reducer_ingests_hook_run_fact() {
                 hook: HookRunFact {
                     event_name: HookEventName::PostToolUse,
                     hook_source: HookSource::Unknown,
+                    handler_type: HookHandlerType::Agent,
+                    execution_mode: HookExecutionMode::Async,
                     status: HookRunStatus::Failed,
                 },
             })),
@@ -4027,6 +4142,8 @@ async fn reducer_ingests_hook_run_fact() {
     assert_eq!(payload[0]["event_type"], "codex_hook_run");
     assert_eq!(payload[0]["event_params"]["hook_name"], "PostToolUse");
     assert_eq!(payload[0]["event_params"]["hook_source"], "unknown");
+    assert_eq!(payload[0]["event_params"]["handler_type"], "agent");
+    assert_eq!(payload[0]["event_params"]["execution_mode"], "async");
     assert_eq!(payload[0]["event_params"]["status"], "failed");
 }
 
