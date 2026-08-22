@@ -1,5 +1,7 @@
 pub(crate) mod apply_patch;
 pub(crate) mod apply_patch_spec;
+mod claude_accounts;
+pub(crate) mod claude_accounts_spec;
 mod current_time;
 mod dynamic;
 pub(crate) mod extension_tools;
@@ -53,6 +55,8 @@ use crate::session::turn_context::TurnEnvironment;
 pub(crate) use crate::tools::code_mode::CodeModeExecuteHandler;
 pub(crate) use crate::tools::code_mode::CodeModeWaitHandler;
 pub use apply_patch::ApplyPatchHandler;
+pub use claude_accounts::ClaudeAccountSelectHandler;
+pub use claude_accounts::ClaudeAccountsHandler;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 pub use current_time::CurrentTimeHandler;

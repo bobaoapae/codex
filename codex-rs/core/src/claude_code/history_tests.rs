@@ -44,6 +44,19 @@ fn established(input: &[ResponseItem]) -> ClaudeSessionContinuity {
         delivered_items: input.len(),
         delivered_fingerprint: fingerprint(input),
         account_dir: None,
+        echoed: Vec::new(),
+    }
+}
+
+/// Continuity as it stands right after Claude answered: the items it authored
+/// are recorded, but Codex has not appended them to `input` yet.
+fn established_with_echo(
+    input: &[ResponseItem],
+    authored: &[ResponseItem],
+) -> ClaudeSessionContinuity {
+    ClaudeSessionContinuity {
+        echoed: authored.iter().map(item_fingerprint).collect(),
+        ..established(input)
     }
 }
 
@@ -275,4 +288,46 @@ fn empty_tail_still_produces_a_turn() {
 
     assert!(!plan.restart_session);
     assert!(!plan.turn_text.trim().is_empty());
+}
+
+/// FORK: Claude's own answer comes back in the next request's tail, because
+/// Codex appends it after the request that produced it. The live session already
+/// has it — resending it makes Claude read its own reply as new input.
+#[test]
+fn follow_up_does_not_echo_claude_own_answer() {
+    let delivered = vec![user("build the thing")];
+    let answer = assistant("built it");
+    let continuity = established_with_echo(&delivered, std::slice::from_ref(&answer));
+    let mut input = delivered;
+    input.push(answer);
+    input.push(user("now add tests"));
+
+    let plan = plan_request(&input, &continuity);
+
+    assert!(!plan.restart_session);
+    assert!(!plan.turn_text.contains("built it"), "{}", plan.turn_text);
+    assert!(plan.turn_text.contains("now add tests"));
+    // The session has still seen everything up to here.
+    assert_eq!(plan.delivered_items, 3);
+}
+
+/// A replay rebuilds the conversation from scratch, so Claude's turns belong in
+/// it — dropping them would hand it a transcript of only one side.
+#[test]
+fn replay_keeps_claude_own_answer() {
+    let answer = assistant("built it");
+    let input = vec![
+        user("build the thing"),
+        answer.clone(),
+        user("now add tests"),
+    ];
+    let continuity = ClaudeSessionContinuity {
+        echoed: vec![item_fingerprint(&answer)],
+        ..ClaudeSessionContinuity::default()
+    };
+
+    let plan = plan_request(&input, &continuity);
+
+    assert!(plan.restart_session);
+    assert!(plan.turn_text.contains("built it"));
 }

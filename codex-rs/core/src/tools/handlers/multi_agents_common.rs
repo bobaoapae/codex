@@ -9,6 +9,7 @@ use crate::session::turn_context::TurnContext;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
+use codex_model_provider_info::CLAUDE_CODE_PROVIDER_ID;
 use codex_model_provider_info::WireApi;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::AgentPath;
@@ -272,6 +273,71 @@ pub(crate) fn apply_spawn_agent_runtime_overrides(
         .map_err(|err| {
             FunctionCallError::RespondToModel(format!("permission_profile is invalid: {err}"))
         })?;
+    align_provider_with_locally_served_model(config)?;
+    Ok(())
+}
+
+/// FORK: pins a Claude-backed child to one configured account.
+///
+/// The pin is tried first and still fails over, so naming a spent account costs
+/// one fast failure rather than stranding the agent. Naming an account for a
+/// child that is not Claude-backed is an error: silently ignoring it would let
+/// the parent believe it had spread a fan-out across accounts.
+pub(crate) fn apply_spawn_agent_claude_account(
+    config: &mut Config,
+    requested_account: Option<&str>,
+) -> Result<(), FunctionCallError> {
+    let Some(requested_account) = requested_account else {
+        return Ok(());
+    };
+    if config.model_provider_id != CLAUDE_CODE_PROVIDER_ID {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "`account` only applies to a Claude-backed agent; this one runs on `{}`. Spawn it with a Claude agent type, or omit `account`.",
+            config.model_provider_id
+        )));
+    }
+    match crate::claude_code::resolve_account_alias(
+        &config.claude_code_account_dirs,
+        requested_account,
+    )
+    .map_err(FunctionCallError::RespondToModel)?
+    {
+        crate::claude_code::AccountAlias::Auto => config.claude_code_account_override = None,
+        crate::claude_code::AccountAlias::Dir(dir) => {
+            config.claude_code_account_override = Some(dir);
+        }
+    }
+    Ok(())
+}
+
+/// FORK: a locally served model (the Claude Code CLI) is only reachable through
+/// the `claude_code` provider.
+///
+/// A role names the provider itself, but `spawn_agent(model = "claude-opus-5")`
+/// does not: the slug is accepted by the catalog and the child would inherit the
+/// parent's provider, which answers such a request with a flat rejection. Align
+/// the two here, after every other override has been applied.
+fn align_provider_with_locally_served_model(config: &mut Config) -> Result<(), FunctionCallError> {
+    let Some(model) = config.model.as_deref() else {
+        return Ok(());
+    };
+    let locally_served = codex_models_manager::local_models::locally_served_models()
+        .iter()
+        .any(|local| local.slug == model);
+    if !locally_served || config.model_provider_id == CLAUDE_CODE_PROVIDER_ID {
+        return Ok(());
+    }
+    let provider = config
+        .model_providers
+        .get(CLAUDE_CODE_PROVIDER_ID)
+        .cloned()
+        .ok_or_else(|| {
+            FunctionCallError::RespondToModel(format!(
+                "model `{model}` is served by the local `{CLAUDE_CODE_PROVIDER_ID}` provider, which is not configured"
+            ))
+        })?;
+    config.model_provider = provider;
+    config.model_provider_id = CLAUDE_CODE_PROVIDER_ID.to_string();
     Ok(())
 }
 
@@ -480,6 +546,7 @@ fn validate_spawn_agent_reasoning_effort(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn native_claude_fork_is_always_task_only() {
@@ -505,5 +572,70 @@ mod tests {
             ),
             Some(SpawnAgentForkMode::LastNTurns(10))
         );
+    }
+
+    /// FORK: pinning an account is only meaningful for a Claude-backed child.
+    #[tokio::test]
+    async fn claude_account_pin_requires_a_claude_backed_child() {
+        let (_home, mut config) = claude_test_config(vec![PathBuf::from("/accounts/a")]).await;
+
+        let err = apply_spawn_agent_claude_account(&mut config, Some("1"))
+            .expect_err("a non-Claude child cannot take an account");
+
+        let FunctionCallError::RespondToModel(message) = err else {
+            panic!("expected a model-facing error");
+        };
+        assert!(message.contains("Claude-backed"), "{message}");
+        assert_eq!(config.claude_code_account_override, None);
+    }
+
+    /// FORK: an index, a path, or part of the email all name the same account.
+    #[tokio::test]
+    async fn claude_account_pin_accepts_an_index_and_clears_on_auto() {
+        let dirs = vec![PathBuf::from("/accounts/a"), PathBuf::from("/accounts/b")];
+        let (_home, mut config) = claude_test_config(dirs.clone()).await;
+        config.model_provider_id = CLAUDE_CODE_PROVIDER_ID.to_string();
+
+        apply_spawn_agent_claude_account(&mut config, Some("2")).expect("index should resolve");
+        assert_eq!(config.claude_code_account_override, Some(dirs[1].clone()));
+
+        apply_spawn_agent_claude_account(&mut config, Some("auto")).expect("auto should clear");
+        assert_eq!(config.claude_code_account_override, None);
+
+        let err = apply_spawn_agent_claude_account(&mut config, Some("nope"))
+            .expect_err("an unknown account is an error, not a silent default");
+        let FunctionCallError::RespondToModel(message) = err else {
+            panic!("expected a model-facing error");
+        };
+        assert!(message.contains("unknown Claude account"), "{message}");
+    }
+
+    /// FORK: naming a locally served model without a role must still route to
+    /// the provider that can serve it.
+    #[tokio::test]
+    async fn a_claude_model_pulls_the_child_onto_the_claude_provider() {
+        let (_home, mut config) = claude_test_config(Vec::new()).await;
+        config.model = Some("claude-opus-5".to_string());
+        assert_ne!(config.model_provider_id, CLAUDE_CODE_PROVIDER_ID);
+
+        align_provider_with_locally_served_model(&mut config).expect("provider should align");
+
+        assert_eq!(config.model_provider_id, CLAUDE_CODE_PROVIDER_ID);
+        assert_eq!(config.model_provider.wire_api, WireApi::ClaudeCode);
+    }
+
+    async fn claude_test_config(
+        account_dirs: Vec<PathBuf>,
+    ) -> (tempfile::TempDir, crate::config::Config) {
+        let home = tempfile::TempDir::new().expect("create temp dir");
+        let home_path = home.path().to_path_buf();
+        let mut config = crate::config::ConfigBuilder::default()
+            .codex_home(home_path.clone())
+            .fallback_cwd(Some(home_path))
+            .build()
+            .await
+            .expect("load test config");
+        config.claude_code_account_dirs = account_dirs;
+        (home, config)
     }
 }

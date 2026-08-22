@@ -57,6 +57,7 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
         expose_spawn_agent_model_overrides: true,
         multi_agent_version: MultiAgentVersion::V2,
         usage_hint_text: None,
+        claude_accounts: Vec::new(),
     });
 
     let ToolSpec::Function(ResponsesApiTool {
@@ -141,6 +142,7 @@ fn spawn_agent_tool_v1_keeps_legacy_fork_context_field() {
         expose_spawn_agent_model_overrides: true,
         multi_agent_version: MultiAgentVersion::V1,
         usage_hint_text: None,
+        claude_accounts: Vec::new(),
     });
 
     let ToolSpec::Namespace(namespace) = tool else {
@@ -206,6 +208,7 @@ fn spawn_agent_tool_caps_visible_model_summaries() {
         expose_spawn_agent_model_overrides: true,
         multi_agent_version: MultiAgentVersion::V2,
         usage_hint_text: None,
+        claude_accounts: Vec::new(),
     });
 
     let ToolSpec::Function(ResponsesApiTool { description, .. }) = tool else {
@@ -252,6 +255,7 @@ fn spawn_agent_tool_keeps_model_controls_when_spawn_metadata_is_hidden() {
         expose_spawn_agent_model_overrides: true,
         multi_agent_version: MultiAgentVersion::V2,
         usage_hint_text: None,
+        claude_accounts: Vec::new(),
     });
 
     let ToolSpec::Function(ResponsesApiTool {
@@ -285,6 +289,7 @@ fn spawn_agent_tool_hides_model_controls_without_override_exposure() {
         expose_spawn_agent_model_overrides: false,
         multi_agent_version: MultiAgentVersion::V2,
         usage_hint_text: None,
+        claude_accounts: Vec::new(),
     });
 
     let ToolSpec::Function(ResponsesApiTool {
@@ -481,4 +486,45 @@ fn list_agents_tool_status_schema_includes_interrupted() {
             "not_found"
         ])
     );
+}
+
+/// FORK: the account argument only exists once accounts are configured, and it
+/// carries the account list so the model can choose without a second lookup.
+#[test]
+fn spawn_agent_v2_exposes_account_only_with_configured_claude_accounts() {
+    let without = create_spawn_agent_tool_v2(SpawnAgentToolOptions {
+        multi_agent_version: MultiAgentVersion::V2,
+        ..SpawnAgentToolOptions::default()
+    });
+    let ToolSpec::Function(ResponsesApiTool { parameters, .. }) = without else {
+        panic!("spawn_agent should be a function tool");
+    };
+    assert!(
+        !parameters
+            .properties
+            .as_ref()
+            .expect("object params")
+            .contains_key("account")
+    );
+
+    let with = create_spawn_agent_tool_v2(SpawnAgentToolOptions {
+        multi_agent_version: MultiAgentVersion::V2,
+        claude_accounts: vec![
+            "1: a@example.com".to_string(),
+            "2: b@example.com".to_string(),
+        ],
+        ..SpawnAgentToolOptions::default()
+    });
+    let ToolSpec::Function(ResponsesApiTool { parameters, .. }) = with else {
+        panic!("spawn_agent should be a function tool");
+    };
+    let account = parameters
+        .properties
+        .as_ref()
+        .expect("object params")
+        .get("account")
+        .expect("account property");
+    let description = account.description.as_deref().unwrap_or_default();
+    assert!(description.contains("1: a@example.com"), "{description}");
+    assert!(description.contains("2: b@example.com"), "{description}");
 }

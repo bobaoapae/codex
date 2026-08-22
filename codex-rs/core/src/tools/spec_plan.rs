@@ -8,6 +8,8 @@ use crate::tools::code_mode::execute_spec::create_code_mode_tool;
 use crate::tools::context::ToolInvocation;
 use crate::tools::effective_tool_mode;
 use crate::tools::handlers::ApplyPatchHandler;
+use crate::tools::handlers::ClaudeAccountSelectHandler;
+use crate::tools::handlers::ClaudeAccountsHandler;
 use crate::tools::handlers::CodeModeExecuteHandler;
 use crate::tools::handlers::CodeModeWaitHandler;
 use crate::tools::handlers::CurrentTimeHandler;
@@ -1051,6 +1053,15 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, registry: &mut Tool
         registry.add(RequestPermissionsHandler);
     }
 
+    // FORK: only worth exposing when there is more than nothing to choose from,
+    // and only to the agent doing the delegating.
+    if !turn_context.config.claude_code_account_dirs.is_empty()
+        && !turn_context.session_source.is_non_root_agent()
+    {
+        registry.add(ClaudeAccountsHandler);
+        registry.add(ClaudeAccountSelectHandler);
+    }
+
     if features.enabled(Feature::TokenBudget) {
         registry.add_with_exposure(NewContextWindowHandler, ToolExposure::DirectModelOnly);
         registry.add(GetContextRemainingHandler);
@@ -1144,6 +1155,9 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
                             .expose_spawn_agent_model_overrides,
                         multi_agent_version: turn_context.multi_agent_version,
                         usage_hint_text: turn_context.config.multi_agent_v2.usage_hint_text.clone(),
+                        claude_accounts: crate::claude_code::account_options(
+                            &turn_context.config.claude_code_account_dirs,
+                        ),
                     }),
                     tool_namespace,
                 ),
@@ -1191,6 +1205,7 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
                     expose_spawn_agent_model_overrides: true,
                     multi_agent_version: turn_context.multi_agent_version,
                     usage_hint_text: turn_context.config.multi_agent_v2.usage_hint_text.clone(),
+                    claude_accounts: Vec::new(),
                 }),
                 exposure,
             );

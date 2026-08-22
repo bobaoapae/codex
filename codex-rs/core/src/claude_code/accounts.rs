@@ -10,6 +10,7 @@
 //! through a small JSON file in `CODEX_HOME`, which also mirrors the configured
 //! directory list and carries a user-selected preferred account.
 
+use codex_config::config_toml::ClaudeCodeAccountSelection;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -77,7 +78,9 @@ impl FailureClass {
 pub(crate) fn classify_failure(text: &str) -> FailureClass {
     let lower = text.to_lowercase();
     if lower.contains("limit")
-        && (lower.contains("hit your") || lower.contains("limit reached") || lower.contains("resets"))
+        && (lower.contains("hit your")
+            || lower.contains("limit reached")
+            || lower.contains("resets"))
     {
         return FailureClass::UsageLimit {
             reset_hint: extract_reset_hint(text),
@@ -120,7 +123,11 @@ pub(crate) fn dir_key(dir: &Path) -> String {
     while key.ends_with('\\') {
         key.pop();
     }
-    if cfg!(windows) { key.to_lowercase() } else { key }
+    if cfg!(windows) {
+        key.to_lowercase()
+    } else {
+        key
+    }
 }
 
 /// Best-effort identity for error messages: the account email, else the dir.
@@ -256,7 +263,9 @@ async fn fetch_usage(dir: &Path) -> Option<UsageSnapshot> {
     let window = |name: &str| {
         let window = raw.get(name)?;
         Some((
-            window.get("utilization").and_then(serde_json::Value::as_f64),
+            window
+                .get("utilization")
+                .and_then(serde_json::Value::as_f64),
             window
                 .get("resets_at")
                 .and_then(serde_json::Value::as_str)
@@ -289,8 +298,8 @@ async fn refresh_usage(state: &mut AccountsFile, dirs: &[&PathBuf], now: u64) ->
     for dir in dirs {
         let key = dir_key(dir);
         let snapshot = state.usage.get(&key);
-        let fresh =
-            snapshot.is_some_and(|snapshot| now.saturating_sub(snapshot.fetched_at_ms) < USAGE_TTL_MS);
+        let fresh = snapshot
+            .is_some_and(|snapshot| now.saturating_sub(snapshot.fetched_at_ms) < USAGE_TTL_MS);
         let attempted_recently = snapshot
             .is_some_and(|snapshot| now.saturating_sub(snapshot.last_attempt_ms) < USAGE_RETRY_MS);
         if fresh || attempted_recently {
@@ -340,15 +349,25 @@ impl AccountsFile {
         let Ok(raw) = serde_json::to_vec_pretty(self) else {
             return;
         };
-        let tmp = path.with_extension("json.tmp");
+        // A shared temp name loses data as soon as two agents save at once: one
+        // writer's temp file is overwritten, renamed, or deleted under the
+        // other. Every writer gets its own.
+        let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
         let write_result = std::fs::write(&tmp, raw).and_then(|()| {
-            // `rename` fails on Windows when the target exists; replace it.
-            if path.exists() {
-                std::fs::remove_file(path)?;
+            // `rename` replaces the destination on both platforms, so it is
+            // the atomic path; it only fails when the target is locked, and
+            // only then is it worth the window where the file does not exist.
+            match std::fs::rename(&tmp, path) {
+                Ok(()) => Ok(()),
+                Err(_) if path.exists() => {
+                    std::fs::remove_file(path)?;
+                    std::fs::rename(&tmp, path)
+                }
+                Err(err) => Err(err),
             }
-            std::fs::rename(&tmp, path)
         });
         if let Err(err) = write_result {
+            let _ = std::fs::remove_file(&tmp);
             warn!("claude_code: failed to persist account state: {err}");
         }
     }
@@ -371,6 +390,136 @@ impl AccountsFile {
     }
 }
 
+/// What the turn knows about which account it should prefer.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AccountPolicy<'a> {
+    pub(crate) selection: ClaudeCodeAccountSelection,
+    /// Headroom, in percent, the sticky account must still have under `hybrid`.
+    pub(crate) sticky_min_headroom_pct: f64,
+    /// The account already serving this thread, if any.
+    pub(crate) sticky: Option<&'a Path>,
+    /// The account this agent was pinned to when it was spawned, if any.
+    pub(crate) pinned: Option<&'a Path>,
+}
+
+impl AccountPolicy<'_> {
+    /// Whether the thread keeps its current account for another turn.
+    ///
+    /// Only `hybrid` ever gives one up early, and only against a *known* usage
+    /// snapshot: unknown usage must not cost a session that is working.
+    fn keeps_sticky(&self, remaining_pct: Option<f64>) -> bool {
+        if self.selection != ClaudeCodeAccountSelection::Hybrid {
+            return true;
+        }
+        match remaining_pct {
+            Some(remaining) => remaining >= self.sticky_min_headroom_pct,
+            None => true,
+        }
+    }
+
+    fn sort_ranked(&self, ranked: &mut [RankedAccount]) {
+        match self.selection {
+            // Least busy first among the accounts that still have real headroom,
+            // so N agents starting at once spread across the accounts instead of
+            // all reading the same snapshot and piling onto the same one.
+            ClaudeCodeAccountSelection::Hybrid => {
+                let threshold = self.sticky_min_headroom_pct;
+                ranked.sort_by(|a, b| {
+                    let a_healthy = a.remaining >= threshold;
+                    let b_healthy = b.remaining >= threshold;
+                    b_healthy
+                        .cmp(&a_healthy)
+                        .then_with(|| {
+                            if a_healthy {
+                                a.in_flight.cmp(&b.in_flight)
+                            } else {
+                                std::cmp::Ordering::Equal
+                            }
+                        })
+                        .then_with(|| {
+                            b.remaining
+                                .partial_cmp(&a.remaining)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .then_with(|| a.index.cmp(&b.index))
+                });
+            }
+            ClaudeCodeAccountSelection::Drain => {
+                ranked.sort_by(|a, b| {
+                    a.remaining
+                        .partial_cmp(&b.remaining)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.index.cmp(&b.index))
+                });
+            }
+            ClaudeCodeAccountSelection::Config => {
+                ranked.sort_by_key(|account| account.index);
+            }
+        }
+    }
+}
+
+/// One candidate account with everything the ordering needs.
+struct RankedAccount {
+    remaining: f64,
+    in_flight: usize,
+    index: usize,
+    dir: PathBuf,
+}
+
+/// Turns currently running against each account, keyed like `dir_key`.
+///
+/// Usage snapshots have a multi-minute TTL, so a burst of spawns would otherwise
+/// read identical headroom and choose identical accounts. This is the only piece
+/// of selection state that is process-local: it describes work in flight right
+/// now, which no other process can observe anyway.
+static IN_FLIGHT: std::sync::LazyLock<std::sync::Mutex<BTreeMap<String, usize>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(BTreeMap::new()));
+
+fn in_flight_counts() -> BTreeMap<String, usize> {
+    IN_FLIGHT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// Marks an account busy for as long as the guard lives.
+pub(crate) struct InFlightGuard {
+    key: Option<String>,
+}
+
+impl InFlightGuard {
+    pub(crate) fn acquire(dir: Option<&Path>) -> Self {
+        let Some(dir) = dir else {
+            return Self { key: None };
+        };
+        let key = dir_key(dir);
+        *IN_FLIGHT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(key.clone())
+            .or_insert(0) += 1;
+        Self { key: Some(key) }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        let Some(key) = self.key.take() else {
+            return;
+        };
+        let mut in_flight = IN_FLIGHT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = in_flight.get_mut(&key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                in_flight.remove(&key);
+            }
+        }
+    }
+}
+
 /// Account plan for one turn: which directories to try, in order.
 pub(crate) struct TurnAccounts {
     /// `None` means "no pinning — inherit the ambient environment" and is only
@@ -383,20 +532,27 @@ impl TurnAccounts {
     /// Resolves the attempt order from config + shared state.
     ///
     /// Policy, in priority order:
-    /// 1. The user-selected preferred account (a deliberate choice).
-    /// 2. `sticky` — the account already serving this thread, so an ongoing
-    ///    conversation keeps its Claude session until the account is spent.
-    /// 3. Remaining accounts with known usage, **least remaining headroom
-    ///    first**: the protocol drains the account closest to its limit and
-    ///    keeps the fresher ones in reserve.
-    /// 4. Accounts with unknown usage, in config order.
-    /// 5. Accounts that look spent (no headroom) or are on a failure cooldown —
+    /// 1. The account this agent was pinned to at spawn time (`spawn_agent`'s
+    ///    `account`) — an explicit, per-agent choice.
+    /// 2. The user-selected preferred account (a deliberate, session-wide one).
+    /// 3. `sticky` — the account already serving this thread — while it still
+    ///    has headroom, so an ongoing conversation keeps its Claude session and
+    ///    its prompt cache. `hybrid` releases it once the tightest window drops
+    ///    below `sticky_min_headroom_pct`; the other policies keep it until it
+    ///    is spent.
+    /// 4. The remaining accounts with known usage, ordered by the policy:
+    ///    `hybrid` prefers the least busy of the accounts that still have real
+    ///    headroom (so a fan-out spreads instead of piling onto one account) and
+    ///    treats the drained ones as a last resort; `drain` spends the account
+    ///    closest to its limit first; `config` keeps the configured order.
+    /// 5. Accounts with unknown usage, in config order.
+    /// 6. Accounts that look spent (no headroom) or are on a failure cooldown —
     ///    still attempted last rather than skipped, so stale local state can
     ///    never dead-lock the provider; hitting their limit fails over anyway.
     pub(crate) async fn resolve(
         account_dirs: &[PathBuf],
         state_path: Option<&Path>,
-        sticky: Option<&Path>,
+        policy: AccountPolicy<'_>,
     ) -> Self {
         if account_dirs.is_empty() {
             return Self {
@@ -449,22 +605,27 @@ impl TurnAccounts {
         }
 
         let now = now_ms();
-        // Usage only matters when there is a choice to make.
-        if usable.len() > 1 {
+        // Usage only matters when there is a choice to make, and `config` order
+        // never consults it — no reason to spend a network round trip.
+        if usable.len() > 1 && policy.selection != ClaudeCodeAccountSelection::Config {
             dirty |= refresh_usage(&mut state, &usable, now).await;
         }
         if dirty && let Some(path) = state_path.as_deref() {
             state.save(path);
         }
 
+        let pinned_key = policy.pinned.map(dir_key);
         let preferred_key = state
             .preferred_dir
             .as_deref()
             .map(|preferred| dir_key(Path::new(preferred)));
-        let sticky_key = sticky.map(dir_key);
+        let sticky_key = policy.sticky.map(dir_key);
+        let in_flight = in_flight_counts();
 
-        let mut pinned: Vec<PathBuf> = Vec::new();
-        let mut drain: Vec<(f64, usize, PathBuf)> = Vec::new();
+        // Rank 0 = per-agent pin, 1 = session preference, 2 = the thread's own
+        // account. A stable sort then keeps config order within a rank.
+        let mut pinned: Vec<(u8, PathBuf)> = Vec::new();
+        let mut ranked: Vec<RankedAccount> = Vec::new();
         let mut unknown: Vec<PathBuf> = Vec::new();
         let mut spent: Vec<PathBuf> = Vec::new();
         let mut cooling: Vec<PathBuf> = Vec::new();
@@ -474,32 +635,40 @@ impl TurnAccounts {
                 cooling.push((*dir).clone());
                 continue;
             }
+            let remaining = state.usage.get(&key).and_then(UsageSnapshot::remaining_pct);
+            // An explicit per-agent pin outranks everything, then the deliberate
+            // session preference, then the thread's own account.
+            let is_pinned = pinned_key.as_deref() == Some(key.as_str());
             let is_preferred = preferred_key.as_deref() == Some(key.as_str());
             let is_sticky = sticky_key.as_deref() == Some(key.as_str());
-            if is_preferred || is_sticky {
-                // Preferred outranks sticky when both exist.
-                if is_preferred {
-                    pinned.insert(0, (*dir).clone());
+            if is_pinned || is_preferred || (is_sticky && policy.keeps_sticky(remaining)) {
+                let rank = if is_pinned {
+                    0
+                } else if is_preferred {
+                    1
                 } else {
-                    pinned.push((*dir).clone());
-                }
+                    2
+                };
+                pinned.push((rank, (*dir).clone()));
                 continue;
             }
-            match state.usage.get(&key).and_then(UsageSnapshot::remaining_pct) {
+            match remaining {
                 Some(remaining) if remaining <= 0.0 => spent.push((*dir).clone()),
-                Some(remaining) => drain.push((remaining, index, (*dir).clone())),
+                Some(remaining) => ranked.push(RankedAccount {
+                    remaining,
+                    in_flight: in_flight.get(&key).copied().unwrap_or(0),
+                    index,
+                    dir: (*dir).clone(),
+                }),
                 None => unknown.push((*dir).clone()),
             }
         }
-        drain.sort_by(|a, b| {
-            a.0.partial_cmp(&b.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.1.cmp(&b.1))
-        });
+        policy.sort_ranked(&mut ranked);
+        pinned.sort_by_key(|(rank, _)| *rank);
 
         let mut candidates: Vec<Option<PathBuf>> = Vec::new();
-        candidates.extend(pinned.into_iter().map(Some));
-        candidates.extend(drain.into_iter().map(|(_, _, dir)| Some(dir)));
+        candidates.extend(pinned.into_iter().map(|(_, dir)| Some(dir)));
+        candidates.extend(ranked.into_iter().map(|account| Some(account.dir)));
         candidates.extend(unknown.into_iter().map(Some));
         candidates.extend(spent.into_iter().map(Some));
         candidates.extend(cooling.into_iter().map(Some));
@@ -549,6 +718,108 @@ impl TurnAccounts {
             state.save(path);
         }
     }
+}
+
+/// FORK: one configured account, as the `claude_accounts` tool reports it.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct AccountStatus {
+    /// 1-based, matching what `spawn_agent(account = …)` accepts.
+    pub(crate) index: usize,
+    pub(crate) account: String,
+    pub(crate) config_dir: String,
+    /// False when the directory has no credentials: the account is configured
+    /// but not logged in, and the provider skips it entirely.
+    pub(crate) logged_in: bool,
+    pub(crate) preferred: bool,
+    pub(crate) five_hour_used_pct: Option<f64>,
+    pub(crate) weekly_used_pct: Option<f64>,
+    /// Headroom before the tightest window closes.
+    pub(crate) remaining_pct: Option<f64>,
+    pub(crate) five_hour_resets_at: Option<String>,
+    pub(crate) weekly_resets_at: Option<String>,
+    /// Turns this process is running against the account right now.
+    pub(crate) running_turns: usize,
+    /// Seconds left on a failure cooldown, if any.
+    pub(crate) cooldown_seconds_left: Option<u64>,
+    pub(crate) cooldown_reason: Option<String>,
+    pub(crate) limit_reset_hint: Option<String>,
+}
+
+/// FORK: reports every configured account, optionally refreshing usage first.
+///
+/// Read-only: it never reorders anything and never spends a turn. `refresh`
+/// respects the same TTL as turn selection, so asking twice in a minute does not
+/// hit the network twice.
+pub(crate) async fn list_accounts(
+    account_dirs: &[PathBuf],
+    state_path: Option<&Path>,
+    refresh: bool,
+) -> Vec<AccountStatus> {
+    let mut state = match state_path {
+        Some(path) => AccountsFile::load(path),
+        None => AccountsFile::default(),
+    };
+    let now = now_ms();
+    if refresh {
+        let usable: Vec<&PathBuf> = account_dirs
+            .iter()
+            .filter(|dir| dir.join(".credentials.json").is_file())
+            .collect();
+        if refresh_usage(&mut state, &usable, now).await
+            && let Some(path) = state_path
+        {
+            state.save(path);
+        }
+    }
+    let preferred_key = state
+        .preferred_dir
+        .as_deref()
+        .map(|preferred| dir_key(Path::new(preferred)));
+    let in_flight = in_flight_counts();
+
+    account_dirs
+        .iter()
+        .enumerate()
+        .map(|(index, dir)| {
+            let key = dir_key(dir);
+            let usage = state.usage.get(&key);
+            let health = state.accounts.get(&key);
+            let cooling = state.is_cooling(dir, now);
+            AccountStatus {
+                index: index + 1,
+                account: account_label(Some(dir)),
+                config_dir: dir.to_string_lossy().into_owned(),
+                logged_in: dir.join(".credentials.json").is_file(),
+                preferred: preferred_key.as_deref() == Some(key.as_str()),
+                five_hour_used_pct: usage.and_then(|usage| usage.five_hour_pct),
+                weekly_used_pct: usage.and_then(|usage| usage.weekly_pct),
+                remaining_pct: usage.and_then(UsageSnapshot::remaining_pct),
+                five_hour_resets_at: usage.and_then(|usage| usage.five_hour_resets_at.clone()),
+                weekly_resets_at: usage.and_then(|usage| usage.weekly_resets_at.clone()),
+                running_turns: in_flight.get(&key).copied().unwrap_or(0),
+                cooldown_seconds_left: cooling.then(|| {
+                    health
+                        .map(|health| health.cooldown_until_ms.saturating_sub(now) / 1000)
+                        .unwrap_or_default()
+                }),
+                cooldown_reason: cooling
+                    .then(|| health.and_then(|health| health.reason.clone()))
+                    .flatten(),
+                limit_reset_hint: health.and_then(|health| health.reset_hint.clone()),
+            }
+        })
+        .collect()
+}
+
+/// FORK: records (or clears) the account new work should prefer.
+///
+/// Running agents keep the account they already resumed against; this only
+/// changes what the next selection tries first.
+pub(crate) fn select_account(state_path: &Path, dir: Option<&Path>) {
+    let mut state = AccountsFile::load(state_path);
+    state.version = 1;
+    state.preferred_dir = dir.map(|dir| dir.to_string_lossy().into_owned());
+    state.save(state_path);
 }
 
 #[cfg(test)]
@@ -608,6 +879,20 @@ mod tests {
             .collect()
     }
 
+    /// Test policy: hybrid with the shipped 20% sticky threshold.
+    fn policy<'a>(
+        selection: ClaudeCodeAccountSelection,
+        sticky: Option<&'a Path>,
+        pinned: Option<&'a Path>,
+    ) -> AccountPolicy<'a> {
+        AccountPolicy {
+            selection,
+            sticky_min_headroom_pct: 20.0,
+            sticky,
+            pinned,
+        }
+    }
+
     fn fresh_snapshot(binding_pct: f64) -> UsageSnapshot {
         UsageSnapshot {
             binding_pct: Some(binding_pct),
@@ -630,7 +915,12 @@ mod tests {
             ..AccountsFile::default()
         };
         state.save(&state_path);
-        let plan = TurnAccounts::resolve(&dirs, Some(&state_path), None).await;
+        let plan = TurnAccounts::resolve(
+            &dirs,
+            Some(&state_path),
+            policy(ClaudeCodeAccountSelection::Hybrid, None, None),
+        )
+        .await;
         assert_eq!(
             plan.candidates,
             vec![Some(dir_b.clone()), Some(dir_a.clone())]
@@ -642,7 +932,12 @@ mod tests {
             &FailureClass::UsageLimit { reset_hint: None },
             "You've hit your weekly limit",
         );
-        let plan = TurnAccounts::resolve(&dirs, Some(&state_path), None).await;
+        let plan = TurnAccounts::resolve(
+            &dirs,
+            Some(&state_path),
+            policy(ClaudeCodeAccountSelection::Hybrid, None, None),
+        )
+        .await;
         assert_eq!(plan.candidates, vec![Some(dir_a), Some(dir_b.clone())]);
 
         // Success clears the record.
@@ -657,7 +952,12 @@ mod tests {
         let dir_a = temp.path().join("a");
         std::fs::create_dir_all(&dir_a).expect("mkdir");
         let dirs = vec![dir_a];
-        let plan = TurnAccounts::resolve(&dirs, None, None).await;
+        let plan = TurnAccounts::resolve(
+            &dirs,
+            None,
+            policy(ClaudeCodeAccountSelection::Hybrid, None, None),
+        )
+        .await;
         assert_eq!(plan.candidates, vec![None]);
     }
 
@@ -678,7 +978,12 @@ mod tests {
         };
         state.save(&state_path);
 
-        let plan = TurnAccounts::resolve(&dirs, Some(&state_path), None).await;
+        let plan = TurnAccounts::resolve(
+            &dirs,
+            Some(&state_path),
+            policy(ClaudeCodeAccountSelection::Drain, None, None),
+        )
+        .await;
         assert_eq!(
             plan.candidates,
             vec![
@@ -705,14 +1010,24 @@ mod tests {
         };
         state.save(&state_path);
 
-        let plan = TurnAccounts::resolve(&dirs, Some(&state_path), Some(&dirs[0])).await;
+        let plan = TurnAccounts::resolve(
+            &dirs,
+            Some(&state_path),
+            policy(ClaudeCodeAccountSelection::Drain, Some(&dirs[0]), None),
+        )
+        .await;
         assert_eq!(plan.candidates.first(), Some(&Some(dirs[0].clone())));
 
         // A deliberate selection outranks the sticky account.
         let mut state = AccountsFile::load(&state_path);
         state.preferred_dir = Some(dirs[2].to_string_lossy().into_owned());
         state.save(&state_path);
-        let plan = TurnAccounts::resolve(&dirs, Some(&state_path), Some(&dirs[0])).await;
+        let plan = TurnAccounts::resolve(
+            &dirs,
+            Some(&state_path),
+            policy(ClaudeCodeAccountSelection::Drain, Some(&dirs[0]), None),
+        )
+        .await;
         assert_eq!(
             plan.candidates,
             vec![
@@ -732,7 +1047,12 @@ mod tests {
         let state_path = temp.path().join(ACCOUNTS_STATE_FILE_NAME);
         let dirs = vec![dir.clone()];
 
-        let plan = TurnAccounts::resolve(&dirs, Some(&state_path), None).await;
+        let plan = TurnAccounts::resolve(
+            &dirs,
+            Some(&state_path),
+            policy(ClaudeCodeAccountSelection::Hybrid, None, None),
+        )
+        .await;
         plan.record_failure(&dir, &FailureClass::Auth, "OAuth token has expired");
         let state = AccountsFile::load(&state_path);
         assert!(state.is_cooling(&dir, now_ms()));
@@ -746,5 +1066,132 @@ mod tests {
             .expect("health entry")
             .cred_mtime_ms = Some(1);
         assert!(!recorded.is_cooling(&dir, now_ms()));
+    }
+
+    #[tokio::test]
+    async fn hybrid_keeps_the_thread_account_while_it_has_headroom() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dirs = account_fixture(&temp, &["a", "b"]);
+        let state_path = temp.path().join(ACCOUNTS_STATE_FILE_NAME);
+
+        // a has 50% left, b has 95%. Keeping a preserves its Claude session.
+        let mut usage = BTreeMap::new();
+        usage.insert(dir_key(&dirs[0]), fresh_snapshot(50.0));
+        usage.insert(dir_key(&dirs[1]), fresh_snapshot(5.0));
+        let state = AccountsFile {
+            usage,
+            ..AccountsFile::default()
+        };
+        state.save(&state_path);
+
+        let plan = TurnAccounts::resolve(
+            &dirs,
+            Some(&state_path),
+            policy(ClaudeCodeAccountSelection::Hybrid, Some(&dirs[0]), None),
+        )
+        .await;
+
+        assert_eq!(
+            plan.candidates,
+            vec![Some(dirs[0].clone()), Some(dirs[1].clone())]
+        );
+    }
+
+    #[tokio::test]
+    async fn hybrid_moves_off_a_thread_account_that_ran_low() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dirs = account_fixture(&temp, &["a", "b"]);
+        let state_path = temp.path().join(ACCOUNTS_STATE_FILE_NAME);
+
+        // a is down to 5% — below the 20% threshold — so the fresher account
+        // wins even though switching costs a replay.
+        let mut usage = BTreeMap::new();
+        usage.insert(dir_key(&dirs[0]), fresh_snapshot(95.0));
+        usage.insert(dir_key(&dirs[1]), fresh_snapshot(30.0));
+        let state = AccountsFile {
+            usage,
+            ..AccountsFile::default()
+        };
+        state.save(&state_path);
+
+        let plan = TurnAccounts::resolve(
+            &dirs,
+            Some(&state_path),
+            policy(ClaudeCodeAccountSelection::Hybrid, Some(&dirs[0]), None),
+        )
+        .await;
+
+        assert_eq!(
+            plan.candidates,
+            vec![Some(dirs[1].clone()), Some(dirs[0].clone())]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_spawn_pin_outranks_the_preferred_and_sticky_accounts() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dirs = account_fixture(&temp, &["a", "b", "c"]);
+        let state_path = temp.path().join(ACCOUNTS_STATE_FILE_NAME);
+        let state = AccountsFile {
+            preferred_dir: Some(dirs[1].to_string_lossy().into_owned()),
+            ..AccountsFile::default()
+        };
+        state.save(&state_path);
+
+        let plan = TurnAccounts::resolve(
+            &dirs,
+            Some(&state_path),
+            policy(
+                ClaudeCodeAccountSelection::Hybrid,
+                Some(&dirs[0]),
+                Some(&dirs[2]),
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            plan.candidates,
+            vec![
+                Some(dirs[2].clone()),
+                Some(dirs[1].clone()),
+                Some(dirs[0].clone()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn hybrid_sends_a_second_agent_to_the_idle_account() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dirs = account_fixture(&temp, &["a", "b"]);
+        let state_path = temp.path().join(ACCOUNTS_STATE_FILE_NAME);
+
+        // Both accounts are healthy; a is marginally fresher.
+        let mut usage = BTreeMap::new();
+        usage.insert(dir_key(&dirs[0]), fresh_snapshot(10.0));
+        usage.insert(dir_key(&dirs[1]), fresh_snapshot(11.0));
+        let state = AccountsFile {
+            usage,
+            ..AccountsFile::default()
+        };
+        state.save(&state_path);
+
+        let busy = InFlightGuard::acquire(Some(&dirs[0]));
+        let plan = TurnAccounts::resolve(
+            &dirs,
+            Some(&state_path),
+            policy(ClaudeCodeAccountSelection::Hybrid, None, None),
+        )
+        .await;
+        assert_eq!(plan.candidates.first(), Some(&Some(dirs[1].clone())));
+
+        // Once that turn ends the headroom order decides again.
+        drop(busy);
+        let plan = TurnAccounts::resolve(
+            &dirs,
+            Some(&state_path),
+            policy(ClaudeCodeAccountSelection::Hybrid, None, None),
+        )
+        .await;
+        assert_eq!(plan.candidates.first(), Some(&Some(dirs[0].clone())));
     }
 }

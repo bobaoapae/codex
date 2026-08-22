@@ -155,6 +155,9 @@ async fn handle_spawn_agent(
     )
     .await?;
     apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
+    // After the provider is final: the account only means something once we
+    // know the child really is Claude-backed.
+    apply_spawn_agent_claude_account(&mut config, args.account.as_deref())?;
 
     // Claude children receive a complete, self-contained plaintext brief through
     // the inter-agent message. Inheriting parent turns makes the local Claude
@@ -296,6 +299,8 @@ struct SpawnAgentArgs {
     service_tier: Option<String>,
     fork_turns: Option<String>,
     fork_context: Option<bool>,
+    /// FORK: Claude account for a Claude-backed agent.
+    account: Option<String>,
 }
 
 impl SpawnAgentArgs {

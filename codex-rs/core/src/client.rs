@@ -1964,6 +1964,7 @@ impl ModelClientSession {
                         .as_ref()
                         .or(self.client.claude_code_workspace.as_ref()),
                     Arc::clone(&self.client.state.claude_code),
+                    self.client.state.thread_id,
                 )
                 .await
             }

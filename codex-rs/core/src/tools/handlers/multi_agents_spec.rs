@@ -17,8 +17,7 @@ pub const MULTI_AGENT_V1_NAMESPACE: &str = "multi_agent_v1";
 ///
 /// `message` is encrypted for the model backend, which an agent served by a
 /// local process cannot decrypt. Those agents need the task in the clear.
-const LOCAL_AGENT_PLAINTEXT_MESSAGE_DESCRIPTION: &str =
-    "Use this instead of `message` when the target agent runs on a local backend \
+const LOCAL_AGENT_PLAINTEXT_MESSAGE_DESCRIPTION: &str = "Use this instead of `message` when the target agent runs on a local backend \
 that cannot decrypt an encrypted payload (any Claude agent type). Exactly one of \
 `message` or `plaintext_message` must be set.";
 const MULTI_AGENT_V1_NAMESPACE_DESCRIPTION: &str = "Tools for spawning and managing sub-agents.";
@@ -40,6 +39,10 @@ pub struct SpawnAgentToolOptions {
     pub expose_spawn_agent_model_overrides: bool,
     pub multi_agent_version: MultiAgentVersion,
     pub usage_hint_text: Option<String>,
+    /// FORK: configured Claude accounts, as `index: label` lines. Empty unless
+    /// `[claude_code].account_dirs` is set, which is what gates the `account`
+    /// argument existing at all.
+    pub claude_accounts: Vec<String>,
 }
 
 impl Default for SpawnAgentToolOptions {
@@ -52,6 +55,7 @@ impl Default for SpawnAgentToolOptions {
             expose_spawn_agent_model_overrides: false,
             multi_agent_version: MultiAgentVersion::Disabled,
             usage_hint_text: None,
+            claude_accounts: Vec::new(),
         }
     }
 }
@@ -133,6 +137,17 @@ pub fn create_spawn_agent_tool_v2(options: SpawnAgentToolOptions) -> ToolSpec {
                 .to_string(),
         )),
     );
+    // FORK: only Claude-backed agents have an account to choose, so the argument
+    // appears only once accounts are configured.
+    if !options.claude_accounts.is_empty() {
+        properties.insert(
+            "account".to_string(),
+            JsonSchema::string(Some(format!(
+                "Claude account for a Claude-backed agent, as an index, a config path, or part of the account email. Omit or pass `auto` to let Codex choose. Check headroom with `claude_accounts` first, and spread parallel agents across accounts. Configured accounts: {}",
+                options.claude_accounts.join("; ")
+            ))),
+        );
+    }
 
     ToolSpec::Function(ResponsesApiTool {
         name: "spawn_agent".to_string(),

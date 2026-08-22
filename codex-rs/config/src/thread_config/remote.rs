@@ -306,7 +306,9 @@ fn proto_wire_api(wire_api: WireApi) -> proto::WireApi {
     match wire_api {
         WireApi::Responses => proto::WireApi::Responses,
         WireApi::ClaudeCode => {
-            unreachable!("claude_code providers are local-only and never appear in remote thread config")
+            unreachable!(
+                "claude_code providers are local-only and never appear in remote thread config"
+            )
         }
     }
 }

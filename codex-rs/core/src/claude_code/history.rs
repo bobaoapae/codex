@@ -13,6 +13,7 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::models::plaintext_agent_message_content;
+use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hash;
 use std::hash::Hasher;
@@ -49,6 +50,13 @@ pub(crate) struct ClaudeSessionContinuity {
     /// works against the history store the session was created in, so a turn
     /// served by a different account must replay instead of resuming.
     pub(super) account_dir: Option<std::path::PathBuf>,
+    /// FORK: fingerprints of the items Claude itself produced last turn.
+    ///
+    /// Codex appends Claude's answer to its own history *after* the request that
+    /// produced it, so the next request carries it in the undelivered tail. The
+    /// session already contains it — resending it makes Claude read its own
+    /// reply back as new input, every single turn.
+    pub(super) echoed: Vec<u64>,
 }
 
 /// Decides between extending the recorded Claude session and replaying history.
@@ -67,8 +75,19 @@ pub(super) fn plan_request(
         (input, true)
     };
 
+    // A replay rebuilds the whole conversation, so Claude's own turns belong in
+    // it. Extending does not: the live session already holds them.
+    let tail: Vec<&ResponseItem> = if restart_session || continuity.echoed.is_empty() {
+        tail.iter().collect()
+    } else {
+        let echoed: HashSet<u64> = continuity.echoed.iter().copied().collect();
+        tail.iter()
+            .filter(|item| !echoed.contains(&item_fingerprint(item)))
+            .collect()
+    };
+
     RequestPlan {
-        turn_text: render_turn(tail, restart_session),
+        turn_text: render_turn(&tail, restart_session),
         restart_session,
         delivered_items: input.len(),
         delivered_fingerprint: fingerprint(input),
@@ -88,10 +107,18 @@ fn fingerprint(items: &[ResponseItem]) -> u64 {
     hasher.finish()
 }
 
-fn render_turn(items: &[ResponseItem], is_replay: bool) -> String {
+/// Fingerprint of a single item, on the same rendered-text basis as
+/// [`fingerprint`], so an item Codex stores can be recognized later.
+pub(super) fn item_fingerprint(item: &ResponseItem) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    render_item(item).hash(&mut hasher);
+    hasher.finish()
+}
+
+fn render_turn(items: &[&ResponseItem], is_replay: bool) -> String {
     let rendered: Vec<String> = items
         .iter()
-        .map(render_item)
+        .map(|item| render_item(item))
         .filter(|text| !text.trim().is_empty())
         .collect();
 

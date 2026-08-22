@@ -149,7 +149,7 @@ pub struct OrchestratorFeatureToml {
 }
 
 /// FORK: settings for the `claude_code` local provider (`[claude_code]`).
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct ClaudeCodeToml {
     /// Ordered list of Claude Code config directories (one per account). When
@@ -158,6 +158,37 @@ pub struct ClaudeCodeToml {
     /// login) fail over to the next directory. When unset, the CLI inherits the
     /// ambient environment, as before.
     pub account_dirs: Option<Vec<PathBuf>>,
+
+    /// How the next account is chosen when more than one is configured.
+    pub selection: Option<ClaudeCodeAccountSelection>,
+
+    /// Headroom, in percent of the tightest usage window, that the account
+    /// already serving a thread must still have for `hybrid` to keep it.
+    /// Below this the thread migrates to the account with the most headroom,
+    /// which costs one transcript replay but avoids stalling on a limit.
+    pub sticky_min_headroom_pct: Option<f64>,
+
+    /// How long the `claude` CLI may produce no output at all before the turn
+    /// is abandoned and its process tree killed. Defaults to 10 minutes; set to
+    /// 0 to wait forever.
+    pub idle_timeout_ms: Option<u64>,
+}
+
+/// FORK: account-selection policy for the `claude_code` provider.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeCodeAccountSelection {
+    /// Keep the thread's account while it has headroom to spare, then move to
+    /// the account with the most headroom. Preserves the Claude session — and
+    /// with it the prompt cache — in the common case.
+    #[default]
+    Hybrid,
+    /// Spend the account closest to its limit first and keep the fresher ones
+    /// in reserve. Maximizes total usable quota, at the cost of a replay every
+    /// time a thread changes account.
+    Drain,
+    /// Try the accounts in the order they are configured.
+    Config,
 }
 
 /// Base config deserialized from ~/.codex/config.toml.

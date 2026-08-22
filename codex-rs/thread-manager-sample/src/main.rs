@@ -16,6 +16,7 @@ use codex_core_api::AskForApproval;
 use codex_core_api::AuthCredentialsStoreMode;
 use codex_core_api::AuthManager;
 use codex_core_api::AutoCompactTokenLimitScope;
+use codex_core_api::ClaudeCodeAccountSelection;
 use codex_core_api::CodexAppsToolsCache;
 use codex_core_api::CodexHomeUserInstructionsProvider;
 use codex_core_api::CodexThread;
@@ -204,6 +205,10 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
         explicit_permission_profile_mode: false,
         custom_permission_profiles: Vec::new(),
         claude_code_account_dirs: Vec::new(),
+        claude_code_selection: ClaudeCodeAccountSelection::default(),
+        claude_code_sticky_min_headroom_pct: 20.0,
+        claude_code_idle_timeout_ms: None,
+        claude_code_account_override: None,
         approvals_reviewer: ApprovalsReviewer::User,
         enforce_residency: Constrained::allow_any(/*initial_value*/ None),
         hide_agent_reasoning: false,

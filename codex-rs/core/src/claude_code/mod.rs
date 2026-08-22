@@ -16,12 +16,14 @@
 //! Authentication is whatever the `claude` binary is logged in as, so this path
 //! spends the user's Claude Code subscription rather than an API key.
 
-mod accounts;
+pub(crate) mod accounts;
 mod history;
+mod sessions;
 
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
+use codex_config::config_toml::ClaudeCodeAccountSelection;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result;
 use codex_protocol::models::ContentItem;
@@ -33,6 +35,7 @@ use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::TokenUsage;
 use serde_json::Value as JsonValue;
+use std::path::Path;
 use std::path::PathBuf;
 
 use std::process::Stdio;
@@ -59,6 +62,12 @@ const DEFAULT_CLAUDE_BIN: &str = "claude";
 /// per tool call, so a turn produces tens of events, not thousands.
 const EVENT_CHANNEL_SIZE: usize = 256;
 
+/// How much of a failed child's stderr is worth reporting back.
+const MAX_STDERR_CHARS: usize = 2_000;
+
+/// Pause before the single retry of a failed process spawn.
+const SPAWN_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Everything the CLI needs to know about the Codex session hosting it.
 ///
 /// Resolved once when the client is built, because a turn-scoped session cannot
@@ -78,6 +87,19 @@ pub(crate) struct ClaudeCodeWorkspace {
     pub(crate) account_dirs: Vec<PathBuf>,
     /// FORK: shared account-health state file under `CODEX_HOME`.
     pub(crate) accounts_state_path: Option<PathBuf>,
+    /// FORK: durable Claude-session record under `CODEX_HOME`, so an evicted
+    /// agent can resume its session instead of replaying its transcript.
+    pub(crate) sessions_state_path: Option<PathBuf>,
+    /// FORK: how to order the accounts for this turn.
+    pub(crate) selection: ClaudeCodeAccountSelection,
+    /// FORK: headroom the thread's current account must keep to stay sticky.
+    pub(crate) sticky_min_headroom_pct: f64,
+    /// FORK: account this agent was pinned to when it was spawned. It is tried
+    /// first and still fails over, so a spent pin cannot strand the agent.
+    pub(crate) pinned_account: Option<PathBuf>,
+    /// FORK: how long the CLI may produce nothing before the turn is abandoned.
+    /// `None` disables the watchdog.
+    pub(crate) idle_timeout: Option<std::time::Duration>,
 }
 
 impl ClaudeCodeWorkspace {
@@ -103,7 +125,86 @@ impl ClaudeCodeWorkspace {
                     .to_path_buf()
                     .join(accounts::ACCOUNTS_STATE_FILE_NAME),
             ),
+            sessions_state_path: Some(
+                config
+                    .codex_home
+                    .to_path_buf()
+                    .join(sessions::SESSIONS_STATE_FILE_NAME),
+            ),
+            selection: config.claude_code_selection,
+            sticky_min_headroom_pct: config.claude_code_sticky_min_headroom_pct,
+            pinned_account: config.claude_code_account_override.clone(),
+            idle_timeout: config
+                .claude_code_idle_timeout_ms
+                .map(std::time::Duration::from_millis),
         }
+    }
+}
+
+/// FORK: how a caller named a Claude account.
+pub(crate) enum AccountAlias {
+    /// Let the selection policy decide, as if no account had been named.
+    Auto,
+    /// A specific configured account directory.
+    Dir(PathBuf),
+}
+
+/// FORK: one line per configured account, for tool descriptions and errors.
+///
+/// The index is what a caller is most likely to use, so it leads.
+pub(crate) fn account_options(account_dirs: &[PathBuf]) -> Vec<String> {
+    account_dirs
+        .iter()
+        .enumerate()
+        .map(|(index, dir)| format!("{}: {}", index + 1, accounts::account_label(Some(dir))))
+        .collect()
+}
+
+/// FORK: resolves a `spawn_agent(account = …)` value against the configured
+/// accounts, accepting an index, a path, or part of the account's email.
+pub(crate) fn resolve_account_alias(
+    account_dirs: &[PathBuf],
+    alias: &str,
+) -> std::result::Result<AccountAlias, String> {
+    let alias = alias.trim();
+    if alias.is_empty() || alias.eq_ignore_ascii_case("auto") {
+        return Ok(AccountAlias::Auto);
+    }
+    if account_dirs.is_empty() {
+        return Err("no Claude accounts are configured; omit `account`".to_string());
+    }
+
+    if let Ok(index) = alias.parse::<usize>()
+        && index >= 1
+        && let Some(dir) = account_dirs.get(index - 1)
+    {
+        return Ok(AccountAlias::Dir(dir.clone()));
+    }
+
+    let alias_key = accounts::dir_key(Path::new(alias));
+    if let Some(dir) = account_dirs
+        .iter()
+        .find(|dir| accounts::dir_key(dir) == alias_key)
+    {
+        return Ok(AccountAlias::Dir(dir.clone()));
+    }
+
+    let needle = alias.to_lowercase();
+    let mut matches = account_dirs.iter().filter(|dir| {
+        accounts::account_label(Some(dir))
+            .to_lowercase()
+            .contains(&needle)
+    });
+    match (matches.next(), matches.next()) {
+        (Some(dir), None) => Ok(AccountAlias::Dir(dir.clone())),
+        (Some(_), Some(_)) => Err(format!(
+            "`{alias}` matches more than one Claude account. Configured accounts: {}",
+            account_options(account_dirs).join("; ")
+        )),
+        _ => Err(format!(
+            "unknown Claude account `{alias}`. Configured accounts: {}",
+            account_options(account_dirs).join("; ")
+        )),
     }
 }
 
@@ -126,6 +227,16 @@ pub(crate) fn permission_mode_for(approval_policy: AskForApproval) -> &'static s
 #[derive(Debug, Default)]
 pub(crate) struct ClaudeCodeThreadState {
     continuity: StdMutex<ClaudeSessionContinuity>,
+    /// FORK: where this thread's continuity is persisted, once a turn has told
+    /// us which thread we are. `None` until then.
+    store: StdMutex<Option<SessionStore>>,
+}
+
+/// FORK: identity of a thread's on-disk continuity record.
+#[derive(Debug, Clone)]
+struct SessionStore {
+    path: PathBuf,
+    thread_key: String,
 }
 
 impl ClaudeCodeThreadState {
@@ -136,31 +247,82 @@ impl ClaudeCodeThreadState {
             .clone()
     }
 
+    /// FORK: binds this state to its durable record, loading it the first time.
+    ///
+    /// Returns the account the agent was pinned to at spawn, which the rebuilt
+    /// config no longer carries. Later calls only re-bind: in-memory continuity
+    /// is always fresher than the file.
+    fn hydrate(&self, path: &Path, thread_key: String) -> Option<PathBuf> {
+        let mut store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if store.is_some() {
+            return None;
+        }
+        *store = Some(SessionStore {
+            path: path.to_path_buf(),
+            thread_key: thread_key.clone(),
+        });
+        drop(store);
+
+        let (recorded, pinned) = sessions::load(path, &thread_key)?;
+        let mut continuity = self
+            .continuity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if continuity.session_id.is_none() {
+            *continuity = recorded;
+        }
+        pinned
+    }
+
+    fn persist(&self, continuity: &ClaudeSessionContinuity, pinned_account: Option<&Path>) {
+        let store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(store) = store {
+            sessions::store(&store.path, &store.thread_key, continuity, pinned_account);
+        }
+    }
+
     fn record(
         &self,
         session_id: String,
         delivered_items: usize,
         delivered_fingerprint: u64,
         account_dir: Option<PathBuf>,
+        echoed: Vec<u64>,
+        pinned_account: Option<&Path>,
     ) {
-        let mut continuity = self
-            .continuity
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        continuity.session_id = Some(session_id);
-        continuity.delivered_items = delivered_items;
-        continuity.delivered_fingerprint = delivered_fingerprint;
-        continuity.account_dir = account_dir;
+        let snapshot = {
+            let mut continuity = self
+                .continuity
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            continuity.session_id = Some(session_id);
+            continuity.delivered_items = delivered_items;
+            continuity.delivered_fingerprint = delivered_fingerprint;
+            continuity.account_dir = account_dir;
+            continuity.echoed = echoed;
+            continuity.clone()
+        };
+        self.persist(&snapshot, pinned_account);
     }
 
-    /// Forgets the resume point after a failed turn, so the next request replays
-    /// the conversation instead of extending a session in an unknown state.
+    /// Forgets the resume point, so the next request replays the conversation
+    /// instead of extending a session in an unknown state.
     fn invalidate(&self) {
-        let mut continuity = self
-            .continuity
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *continuity = ClaudeSessionContinuity::default();
+        {
+            let mut continuity = self
+                .continuity
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *continuity = ClaudeSessionContinuity::default();
+        }
+        self.persist(&ClaudeSessionContinuity::default(), None);
     }
 }
 
@@ -171,8 +333,9 @@ pub(crate) async fn stream(
     effort: Option<ReasoningEffortConfig>,
     workspace: Option<&ClaudeCodeWorkspace>,
     state: Arc<ClaudeCodeThreadState>,
+    thread_id: codex_protocol::ThreadId,
 ) -> Result<ResponseStream> {
-    let workspace = match workspace {
+    let mut workspace = match workspace {
         Some(workspace) => workspace.clone(),
         None => ClaudeCodeWorkspace {
             cwd: std::env::current_dir().map_err(|err| {
@@ -184,8 +347,21 @@ pub(crate) async fn stream(
             permission_mode: permission_mode_for(AskForApproval::OnRequest),
             account_dirs: Vec::new(),
             accounts_state_path: None,
+            sessions_state_path: None,
+            selection: ClaudeCodeAccountSelection::default(),
+            sticky_min_headroom_pct: 0.0,
+            pinned_account: None,
+            idle_timeout: None,
         },
     };
+
+    // FORK: recover the Claude session this thread was using, in case the agent
+    // was evicted and rebuilt since its last turn.
+    if let Some(path) = workspace.sessions_state_path.clone()
+        && let Some(pinned) = state.hydrate(&path, thread_id.to_string())
+    {
+        workspace.pinned_account.get_or_insert(pinned);
+    }
 
     let input = prompt.input.clone();
     let model_slug = model_info.slug.clone();
@@ -259,7 +435,12 @@ async fn run_turn(
     let turn_accounts = accounts::TurnAccounts::resolve(
         &workspace.account_dirs,
         workspace.accounts_state_path.as_deref(),
-        sticky.as_deref(),
+        accounts::AccountPolicy {
+            selection: workspace.selection,
+            sticky_min_headroom_pct: workspace.sticky_min_headroom_pct,
+            sticky: sticky.as_deref(),
+            pinned: workspace.pinned_account.as_deref(),
+        },
     )
     .await;
 
@@ -268,6 +449,9 @@ async fn run_turn(
     let mut failures: Vec<String> = Vec::new();
 
     for (index, account_dir) in candidates.into_iter().enumerate() {
+        // Held for the whole attempt so a concurrent spawn can see this account
+        // is already busy and pick a quieter one.
+        let _in_flight = accounts::InFlightGuard::acquire(account_dir.as_deref());
         let continuity = state.snapshot();
         let continuity = if continuity_matches_account(&continuity, account_dir.as_deref()) {
             continuity
@@ -283,13 +467,30 @@ async fn run_turn(
             continuity.session_id.clone()
         };
 
-        let mut child = match spawn_claude(
+        let spawned = match spawn_claude(
             &model_slug,
             effort.as_ref(),
             resume_session_id.as_deref(),
             &workspace,
             account_dir.as_deref(),
         ) {
+            Ok(child) => Ok(child),
+            // Nothing has run yet, so one retry is free of side effects. It
+            // covers the transient cases — a locked binary right after an
+            // upgrade, a momentarily exhausted handle table — without papering
+            // over a missing install, which fails again immediately.
+            Err(_) => {
+                tokio::time::sleep(SPAWN_RETRY_DELAY).await;
+                spawn_claude(
+                    &model_slug,
+                    effort.as_ref(),
+                    resume_session_id.as_deref(),
+                    &workspace,
+                    account_dir.as_deref(),
+                )
+            }
+        };
+        let mut child = match spawned {
             Ok(child) => child,
             Err(err) => {
                 // Startup failures (missing binary) are account-independent:
@@ -328,16 +529,20 @@ async fn run_turn(
             &mut child,
             &tx_event,
             &consumer_dropped,
-            &plan,
-            account_dir.clone(),
-            &state,
+            AttemptContext {
+                plan: &plan,
+                account_dir: account_dir.clone(),
+                state: &state,
+                pinned_account: workspace.pinned_account.as_deref(),
+                idle_timeout: workspace.idle_timeout,
+            },
         )
         .await;
 
         // The consumer stopped polling (an interrupt, or an error upstream):
         // the CLI would otherwise keep running its tool loop unattended.
         if consumer_dropped.is_cancelled() {
-            let _ = child.start_kill();
+            kill_process_tree(&mut child);
         }
         let _ = child.wait().await;
 
@@ -352,7 +557,14 @@ async fn run_turn(
                 emitted_output,
                 turn_reported,
             } => {
-                state.invalidate();
+                // Only a session that cannot be resumed is worth forgetting.
+                // `delivered_items` advances on success alone, so keeping the
+                // resume point after a transient failure just re-sends the same
+                // tail — while dropping it replays the entire transcript and
+                // throws away the prompt cache with it.
+                if session_lost(&detail) {
+                    state.invalidate();
+                }
                 let class = accounts::classify_failure(&detail);
                 let label = accounts::account_label(account_dir.as_deref());
                 if let Some(dir) = account_dir.as_deref() {
@@ -397,6 +609,64 @@ async fn run_turn(
         .await;
 }
 
+/// FORK: kills the CLI *and* everything it started.
+///
+/// `Child::start_kill` only signals the direct child, so Claude's shells, build
+/// and test processes keep running against the workspace. On Unix the child is
+/// its own process group; on Windows `taskkill /T` walks the tree.
+fn kill_process_tree(child: &mut Child) {
+    let pid = child.id();
+    let _ = child.start_kill();
+    let Some(pid) = pid else {
+        return;
+    };
+    #[cfg(unix)]
+    {
+        // Negative pid = the whole process group created with `process_group(0)`.
+        unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
+}
+
+/// FORK: reads a child's stderr to completion in the background.
+///
+/// The handle resolves to what the child said, capped, once the pipe closes.
+fn drain_stderr(stderr: tokio::process::ChildStderr) -> tokio::task::JoinHandle<String> {
+    tokio::spawn(async move {
+        let mut buffer = String::new();
+        let mut reader = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = reader.next_line().await {
+            // Keep reading past the cap so the pipe never fills; just stop
+            // growing the buffer we report.
+            if buffer.len() <= MAX_STDERR_CHARS {
+                buffer.push_str(line.trim());
+                buffer.push('\n');
+            }
+        }
+        buffer.trim().to_string()
+    })
+}
+
+/// FORK: whether a failure means the recorded Claude session is unusable.
+///
+/// The CLI refuses an unknown id outright ("No conversation found with session
+/// ID: …"), and a corrupt or partially written session file surfaces the same
+/// way. Everything else — a crash, a killed process, a bad flag — leaves the
+/// session resumable.
+fn session_lost(detail: &str) -> bool {
+    let lower = detail.to_lowercase();
+    lower.contains("no conversation found")
+        || (lower.contains("session") && lower.contains("not found"))
+        || lower.contains("--resume")
+}
+
 /// True when the recorded Claude session belongs to the account we are about to
 /// spawn, so `--resume` will find it.
 fn continuity_matches_account(
@@ -415,19 +685,26 @@ fn continuity_matches_account(
     }
 }
 
-fn spawn_claude(
+/// The configured CLI location, or plain `claude` from `PATH`.
+fn claude_bin() -> String {
+    std::env::var(CLAUDE_BIN_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_CLAUDE_BIN.to_string())
+}
+
+/// Builds the CLI invocation for one attempt.
+///
+/// Separate from spawning so the command line — the entire contract with the
+/// CLI, and invisible at runtime — can be asserted on.
+fn build_claude_command(
     model_slug: &str,
     effort: Option<&ReasoningEffortConfig>,
     resume_session_id: Option<&str>,
     workspace: &ClaudeCodeWorkspace,
     config_dir: Option<&std::path::Path>,
-) -> Result<Child> {
-    let bin = std::env::var(CLAUDE_BIN_ENV)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_CLAUDE_BIN.to_string());
-
-    let mut command = Command::new(&bin);
+) -> Command {
+    let mut command = Command::new(claude_bin());
     command
         .arg("--print")
         // stream-json output is rejected without --verbose under --print.
@@ -472,12 +749,31 @@ fn spawn_claude(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    command.spawn().map_err(|err| {
-        CodexErr::UnsupportedOperation(format!(
-            "claude_code provider could not start `{bin}`: {err}. \
+    // FORK: Claude spawns its own shells, builds and test runners. Killing only
+    // the CLI leaves those running against the workspace after Codex has moved
+    // on, so put the whole run in one killable group.
+    #[cfg(unix)]
+    command.process_group(0);
+
+    command
+}
+
+fn spawn_claude(
+    model_slug: &str,
+    effort: Option<&ReasoningEffortConfig>,
+    resume_session_id: Option<&str>,
+    workspace: &ClaudeCodeWorkspace,
+    config_dir: Option<&std::path::Path>,
+) -> Result<Child> {
+    build_claude_command(model_slug, effort, resume_session_id, workspace, config_dir)
+        .spawn()
+        .map_err(|err| {
+            let bin = claude_bin();
+            CodexErr::UnsupportedOperation(format!(
+                "claude_code provider could not start `{bin}`: {err}. \
 Install Claude Code and log in, or set {CLAUDE_BIN_ENV} to its path."
-        ))
-    })
+            ))
+        })
 }
 
 /// Reads the CLI's stream-json output and republishes it as Codex events.
@@ -485,14 +781,31 @@ Install Claude Code and log in, or set {CLAUDE_BIN_ENV} to its path."
 /// `Created` is emitted by the caller (once per turn, not per attempt); this
 /// reports how the attempt ended so the caller can decide whether another
 /// account may retry it.
+/// Everything one attempt needs beyond the process and the event channel.
+struct AttemptContext<'a> {
+    plan: &'a history::RequestPlan,
+    /// Account serving this attempt; `None` = the ambient environment.
+    account_dir: Option<PathBuf>,
+    state: &'a ClaudeCodeThreadState,
+    /// Account the agent was pinned to at spawn, recorded with the session.
+    pinned_account: Option<&'a Path>,
+    /// How long the CLI may stay silent before the turn is abandoned.
+    idle_timeout: Option<std::time::Duration>,
+}
+
 async fn translate_stream(
     child: &mut Child,
     tx_event: &mpsc::Sender<Result<ResponseEvent>>,
     consumer_dropped: &CancellationToken,
-    plan: &history::RequestPlan,
-    account_dir: Option<PathBuf>,
-    state: &ClaudeCodeThreadState,
+    attempt: AttemptContext<'_>,
 ) -> AttemptOutcome {
+    let AttemptContext {
+        plan,
+        account_dir,
+        state,
+        pinned_account,
+        idle_timeout,
+    } = attempt;
     let mut emitted_output = false;
     let Some(stdout) = child.stdout.take() else {
         return AttemptOutcome::Failed {
@@ -501,23 +814,48 @@ async fn translate_stream(
             turn_reported: false,
         };
     };
-    let stderr = child.stderr.take();
+    // Drained continuously, not only when the turn fails: a chatty child that
+    // fills the stderr pipe buffer would otherwise block on its own write and
+    // hang the turn.
+    let stderr = child.stderr.take().map(drain_stderr);
     let mut lines = BufReader::new(stdout).lines();
 
     let mut session_id: Option<String> = None;
+    let account_label_dir = account_dir.clone();
     let mut assembler = StreamAssembler::new(tx_event);
 
     loop {
+        let next_line = async {
+            match idle_timeout {
+                // A wedged CLI produces nothing at all: no events, no exit. Time
+                // out on silence rather than pinning the turn open forever.
+                Some(idle_timeout) => tokio::time::timeout(idle_timeout, lines.next_line())
+                    .await
+                    .map_err(|_| ()),
+                None => Ok(lines.next_line().await),
+            }
+        };
         let line = tokio::select! {
             _ = consumer_dropped.cancelled() => return AttemptOutcome::ConsumerGone,
-            line = lines.next_line() => line,
+            line = next_line => line,
         };
         let line = match line {
-            Ok(Some(line)) => line,
-            Ok(None) => break,
-            Err(err) => {
+            Ok(Ok(Some(line))) => line,
+            Ok(Ok(None)) => break,
+            Ok(Err(err)) => {
                 return AttemptOutcome::Failed {
                     detail: format!("claude_code provider read failed: {err}"),
+                    emitted_output,
+                    turn_reported: false,
+                };
+            }
+            Err(()) => {
+                let seconds = idle_timeout.map(|idle| idle.as_secs()).unwrap_or_default();
+                kill_process_tree(child);
+                return AttemptOutcome::Failed {
+                    detail: format!(
+                        "claude_code turn produced no output for {seconds}s and was stopped"
+                    ),
                     emitted_output,
                     turn_reported: false,
                 };
@@ -645,6 +983,8 @@ async fn translate_stream(
                         plan.delivered_items,
                         plan.delivered_fingerprint,
                         account_dir,
+                        assembler.take_authored(),
+                        pinned_account,
                     );
                 } else {
                     state.invalidate();
@@ -652,6 +992,25 @@ async fn translate_stream(
 
                 let response_id = session_id.clone().unwrap_or_default();
                 let token_usage = parse_token_usage(event.get("usage"));
+                // FORK: the one line that shows whether the session/cache work
+                // is paying off — and the only place the chosen account is
+                // visible after the fact.
+                match token_usage.as_ref() {
+                    Some(usage) => tracing::info!(
+                        account = %accounts::account_label(account_label_dir.as_deref()),
+                        resumed = !plan.restart_session,
+                        input_tokens = usage.input_tokens,
+                        cached_input_tokens = usage.cached_input_tokens,
+                        cache_write_input_tokens = usage.cache_write_input_tokens,
+                        output_tokens = usage.output_tokens,
+                        "claude_code turn completed"
+                    ),
+                    None => tracing::info!(
+                        account = %accounts::account_label(account_label_dir.as_deref()),
+                        resumed = !plan.restart_session,
+                        "claude_code turn completed without usage; context accounting will not advance"
+                    ),
+                }
                 if tx_event
                     .send(Ok(ResponseEvent::Completed {
                         response_id,
@@ -672,18 +1031,7 @@ async fn translate_stream(
     // The CLI exited without a terminal `result`: surface whatever it said on
     // stderr, which is where startup and auth failures land.
     let detail = match stderr {
-        Some(stderr) => {
-            let mut buffer = String::new();
-            let mut reader = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = reader.next_line().await {
-                if buffer.len() > 2_000 {
-                    break;
-                }
-                buffer.push_str(line.trim());
-                buffer.push('\n');
-            }
-            buffer.trim().to_string()
-        }
+        Some(stderr) => stderr.await.unwrap_or_default(),
         None => String::new(),
     };
     warn!("claude_code: CLI ended without a result event");
@@ -708,6 +1056,9 @@ struct StreamAssembler<'a> {
     tx: &'a mpsc::Sender<Result<ResponseEvent>>,
     active: Option<ActiveItem>,
     streamed_any_text: bool,
+    /// FORK: fingerprints of every item this turn produced, so the next request
+    /// can drop them from its tail instead of reading them back to Claude.
+    authored: Vec<u64>,
 }
 
 enum ActiveItem {
@@ -721,11 +1072,22 @@ impl<'a> StreamAssembler<'a> {
             tx,
             active: None,
             streamed_any_text: false,
+            authored: Vec::new(),
         }
     }
 
     fn streamed_any_text(&self) -> bool {
         self.streamed_any_text
+    }
+
+    fn take_authored(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.authored)
+    }
+
+    /// Sends a finished item and remembers it as this turn's own output.
+    async fn send_done(&mut self, item: ResponseItem) -> bool {
+        self.authored.push(history::item_fingerprint(&item));
+        self.send(ResponseEvent::OutputItemDone(item)).await
     }
 
     /// Sends one event; `false` means the consumer is gone and we should stop.
@@ -788,14 +1150,8 @@ impl<'a> StreamAssembler<'a> {
     async fn close(&mut self, phase: MessagePhase) -> bool {
         match self.active.take() {
             None => true,
-            Some(ActiveItem::Reasoning(text)) => {
-                self.send(ResponseEvent::OutputItemDone(reasoning_item(text)))
-                    .await
-            }
-            Some(ActiveItem::Message(text)) => {
-                self.send(ResponseEvent::OutputItemDone(message_item(text, &phase)))
-                    .await
-            }
+            Some(ActiveItem::Reasoning(text)) => self.send_done(reasoning_item(text)).await,
+            Some(ActiveItem::Message(text)) => self.send_done(message_item(text, &phase)).await,
         }
     }
 
@@ -811,8 +1167,7 @@ impl<'a> StreamAssembler<'a> {
             return false;
         }
         self.streamed_any_text = true;
-        self.send(ResponseEvent::OutputItemDone(message_item(text, &phase)))
-            .await
+        self.send_done(message_item(text, &phase)).await
     }
 }
 
@@ -897,6 +1252,111 @@ mod tests {
         assert_eq!(
             permission_mode_for(AskForApproval::Never),
             "bypassPermissions"
+        );
+    }
+
+    fn test_workspace(temp: &tempfile::TempDir) -> ClaudeCodeWorkspace {
+        ClaudeCodeWorkspace {
+            cwd: temp.path().join("repo"),
+            extra_roots: vec![temp.path().join("sibling"), temp.path().join("repo")],
+            permission_mode: "bypassPermissions",
+            account_dirs: Vec::new(),
+            accounts_state_path: None,
+            sessions_state_path: None,
+            selection: ClaudeCodeAccountSelection::default(),
+            sticky_min_headroom_pct: 20.0,
+            pinned_account: None,
+            idle_timeout: None,
+        }
+    }
+
+    /// The command line is the whole contract with the CLI, and none of it is
+    /// observable at runtime — a wrong flag just produces a worse agent.
+    #[test]
+    fn a_resumed_turn_pins_the_account_and_reaches_every_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = test_workspace(&temp);
+        let account = temp.path().join("account-a");
+
+        let child = spawn_claude(
+            "claude-opus-5",
+            Some(&ReasoningEffortConfig::High),
+            Some("session-42"),
+            &workspace,
+            Some(&account),
+        );
+        // Without the CLI installed the spawn fails, but the command was already
+        // built; keep the assertions on what we control.
+        let command = build_claude_command(
+            "claude-opus-5",
+            Some(&ReasoningEffortConfig::High),
+            Some("session-42"),
+            &workspace,
+            Some(&account),
+        );
+        drop(child);
+
+        let args: Vec<String> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--model", "claude-opus-5"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--permission-mode", "bypassPermissions"])
+        );
+        assert!(args.windows(2).any(|pair| pair == ["--effort", "high"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--resume", "session-42"])
+        );
+        assert!(!args.iter().any(|arg| arg == "--session-id"));
+        // The cwd plus each distinct sibling root, and no duplicate for the cwd
+        // appearing in both lists.
+        let add_dirs = args
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index > 0 && args[index - 1] == "--add-dir")
+            .count();
+        assert_eq!(add_dirs, 2, "{args:?}");
+
+        let config_dir = command
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("CLAUDE_CONFIG_DIR"))
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_string_lossy().into_owned());
+        assert_eq!(
+            config_dir.as_deref(),
+            Some(account.to_string_lossy().as_ref())
+        );
+    }
+
+    /// A turn with no session to resume must get a fresh id, not resume nothing.
+    #[test]
+    fn a_first_turn_asks_for_a_new_session_id() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = test_workspace(&temp);
+
+        let command = build_claude_command("claude-sonnet-5", None, None, &workspace, None);
+
+        let args: Vec<String> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.iter().any(|arg| arg == "--session-id"));
+        assert!(!args.iter().any(|arg| arg == "--resume"));
+        assert!(!args.iter().any(|arg| arg == "--effort"));
+        assert!(
+            command
+                .as_std()
+                .get_envs()
+                .all(|(key, _)| key != std::ffi::OsStr::new("CLAUDE_CONFIG_DIR"))
         );
     }
 }

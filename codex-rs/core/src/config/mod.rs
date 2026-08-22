@@ -23,6 +23,7 @@ use codex_config::ResidencyRequirement;
 use codex_config::SandboxModeRequirement;
 use codex_config::Sourced;
 use codex_config::ThreadConfigLoader;
+use codex_config::config_toml::ClaudeCodeAccountSelection;
 use codex_config::config_toml::ConfigToml;
 use codex_config::config_toml::DEFAULT_PROJECT_DOC_MAX_BYTES;
 use codex_config::config_toml::ProjectConfig;
@@ -233,6 +234,11 @@ pub(crate) const HARD_MIN_MULTI_AGENT_V2_TIMEOUT_MS: i64 = 0;
 pub(crate) const HARD_MAX_MULTI_AGENT_V2_TIMEOUT_MS: i64 =
     DEFAULT_MULTI_AGENT_V2_MAX_WAIT_TIMEOUT_MS;
 pub(crate) const DEFAULT_AGENT_MAX_DEPTH: i32 = 1;
+/// FORK: a thread keeps its Claude account — and therefore its resumable Claude
+/// session — while the tightest usage window still has this much headroom.
+pub(crate) const DEFAULT_CLAUDE_CODE_STICKY_MIN_HEADROOM_PCT: f64 = 20.0;
+/// FORK: Claude runs long tool loops, but ten silent minutes means it is wedged.
+pub(crate) const DEFAULT_CLAUDE_CODE_IDLE_TIMEOUT_MS: u64 = 10 * 60 * 1000;
 const LOCAL_DEV_BUILD_VERSION: &str = "0.0.0";
 
 pub const CONFIG_TOML_FILE: &str = "config.toml";
@@ -890,6 +896,22 @@ pub struct Config {
     /// FORK: ordered Claude Code config directories (one per account) for the
     /// `claude_code` provider. Empty means "inherit the ambient environment".
     pub claude_code_account_dirs: Vec<PathBuf>,
+
+    /// FORK: how the `claude_code` provider picks among those directories.
+    pub claude_code_selection: ClaudeCodeAccountSelection,
+
+    /// FORK: headroom a thread's current Claude account must keep for the
+    /// `hybrid` policy to stay on it.
+    pub claude_code_sticky_min_headroom_pct: f64,
+
+    /// FORK: how long the `claude` CLI may go silent before its turn is
+    /// abandoned. `None` waits forever.
+    pub claude_code_idle_timeout_ms: Option<u64>,
+
+    /// FORK: Claude account this agent was pinned to at spawn time, if any.
+    /// Set from `spawn_agent(account = …)` and persisted with the child thread,
+    /// so its follow-up turns keep resuming the same Claude session.
+    pub claude_code_account_override: Option<PathBuf>,
 
     /// Resolved configuration shared by all Codex SQLite databases.
     pub sqlite: codex_state::SqliteConfig,
@@ -4136,6 +4158,27 @@ impl Config {
                 .as_ref()
                 .and_then(|claude_code| claude_code.account_dirs.clone())
                 .unwrap_or_default(),
+            claude_code_selection: cfg
+                .claude_code
+                .as_ref()
+                .and_then(|claude_code| claude_code.selection)
+                .unwrap_or_default(),
+            claude_code_sticky_min_headroom_pct: cfg
+                .claude_code
+                .as_ref()
+                .and_then(|claude_code| claude_code.sticky_min_headroom_pct)
+                .unwrap_or(DEFAULT_CLAUDE_CODE_STICKY_MIN_HEADROOM_PCT)
+                .clamp(0.0, 100.0),
+            // 0 means "wait forever", which is what `None` does downstream.
+            claude_code_idle_timeout_ms: Some(
+                cfg.claude_code
+                    .as_ref()
+                    .and_then(|claude_code| claude_code.idle_timeout_ms)
+                    .unwrap_or(DEFAULT_CLAUDE_CODE_IDLE_TIMEOUT_MS),
+            )
+            .filter(|timeout| *timeout > 0),
+            // Only a spawn request sets this; it never comes from config.toml.
+            claude_code_account_override: None,
             notify: cfg.notify,
             base_instructions,
             base_instructions_provenance,
