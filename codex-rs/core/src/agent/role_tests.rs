@@ -4,6 +4,7 @@ use crate::plugins::plugins_manager_for_config;
 use crate::skills_load_input_from_config;
 use codex_config::test_support::CloudConfigBundleFixture;
 use codex_login::test_support::auth_manager_from_optional_auth;
+use codex_model_provider_info::WireApi;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::models::BaseInstructionsProvenance;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -741,4 +742,96 @@ fn built_in_config_file_contents_resolves_explorer_only() {
         built_in::config_file_contents(Path::new("missing.toml")),
         None
     );
+}
+
+/// FORK: the local Claude Code CLI is the one provider a role may select.
+#[tokio::test]
+async fn apply_role_selects_the_local_claude_provider() {
+    let (home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
+    let role_path = write_role_config(
+        &home,
+        "claude-role.toml",
+        r#"model = "claude-opus-5"
+model_provider = "claude_code"
+"#,
+    )
+    .await;
+    config.agent_roles.insert(
+        "claude".to_string(),
+        AgentRoleConfig {
+            description: None,
+            config_file: Some(role_path),
+            nickname_candidates: None,
+        },
+    );
+
+    apply_role_to_config(&mut config, Some("claude"))
+        .await
+        .expect("claude role should apply");
+
+    assert_eq!(config.model.as_deref(), Some("claude-opus-5"));
+    assert_eq!(config.model_provider_id, CLAUDE_CODE_PROVIDER_ID);
+    assert_eq!(config.model_provider.wire_api, WireApi::ClaudeCode);
+}
+
+/// FORK: every other provider stays parent-owned, exactly as upstream requires.
+#[tokio::test]
+async fn apply_role_ignores_a_non_claude_provider() {
+    let (home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
+    let role_path = write_role_config(
+        &home,
+        "ollama-role.toml",
+        r#"model = "role-model"
+model_provider = "ollama"
+"#,
+    )
+    .await;
+    config.agent_roles.insert(
+        "custom".to_string(),
+        AgentRoleConfig {
+            description: None,
+            config_file: Some(role_path),
+            nickname_candidates: None,
+        },
+    );
+    let parent = config.clone();
+
+    apply_role_to_config(&mut config, Some("custom"))
+        .await
+        .expect("custom role should apply");
+
+    assert_eq!(config.model.as_deref(), Some("role-model"));
+    assert_eq!(config.model_provider_id, parent.model_provider_id);
+    assert_eq!(config.model_provider, parent.model_provider);
+}
+
+/// FORK: the orchestrator has to know a role is Claude-backed before it writes
+/// the task, because such a child never sees the parent conversation.
+#[test]
+fn spawn_tool_spec_reports_a_claude_backed_role() {
+    let home = TempDir::new().expect("create temp dir");
+    let role_path = home.path().join("claude-role.toml");
+    fs::write(
+        &role_path,
+        r#"model = "claude-opus-5"
+model_provider = "claude_code"
+"#,
+    )
+    .expect("write role config");
+    let user_defined_roles = BTreeMap::from([(
+        "claude".to_string(),
+        AgentRoleConfig {
+            description: Some("Deep review.".to_string()),
+            config_file: Some(role_path),
+            nickname_candidates: None,
+        },
+    )]);
+
+    let spec = spawn_tool_spec::build(&user_defined_roles);
+
+    assert!(
+        spec.contains("This role runs on the local Claude Code CLI"),
+        "{spec}"
+    );
+    assert!(spec.contains("`plaintext_message`"), "{spec}");
 }

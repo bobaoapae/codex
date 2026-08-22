@@ -16,6 +16,7 @@ use codex_config::loader::resolve_relative_paths_in_config_toml;
 use codex_exec_server::read_sensitive_file_to_string;
 use codex_features::Feature;
 use codex_features::feature_for_key;
+use codex_model_provider_info::CLAUDE_CODE_PROVIDER_ID;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::ServiceTier;
@@ -42,6 +43,11 @@ struct AgentRoleOverrides {
     model_verbosity: Option<Verbosity>,
     personality: Option<Personality>,
     service_tier: Option<String>,
+    /// FORK: only ever `claude_code`. Upstream keeps providers parent-owned; the
+    /// fork carves out the one provider that is local, keyless, and useless to
+    /// an attacker — see `apply_role_to_config_inner`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_provider: Option<String>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     features: BTreeMap<String, bool>,
     skills: Option<SkillsConfig>,
@@ -85,6 +91,12 @@ async fn apply_role_to_config_inner(
         model_verbosity: role_config.model_verbosity,
         personality: role_config.personality,
         service_tier: role_config.service_tier,
+        // FORK: a role may point a child at the local Claude Code CLI, and at
+        // nothing else. Every other provider stays parent-owned, so a role can
+        // still never redirect a child at a different endpoint or credential.
+        model_provider: role_config
+            .model_provider
+            .filter(|provider| provider == CLAUDE_CODE_PROVIDER_ID),
         ..Default::default()
     };
 
@@ -184,6 +196,18 @@ mod role_overrides {
         next_config.config_layer_stack = build_config_layer_stack(config, &role_layer_toml)?;
         if let Some(model) = &overrides.model {
             next_config.model = Some(model.clone());
+        }
+        // FORK: both fields move together. `model_provider_id` is what `/status`
+        // renders and what the thread persists, so setting only the info struct
+        // leaves a child that routes to Claude while reporting the parent's
+        // provider — and a resumed child would then be rebuilt on the wrong one.
+        if let Some(provider_id) = &overrides.model_provider {
+            next_config.model_provider = next_config
+                .model_providers
+                .get(provider_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("model provider `{provider_id}` is not configured"))?;
+            next_config.model_provider_id = provider_id.clone();
         }
         if let Some(instructions) = &overrides.developer_instructions {
             next_config.developer_instructions = Some(instructions.clone());
@@ -314,6 +338,16 @@ pub(crate) mod spawn_tool_spec {
                     let service_tier = role_toml
                         .get("service_tier")
                         .and_then(TomlValue::as_str);
+                    // FORK: a Claude-backed role behaves differently enough that
+                    // the orchestrator has to know before it writes the task.
+                    let claude_note = role_toml
+                        .get("model_provider")
+                        .and_then(TomlValue::as_str)
+                        .filter(|provider| *provider == CLAUDE_CODE_PROVIDER_ID)
+                        .map(|_| {
+                            "\n- This role runs on the local Claude Code CLI. It starts from the task you send it, without the parent conversation, so the task must be self-contained, and it must be sent as `plaintext_message`."
+                        })
+                        .unwrap_or_default();
 
                     let model_and_reasoning_note = match (model, reasoning_effort) {
                         (Some(model), Some(reasoning_effort)) => format!(
@@ -338,7 +372,7 @@ pub(crate) mod spawn_tool_spec {
                             )
                         })
                         .unwrap_or_default();
-                    format!("{model_and_reasoning_note}{service_tier_note}")
+                    format!("{model_and_reasoning_note}{service_tier_note}{claude_note}")
                 })
                 .unwrap_or_default();
             format!("{name}: {{\n{description}{locked_settings_note}\n}}")
