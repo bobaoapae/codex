@@ -12,6 +12,7 @@ use codex_tools::ToolExecutor;
 use crate::ExtensionData;
 use crate::ExtensionMetrics;
 
+mod approval_review;
 mod context;
 mod mcp;
 mod prompt;
@@ -22,6 +23,9 @@ mod turn_input;
 mod turn_lifecycle;
 mod world_state;
 
+pub use approval_review::ApprovalAssessment;
+pub use approval_review::ApprovalReviewError;
+pub use approval_review::ApprovalReviewInput;
 pub use context::TurnContextContributionInput;
 pub use mcp::McpServerContribution;
 pub use mcp::McpServerContributionContext;
@@ -39,7 +43,6 @@ pub use thread_lifecycle::ThreadResumeInput;
 pub use thread_lifecycle::ThreadStartInput;
 pub use thread_lifecycle::ThreadStopInput;
 pub use tool_lifecycle::ToolCallOutcome;
-pub use tool_lifecycle::ToolCallSource;
 pub use tool_lifecycle::ToolFinishInput;
 pub use tool_lifecycle::ToolLifecycleFuture;
 pub use tool_lifecycle::ToolStartInput;
@@ -272,6 +275,13 @@ pub trait TokenUsageContributor: Send + Sync {
 /// Implementations should treat the skill resource as an opaque identity and keep this callback
 /// cheap because it runs inline with skill loading or command dispatch.
 pub trait SkillInvocationContributor: Send + Sync {
+    /// Whether this contributor needs a snapshot of host-owned skills.
+    ///
+    /// The default preserves legacy discovery for contributors that do not explicitly opt out.
+    fn requires_host_skill_discovery(&self) -> bool {
+        true
+    }
+
     /// Called after one explicit skill load or deduplicated implicit skill invocation is observed.
     fn on_skill_invocation<'a>(
         &'a self,
@@ -327,16 +337,30 @@ pub trait ToolLifecycleContributor: Send + Sync {
     }
 }
 
-/// Extension contribution that can claim rendered approval-review prompts.
+/// Extension contribution for fast approval decisions and full action reviews.
+///
+/// Implementations can provide a fast decision from existing evidence, perform
+/// a full structured review, or support both paths. Returning `None` leaves the
+/// request available to the next contributor or the host's fallback path.
 pub trait ApprovalReviewContributor: Send + Sync {
-    /// Reviews one action using metrics bound to the active turn's model.
-    fn contribute<'a>(
+    /// Returns an available approval decision without performing a full review.
+    fn fast_decision<'a>(
         &'a self,
-        session_store: &'a ExtensionData,
-        thread_store: &'a ExtensionData,
-        prompt: &'a str,
-        extension_metrics: Option<Arc<dyn ExtensionMetrics>>,
-    ) -> ExtensionFuture<'a, Option<ReviewDecision>>;
+        _session_store: &'a ExtensionData,
+        _thread_store: &'a ExtensionData,
+        _prompt: &'a str,
+        _extension_metrics: Option<Arc<dyn ExtensionMetrics>>,
+    ) -> ExtensionFuture<'a, Option<ReviewDecision>> {
+        Box::pin(std::future::ready(None))
+    }
+
+    /// Performs a full review of a structured host-owned approval request.
+    fn full_review<'a>(
+        &'a self,
+        _input: &'a ApprovalReviewInput<'_>,
+    ) -> ExtensionFuture<'a, Option<Result<ApprovalAssessment, ApprovalReviewError>>> {
+        Box::pin(std::future::ready(None))
+    }
 }
 
 /// Ordered post-processing contribution for one parsed turn item.

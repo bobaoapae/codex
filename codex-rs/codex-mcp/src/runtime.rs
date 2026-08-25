@@ -471,10 +471,12 @@ impl McpRuntime {
         self.latest_connections().list_all_tools().await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn latest_call_tool(
         &self,
         server: &str,
         tool: &str,
+        environment_id: Option<&str>,
         arguments: Option<serde_json::Value>,
         meta: Option<serde_json::Value>,
         requested_timeout: Option<Duration>,
@@ -484,6 +486,7 @@ impl McpRuntime {
             .call_tool(
                 server,
                 tool,
+                environment_id,
                 arguments,
                 meta,
                 requested_timeout,
@@ -514,6 +517,25 @@ impl McpRuntime {
 
     pub fn cancel_startup(&self) {
         self.current.load().connections.cancel_startup();
+    }
+
+    /// Observes matching published registrations without starting or reconnecting servers.
+    pub async fn connection_statuses(
+        &self,
+        config: &McpConfig,
+    ) -> std::collections::HashMap<String, codex_protocol::mcp::McpServerConnectionStatus> {
+        let current = self.current.load_full();
+        let Some(published_config) = current.config.as_ref() else {
+            return HashMap::new();
+        };
+        let mut statuses = current.connections.connection_statuses().await;
+        statuses.retain(|name, _| {
+            published_config
+                .mcp_server_catalog
+                .server(name)
+                .is_some_and(|server| config.mcp_server_catalog.server(name) == Some(server))
+        });
+        statuses
     }
 
     pub(crate) fn latest_connections(&self) -> Arc<McpConnectionSet> {

@@ -78,6 +78,7 @@ impl ToolOrchestrator {
         let attempt_tool_ctx = ToolCtx {
             session: tool_ctx.session.clone(),
             step_context: Arc::clone(&tool_ctx.step_context),
+            cancellation_token: tool_ctx.cancellation_token.clone(),
             call_id: tool_ctx.call_id.clone(),
             tool_name: tool_ctx.tool_name.clone(),
         };
@@ -178,6 +179,7 @@ impl ToolOrchestrator {
                         })?;
                     let approval_ctx = ApprovalContext {
                         review_context: GuardianReviewContext::from(&tool_ctx.step_context),
+                        cancellation_token: Some(tool_ctx.cancellation_token.clone()),
                         call_id: tool_ctx.call_id.clone(),
                         tool_name: tool_ctx.tool_name.clone(),
                         strict_auto_review,
@@ -210,6 +212,7 @@ impl ToolOrchestrator {
                     })?;
                 let approval_ctx = ApprovalContext {
                     review_context: GuardianReviewContext::from(&tool_ctx.step_context),
+                    cancellation_token: Some(tool_ctx.cancellation_token.clone()),
                     call_id: tool_ctx.call_id.clone(),
                     tool_name: tool_ctx.tool_name.clone(),
                     strict_auto_review,
@@ -266,6 +269,8 @@ impl ToolOrchestrator {
                 managed_network_active,
             ),
         };
+        // TODO(anp): Reconcile backend selection and both attempts with
+        // TurnEnvironment::sandbox_context; turn-wide inputs can differ from owner config.
         let initial_sandbox = if sandbox_requested && !executor_managed_process_sandbox {
             self.sandbox.select_initial(
                 &permissions,
@@ -423,6 +428,7 @@ impl ToolOrchestrator {
                         })?;
                     let approval_ctx = ApprovalContext {
                         review_context: GuardianReviewContext::from(&tool_ctx.step_context),
+                        cancellation_token: Some(tool_ctx.cancellation_token.clone()),
                         call_id: tool_ctx.call_id.clone(),
                         tool_name: tool_ctx.tool_name.clone(),
                         strict_auto_review,

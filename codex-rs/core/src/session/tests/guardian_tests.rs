@@ -5,6 +5,7 @@ use crate::guardian::GUARDIAN_REVIEWER_NAME;
 use crate::plugins::plugins_manager_for_config;
 use crate::sandboxing::SandboxPermissions;
 use crate::session::step_context::StepContext;
+use crate::session::tests::update_turn_settings_for_test;
 use crate::test_support::models_manager_with_provider;
 use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolOutput;
@@ -23,6 +24,7 @@ use codex_model_provider::create_model_provider;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::models::AdditionalPermissionProfile as PermissionProfile;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::ContentItemKind;
 use codex_protocol::models::NetworkPermissions;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
@@ -96,7 +98,9 @@ async fn request_permissions_routes_to_guardian_when_reviewer_is_enabled() {
     .await;
 
     let (mut session, mut turn_context_raw) = make_session_and_context().await;
-    Arc::make_mut(&mut turn_context_raw.model_info).node_repl_auto_review_required = true;
+    update_turn_settings_for_test(&mut turn_context_raw, |settings| {
+        Arc::make_mut(&mut settings.model_info).node_repl_auto_review_required = true;
+    });
     *session.active_turn.lock().await = Some(ActiveTurn::default());
     Arc::make_mut(&mut turn_context_raw.config)
         .permissions
@@ -495,7 +499,6 @@ async fn strict_auto_review_turn_grant_forces_guardian_for_exec_command_policy_s
                 kind: crate::state::TaskKind::Regular,
                 listen_to_cancellation_token: true,
             },
-            crate::tasks::MailboxParentProvenance::Ignore,
         )
         .await;
 
@@ -640,7 +643,13 @@ async fn process_compacted_history_preserves_separate_guardian_developer_message
         .iter()
         .filter_map(|item| match item {
             ResponseItem::Message { role, content, .. } if role == "developer" => {
-                crate::content_items_to_text(content)
+                crate::content_items_to_text(content).map(|text| {
+                    (
+                        text,
+                        item.executed_tool_call_metadata()
+                            .and_then(|metadata| metadata.content_item_kinds.clone()),
+                    )
+                })
             }
             _ => None,
         })
@@ -649,10 +658,16 @@ async fn process_compacted_history_preserves_separate_guardian_developer_message
     assert!(
         !developer_messages
             .iter()
-            .any(|message| message.contains("stale developer message"))
+            .any(|(message, _)| message.contains("stale developer message"))
     );
     assert!(developer_messages.len() >= 2);
-    assert_eq!(developer_messages.last(), Some(&guardian_policy));
+    assert_eq!(
+        developer_messages.last(),
+        Some(&(
+            guardian_policy,
+            Some(vec![ContentItemKind("guardian.policy".to_string())]),
+        ))
+    );
 }
 
 #[tokio::test]

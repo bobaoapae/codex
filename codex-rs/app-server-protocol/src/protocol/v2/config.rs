@@ -1,5 +1,7 @@
 use super::ApprovalsReviewer;
 use super::AskForApproval;
+use super::BrowserUseConfig;
+use super::ComputerUseConfig;
 use super::SandboxMode;
 use super::WindowsSandboxSetupMode;
 use super::shared::default_enabled;
@@ -282,6 +284,8 @@ pub struct Config {
     #[experimental("config/read.apps")]
     #[serde(default)]
     pub apps: Option<AppsConfig>,
+    pub browser_use: Option<BrowserUseConfig>,
+    pub computer_use: Option<ComputerUseConfig>,
     pub desktop: Option<HashMap<String, JsonValue>>,
     #[serde(default, flatten)]
     pub additional: HashMap<String, JsonValue>,
@@ -585,6 +589,9 @@ pub struct ManagedHooksRequirements {
     #[serde(rename = "Stop")]
     #[ts(rename = "Stop")]
     pub stop: Vec<ConfiguredHookMatcherGroup>,
+    #[serde(rename = "Interrupt", default)]
+    #[ts(rename = "Interrupt")]
+    pub interrupt: Vec<ConfiguredHookMatcherGroup>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]

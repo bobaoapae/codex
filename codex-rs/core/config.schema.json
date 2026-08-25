@@ -70,6 +70,13 @@
       },
       "type": "object"
     },
+    "AllowDenyRequirementToml": {
+      "enum": [
+        "allow",
+        "deny"
+      ],
+      "type": "string"
+    },
     "AltScreenMode": {
       "description": "Controls whether the TUI uses the terminal's alternate screen buffer.\n\n- `auto` (default): Use alternate screen mode. - `always`: Always use alternate screen mode. - `never`: Never use alternate screen mode. Runs in inline mode, preserving scrollback.\n\nThe CLI flag `--no-alt-screen` can override this setting at runtime.",
       "oneOf": [
@@ -374,6 +381,42 @@
       ],
       "type": "object"
     },
+    "BrowserUseConfigToml": {
+      "additionalProperties": false,
+      "properties": {
+        "allow_history_access": {
+          "type": "boolean"
+        },
+        "default_origin_policy": {
+          "$ref": "#/definitions/BrowserUseOriginPolicyConfigToml"
+        },
+        "origins": {
+          "additionalProperties": {
+            "$ref": "#/definitions/BrowserUseOriginPolicyConfigToml"
+          },
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "BrowserUseOriginPolicyConfigToml": {
+      "additionalProperties": false,
+      "properties": {
+        "access": {
+          "$ref": "#/definitions/AllowDenyRequirementToml"
+        },
+        "downloads": {
+          "$ref": "#/definitions/AllowDenyRequirementToml"
+        },
+        "full_cdp_access": {
+          "$ref": "#/definitions/AllowDenyRequirementToml"
+        },
+        "uploads": {
+          "$ref": "#/definitions/AllowDenyRequirementToml"
+        }
+      },
+      "type": "object"
+    },
     "BundledSkillsConfig": {
       "additionalProperties": false,
       "properties": {
@@ -485,6 +528,74 @@
       },
       "type": "object"
     },
+    "ComputerUseConfigToml": {
+      "additionalProperties": false,
+      "properties": {
+        "default_app_access": {
+          "$ref": "#/definitions/AllowDenyRequirementToml"
+        },
+        "macos": {
+          "$ref": "#/definitions/ComputerUseMacosConfigToml"
+        },
+        "windows": {
+          "$ref": "#/definitions/ComputerUseWindowsConfigToml"
+        }
+      },
+      "type": "object"
+    },
+    "ComputerUseMacosConfigToml": {
+      "additionalProperties": false,
+      "properties": {
+        "bundle_ids": {
+          "additionalProperties": {
+            "$ref": "#/definitions/AllowDenyRequirementToml"
+          },
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "ComputerUseWindowsConfigToml": {
+      "additionalProperties": false,
+      "properties": {
+        "aumids": {
+          "additionalProperties": {
+            "$ref": "#/definitions/AllowDenyRequirementToml"
+          },
+          "type": "object"
+        },
+        "exes": {
+          "items": {
+            "$ref": "#/definitions/ComputerUseWindowsExeConfigToml"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "ComputerUseWindowsExeConfigToml": {
+      "additionalProperties": false,
+      "properties": {
+        "access": {
+          "$ref": "#/definitions/AllowDenyRequirementToml"
+        },
+        "binary_name": {
+          "type": "string"
+        },
+        "product_name": {
+          "type": "string"
+        },
+        "publisher_name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "access",
+        "product_name",
+        "publisher_name"
+      ],
+      "type": "object"
+    },
     "ConfigProfile": {
       "additionalProperties": false,
       "description": "Collection of common configuration options that a user can define as a unit in `config.toml`.",
@@ -549,6 +660,9 @@
             "background_paginated_rollout_migration": {
               "type": "boolean"
             },
+            "bedrock_setup_wizard": {
+              "type": "boolean"
+            },
             "browser_use": {
               "type": "boolean"
             },
@@ -576,6 +690,9 @@
             "code_mode_only": {
               "type": "boolean"
             },
+            "code_mode_prewarm": {
+              "type": "boolean"
+            },
             "codex_git_commit": {
               "type": "boolean"
             },
@@ -588,6 +705,9 @@
             "collaboration_modes": {
               "type": "boolean"
             },
+            "compaction_image_budget": {
+              "type": "boolean"
+            },
             "computer_use": {
               "type": "boolean"
             },
@@ -595,6 +715,9 @@
               "type": "boolean"
             },
             "connectors": {
+              "type": "boolean"
+            },
+            "content_item_kinds": {
               "type": "boolean"
             },
             "current_time_reminder": {
@@ -694,6 +817,9 @@
               "type": "boolean"
             },
             "in_app_dictation": {
+              "type": "boolean"
+            },
+            "in_app_local_automation": {
               "type": "boolean"
             },
             "in_app_updates": {
@@ -834,6 +960,9 @@
             "skill_search": {
               "type": "boolean"
             },
+            "skip_host_skill_discovery": {
+              "type": "boolean"
+            },
             "sqlite": {
               "type": "boolean"
             },
@@ -841,6 +970,9 @@
               "type": "boolean"
             },
             "steer": {
+              "type": "boolean"
+            },
+            "step_model_switching": {
               "type": "boolean"
             },
             "telepathy": {
@@ -868,6 +1000,9 @@
               "type": "boolean"
             },
             "tool_suggest": {
+              "type": "boolean"
+            },
+            "transcript_v2": {
               "type": "boolean"
             },
             "tui_app_server": {
@@ -1386,6 +1521,10 @@
       "additionalProperties": false,
       "description": "Optional tool-call categories available to the Guardian v2 classifier.",
       "properties": {
+        "computer_use_only": {
+          "description": "Restrict asynchronous classification and fast approvals to browser and computer-use tools.",
+          "type": "boolean"
+        },
         "sandboxed_exec_commands": {
           "description": "Include sandboxed shell command calls in Guardian v2 classification.",
           "type": "boolean"
@@ -1613,6 +1752,13 @@
     },
     "HooksToml": {
       "properties": {
+        "Interrupt": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/MatcherGroup"
+          },
+          "type": "array"
+        },
         "PermissionRequest": {
           "default": [],
           "items": {
@@ -1832,6 +1978,10 @@
           "format": "uint16",
           "minimum": 0.0,
           "type": "integer"
+        },
+        "callback_url": {
+          "description": "Registered callback URL associated with this OAuth client.",
+          "type": "string"
         },
         "client_id": {
           "description": "Explicit OAuth client identifier to present during authorization and token exchange.",
@@ -2318,6 +2468,9 @@
           "type": "boolean"
         },
         "allow_upstream_proxy": {
+          "type": "boolean"
+        },
+        "credential_broker": {
           "type": "boolean"
         },
         "dangerously_allow_all_unix_sockets": {
@@ -3726,6 +3879,7 @@
               "open_line_above": null,
               "open_line_below": null,
               "paste_after": null,
+              "repeat_last_change": null,
               "replace_char": null,
               "start_change_operator": null,
               "start_delete_operator": null,
@@ -4533,6 +4687,7 @@
             "open_line_above": null,
             "open_line_below": null,
             "paste_after": null,
+            "repeat_last_change": null,
             "replace_char": null,
             "start_change_operator": null,
             "start_delete_operator": null,
@@ -4940,6 +5095,14 @@
             }
           ],
           "description": "Paste after cursor (`p`)."
+        },
+        "repeat_last_change": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Repeat the last complete edit (`.`)."
         },
         "replace_char": {
           "allOf": [
@@ -5400,6 +5563,9 @@
       "minimum": 0.0,
       "type": "integer"
     },
+    "browser_use": {
+      "$ref": "#/definitions/BrowserUseConfigToml"
+    },
     "chatgpt_base_url": {
       "description": "Base URL for requests to ChatGPT (as opposed to the OpenAI API).",
       "type": "string"
@@ -5429,6 +5595,9 @@
     "compact_prompt": {
       "description": "Compact prompt used for history compaction.",
       "type": "string"
+    },
+    "computer_use": {
+      "$ref": "#/definitions/ComputerUseConfigToml"
     },
     "default_permissions": {
       "description": "Default permissions profile to apply. Names starting with `:` refer to built-in profiles; other names are resolved from the `[permissions]` table.",
@@ -5529,6 +5698,9 @@
         "background_paginated_rollout_migration": {
           "type": "boolean"
         },
+        "bedrock_setup_wizard": {
+          "type": "boolean"
+        },
         "browser_use": {
           "type": "boolean"
         },
@@ -5556,6 +5728,9 @@
         "code_mode_only": {
           "type": "boolean"
         },
+        "code_mode_prewarm": {
+          "type": "boolean"
+        },
         "codex_git_commit": {
           "type": "boolean"
         },
@@ -5568,6 +5743,9 @@
         "collaboration_modes": {
           "type": "boolean"
         },
+        "compaction_image_budget": {
+          "type": "boolean"
+        },
         "computer_use": {
           "type": "boolean"
         },
@@ -5575,6 +5753,9 @@
           "type": "boolean"
         },
         "connectors": {
+          "type": "boolean"
+        },
+        "content_item_kinds": {
           "type": "boolean"
         },
         "current_time_reminder": {
@@ -5674,6 +5855,9 @@
           "type": "boolean"
         },
         "in_app_dictation": {
+          "type": "boolean"
+        },
+        "in_app_local_automation": {
           "type": "boolean"
         },
         "in_app_updates": {
@@ -5814,6 +5998,9 @@
         "skill_search": {
           "type": "boolean"
         },
+        "skip_host_skill_discovery": {
+          "type": "boolean"
+        },
         "sqlite": {
           "type": "boolean"
         },
@@ -5821,6 +6008,9 @@
           "type": "boolean"
         },
         "steer": {
+          "type": "boolean"
+        },
+        "step_model_switching": {
           "type": "boolean"
         },
         "telepathy": {
@@ -5848,6 +6038,9 @@
           "type": "boolean"
         },
         "tool_suggest": {
+          "type": "boolean"
+        },
+        "transcript_v2": {
           "type": "boolean"
         },
         "tui_app_server": {
