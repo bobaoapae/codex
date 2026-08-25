@@ -43,6 +43,7 @@ fn chatgpt_auth(email: &str, account_id: &str) -> AuthDotJson {
         agent_identity: None,
         personal_access_token: None,
         bedrock_api_key: None,
+        bedrock_access_keys: None,
     }
 }
 
@@ -264,6 +265,7 @@ fn api_key_payloads_are_storable_and_identifiable() {
         agent_identity: None,
         personal_access_token: None,
         bedrock_api_key: None,
+        bedrock_access_keys: None,
     };
     let home = TempDir::new().expect("tempdir");
     let vault = AccountVault::new(home.path());
