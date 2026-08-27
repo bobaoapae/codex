@@ -101,10 +101,12 @@ impl ChatgptWebCli {
                 Ok(())
             }
             ChatgptWebSubcommand::Doctor => run_doctor(&config).await,
-            ChatgptWebSubcommand::Setup(args) => run_setup(&codex_home, args).await,
+            ChatgptWebSubcommand::Setup(args) => run_setup(&config, args).await,
             ChatgptWebSubcommand::Registry(args) => match args.action {
                 RegistryAction::Reconcile => {
-                    let body = chatgpt_web_daemon::reconcile_via_daemon(&codex_home).await?;
+                    let body =
+                        chatgpt_web_daemon::reconcile_via_daemon(&codex_home, &config.chatgpt_web)
+                            .await?;
                     println!("{}", serde_json::to_string_pretty(&body)?);
                     Ok(())
                 }
@@ -225,7 +227,12 @@ async fn run_registry_delete(config: &Config) -> Result<()> {
     Ok(())
 }
 
-async fn run_setup(codex_home: &Path, args: SetupArgs) -> Result<()> {
+async fn run_setup(config: &Config, args: SetupArgs) -> Result<()> {
+    let codex_home = config.codex_home.as_path();
+    // The credentials just written must win over whatever the session passed.
+    let mut settings = config.chatgpt_web.clone();
+    settings.tunnel = codex_config::config_toml::ChatGptWebTunnel::Openai;
+    settings.tunnel_id = Some(args.tunnel_id.clone());
     let api_key = if args.api_key_file == Path::new("-") {
         let mut buffer = String::new();
         std::io::Read::read_to_string(&mut std::io::stdin(), &mut buffer)
@@ -249,7 +256,8 @@ async fn run_setup(codex_home: &Path, args: SetupArgs) -> Result<()> {
     }
     println!("starting the daemon and waiting for the tunnel…");
     let health =
-        chatgpt_web_daemon::wait_tunnel_ready(codex_home, Duration::from_secs(150)).await?;
+        chatgpt_web_daemon::wait_tunnel_ready(codex_home, &settings, Duration::from_secs(150))
+            .await?;
     println!(
         "tunnel ready ({}); registry: {}",
         health.public_url.unwrap_or_default(),

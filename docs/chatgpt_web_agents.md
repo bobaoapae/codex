@@ -237,18 +237,22 @@ must touch the workspace is the parent's job — or the connector's.
 
 ## `tools = "connector"`
 
-> **Status.** The daemon, contract, broker, tunnel supervisor, connector
-> registry and the `codex chatgpt-web` CLI are built and covered by unit and
-> integration tests plus a CLI smoke with `tunnel = "manual"`. The
-> browser-side flow (@mention, approval card, tool calls, a 60 s call,
-> serialization) was verified live in the spikes with a throwaway MCP server
-> over cloudflared. The `openai` tunnel path has **not** been exercised live
-> (the test account had no tunnel yet), so the pinned `tunnel-client` flags are
-> unconfirmed. As of this writing the provider-side turn loop — registering the
-> turn, mentioning the connector, mapping calls into the transcript — is still
-> being wired; a build without it rejects `tools = "connector"` with
-> `[chatgpt_web] tools = "connector" needs the connector daemon, which this
-> build does not wire yet; use tools = "none"`.
+> **Status.** Connector mode works end to end over `tunnel = "cloudflared"`,
+> verified live: `codex exec -m chatgpt-web/instant "...codex_exec... echo
+> CONNECTOR_OK"` produced a real `exec_command` cell run by Codex and an answer
+> containing `CONNECTOR_OK`, and a `codex_apply_patch` turn wrote a file to
+> disk (a `CustomToolCall`). The daemon autostarts with the session's
+> `[chatgpt_web]` settings, registers the "Codex Native" connector, and
+> reconnects a fresh tunnel URL + re-reconciles within ~90 s when cloudflared is
+> killed. The daemon, contract, broker, tunnel supervisor, connector registry
+> and the `codex chatgpt-web` CLI are covered by unit and integration tests.
+> Still unverified live: the `openai` tunnel path (the test account had no
+> tunnel yet, so the pinned `tunnel-client` flags are unconfirmed — run
+> `codex chatgpt-web setup` then check `tunnel-client run --help`); and a
+> follow-up turn issued as a **separate** `codex exec` process (`exec resume`)
+> against the same conversation, where ChatGPT re-prompts its own tool-approval
+> card for the new turn_token and the auto-approver may not click it in time —
+> a single multi-tool turn, and continuation within one process, are fine.
 
 In connector mode ChatGPT calls Codex tools as real function calls. Codex
 exposes a custom MCP connector (Developer Mode) named `connector_name`

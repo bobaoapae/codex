@@ -59,10 +59,10 @@ async fn a_daemon_starts_writes_its_state_and_answers_healthz() {
     assert!(status.health.is_some());
 
     // A second daemon for the same home is refused.
-    let err = start(test_config(temp.path()))
-        .await
-        .err()
-        .expect("second start fails");
+    let err = match start(test_config(temp.path())).await {
+        Ok(_) => panic!("second start should fail"),
+        Err(err) => err,
+    };
     assert!(err.to_string().contains("already running"), "{err}");
 
     let endpoint = running_endpoint(temp.path()).await.expect("endpoint");

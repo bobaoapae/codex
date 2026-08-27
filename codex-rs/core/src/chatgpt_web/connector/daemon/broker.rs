@@ -437,11 +437,11 @@ impl TurnBroker {
                 // Forget the call so a late result is rejected rather than
                 // completing nothing.
                 let mut state = self.lock();
-                if let Some(slot) = state.calls.remove(&call_id) {
-                    if let Some(turn) = state.turns.get_mut(&slot.turn_token) {
-                        turn.in_flight.remove(&call_id);
-                        turn.queued.retain(|call| call.call_id != call_id);
-                    }
+                if let Some(slot) = state.calls.remove(&call_id)
+                    && let Some(turn) = state.turns.get_mut(&slot.turn_token)
+                {
+                    turn.in_flight.remove(&call_id);
+                    turn.queued.retain(|call| call.call_id != call_id);
                 }
                 BrokerResult::error(format!(
                     "Codex did not finish {display} within {}s. For long commands use yield_time_ms ≤ {} and poll the session with codex_write_stdin.",

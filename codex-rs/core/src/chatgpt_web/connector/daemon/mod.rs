@@ -593,10 +593,103 @@ pub async fn running_endpoint(codex_home: &Path) -> Option<DaemonEndpoint> {
     })
 }
 
-/// Spawns `codex chatgpt-web daemon` detached from this process.
-pub fn spawn_detached(codex_home: &Path) -> anyhow::Result<u32> {
+/// FORK (C5): the `[chatgpt_web]` settings the daemon must share with the
+/// session that starts it, as `-c` overrides for the spawned process.
+///
+/// The daemon reads `config.toml` like any other command, so a session that
+/// runs under `-c chatgpt_web.tunnel="cloudflared"` (or any other override)
+/// used to autostart a daemon with the *file's* settings — the wrong tunnel,
+/// port or connector name. Only the keys the daemon itself consumes are
+/// forwarded; secrets never travel here (the key file path does, not the key).
+pub fn daemon_overrides(settings: &ChatGptWebSettings) -> Vec<String> {
+    fn quote(value: &str) -> String {
+        // A JSON string literal is a valid TOML basic string.
+        serde_json::to_string(value).unwrap_or_else(|_| String::from("\"\""))
+    }
+    fn path(value: &Path) -> String {
+        quote(&value.to_string_lossy())
+    }
+    let tunnel = match settings.tunnel {
+        ChatGptWebTunnel::Openai => "openai",
+        ChatGptWebTunnel::Cloudflared => "cloudflared",
+        ChatGptWebTunnel::Manual => "manual",
+    };
+    let mut overrides = vec![
+        format!("chatgpt_web.tunnel={}", quote(tunnel)),
+        format!("chatgpt_web.tunnel_port={}", settings.tunnel_port),
+        format!("chatgpt_web.daemon_port={}", settings.daemon_port),
+        format!(
+            "chatgpt_web.daemon_idle_shutdown_ms={}",
+            settings.daemon_idle_shutdown_ms
+        ),
+        format!(
+            "chatgpt_web.connector_name={}",
+            quote(&settings.connector_name)
+        ),
+        format!(
+            "chatgpt_web.connector_description={}",
+            quote(&settings.connector_description)
+        ),
+        format!("chatgpt_web.daemon_url={}", quote(&settings.daemon_url)),
+        format!("chatgpt_web.base_url={}", quote(&settings.base_url)),
+        format!(
+            "chatgpt_web.tunnel_client_version={}",
+            quote(&settings.tunnel_client_version)
+        ),
+        format!(
+            "chatgpt_web.connector_auto_developer_mode={}",
+            settings.connector_auto_developer_mode
+        ),
+        format!(
+            "chatgpt_web.connector_call_timeout_ms={}",
+            settings.connector_call_timeout.as_millis()
+        ),
+        format!(
+            "chatgpt_web.connector_exec_default_yield_ms={}",
+            settings.connector_exec_default_yield.as_millis()
+        ),
+        format!("chatgpt_web.turn_ttl_ms={}", settings.turn_ttl.as_millis()),
+    ];
+    if !settings.cloudflared_extra_args.is_empty() {
+        let args: Vec<String> = settings
+            .cloudflared_extra_args
+            .iter()
+            .map(|arg| quote(arg))
+            .collect();
+        overrides.push(format!(
+            "chatgpt_web.cloudflared_extra_args=[{}]",
+            args.join(",")
+        ));
+    }
+    if let Some(id) = settings.tunnel_id.as_deref() {
+        overrides.push(format!("chatgpt_web.tunnel_id={}", quote(id)));
+    }
+    if let Some(url) = settings.manual_mcp_url.as_deref() {
+        overrides.push(format!("chatgpt_web.manual_mcp_url={}", quote(url)));
+    }
+    if let Some(value) = settings.token_file.as_deref() {
+        overrides.push(format!("chatgpt_web.token_file={}", path(value)));
+    }
+    if let Some(value) = settings.tunnel_key_file.as_deref() {
+        overrides.push(format!("chatgpt_web.tunnel_key_file={}", path(value)));
+    }
+    if let Some(value) = settings.tunnel_client_path.as_deref() {
+        overrides.push(format!("chatgpt_web.tunnel_client_path={}", path(value)));
+    }
+    if let Some(value) = settings.cloudflared_path.as_deref() {
+        overrides.push(format!("chatgpt_web.cloudflared_path={}", path(value)));
+    }
+    overrides
+}
+
+/// Spawns `codex chatgpt-web daemon` detached from this process, carrying the
+/// given `-c` overrides (see [`daemon_overrides`]).
+pub fn spawn_detached(codex_home: &Path, overrides: &[String]) -> anyhow::Result<u32> {
     let exe = std::env::current_exe().context("locating the codex executable")?;
     let mut command = std::process::Command::new(exe);
+    for entry in overrides {
+        command.arg("-c").arg(entry);
+    }
     command
         .args(["chatgpt-web", "daemon"])
         .env("CODEX_HOME", codex_home)
@@ -621,14 +714,17 @@ pub fn spawn_detached(codex_home: &Path) -> anyhow::Result<u32> {
 }
 
 /// Uses the running daemon or starts one, waiting until it answers.
-pub async fn ensure_daemon(codex_home: &Path) -> anyhow::Result<DaemonEndpoint> {
+pub async fn ensure_daemon(
+    codex_home: &Path,
+    overrides: &[String],
+) -> anyhow::Result<DaemonEndpoint> {
     if let Some(endpoint) = running_endpoint(codex_home).await {
         return Ok(endpoint);
     }
     let paths = DaemonPaths::new(codex_home);
     paths.ensure_dir()?;
     // Whoever wins the lock serves; the loser simply exits.
-    let pid = spawn_detached(codex_home)?;
+    let pid = spawn_detached(codex_home, overrides)?;
     tracing::info!("chatgpt_web daemon: spawned pid {pid}");
     let deadline = tokio::time::Instant::now() + AUTOSTART_TIMEOUT;
     loop {
@@ -706,8 +802,11 @@ pub async fn probe_chrome_mcp(daemon_url: &str) -> anyhow::Result<serde_json::Va
 }
 
 /// Asks the running daemon to reconcile the connector registry.
-pub async fn reconcile_via_daemon(codex_home: &Path) -> anyhow::Result<serde_json::Value> {
-    let endpoint = ensure_daemon(codex_home).await?;
+pub async fn reconcile_via_daemon(
+    codex_home: &Path,
+    settings: &ChatGptWebSettings,
+) -> anyhow::Result<serde_json::Value> {
+    let endpoint = ensure_daemon(codex_home, &daemon_overrides(settings)).await?;
     let response = http_client()
         .post(format!("{}/v1/registry/reconcile", endpoint.control_url))
         .bearer_auth(&endpoint.token)
@@ -729,9 +828,10 @@ pub async fn reconcile_via_daemon(codex_home: &Path) -> anyhow::Result<serde_jso
 /// Polls the daemon until its tunnel is ready (or fatal / timed out).
 pub async fn wait_tunnel_ready(
     codex_home: &Path,
+    settings: &ChatGptWebSettings,
     timeout: Duration,
 ) -> anyhow::Result<wire::HealthResponse> {
-    let endpoint = ensure_daemon(codex_home).await?;
+    let endpoint = ensure_daemon(codex_home, &daemon_overrides(settings)).await?;
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         if let Some(health) = fetch_health(&endpoint.control_url).await {

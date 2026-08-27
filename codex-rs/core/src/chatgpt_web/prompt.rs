@@ -109,6 +109,15 @@ pub(crate) fn render(request: RenderRequest<'_>) -> RenderedTurn {
             text.push_str("\n\n");
             text.push_str(IMAGES_NOTE);
         }
+        // FORK (C5, verified live): a connector extension mints a *fresh*
+        // turn_token, and ChatGPT only sees the token that reaches it in the
+        // message. Without re-stating the contract here the model reads the
+        // previous turn's token out of the conversation and refuses ("that
+        // token was for the previous turn"), so every follow-up stalled. The
+        // `none`/compaction modes carry no token and need nothing.
+        if let PromptMode::Connector(contract) = &mode {
+            text = format!("{}\n\n{text}", contract.join("\n"));
+        }
         return RenderedTurn {
             text,
             attachments,

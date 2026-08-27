@@ -429,6 +429,27 @@ fn backoff(attempt: u32) -> Duration {
     Duration::from_secs(secs).min(MAX_BACKOFF)
 }
 
+/// Outcome of one public probe, distinguishing "no server answered" (DNS,
+/// connect, TLS) from "a server answered, but not 2xx".
+enum Probe {
+    Ok,
+    HttpError(u16),
+    Unreachable(String),
+}
+
+async fn probe_public(http: &reqwest::Client, url: &str) -> Probe {
+    match http.get(url).timeout(Duration::from_secs(5)).send().await {
+        Ok(response) if response.status().is_success() => Probe::Ok,
+        Ok(response) => Probe::HttpError(response.status().as_u16()),
+        Err(error) => Probe::Unreachable(error.to_string()),
+    }
+}
+
+/// cloudflared's "I am connected to the edge" line.
+pub fn is_registered_line(line: &str) -> bool {
+    line.contains("Registered tunnel connection")
+}
+
 async fn probe_ok(http: &reqwest::Client, url: &str) -> bool {
     matches!(
         http.get(url)
@@ -437,28 +458,6 @@ async fn probe_ok(http: &reqwest::Client, url: &str) -> bool {
             .await,
         Ok(response) if response.status().is_success()
     )
-}
-
-/// Polls `url` until it answers 2xx, the deadline passes, or `cancel` fires.
-async fn wait_for_ok(
-    http: &reqwest::Client,
-    url: &str,
-    timeout: Duration,
-    cancel: &CancellationToken,
-) -> bool {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        if probe_ok(http, url).await {
-            return true;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return false;
-        }
-        tokio::select! {
-            _ = cancel.cancelled() => return false,
-            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -526,6 +525,7 @@ impl CloudflaredTunnel {
             .map_err(|error| format!("could not start cloudflared: {error}"))?;
         let mut lines = child.lines();
 
+        let mut url_registered = false;
         let url = {
             let deadline = tokio::time::Instant::now() + CLOUDFLARED_URL_TIMEOUT;
             let mut found = None;
@@ -534,6 +534,9 @@ impl CloudflaredTunnel {
                     _ = ctx.cancel.cancelled() => break,
                     line = lines.recv() => match line {
                         Some(line) => {
+                            if is_registered_line(&line) {
+                                url_registered = true;
+                            }
                             if let Some(url) = parse_trycloudflare_url(&line) {
                                 found = Some(url);
                                 break;
@@ -553,16 +556,72 @@ impl CloudflaredTunnel {
         let mcp_path = ctx.mcp_path();
         let public_mcp_url = format!("{public_base}{mcp_path}");
         let public_health = format!("{public_mcp_url}/healthz");
-        if !wait_for_ok(
-            &self.http,
-            &public_health,
-            CLOUDFLARED_READY_TIMEOUT,
-            &ctx.cancel,
-        )
-        .await
+        // FORK (C5): readiness. The public healthz is the strongest proof, but
+        // it is probed from *this* machine, and a fresh `*.trycloudflare.com`
+        // name is routinely NXDOMAIN on local resolvers for a while (negative
+        // caching) even though ChatGPT — which resolves through Cloudflare —
+        // reaches it fine (verified live: the local resolver never answered
+        // within 90 s while DoH did after 20 s). So: a registered tunnel
+        // connection plus a probe that fails *before* any HTTP answer counts as
+        // ready-but-unverified; the connector registry (ChatGPT connects at
+        // create time and returns 424 otherwise) is the effective check. A
+        // probe that reaches a server but gets a non-2xx keeps the tunnel down.
+        let mut registered = url_registered;
+        let mut verified_locally = false;
+        let mut saw_http_answer = false;
         {
+            let deadline = tokio::time::Instant::now() + CLOUDFLARED_READY_TIMEOUT;
+            loop {
+                match probe_public(&self.http, &public_health).await {
+                    Probe::Ok => {
+                        verified_locally = true;
+                        break;
+                    }
+                    Probe::HttpError(status) => {
+                        tracing::debug!(
+                            "chatgpt_web tunnel: public healthz answered HTTP {status}"
+                        );
+                        saw_http_answer = true;
+                    }
+                    Probe::Unreachable(reason) => {
+                        tracing::debug!("chatgpt_web tunnel: public healthz unreachable: {reason}");
+                    }
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+                tokio::select! {
+                    _ = ctx.cancel.cancelled() => break,
+                    line = lines.recv() => match line {
+                        Some(line) => {
+                            if is_registered_line(&line) {
+                                registered = true;
+                            }
+                        }
+                        None => break,
+                    },
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                }
+            }
+        }
+        if ctx.cancel.is_cancelled() {
             child.kill_tree().await;
-            return Err("cloudflared URL never answered healthz".to_string());
+            return Ok(());
+        }
+        if !verified_locally {
+            if registered && !saw_http_answer {
+                // The secret path never reaches the log: host only.
+                tracing::warn!(
+                    "chatgpt_web tunnel: cloudflared registered its connection but {public_base} is unreachable from this machine (local DNS?); trusting the tunnel and leaving verification to the connector registry"
+                );
+            } else {
+                child.kill_tree().await;
+                return Err(if saw_http_answer {
+                    "cloudflared URL answered healthz with an error".to_string()
+                } else {
+                    "cloudflared URL never answered healthz".to_string()
+                });
+            }
         }
         ctx.publish(TunnelState::Ready {
             endpoint: TunnelEndpoint::Public {
@@ -570,7 +629,9 @@ impl CloudflaredTunnel {
             },
         });
 
-        // Keep the log drained and watch health until something gives.
+        // Keep the log drained and watch health until something gives. When
+        // the public probe never worked from here, only the process and its
+        // own log are watched; a later successful probe upgrades the watch.
         let ran_for = tokio::time::Instant::now();
         let outcome = loop {
             tokio::select! {
@@ -581,10 +642,14 @@ impl CloudflaredTunnel {
                     }
                 }
                 _ = tokio::time::sleep(WATCH_INTERVAL) => {
-                    if !probe_ok(&self.http, &public_health).await
-                        && !probe_ok(&self.http, &public_health).await
-                    {
-                        break Err("cloudflared URL stopped answering".to_string());
+                    match probe_public(&self.http, &public_health).await {
+                        Probe::Ok => verified_locally = true,
+                        Probe::HttpError(_) | Probe::Unreachable(_)
+                            if verified_locally && !probe_ok(&self.http, &public_health).await =>
+                        {
+                            break Err("cloudflared URL stopped answering".to_string());
+                        }
+                        _ => {}
                     }
                 }
             }

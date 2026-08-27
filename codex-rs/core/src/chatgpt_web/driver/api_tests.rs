@@ -248,10 +248,15 @@ fn api_tool_requests_pair_results_by_parent_id() {
     assert!(!conv.api_tool_requests.iter().all(|r| r.has_result));
 }
 
+/// FORK (C5, verified live): a custom-connector result never shows up as a
+/// `tool` node in the mapping, so a request that the chain has moved past
+/// counts as answered; only the newest request with nothing after it is
+/// still pending.
 #[test]
-fn api_tool_result_must_be_a_tool_message_pointing_at_the_request() {
+fn api_tool_request_followed_by_a_later_message_counts_as_answered() {
     let mut raw = conv_api_tool();
-    // Re-point the existing result at a different parent: request 1 loses it.
+    // Re-point the existing result at a different parent: request 1 has no
+    // matching `tool` node any more, but request 2 comes after it.
     let result = raw
         .mapping
         .get_mut("55555555-0000-4000-8000-000000000003")
@@ -260,7 +265,8 @@ fn api_tool_result_must_be_a_tool_message_pointing_at_the_request() {
     result.metadata.parent_id = Some("55555555-0000-4000-8000-000000000001".to_string());
     let conv = normalize(&raw);
     assert_eq!(conv.api_tool_requests.len(), 2);
-    assert!(conv.api_tool_requests.iter().all(|r| !r.has_result));
+    assert!(conv.api_tool_requests[0].has_result);
+    assert!(!conv.api_tool_requests[1].has_result);
 }
 
 #[test]

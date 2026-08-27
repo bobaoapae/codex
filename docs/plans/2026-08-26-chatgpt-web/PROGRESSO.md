@@ -225,3 +225,62 @@ Divergência: o broker é anexado por um **process-global** (`connector_broker`,
 Gate: `cargo test -p codex-core --lib chatgpt_web::connector` → **85 passed** (seam `tool_summaries`, scripts de attach, mapeamento de resultado do cliente, round-trip completo `DaemonSessionBroker`↔daemon in-process sem browser, `target_to_item`/`extract_output`); integração `--test all -- chatgpt_web_connector` → 4/4; `chatgpt_web::`+`claude_code::` → 316/316; clippy limpo nos ficheiros deste bloco; `cargo build -p codex-cli` ok.
 
 **Pendente (validação):** o smoke live do modo conector (`codex chatgpt-web daemon` + cloudflared + turno real com `codex_exec` → `CONNECTOR_OK`) não foi corrido neste bloco — envolve registar o conector "Codex Native" na conta real e conduzir uma volta completa no browser, melhor executado interativamente pelo orquestrador (que coordena daemon + Chrome e observa a corrida), e o túnel `openai` continua a depender do setup do usuário no platform.openai.com.
+
+## C5 — smoke ponta-a-ponta, endurecimento, docs, gates ✅ (conector ao vivo)
+
+Smoke do modo conector conduzido ao vivo (binário `target/debug/codex.exe`, Chrome logado,
+chrome-mcp 127.0.0.1:8848, Developer Mode on) com `tunnel = "cloudflared"` (o `openai`
+continua pendente do setup do usuário):
+
+| passo | resultado |
+|---|---|
+| `codex chatgpt-web daemon` (autostart) + tunnel + registo | Ready + `Codex Native` verified (6 actions) em ~75 s |
+| `codex exec -m chatgpt-web/instant "…codex_exec… echo CONNECTOR_OK"` | **CONNECTOR_OK** (176 s): transcript com célula `pwsh.exe -Command 'echo CONNECTOR_OK'` executada pelo Codex, resposta `CONNECTOR_OK` — teste de aceitação do plano ✅ |
+| `codex_apply_patch` (turno único, conversa nova) | **hello.txt = HELLO** no disco (via `CustomToolCall`); modelo respondeu `done` ✅ |
+| matar o cloudflared | daemon reconecta URL nova + re-reconcilia para `verified` em ~88 s (< 90 s) ✅ |
+| `codex chatgpt-web stop` | limpo; sem quick-tunnels órfãos ✅ |
+
+**Bugs encontrados e corrigidos no smoke:**
+1. **Readiness do cloudflared vs DNS local** (`connector/daemon/tunnel.rs`): o resolver local
+   deste PC devolve NXDOMAIN para um `*.trycloudflare.com` fresco por muito tempo (negative
+   caching) — provado: DoH resolvia em ~20 s, o resolver local nunca em 90 s — enquanto o ChatGPT
+   (que resolve pela Cloudflare) alcança. O healthz público era sondado *desta* máquina e o túnel
+   ficava eternamente `connecting`. Agora: "Registered tunnel connection" + probe que falha **antes**
+   de qualquer resposta HTTP = ready-mas-não-verificado-localmente (o registo do conector, que dá
+   424 se o ChatGPT não alcança, é o cheque efetivo); um probe que recebe resposta não-2xx mantém
+   `down`. Novo `enum Probe {Ok, HttpError, Unreachable}`.
+2. **Overrides do daemon autostart** (`connector/daemon/mod.rs`, `mod.rs`, `chatgpt_web_cmd.rs`):
+   uma sessão sob `-c chatgpt_web.tunnel="cloudflared"` autostartava o daemon com as settings do
+   *ficheiro* (tunnel `openai` → `fatal: no tunnel_id`). Novo `daemon_overrides(&settings)` passa as
+   chaves que o daemon consome como `-c` ao processo destacado (`ensure_daemon` e `spawn_detached`
+   recebem `overrides`; segredos nunca viajam — só o caminho do ficheiro de chave); `reconcile_via_daemon`
+   e `wait_tunnel_ready` também.
+3. **turn_token na extensão do conector** (`prompt.rs`): um turno de continuação (novo `codex exec`
+   na mesma conversa) cunha um `turn_token` **novo**, mas o render de extensão mandava só os itens
+   novos — sem o contrato — e o modelo lia o token do turno anterior no histórico e recusava
+   ("esse token era do turno anterior"). Agora a extensão em modo `Connector` reafirma as linhas do
+   contrato (com o token fresco) antes dos itens novos. Teste novo em `prompt_tests.rs`.
+4. **`api_tool` sem nó `tool` no mapping** (`driver/api.rs`): para um conector custom o resultado da
+   tool **não** aparece como nó `tool` em `/backend-api/conversation` — o mapping salta do pedido
+   `api_tool.call_tool` direto para a mensagem seguinte do assistente. `has_result` passou a contar
+   qualquer mensagem posterior na cadeia como "respondido", senão um turno de conector nunca
+   concluía. Teste ajustado.
+
+**Endurecimento (verificado, já vinha de C1/C2):** rate limiter no servidor público
+(30 chamadas/10 s + 10 claims falhados/min), resultado de chamada só aceite da sessão dona
+(`complete(session_id, call_id)` → `WrongSession` → 403), sem segredos em logs (auditado: nenhum
+`info!/warn!/error!/debug!` do módulo `connector` imprime token/secret/key/bearer cru; o path
+secreto do túnel saiu do único `warn!` que o continha), body cap 8 MiB, `legacy_session_mode:false`
++ SSE, path secreto por start com comparação em tempo constante. `scripts/chatgpt_web_connector_smoke.ps1`
+adicionado (switch `-Tunnel cloudflared|openai`).
+
+**Docs:** admonição "Status" de `docs/chatgpt_web_agents.md` atualizada para o que o smoke provou
+(codex_exec/apply_patch ao vivo, reconexão de túnel) e o que falta (túnel `openai`; follow-up
+como processo `exec resume` separado, onde o ChatGPT re-pede o card de aprovação para o token novo
+e o auto-approver pode não clicar a tempo — turno único e continuação no mesmo processo funcionam).
+
+**Pendente / não verificado ao vivo:** túnel `openai` (setup do usuário no platform.openai.com);
+modos Thinking/Extra-high/Pro com tools de escrita (só Instant confirmado); `exec resume` como
+processo separado (card de aprovação do token novo). `config_toml.rs` não mudou → schema intocado.
+
+**Gates (C5, `RUST_MIN_STACK=8388608`):** clippy `-p codex-core -p codex-cli -p codex-config -p codex-models-manager -p codex-model-provider-info --lib --bins --tests` limpo (3 avisos residuais de C1 corrigidos: `collapsible_if` em `broker.rs`, `collapsible_match` em `tunnel.rs`, `err().expect()` em `daemon/mod_tests.rs`); `cargo fmt --check` core/cli ok (churn EOL do buildifier nos `.bazel` revertido); `cargo check --workspace` verde; `cargo test`: model-provider-info 29/29, models-manager 54/54, config 284/284, `--test all -- chatgpt_web_connector` 4/4, `chatgpt_web::` + `claude_code::` 316/316 (8 ignored = live), `chatgpt_web::connector` 85/85, `codex-cli --lib` 13/13, `codex-core --lib` **2559 passed / 3 failed / 11 ignored** — as 3 falhas são as pré-existentes do débito conhecido (`agents_md_paths_preserve_symlinked_cwd` privilégio de symlink; `environment_selection::blocking_snapshot_waits_for_starting_environment` e `session::turn::tests::post_sampling_token_estimate_is_disabled_by_always_on_sinks` flakes de execução paralela), nenhuma em `chatgpt_web`.

@@ -178,6 +178,24 @@ fn an_extension_sends_only_the_new_items_without_a_header() {
     assert!(!rendered.is_replay);
     assert_eq!(rendered.text, "<user>\nmore\n</user>");
 
+    // FORK (C5): a connector extension re-states the fresh turn_token contract
+    // ahead of the new items, so ChatGPT does not reuse the previous turn's
+    // token (which it refuses to).
+    let plan = plan_request(&input, &continuity, "chatgpt-web/thinking", None);
+    let rendered = render(RenderRequest {
+        plan: &plan,
+        workspace: &workspace,
+        mode: PromptMode::Connector(vec!["Pass turn_token TOK-2 unchanged.".to_string()]),
+        is_pro: false,
+        resume_after_interrupt: false,
+        images: None,
+    });
+    assert!(!rendered.is_replay);
+    assert_eq!(
+        rendered.text,
+        "Pass turn_token TOK-2 unchanged.\n\n<user>\nmore\n</user>"
+    );
+
     // Nothing new: say so. After an interrupted turn: say that too.
     let plan = plan_request(&first, &continuity, "chatgpt-web/thinking", None);
     let rendered = render(RenderRequest {

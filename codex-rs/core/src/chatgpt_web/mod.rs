@@ -799,10 +799,11 @@ async fn connector_broker(
         )
     };
     let connector_name = settings.connector_name.clone();
+    let overrides = connector::daemon::daemon_overrides(settings);
     let codex_home = codex_home.to_path_buf();
     let broker = cell
         .get_or_try_init(|| async move {
-            let endpoint = connector::daemon::ensure_daemon(&codex_home)
+            let endpoint = connector::daemon::ensure_daemon(&codex_home, &overrides)
                 .await
                 .map_err(|err| err.to_string())?;
             let broker =

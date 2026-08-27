@@ -422,9 +422,19 @@ pub(crate) fn normalize_with(raw: &RawConversation, opts: NormalizeOptions) -> C
         let Some(recipient) = m.recipient.as_deref().filter(|r| r.starts_with("api_tool")) else {
             continue;
         };
+        // FORK (C5, verified live): for a custom MCP connector the `tool`
+        // result message is *not* part of the mapping `/backend-api/conversation`
+        // returns — the chain goes straight from the `api_tool.call_tool`
+        // request to the assistant's next message (whose `metadata.parent_id`
+        // names the missing result node). The model only continues once the
+        // result has landed, so any later message on the chain also counts as
+        // the request having been answered; otherwise a connector turn could
+        // never complete.
         let has_result = chain[i + 1..].iter().any(|later| {
             later.message.as_ref().is_some_and(|r| {
-                r.author.role == "tool" && r.metadata.parent_id.as_deref() == Some(m.id.as_str())
+                (r.author.role == "tool" && r.metadata.parent_id.as_deref() == Some(m.id.as_str()))
+                    || r.author.role == "assistant"
+                    || r.author.role == "user"
             })
         });
         api_tool_requests.push(ApiToolRequest {
