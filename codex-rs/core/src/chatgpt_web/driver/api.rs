@@ -750,7 +750,10 @@ impl BackendLimiter {
             return;
         };
         let wait = {
-            let last = self.last.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let last = self
+                .last
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             last.map(|at| self.min_interval.saturating_sub(at.elapsed()))
         };
         if let Some(wait) = wait
@@ -758,7 +761,10 @@ impl BackendLimiter {
         {
             tokio::time::sleep(wait).await;
         }
-        let mut last = self.last.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut last = self
+            .last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *last = Some(Instant::now());
     }
 }

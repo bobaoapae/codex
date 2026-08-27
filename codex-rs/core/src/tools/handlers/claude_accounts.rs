@@ -146,7 +146,10 @@ impl ToolExecutor<ToolInvocation> for ClaudeAccountsHandler {
         create_claude_accounts_tool()
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(async move {
             let args: ClaudeAccountsArgs =
                 parse_args(&invocation.payload, CLAUDE_ACCOUNTS_TOOL_NAME)?;
@@ -209,7 +212,10 @@ impl ToolExecutor<ToolInvocation> for ClaudeAccountSelectHandler {
         create_claude_account_select_tool()
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(async move {
             let ToolPayload::Function { arguments } = &invocation.payload else {
                 return Err(FunctionCallError::RespondToModel(format!(

@@ -718,6 +718,7 @@ async fn run_turn(
                 .send(Ok(ResponseEvent::Completed {
                     response_id: conversation_id,
                     token_usage: Some(estimate_usage(transcript_chars, text_chars)),
+                    usage_metadata: None,
                     end_turn: Some(true),
                 }))
                 .await;
@@ -1197,6 +1198,7 @@ async fn connector_loop(
                     .send(ResponseEvent::Completed {
                         response_id: live.conversation_id.clone(),
                         token_usage: Some(usage),
+                        usage_metadata: None,
                         end_turn: Some(false),
                     })
                     .await;
@@ -1328,6 +1330,7 @@ async fn connector_loop(
                                 .send(Ok(ResponseEvent::Completed {
                                     response_id: live.conversation_id.clone(),
                                     token_usage: Some(estimate_usage(live.transcript_chars, text_chars)),
+                                    usage_metadata: None,
                                     end_turn: Some(true),
                                 }))
                                 .await;
@@ -1426,6 +1429,7 @@ async fn run_compaction_turn(
                 .send(Ok(ResponseEvent::Completed {
                     response_id: conversation_id,
                     token_usage: Some(estimate_usage(transcript_chars, text_chars)),
+                    usage_metadata: None,
                     end_turn: Some(true),
                 }))
                 .await;

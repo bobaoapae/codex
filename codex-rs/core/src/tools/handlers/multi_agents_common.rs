@@ -643,7 +643,9 @@ fn reasoning_effort_rank(effort: &ReasoningEffort) -> Option<u8> {
         ReasoningEffort::XHigh => Some(5),
         ReasoningEffort::Max => Some(6),
         ReasoningEffort::Ultra => Some(7),
-        ReasoningEffort::Custom(_) => None,
+        // FORK: `Persistent` is a proactivity mode, not a depth; like `Custom`
+        // it has no position on the scale.
+        ReasoningEffort::Custom(_) | ReasoningEffort::Persistent => None,
     }
 }
 

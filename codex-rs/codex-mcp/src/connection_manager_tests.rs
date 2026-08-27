@@ -513,6 +513,8 @@ async fn prepared_call_timeout_includes_trusted_access_lookup() {
         supports_parallel_tool_calls: false,
         default_tools_approval_mode: None,
         tool_approval_modes: HashMap::new(),
+        tool_approval_overrides: Default::default(),
+        root_only_tools: Vec::new(),
     };
     let prepared = crate::PreparedMcpCall::new(
         manager,

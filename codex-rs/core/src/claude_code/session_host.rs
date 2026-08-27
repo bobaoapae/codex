@@ -11,6 +11,7 @@
 //! behind the "dotnet requires approval" dead ends — the child was not blocked
 //! by policy, it was blocked by having no prompt surface.
 
+use codex_protocol::approvals::ExecApprovalKind;
 use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::ReviewDecision;
 use futures::FutureExt;
@@ -86,11 +87,12 @@ impl SessionClaudeHost {
         self.session
             .request_command_approval(
                 turn_context,
+                ExecApprovalKind::Command,
                 call_id,
                 /*approval_id*/ None,
                 /*environment_id*/ None,
                 command,
-                cwd,
+                cwd.into(),
                 reason,
                 /*network_approval_context*/ None,
                 /*proposed_execpolicy_amendment*/ None,

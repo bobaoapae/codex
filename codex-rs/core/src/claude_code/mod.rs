@@ -1124,8 +1124,9 @@ fn claude_effort(effort: &ReasoningEffortConfig) -> Option<&'static str> {
         | ReasoningEffortConfig::Max
         | ReasoningEffortConfig::Ultra => Some("max"),
         // A value this build does not know: let the CLI pick its own default
-        // rather than forwarding a string it may reject.
-        ReasoningEffortConfig::Custom(_) => None,
+        // rather than forwarding a string it may reject. `Persistent` is an
+        // OpenAI proactivity mode (wire effort "disabled"), not a depth.
+        ReasoningEffortConfig::Custom(_) | ReasoningEffortConfig::Persistent => None,
     }
 }
 
@@ -1529,6 +1530,7 @@ async fn translate_stream(
                     .send(Ok(ResponseEvent::Completed {
                         response_id,
                         token_usage,
+                        usage_metadata: None,
                         end_turn: Some(true),
                     }))
                     .await
