@@ -44,6 +44,7 @@ impl ImageStore {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn dir(&self) -> &Path {
         &self.dir
     }

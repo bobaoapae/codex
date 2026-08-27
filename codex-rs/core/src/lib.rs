@@ -24,6 +24,8 @@ pub mod chatgpt_web_daemon {
     pub use crate::chatgpt_web::connector::daemon::ensure_daemon;
     pub use crate::chatgpt_web::connector::daemon::probe_chrome_mcp;
     pub use crate::chatgpt_web::connector::daemon::reconcile_via_daemon;
+    pub use crate::chatgpt_web::connector::daemon::registry;
+    pub use crate::chatgpt_web::connector::daemon::registry_api;
     pub use crate::chatgpt_web::connector::daemon::run;
     pub use crate::chatgpt_web::connector::daemon::running_endpoint;
     pub use crate::chatgpt_web::connector::daemon::setup_tunnel;

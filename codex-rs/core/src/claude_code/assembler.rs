@@ -254,14 +254,6 @@ impl StreamAssembler<'_> {
     pub(crate) fn message_open(&self) -> bool {
         matches!(self.active, Some(ActiveItem::Message(_)))
     }
-
-    /// FORK: text accumulated in the open item, if any.
-    pub(crate) fn active_text(&self) -> Option<&str> {
-        match self.active.as_ref() {
-            Some(ActiveItem::Reasoning(text)) | Some(ActiveItem::Message(text)) => Some(text),
-            None => None,
-        }
-    }
 }
 
 impl StreamAssembler<'_> {

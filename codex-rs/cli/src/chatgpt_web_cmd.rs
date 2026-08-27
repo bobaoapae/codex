@@ -109,11 +109,7 @@ impl ChatgptWebCli {
                     Ok(())
                 }
                 RegistryAction::Show => run_registry_show(&codex_home).await,
-                RegistryAction::Delete => {
-                    anyhow::bail!(
-                        "`registry delete` is served by the connector registry, which this build does not include yet; delete the connector under ChatGPT → Settings → Apps → Connectors"
-                    )
-                }
+                RegistryAction::Delete => run_registry_delete(&config).await,
             },
         }
     }
@@ -164,7 +160,8 @@ async fn run_daemon(config: &Config, args: DaemonArgs) -> Result<()> {
         .filter(|ms| *ms > 0)
         .map(Duration::from_millis);
     let mut run_config =
-        chatgpt_web_daemon::DaemonRunConfig::new(config.chatgpt_web.clone(), codex_home);
+        chatgpt_web_daemon::DaemonRunConfig::new(config.chatgpt_web.clone(), codex_home)
+            .with_live_registry();
     run_config.foreground = args.foreground;
     run_config.idle_shutdown = idle_shutdown;
     chatgpt_web_daemon::run(run_config).await
@@ -187,6 +184,44 @@ async fn run_registry_show(codex_home: &Path) -> Result<()> {
             paths.connector.display()
         ),
     }
+    // FORK (C2): the live status comes from the running daemon, if any.
+    let status = chatgpt_web_daemon::status(codex_home).await;
+    match status.health {
+        Some(health) => println!(
+            "daemon pid {}: registry {}, tunnel {}",
+            health.pid, health.registry_status, health.tunnel_state
+        ),
+        None => println!("daemon not running"),
+    }
+    Ok(())
+}
+
+/// Deletes the recorded connector (and any other connector carrying the
+/// configured name) on the ChatGPT side, directly through chrome-mcp — no
+/// daemon needed.
+async fn run_registry_delete(config: &Config) -> Result<()> {
+    let settings = &config.chatgpt_web;
+    let paths = chatgpt_web_daemon::state::DaemonPaths::new(&config.codex_home);
+    let api = chatgpt_web_daemon::registry_api::ChromeMcpPageApi::from_settings(settings);
+    let deleted = chatgpt_web_daemon::registry::delete_recorded(
+        &api,
+        &settings.connector_name,
+        &paths.connector,
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("{error}"))?;
+    if deleted.is_empty() {
+        println!(
+            "no connector named `{}` found on the ChatGPT side; {} removed",
+            settings.connector_name,
+            paths.connector.display()
+        );
+    } else {
+        for entry in deleted {
+            println!("deleted {entry}");
+        }
+    }
+    println!("the running daemon (if any) will recreate the connector on its next reconcile");
     Ok(())
 }
 

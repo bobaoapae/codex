@@ -378,6 +378,7 @@ pub(crate) struct PollLoop<'a> {
     pub(crate) sent_at: Instant,
     /// FORK: reserved for the connector mode (M6): a tool request arriving
     /// here suspends the poll. Never fires in `tools = "none"`.
+    #[allow(dead_code)]
     pub(crate) connector_rx: Option<tokio::sync::mpsc::Receiver<()>>,
 }
 

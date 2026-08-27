@@ -69,9 +69,41 @@ pub struct ControlState {
     /// Cancels the whole daemon.
     pub shutdown: CancellationToken,
     pub shutdown_when_idle: AtomicBool,
+    /// FORK (C2): a background reconcile kicked off by `POST /v1/turns` is
+    /// running; a second one is not queued behind it.
+    pub reconcile_in_flight: AtomicBool,
 }
 
 impl ControlState {
+    /// Starts a reconcile in the background when the registry is not
+    /// `Verified` and none is running: a turn arriving before the connector
+    /// exists is the lazy trigger the plan asks for.
+    pub fn trigger_reconcile_if_needed(self: &Arc<Self>) {
+        if matches!(self.registry_status(), RegistryStatus::Verified { .. }) {
+            return;
+        }
+        let Some(hook) = self.reconcile.clone() else {
+            return;
+        };
+        if self
+            .reconcile_in_flight
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            match hook().await {
+                Ok(status) => state.set_registry_status(status),
+                Err(reason) => {
+                    tracing::warn!("chatgpt_web registry: background reconcile failed: {reason}");
+                }
+            }
+            state.reconcile_in_flight.store(false, Ordering::SeqCst);
+        });
+    }
+
     pub fn registry_status(&self) -> RegistryStatus {
         self.registry
             .lock()
@@ -93,7 +125,9 @@ impl ControlState {
             ok: true,
             pid: std::process::id(),
             version: self.version.clone(),
-            public_url: tunnel.endpoint().map(|endpoint| endpoint.public_label()),
+            public_url: tunnel
+                .endpoint()
+                .map(super::tunnel::TunnelEndpoint::public_label),
             registry_status: self.registry_status().label().to_string(),
             tunnel_state: tunnel.label(),
             sessions,
@@ -196,11 +230,14 @@ async fn register_turn(
         apply_patch: request.apply_patch,
     };
     match state.broker.register_turn(registration) {
-        Ok(()) => Json(RegisterTurnResponse {
-            registry_status: state.registry_status().label().to_string(),
-            tunnel_state: state.tunnel.borrow().label(),
-        })
-        .into_response(),
+        Ok(()) => {
+            state.trigger_reconcile_if_needed();
+            Json(RegisterTurnResponse {
+                registry_status: state.registry_status().label().to_string(),
+                tunnel_state: state.tunnel.borrow().label(),
+            })
+            .into_response()
+        }
         Err(RegisterTurnError::Duplicate) => {
             error(StatusCode::CONFLICT, "turn_token already registered")
         }

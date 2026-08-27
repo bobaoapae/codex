@@ -632,28 +632,30 @@ pub fn is_valid_tunnel_id(candidate: &str) -> bool {
 
 /// Log lines that mean the key or tunnel id is wrong (terminal).
 pub fn is_auth_failure(line: &str) -> bool {
-    static PATTERN: std::sync::OnceLock<regex_lite::Regex> = std::sync::OnceLock::new();
+    static PATTERN: std::sync::OnceLock<Option<regex_lite::Regex>> = std::sync::OnceLock::new();
     PATTERN
         .get_or_init(|| {
             regex_lite::Regex::new(
                 r"(?i)\b(401|403|unauthorized|invalid[_ ]api[_ ]key|invalid_request_error|forbidden)\b",
             )
-            .expect("static regex")
+            .ok()
         })
-        .is_match(line)
+        .as_ref()
+        .is_some_and(|pattern| pattern.is_match(line))
 }
 
 /// Log lines that mean this machine cannot reach OpenAI right now (retry).
 pub fn is_unreachable(line: &str) -> bool {
-    static PATTERN: std::sync::OnceLock<regex_lite::Regex> = std::sync::OnceLock::new();
+    static PATTERN: std::sync::OnceLock<Option<regex_lite::Regex>> = std::sync::OnceLock::new();
     PATTERN
         .get_or_init(|| {
             regex_lite::Regex::new(
                 r"(?i)poll failed|no such host|dial tcp|i/o timeout|connection (was )?(aborted|refused|reset)|network is (unreachable|down)|no route to host|tls handshake timeout|temporary failure in name resolution|forcibly closed",
             )
-            .expect("static regex")
+            .ok()
         })
-        .is_match(line)
+        .as_ref()
+        .is_some_and(|pattern| pattern.is_match(line))
 }
 
 impl TunnelAdapter for OpenAiTunnel {

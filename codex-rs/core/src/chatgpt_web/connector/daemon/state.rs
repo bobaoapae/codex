@@ -171,7 +171,7 @@ pub fn read_json_opt<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
 fn temp_path_for(path: &Path) -> PathBuf {
     let mut name = path
         .file_name()
-        .map(|name| name.to_os_string())
+        .map(std::ffi::OsStr::to_os_string)
         .unwrap_or_default();
     name.push(format!(".{}.tmp", std::process::id()));
     path.with_file_name(name)

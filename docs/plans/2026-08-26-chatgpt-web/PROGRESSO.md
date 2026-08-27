@@ -57,6 +57,19 @@ Gate: check verde em core/tui/exec/app-server/cli/otel/config/core-api/sample; m
 Gate: 77 testes unitários (`chatgpt_web::driver::`) + 2 live verdes; clippy limpo nos ficheiros novos; `just fmt`.
 
 
+## M3 — ops: envio, seleção de modelo, stop, uploads ✅
+
+`core/src/chatgpt_web/driver/ops.rs` (porte de `ops.ts`, ~2.1k linhas) + `ops_tests.rs`:
+
+- `ModelSpec{Auto,Instant,Thinking,Medium,High,ExtraHigh,Pro,Slug}`, `resolve_model_with` (puro; base = `default_model_slug` sem sufixo `-(instant|thinking|pro|mini|t-mini)`), `LEVEL_LABEL_*` (PT/EN), `set_level_via_menu` (ativar → menu → reload → restaurar).
+- `send(SendRequest{conversation_id, text, model, files}) -> Sent{conversation_id, phase_reached, model_label, notes}` com a máquina de fases navigate→model→precheck→upload→compose→attachments-wait→submit→confirm; todo erro sai com `FailurePhase` + `message_landed` (`Some(false)` antes do submit, `Some(true)` no confirm, `None` só em submit ambíguo ⇒ `SubmitAmbiguous`); `confirm_submitted` (15 s) em continuação; precheck "generating" = `DriverErrorKind::Busy` (novo, transitório) com graça de 5 s + reload.
+- Uploads: imagens em `input[data-testid="upload-photos-input"]`, restantes pelos 3 seletores do TS; dedupe por nome+tamanho; popup "já carregou este arquivo" auto-dispensado (o ChatGPT dedupe uploads por conteúdo, à escala da conta).
+- `wait_reply` (âncora no último user turn; `done = reply && idle && (end_turn==true || fingerprint estável)`), `stop` (click_stop até 8 s), `download_assets`, `check_reply` puro; `classify_page_error` (diálogos PT/EN → RateLimited/MessageTooLong/LoginRequired/Upstream — **não exercitado ao vivo**).
+- Seam corrigido: `PageEval::eval`/`ChatGptApi` passam a usar `TabId = i64`.
+- Divergências: `send` não espera a resposta (separado em `wait_reply`); continuação sem botão Stop após 12 s → confirmação pela API em vez de poll cego.
+
+Gate: 119 testes do driver verdes; live 5/5 (`--test-threads=1`, 64 s): `pro_resolves` (`gpt-5-6-pro`), `new_chat_instant_reply` ("PONG", label "Instantâneo"), `continue_conversation`, `stop` (thinking, parado aos 3 s), `upload_and_reply` ("Red"). Conversas escondidas (`is_visible:false` — repetir dá 404 `conversation_deleted`), registo de abas limpo.
+
 ## C1 — esqueleto do daemon do conector (+ TurnBroker) ✅
 
 `core/src/chatgpt_web/connector/` (facade pública `codex_core::chatgpt_web_daemon` em `core/src/lib.rs`):
@@ -74,3 +87,94 @@ Gate: 77 testes unitários (`chatgpt_web::driver::`) + 2 live verdes; clippy lim
 Gate: 46 testes unitários (`chatgpt_web::connector`) + 4 de integração (`core/tests/suite/chatgpt_web_connector.rs`: contrato via `initialize`+`tools/list`, `tools/call` sem `initialize` e `server/discover` respondidos, round-trip `codex_exec`/`codex_apply_patch`/inventory por long-poll, token retirado, sessão desconectada falha a chamada, resultado de outra sessão → 403); clippy limpo nos ficheiros novos; smoke do CLI com `tunnel = "manual"` em `CODEX_HOME` temporário: `status` → `doctor` → autostart destacado via `registry reconcile` (501 esperado) → `status` vivo → `stop`; `daemon --foreground` + segunda instância recusada pelo lock + `stop` termina o processo.
 
 Pendente para C2/C3/C4: registo do conector (chrome-mcp a partir do daemon, `ReconcileHook`), cliente de sessão (`connector/client.rs`) sobre `wire.rs`, anexação no browser; validação ao vivo das flags do `tunnel-client` quando o usuário criar o Tunnel + key.
+## M4 — núcleo: history, sessions, prompt, poll→eventos, `stream()` em `tools = "none"` ✅
+
+Reuso do `claude_code` (`// FORK:` em cada ponto): `StreamAssembler`/`message_item`/`reasoning_item`
+movidos para `claude_code/assembler.rs` (`pub(crate)`, + `open_reasoning`/`open_message`/
+`reasoning_open`/`message_open`); `claude_code::history::{render_item, render_item_with,
+fingerprint, item_fingerprint, truncate_*}` e `claude_code::state_file` passaram a `pub(crate)`.
+`render_item_with` recebe o renderizador de imagens (o Claude continua a ver `[image omitted]`).
+Gate: `cargo test -p codex-core --lib claude_code::` → 68 passed.
+
+`core/src/chatgpt_web/`:
+
+- `history.rs`: `ConversationContinuity{conversation_id, model_slug, delivered_items,
+  delivered_fingerprint, echoed, message_landed_unanswered}`; `plan_request(input, &continuity,
+  model_slug, compact_prompt)` = cópia de `claude_code/history.rs:64–96` com `can_extend` a exigir o
+  mesmo `model_slug`; `is_compaction` quando o último item é a mensagem user igual ao prompt de
+  sumarização (→ `restart`, conversa descartável). 7 testes.
+- `sessions.rs`: `CODEX_HOME/chatgpt_web_sessions.json` (TTL 7 d, 512 entradas, `state_file`),
+  `load`/`store`/`forget`. `ChatGptWebThreadState{continuity, store}` com `hydrate`/`record`/
+  `invalidate`/`mark_unanswered`.
+- `prompt.rs`: `render(RenderRequest{plan, workspace, mode: None|Connector(linhas)|Compaction,
+  is_pro, resume_after_interrupt, images})` → `RenderedTurn{text, attachments, is_replay}`.
+  Replay = header + contrato do modo + `[pro]` + nota de imagens + fecho + `Environment:` +
+  `<developer_instructions>` + `<codex_transcript>` + `<codex_transport_resume>`; extensão = itens
+  novos (`(no new input; …)` / prefixo `(the previous request was interrupted; …)`).
+  `warning_text(level)` = aviso commentary do modo none. `transcript_chars` para o medidor.
+- `attachments.rs` (M5): `ImageStore` em `CODEX_HOME/chatgpt_web/attachments/`, nome
+  `codex-img-<hash[..12]>.<ext>` (**sha1**, já dependência do core — o plano dizia sha256; só afeta
+  o nome), cap 10 por mensagem (as mais recentes; as antigas ficam `(not attached; …)` na
+  transcrição), limpeza >24 h no início do turno.
+- `stream.rs`: `ReplyTracker::observe(conv, mode) -> Vec<Delta>` (puro; âncora = primeiros 120
+  chars do texto enviado, como o `waitReply` TS; `OpenReasoning/Reasoning/OpenText/Text/Rewrite/
+  Note/Progress/PartialCompletion/Done{EndTurn|Stable}`; idle = `!is_generating && async_status ∈
+  {None,0}`; `Done{EndTurn}` = idle && texto mais recente `end_turn:true` + `finished_successfully`;
+  `Done{Stable}` = idle && assets && fingerprint estável 2 polls; **fallback** `Stable` sem assets
+  após 8 polls estáveis (~20 s) para não ficar 20 min preso quando o `end_turn` nunca chega —
+  divergência do plano, fail-closed na janela em que o botão Stop pisca entre fases; `Connector`
+  exige `api_tool_requests.all(has_result)`; `finished_partial_completion` idle → erro upstream).
+  `PollLoop::run` (`select!{consumer_dropped, watchdog last_progress+idle_timeout, sleep(poll)}`,
+  404 tolerado 30 s após o envio, 8 leituras falhadas consecutivas → `Failed`, `connector_rx`
+  stub para M6) alimenta o `StreamAssembler`. 15 testes sobre as fixtures reais.
+- `mod.rs`: `stream()` → `tokio::spawn(run_turn)`; `run_turn`: `Created` → `TURN_SLOTS`
+  (semáforo estático, `max_parallel_turns`) → `plan_request` → `prompt::render` → item commentary
+  de aviso (modo none) → driver partilhado por processo (`OnceLock` por `daemon_url|base_url`:
+  `DaemonClient` + `TabPool` + `ChatGptOps`; cliente HTTP plain `ReqwestDefault` porque o daemon
+  é loopback) → `health()` (exige `extension_connected`) → `ops.send` (modelo só no restart; 429 →
+  pausa 30 s e 1 retry) → grava continuidade com `message_landed_unanswered=true` **antes** do
+  poll → `PollLoop` → `Completed{response_id: conv_id, usage, end_turn: Some(true)}` + grava
+  `echoed = assembler.take_authored()`. Uso = `ceil(chars(render(histórico inteiro))/4) + 8192`
+  entrada, `ceil(chars(reply)/4)` saída. Mapeamento de erros = tabela do plano (`Busy`, novo no
+  driver, → `Stream`). Interrupt/stall → `ops.stop` (10 s) + `mark_unanswered`. `tools =
+  "connector"` → `UnsupportedOperation` acionável até M6/C3.
+
+Gate: `cargo test -p codex-core --lib -- chatgpt_web:: claude_code::` → 302 passed, 0 failed
+(8 ignored = live); clippy limpo nos ficheiros novos/tocados; `just fmt` (revertido o churn de
+EOL nos `BUILD.bazel`).
+
+E2E com o binário (`target/debug/codex.exe`, conta web `pro`, aba dedicada 626460273):
+
+| corrida | resultado |
+|---|---|
+| `codex exec -c model_provider=chatgpt_web -m chatgpt-web/instant "Reply with the single word PONG."` | **PONG** em 20 s (26 389 chars enviados, conversa nova, `EndTurn`) |
+| 2 turnos (`exec` + `exec resume --last`, `archive_on_shutdown=false`) | turno 2 = **extensão** de 57 chars na mesma conversa; respondeu o codeword `ZEBRA-42` em 6 s |
+| `exec -i red.png "What color…"` | **Red**; ficheiro `codex-img-8218b38a220c.png` materializado e anexado (popup "já carregou este arquivo" auto-dispensado) |
+| `spawn_agent` do role `~/.codex/agents/chatgpt-pro.toml` (`chatgpt-web/thinking`) a partir de um pai `gpt-5.6-sol` | pai respondeu `AGENT SAID: PONG` (e `PING` na 2.ª corrida); o filho correu numa conversa própria |
+
+Nota: `codex exec` lê o prompt de stdin quando não é TTY — nos scripts usar `< /dev/null`.
+
+## M5 — imagens, arquivamento, compaction ✅
+
+- Imagens: ver `attachments.rs` acima; `ContentItem::InputImage{data:…}` → ficheiro → upload pelo
+  driver; placeholder `[image_attachment: nome]` + nota no header.
+- Arquivar: `chatgpt_web::archive_thread_conversation(config, thread_id)` (gate
+  `archive_on_shutdown`, `PATCH {is_archived:true}` com 10 s, depois `sessions::forget`; no-op sem
+  registo, logo agnóstico ao provider). Chamado (a) no shutdown do **root** (`session/handlers.rs
+  shutdown`, via `Session::is_root_thread`) para o root **e todos os agentes vivos da árvore**
+  (`AgentControl::archive_chatgpt_web_conversations`), e (b) em `close_agent`
+  (`agent/control/legacy.rs`) para o agente e descendentes — nunca na eviction, que passa por
+  `shutdown_and_wait` e reconstrói o agente depois. Verificado: a 2.ª corrida de `spawn_agent`
+  arquivou a conversa do filho ao sair. Consequência: cada `codex exec` arquiva a conversa ao sair,
+  pelo que `exec resume` replay (26 k chars) em vez de estender — desligar com
+  `-c chatgpt_web.archive_on_shutdown=false` quando se quer continuidade entre `exec`s. "Enviar
+  numa conversa arquivada" ficou moot: o registo é esquecido ao arquivar.
+- Compaction: `plan_request` reconhece o prompt de sumarização (`config.compact_prompt` ou
+  `SUMMARIZATION_PROMPT`) → replay com o contrato de checkpoint em conversa nova, continuidade
+  intocada, conversa arquivada após a resposta (`archive_conversation`); `compact.rs:128` continua
+  a saltar só o Claude. Testes em `history_tests`/`prompt_tests`; o turno seguinte replay porque
+  `replace_compacted_history` muda o prefixo (coberto por `a_shorter_history_than_delivered_restarts`
+  e `echoed_items_are_dropped…`).
+- Pendente: um filho `chatgpt-pro` da 1.ª corrida (binário anterior à arquivagem em árvore) ficou
+  sem arquivar (`6a8fc37a…`, registo expira em 7 d); sub-agentes não são retomáveis por `exec resume`.
+

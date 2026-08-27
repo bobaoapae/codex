@@ -23,6 +23,8 @@ pub(crate) enum PromptMode {
     None,
     /// `tools = "connector"`: the broker's contract lines (connector name,
     /// `turn_token` instructions).
+    // TODO(M6): constructed by the connector turn.
+    #[allow(dead_code)]
     Connector(Vec<String>),
     /// Codex's own history-compaction turn.
     Compaction,
@@ -33,8 +35,6 @@ pub(crate) struct RenderRequest<'a> {
     pub(crate) plan: &'a RequestPlan<'a>,
     pub(crate) workspace: &'a ChatGptWebWorkspace,
     pub(crate) mode: PromptMode,
-    /// Human label of the model line (`Instant`, `Thinking`, `Pro`, …).
-    pub(crate) level_label: &'a str,
     /// `chatgpt-web/pro`: tell ChatGPT not to delegate to sub-agents.
     pub(crate) is_pro: bool,
     /// The previous turn was interrupted or stalled after its message landed.
@@ -89,7 +89,6 @@ pub(crate) fn render(request: RenderRequest<'_>) -> RenderedTurn {
         plan,
         workspace,
         mode,
-        level_label: _,
         is_pro,
         resume_after_interrupt,
         images,

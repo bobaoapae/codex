@@ -8,6 +8,8 @@
 pub mod broker;
 pub mod control;
 pub mod public_server;
+pub mod registry;
+pub mod registry_api;
 pub mod state;
 pub mod tunnel;
 pub mod wire;
@@ -53,8 +55,13 @@ pub struct DaemonRunConfig {
     pub idle_shutdown: Option<Duration>,
     /// Replaces the configured tunnel (tests, `manual`).
     pub tunnel_override: Option<Arc<dyn TunnelAdapter>>,
-    /// Registry reconcile hook (C2); `None` → registry reports `NotImplemented`.
+    /// Registry reconcile hook. `None` + `live_registry = false` → the
+    /// registry reports `NotImplemented` (tests); `None` + `live_registry =
+    /// true` → the real registry over chrome-mcp (`registry_api`).
     pub reconcile: Option<control::ReconcileHook>,
+    /// FORK (C2): run the connector registry against the real chatgpt.com
+    /// account when no explicit hook is given.
+    pub live_registry: bool,
 }
 
 impl DaemonRunConfig {
@@ -66,7 +73,14 @@ impl DaemonRunConfig {
             idle_shutdown: None,
             tunnel_override: None,
             reconcile: None,
+            live_registry: false,
         }
+    }
+
+    /// The daemon as the CLI runs it: registry included.
+    pub fn with_live_registry(mut self) -> Self {
+        self.live_registry = true;
+        self
     }
 }
 
@@ -269,20 +283,44 @@ pub async fn start(config: DaemonRunConfig) -> anyhow::Result<RunningDaemon> {
     };
     let tunnel = tunnel::start(adapter, public.local_mcp_url());
 
-    let registry = Arc::new(Mutex::new(if config.reconcile.is_some() {
+    let has_registry = config.reconcile.is_some() || config.live_registry;
+    let registry = Arc::new(Mutex::new(if has_registry {
         RegistryStatus::Unknown
     } else {
         RegistryStatus::NotImplemented
     }));
+    // FORK (C2): the live registry drives chatgpt.com through chrome-mcp;
+    // it re-runs whenever the tunnel endpoint changes.
+    let mut registry_service: Option<Arc<registry::RegistryService>> = None;
+    let reconcile = match config.reconcile {
+        Some(hook) => Some(hook),
+        None if config.live_registry => {
+            let api: Arc<dyn registry::ConnectorApi> =
+                Arc::new(registry_api::ChromeMcpPageApi::from_settings(settings));
+            let service = registry::RegistryService::new(
+                api,
+                &settings.connector_name,
+                &settings.connector_description,
+                paths.connector.clone(),
+                tunnel.state(),
+                Arc::clone(&registry),
+            );
+            let hook = service.hook();
+            registry_service = Some(service);
+            Some(hook)
+        }
+        None => None,
+    };
     let control_state = Arc::new(control::ControlState {
         broker: Arc::clone(&broker),
         token: token.clone(),
         version: DAEMON_VERSION.to_string(),
         tunnel: tunnel.state(),
         registry,
-        reconcile: config.reconcile,
+        reconcile,
         shutdown: cancel.clone(),
         shutdown_when_idle: AtomicBool::new(false),
+        reconcile_in_flight: AtomicBool::new(false),
     });
     let (control_addr, control_task) = control::start(
         Arc::clone(&control_state),
@@ -293,6 +331,9 @@ pub async fn start(config: DaemonRunConfig) -> anyhow::Result<RunningDaemon> {
     .context("starting the control API")?;
 
     let mut tasks = vec![control_task];
+    if let Some(service) = registry_service.as_ref() {
+        tasks.push(service.spawn_watcher(cancel.clone()));
+    }
     tasks.push(broker.spawn_sweeper(Duration::from_secs(5), cancel.clone()));
     tasks.push(spawn_state_writer(
         paths.clone(),

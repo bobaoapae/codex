@@ -105,6 +105,8 @@ pub(crate) struct ChatGptWebWorkspace {
     pub(crate) sessions_state_path: Option<PathBuf>,
     /// The connector broker, attached per sampling request when
     /// `tools = "connector"`; `None` in `tools = "none"`.
+    // TODO(M6): read by the connector turn.
+    #[allow(dead_code)]
     pub(crate) connector: Option<Arc<dyn ConnectorBroker>>,
     /// The summarization prompt Codex appends on a compaction turn, so the
     /// provider can recognise that turn and answer it from a disposable
@@ -523,7 +525,6 @@ async fn run_turn(
         } else {
             prompt::PromptMode::None
         },
-        level_label: line.label,
         is_pro: line.is_pro,
         resume_after_interrupt: continuity.message_landed_unanswered && !plan.restart,
         images: Some(&image_store),

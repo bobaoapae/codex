@@ -85,13 +85,7 @@ impl AgentControl {
         }
         // FORK: archive the ChatGPT Web conversations of the agent and its live
         // descendants before they shut down (an eviction keeps them).
-        if let Ok(descendants) = self.live_thread_spawn_descendants(agent_id).await {
-            for id in std::iter::once(agent_id).chain(descendants) {
-                if let Ok(thread) = state.get_thread(id).await {
-                    thread.session.archive_chatgpt_web_conversation().await;
-                }
-            }
-        }
+        self.archive_chatgpt_web_conversations(agent_id).await;
         match Box::pin(self.shutdown_agent_tree(agent_id)).await {
             Err(err)
                 if known_agent
@@ -103,6 +97,24 @@ impl AgentControl {
                 Ok(String::new())
             }
             result => result,
+        }
+    }
+
+    /// FORK: archives the ChatGPT Web conversations backing `root` and its live
+    /// spawn descendants. Called when a thread ends for good (root shutdown,
+    /// explicit close) — never on an eviction, which rebuilds the agent later.
+    pub(crate) async fn archive_chatgpt_web_conversations(&self, root: ThreadId) {
+        let Ok(state) = self.upgrade() else {
+            return;
+        };
+        let descendants = self
+            .live_thread_spawn_descendants(root)
+            .await
+            .unwrap_or_default();
+        for id in std::iter::once(root).chain(descendants) {
+            if let Ok(thread) = state.get_thread(id).await {
+                thread.session.archive_chatgpt_web_conversation().await;
+            }
         }
     }
 

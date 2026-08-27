@@ -432,6 +432,12 @@ pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
     // FORK: a root thread's ChatGPT Web conversation is archived when the
     // session ends; agents are handled by `close_agent`, never on eviction.
     if sess.is_root_thread().await {
+        // The root's own record plus every live agent it spawned; the agents
+        // are torn down with the root and would otherwise never be archived.
+        sess.services
+            .agent_control
+            .archive_chatgpt_web_conversations(sess.thread_id())
+            .await;
         sess.archive_chatgpt_web_conversation().await;
     }
     info!("Shutting down Codex instance");
