@@ -125,6 +125,16 @@ impl ReplyTracker {
         self.text_chars
     }
 
+    /// FORK: forgets which item is open, without forgetting what was emitted.
+    ///
+    /// The connector turn spans several `stream()` calls, each with a fresh
+    /// assembler; after a reattach nothing is open, so a message that grew
+    /// across the boundary must reopen (the `Rewrite` path) rather than emit a
+    /// bare suffix into an empty assembler.
+    pub(crate) fn reset_open(&mut self) {
+        self.open = None;
+    }
+
     /// Whether the conversation shows our message as its last user turn.
     fn anchored(&self, conv: &Conversation) -> bool {
         let Some(index) = conv.last_user_turn_index() else {

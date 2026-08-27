@@ -188,3 +188,40 @@ Nota: `codex exec` lê o prompt de stdin quando não é TTY — nos scripts usar
 - **Live** (`live_registry_reconciles_a_manual_url`, conta real): URL inalcançável → `POST /aip/connectors/mcp` devolve **HTTP 424** `{"kind":"network","type":"mcp_error"}` (o ChatGPT liga-se ao servidor no create — facto novo, registado no api_shapes.md); URL alcançável (spike `server.mjs` + cloudflared) → create/link/verify com **6 ações** em ~18 s, e `delete_recorded` não deixou nada.
 
 Gate: 28 testes em `registry_tests.rs` (planner, executor com `FakeApi`, serviço/backoff/watcher, `ChromeMcpPageApi` com daemon fake — 429→backoff→ok, corpos/headers capturados, 403/login, aba emprestada vs criada+fechada, `POST /v1/turns` dispara reconcile) + 1 live verde; clippy limpo nos ficheiros novos.
+
+## M6 — seam do conector no provider ✅
+
+`core/src/chatgpt_web/connector/mod.rs`:
+
+- `trait ConnectorBroker { begin_turn(BeginTurn) -> ConnectorTurn; prompt_contract(&ConnectorTurn) -> Vec<String>; end_turn(turn_token, reason) }`; `ConnectorTurn{turn_token, connector_name, requests: mpsc::Receiver<ToolRequest>}`; `ToolRequest{call_id, target: contract::CallTarget, respond: oneshot::Sender<FunctionCallOutputPayload>}`.
+- `tool_summaries(&[ToolSpec]) -> (Vec<ToolSummary>, ExecTool, bool)`: achata o namespace default para `None`, mantém os namespaces MCP, detecta `exec_command` vs `shell` e o `apply_patch` freeform.
+
+`core/src/chatgpt_web/mod.rs` (arms do conector):
+
+- `ChatGptWebThreadState.live_turn: Mutex<Option<LiveTurn>>` guarda o turno suspenso entre `stream()`s (turn_token, conversa, `requests`, responders pendentes, `ReplyTracker`, `echoed`, metadados de continuidade).
+- `run_connector_turn`: reattach (se o `input` já traz `FunctionCallOutput` para todo pending → responde os `oneshot`, retoma o poll) ou turno novo (slot, `plan_request`, `begin_turn`, prompt `PromptMode::Connector(prompt_contract)`, health, `send` com `mention` só em conversa nova, grava continuidade `message_landed_unanswered=true`, entra no loop).
+- `connector_loop`: `select!` entre `consumer_dropped`, `requests.recv()` (batch 15 ms → emite `OutputItemAdded/Done(FunctionCall|CustomToolCall)` por chamada + `Completed{end_turn: Some(false)}`, estaciona o `LiveTurn`, retorna), poll da conversa (`TrackMode::Connector` → `apply_delta`; conclusão exige todo `api_tool` respondido), e watchdog de stall. `Done` → `Completed{end_turn: Some(true)}` + `end_turn` do broker.
+- `target_to_item` (Function→`FunctionCall{namespace, arguments: string}`, Custom→`CustomToolCall{name:"apply_patch"}`), `extract_output` (casa `FunctionCallOutput`/`CustomToolCallOutput` por `call_id`), `collect_batch`.
+- Compaction em modo conector: `run_compaction_turn` responde numa conversa descartável com `PromptMode::Compaction`, sem broker, e arquiva.
+- `stream.rs`: `apply_delta`/`DeltaStep` extraídos do `PollLoop` e partilhados; `ReplyTracker::reset_open` para o reattach com assembler novo.
+
+Divergência: o broker é anexado por um **process-global** (`connector_broker`, `OnceCell` por `CODEX_HOME` → uma sessão/`session_id` por processo) em vez de `turn.rs` — a construção do broker é assíncrona (regista sessão), o que não cabe no ponto de attach síncrono do host Claude; `workspace.connector` continua a existir como seam para injeção em teste. Sem edição de `turn.rs`/`client.rs`.
+
+## C3 — cliente de sessão do conector ✅
+
+`core/src/chatgpt_web/connector/client.rs` — `DaemonSessionBroker`:
+
+- `connect(control_url, token, connector_name)` regista **uma** sessão (`POST /v1/sessions`), sobe heartbeat (10 s) e **um** long-poll partilhado (`GET /v1/sessions/{sid}/calls`, dedupe por `call_id`, ack por `seq`) que roteia cada batch para o canal do `turn_token` dono; `Drop` faz `DELETE` da sessão.
+- `begin_turn`: espera `Verified` (poll do `/healthz`, mensagens acionáveis para `developer_mode_off`/`browser_unavailable`), cunha `turn_token` (32 chars base64url), `POST /v1/turns` com os `ToolSummary`, cria o canal e regista o sink; `prompt_contract` (nome, contrato do `turn_token`, as 6 tools); `end_turn` → `DELETE /v1/turns`.
+- Resultado de cada chamada: `FunctionCallOutputPayload` → `POST /v1/calls/{id}/result` (texto; imagens `data:` → `ResultContent::Image`; `success==Some(false)` → `is_error`).
+
+## C4 — anexação no browser ✅
+
+`core/src/chatgpt_web/connector/connector_attach.rs`:
+
+- `mention_and_compose_script(name, text)`: seleciona o conector (idempotente — pill `[data-id^="plugin:"][data-keyword=<name>]` já presente é no-op) via `@<primeira palavra>` → espera `.__menu-item[tabindex="0"]` com o título exato → `ArrowDown` sintético até `data-highlighted` → `Enter` → verifica a pill, e **acrescenta** o texto depois da pill (sem select-all, que apagaria a pill). Usado por `ops::send` quando `SendRequest.mention` está definido; `ops.rs` ganhou o campo `mention` e escolhe este script em vez de `set_composer_text`.
+- `approval_script(name, prefer_always)` + `ConnectorAttach::approve_on_conversation`: clica `Sempre permitir|Allow always|Permitir uma vez|Allow once` (regex PT/EN) no `[data-testid="tool-approval-card"]`; o `connector_loop` chama a cada 2 polls com `connector_auto_approve_ui`.
+
+Gate: `cargo test -p codex-core --lib chatgpt_web::connector` → **85 passed** (seam `tool_summaries`, scripts de attach, mapeamento de resultado do cliente, round-trip completo `DaemonSessionBroker`↔daemon in-process sem browser, `target_to_item`/`extract_output`); integração `--test all -- chatgpt_web_connector` → 4/4; `chatgpt_web::`+`claude_code::` → 316/316; clippy limpo nos ficheiros deste bloco; `cargo build -p codex-cli` ok.
+
+**Pendente (validação):** o smoke live do modo conector (`codex chatgpt-web daemon` + cloudflared + turno real com `codex_exec` → `CONNECTOR_OK`) não foi corrido neste bloco — envolve registar o conector "Codex Native" na conta real e conduzir uma volta completa no browser, melhor executado interativamente pelo orquestrador (que coordena daemon + Chrome e observa a corrida), e o túnel `openai` continua a depender do setup do usuário no platform.openai.com.

@@ -24,7 +24,6 @@ pub(crate) mod stream;
 pub(crate) use connector::ConnectorBroker;
 
 use crate::chatgpt_web::connector::BeginTurn;
-use crate::chatgpt_web::connector::ConnectorTurn;
 use crate::chatgpt_web::connector::ToolRequest;
 use crate::chatgpt_web::connector::client::DaemonSessionBroker;
 use crate::chatgpt_web::connector::connector_attach::ConnectorAttach;
@@ -496,7 +495,7 @@ fn estimate_usage(transcript_chars: usize, reply_chars: usize) -> TokenUsage {
     }
 }
 
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 async fn run_turn(
     input: Vec<ResponseItem>,
     model_slug: String,
@@ -856,7 +855,9 @@ fn extract_output(
             ..
         } if id == call_id => Some(output.clone()),
         ResponseItem::CustomToolCallOutput {
-            call_id: id, output, ..
+            call_id: id,
+            output,
+            ..
         } if id == call_id => Some(output.clone()),
         _ => None,
     })
@@ -982,11 +983,6 @@ async fn run_connector_turn(
     let begin = BeginTurn {
         thread_id,
         turn_id: &turn_id,
-        conversation_id: if plan.restart {
-            None
-        } else {
-            continuity.conversation_id.as_deref()
-        },
         tools,
         exec_tool,
         apply_patch,
@@ -1242,7 +1238,7 @@ async fn connector_loop(
                     }
                 }
                 polls = polls.wrapping_add(1);
-                if polls % 2 == 0 {
+                if polls.is_multiple_of(2) {
                     let attach = ConnectorAttach {
                         daemon: &driver.daemon,
                         tabs: &driver.tabs,
@@ -1478,6 +1474,90 @@ mod tests {
                 .to_string()
                 .contains("compose")
         );
+    }
+
+    #[test]
+    fn a_function_target_becomes_a_function_call_item() {
+        let target = CallTarget::Function {
+            namespace: Some("figma".to_string()),
+            name: "get_file".to_string(),
+            arguments: serde_json::json!({"id": "1"}),
+        };
+        match target_to_item(&target, "call_1") {
+            ResponseItem::FunctionCall {
+                name,
+                namespace,
+                arguments,
+                call_id,
+                ..
+            } => {
+                assert_eq!(name, "get_file");
+                assert_eq!(namespace.as_deref(), Some("figma"));
+                assert_eq!(call_id, "call_1");
+                // Arguments are re-serialized to the JSON string the loop wants.
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&arguments).unwrap(),
+                    serde_json::json!({"id": "1"})
+                );
+            }
+            other => panic!("unexpected item {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_custom_target_becomes_a_custom_tool_call_item() {
+        let target = CallTarget::Custom {
+            name: "apply_patch".to_string(),
+            input: "*** Begin Patch".to_string(),
+        };
+        match target_to_item(&target, "call_2") {
+            ResponseItem::CustomToolCall {
+                name,
+                input,
+                call_id,
+                ..
+            } => {
+                assert_eq!(name, "apply_patch");
+                assert_eq!(input, "*** Begin Patch");
+                assert_eq!(call_id, "call_2");
+            }
+            other => panic!("unexpected item {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_output_finds_function_and_custom_outputs_by_call_id() {
+        use codex_protocol::models::FunctionCallOutputBody;
+        use codex_protocol::models::FunctionCallOutputPayload;
+        let input = vec![
+            ResponseItem::FunctionCallOutput {
+                id: None,
+                call_id: Some("call_1".to_string()),
+                name: None,
+                namespace: None,
+                output: FunctionCallOutputPayload {
+                    body: FunctionCallOutputBody::Text("out-1".to_string()),
+                    success: Some(true),
+                },
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::CustomToolCallOutput {
+                id: None,
+                call_id: "call_2".to_string(),
+                name: None,
+                output: FunctionCallOutputPayload {
+                    body: FunctionCallOutputBody::Text("out-2".to_string()),
+                    success: Some(false),
+                },
+                internal_chat_message_metadata_passthrough: None,
+            },
+        ];
+        assert_eq!(
+            extract_output(&input, "call_1").unwrap().body,
+            FunctionCallOutputBody::Text("out-1".to_string())
+        );
+        assert!(!extract_output(&input, "call_2").unwrap().success.unwrap());
+        assert!(extract_output(&input, "call_missing").is_none());
     }
 
     #[test]

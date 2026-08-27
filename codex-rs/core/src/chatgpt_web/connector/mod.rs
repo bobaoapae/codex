@@ -37,7 +37,10 @@ use tokio::sync::oneshot;
 pub(crate) trait ConnectorBroker: Send + Sync + std::fmt::Debug {
     /// Registers a turn with the daemon and starts delivering the tool calls
     /// ChatGPT makes during it.
-    fn begin_turn<'a>(&'a self, params: BeginTurn<'a>) -> BoxFuture<'a, Result<ConnectorTurn, String>>;
+    fn begin_turn<'a>(
+        &'a self,
+        params: BeginTurn<'a>,
+    ) -> BoxFuture<'a, Result<ConnectorTurn, String>>;
 
     /// The contract lines the prompt carries for this turn: the connector name,
     /// how to pass the `turn_token`, and what the six tools are for.
@@ -51,7 +54,6 @@ pub(crate) trait ConnectorBroker: Send + Sync + std::fmt::Debug {
 pub(crate) struct BeginTurn<'a> {
     pub(crate) thread_id: ThreadId,
     pub(crate) turn_id: &'a str,
-    pub(crate) conversation_id: Option<&'a str>,
     /// The tools the owning Codex turn announced, already reduced.
     pub(crate) tools: Vec<ToolSummary>,
     pub(crate) exec_tool: ExecTool,
@@ -113,8 +115,8 @@ pub(crate) fn tool_summaries(tools: &[ToolSpec]) -> (Vec<ToolSummary>, ExecTool,
                 freeform.description.clone(),
             ),
             ToolSpec::Namespace(namespace) => {
-                let ns = (namespace.name != DEFAULT_FUNCTION_NAMESPACE)
-                    .then(|| namespace.name.clone());
+                let ns =
+                    (namespace.name != DEFAULT_FUNCTION_NAMESPACE).then(|| namespace.name.clone());
                 for tool in &namespace.tools {
                     use codex_tools::ResponsesApiNamespaceTool;
                     match tool {
@@ -153,9 +155,9 @@ pub(crate) fn tool_summaries(tools: &[ToolSpec]) -> (Vec<ToolSummary>, ExecTool,
     } else {
         ExecTool::Shell
     };
-    let apply_patch = summaries
-        .iter()
-        .any(|tool| tool.namespace.is_none() && tool.name == "apply_patch" && tool.kind == ToolKind::Freeform);
+    let apply_patch = summaries.iter().any(|tool| {
+        tool.namespace.is_none() && tool.name == "apply_patch" && tool.kind == ToolKind::Freeform
+    });
 
     (summaries, exec_tool, apply_patch)
 }

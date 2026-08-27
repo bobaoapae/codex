@@ -18,7 +18,6 @@ use super::BeginTurn;
 use super::ConnectorBroker;
 use super::ConnectorTurn;
 use super::ToolRequest;
-use super::contract::CallTarget;
 use super::daemon::wire;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
@@ -115,7 +114,11 @@ impl Drop for SharedSession {
 
 impl SharedSession {
     async fn register(daemon: DaemonHandle) -> Result<Arc<Self>, String> {
-        let session_id = format!("codex-{}-{}", std::process::id(), super::daemon::state::new_token());
+        let session_id = format!(
+            "codex-{}-{}",
+            std::process::id(),
+            super::daemon::state::new_token()
+        );
         let request = wire::RegisterSessionRequest {
             codex_pid: std::process::id(),
             session_id: session_id.clone(),
@@ -145,12 +148,7 @@ impl SharedSession {
             cancel: cancel.clone(),
         });
         spawn_heartbeat(daemon.clone(), session_id.clone(), cancel.clone());
-        spawn_poll_loop(
-            daemon,
-            session_id,
-            Arc::clone(&session.turns),
-            cancel,
-        );
+        spawn_poll_loop(daemon, session_id, Arc::clone(&session.turns), cancel);
         Ok(session)
     }
 
@@ -328,10 +326,15 @@ fn spawn_result_poster(
 }
 
 /// Maps a Codex tool output onto the daemon's result wire shape.
-fn payload_to_result(session_id: &str, payload: &FunctionCallOutputPayload) -> wire::CallResultRequest {
+fn payload_to_result(
+    session_id: &str,
+    payload: &FunctionCallOutputPayload,
+) -> wire::CallResultRequest {
     let is_error = payload.success == Some(false);
     let content = match &payload.body {
-        FunctionCallOutputBody::Text(text) => vec![wire::ResultContent::Text { text: text.clone() }],
+        FunctionCallOutputBody::Text(text) => {
+            vec![wire::ResultContent::Text { text: text.clone() }]
+        }
         FunctionCallOutputBody::ContentItems(items) => items
             .iter()
             .filter_map(|item| match item {
@@ -381,7 +384,7 @@ impl std::fmt::Debug for DaemonSessionBroker {
 impl DaemonSessionBroker {
     /// Builds a broker over an already-registered session (used by tests and by
     /// `ensure`).
-    pub(crate) fn with_session(session: Arc<SharedSession>, connector_name: String) -> Self {
+    fn with_session(session: Arc<SharedSession>, connector_name: String) -> Self {
         Self {
             session,
             connector_name,

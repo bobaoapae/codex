@@ -1362,7 +1362,10 @@ impl ChatGptOps {
         // selects the connector (idempotently) and appends the text.
         let compose_script = || match request.mention.as_deref() {
             Some(name) => {
-                super::connector::connector_attach::mention_and_compose_script(name, &request.text)
+                crate::chatgpt_web::connector::connector_attach::mention_and_compose_script(
+                    name,
+                    &request.text,
+                )
             }
             None => page_scripts::set_composer_text(&request.text),
         };
