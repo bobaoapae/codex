@@ -12,6 +12,29 @@ pub mod claude_accounts_api;
 mod claude_code;
 // FORK: ChatGPT Pro web as a model backend (`wire_api = "chatgpt_web"`).
 mod chatgpt_web;
+// FORK: the narrow public surface of the chatgpt_web connector daemon, for the
+// `codex chatgpt-web` CLI and the integration tests.
+pub mod chatgpt_web_daemon {
+    pub use crate::chatgpt_web::connector::contract;
+    pub use crate::chatgpt_web::connector::daemon::DAEMON_VERSION;
+    pub use crate::chatgpt_web::connector::daemon::DaemonEndpoint;
+    pub use crate::chatgpt_web::connector::daemon::DaemonRunConfig;
+    pub use crate::chatgpt_web::connector::daemon::DaemonStatus;
+    pub use crate::chatgpt_web::connector::daemon::RunningDaemon;
+    pub use crate::chatgpt_web::connector::daemon::ensure_daemon;
+    pub use crate::chatgpt_web::connector::daemon::probe_chrome_mcp;
+    pub use crate::chatgpt_web::connector::daemon::reconcile_via_daemon;
+    pub use crate::chatgpt_web::connector::daemon::run;
+    pub use crate::chatgpt_web::connector::daemon::running_endpoint;
+    pub use crate::chatgpt_web::connector::daemon::setup_tunnel;
+    pub use crate::chatgpt_web::connector::daemon::start;
+    pub use crate::chatgpt_web::connector::daemon::state;
+    pub use crate::chatgpt_web::connector::daemon::status;
+    pub use crate::chatgpt_web::connector::daemon::stop;
+    pub use crate::chatgpt_web::connector::daemon::tunnel;
+    pub use crate::chatgpt_web::connector::daemon::wait_tunnel_ready;
+    pub use crate::chatgpt_web::connector::daemon::wire;
+}
 mod client;
 mod client_common;
 mod realtime_context;

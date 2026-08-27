@@ -73,6 +73,9 @@ pub(crate) enum DriverErrorKind {
     Timeout,
     /// The submit click was ambiguous and could not be confirmed either way.
     SubmitAmbiguous,
+    /// The conversation is still generating a reply (send refused before
+    /// anything was typed). Transient: wait or `stop`, then retry.
+    Busy,
     /// Anything else (JSON parse, unexpected shape, IO).
     Other,
 }
@@ -128,6 +131,10 @@ impl DriverError {
 
     pub(crate) fn ui_changed(message: impl Into<String>) -> Self {
         Self::new(DriverErrorKind::UiChanged, message)
+    }
+
+    pub(crate) fn busy(message: impl Into<String>) -> Self {
+        Self::new(DriverErrorKind::Busy, message)
     }
 }
 

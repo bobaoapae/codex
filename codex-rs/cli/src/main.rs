@@ -45,8 +45,10 @@ use supports_color::Stream;
 
 // FORK: multi-account management (`codex account`).
 mod account_cmd;
+// FORK: `codex chatgpt-web …` — the shared connector daemon for the chatgpt_web provider.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod app_cmd;
+mod chatgpt_web_cmd;
 mod cloud_config;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod desktop_app;
@@ -163,6 +165,10 @@ enum Subcommand {
 
     /// [experimental] Run the app server or related tooling.
     AppServer(AppServerCommand),
+
+    /// FORK: manage the ChatGPT Web connector daemon (`[chatgpt_web] tools = "connector"`).
+    #[clap(name = "chatgpt-web")]
+    ChatgptWeb(chatgpt_web_cmd::ChatgptWebCli),
 
     /// [experimental] Manage the app-server daemon with remote control enabled.
     RemoteControl(RemoteControlCommand),
@@ -1586,6 +1592,18 @@ async fn cli_main(
             );
             account_cli.run().await?;
         }
+        Some(Subcommand::ChatgptWeb(mut chatgpt_web_cli)) => {
+            reject_remote_mode_for_subcommand(
+                root_remote.as_deref(),
+                root_remote_auth_token_env.as_deref(),
+                "chatgpt-web",
+            )?;
+            prepend_config_flags(
+                &mut chatgpt_web_cli.config_overrides,
+                root_config_overrides.clone(),
+            );
+            chatgpt_web_cli.run().await?;
+        }
         Some(Subcommand::Completion(completion_cli)) => {
             reject_remote_mode_for_subcommand(
                 root_remote.as_deref(),
@@ -2454,6 +2472,7 @@ fn unsupported_subcommand_name_for_strict_config(
         Some(Subcommand::Login(_)) => Some("login"),
         Some(Subcommand::Logout(_)) => Some("logout"),
         Some(Subcommand::Account(_)) => Some("account"),
+        Some(Subcommand::ChatgptWeb(_)) => Some("chatgpt-web"),
         Some(Subcommand::Completion(_)) => Some("completion"),
         Some(Subcommand::Update) => Some("update"),
         Some(Subcommand::Cloud(_)) => Some("cloud"),

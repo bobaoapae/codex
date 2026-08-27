@@ -19,6 +19,8 @@ workspace = true
 anyhow = { workspace = true }
 arc-swap = { workspace = true }
 async-channel = { workspace = true }
+# FORK: chatgpt_web connector daemon (loopback control API + public MCP server).
+axum = { workspace = true, features = ["http1", "json", "query", "tokio"] }
 base64 = { workspace = true }
 bm25 = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
@@ -104,10 +106,14 @@ rmcp = { workspace = true, default-features = false, features = [
     "macros",
     "schemars",
     "server",
+    # FORK: the chatgpt_web connector daemon serves MCP over Streamable HTTP.
+    "transport-streamable-http-server",
 ] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha1 = { workspace = true }
+# FORK: chatgpt_web tunnel-client release verification.
+sha2 = { workspace = true }
 shlex = { workspace = true }
 similar = { workspace = true }
 tempfile = { workspace = true }
@@ -128,6 +134,8 @@ url = { workspace = true }
 uuid = { workspace = true, features = ["serde", "v4", "v5", "v7"] }
 which = { workspace = true }
 whoami = { workspace = true }
+# FORK: chatgpt_web tunnel-client release extraction.
+zip = { workspace = true }
 
 # Build OpenSSL from source for musl builds.
 [target.x86_64-unknown-linux-musl.dependencies]

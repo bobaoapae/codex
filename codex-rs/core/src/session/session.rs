@@ -1589,3 +1589,23 @@ impl Session {
         }
     }
 }
+
+// FORK: ChatGPT Web conversations are archived when their thread ends for
+// good (root shutdown, explicit agent close) — not on an eviction, which
+// rebuilds the agent later and must find its conversation intact.
+impl Session {
+    /// Whether this session is the root of its agent tree.
+    pub(crate) async fn is_root_thread(&self) -> bool {
+        let state = self.state.lock().await;
+        state.session_configuration.parent_thread_id.is_none()
+    }
+
+    /// Archives the ChatGPT Web conversation recorded for this thread, if any.
+    pub(crate) async fn archive_chatgpt_web_conversation(&self) {
+        let config = {
+            let state = self.state.lock().await;
+            Arc::clone(&state.session_configuration.original_config_do_not_use)
+        };
+        crate::chatgpt_web::archive_thread_conversation(config.as_ref(), self.thread_id()).await;
+    }
+}

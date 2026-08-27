@@ -135,13 +135,6 @@ fn client_timeout_is_at_least_two_minutes_and_outlives_the_daemon_cap() {
 }
 
 #[test]
-fn tab_ids_are_sent_as_numbers_when_numeric() {
-    assert_eq!(tab_id_value("626460085"), json!(626460085));
-    assert_eq!(tab_id_value("-3"), json!(-3));
-    assert_eq!(tab_id_value("abc"), json!("abc"));
-}
-
-#[test]
 fn health_url_replaces_the_mcp_path_and_drops_the_query() {
     assert_eq!(
         health_url_for("http://127.0.0.1:8848/mcp?x=1#frag"),

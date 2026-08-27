@@ -99,7 +99,8 @@ pub(super) fn plan_request(
 ///
 /// Only the rendered text is hashed: ids and other transport metadata change
 /// between requests without changing what the model was told.
-fn fingerprint(items: &[ResponseItem]) -> u64 {
+// FORK: `pub(crate)` — shared with the `chatgpt_web` provider.
+pub(crate) fn fingerprint(items: &[ResponseItem]) -> u64 {
     let mut hasher = DefaultHasher::new();
     items.len().hash(&mut hasher);
     for item in items {
@@ -110,7 +111,7 @@ fn fingerprint(items: &[ResponseItem]) -> u64 {
 
 /// Fingerprint of a single item, on the same rendered-text basis as
 /// [`fingerprint`], so an item Codex stores can be recognized later.
-pub(super) fn item_fingerprint(item: &ResponseItem) -> u64 {
+pub(crate) fn item_fingerprint(item: &ResponseItem) -> u64 {
     let mut hasher = DefaultHasher::new();
     render_item(item).hash(&mut hasher);
     hasher.finish()
@@ -139,7 +140,19 @@ the last message.\n\n<codex_transcript>\n{}\n</codex_transcript>",
     )
 }
 
-fn render_item(item: &ResponseItem) -> String {
+/// Renders one history item as plain text.
+// FORK: `pub(crate)` — shared with the `chatgpt_web` provider.
+pub(crate) fn render_item(item: &ResponseItem) -> String {
+    render_item_with(item, &mut |_| "[image omitted]".to_string())
+}
+
+/// FORK: [`render_item`] with a caller-supplied rendering for input images,
+/// so a provider that can attach images (chatgpt_web) can name them in the
+/// transcript instead of dropping them.
+pub(crate) fn render_item_with(
+    item: &ResponseItem,
+    image: &mut dyn FnMut(&str) -> String,
+) -> String {
     match item {
         ResponseItem::Message {
             role,
@@ -166,10 +179,10 @@ fn render_item(item: &ResponseItem) -> String {
                 })
                 .map(|(_, content_item)| match content_item {
                     ContentItem::InputText { text } | ContentItem::OutputText { text } => {
-                        text.as_str()
+                        text.clone()
                     }
-                    ContentItem::InputImage { .. } => "[image omitted]",
-                    ContentItem::InputAudio { .. } => "[audio omitted]",
+                    ContentItem::InputImage { image_url, .. } => image(image_url),
+                    ContentItem::InputAudio { .. } => "[audio omitted]".to_string(),
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
@@ -380,11 +393,11 @@ fn strip_codex_harness_sections(text: &str) -> String {
 
 /// FORK: the same elision used on replayed tool output, for the tool results
 /// this fork now records from Claude's own calls.
-pub(super) fn truncate_tool_output(text: &str) -> String {
+pub(crate) fn truncate_tool_output(text: &str) -> String {
     truncate_middle(text, MAX_TOOL_OUTPUT_CHARS)
 }
 
-fn truncate_middle(text: &str, max_chars: usize) -> String {
+pub(crate) fn truncate_middle(text: &str, max_chars: usize) -> String {
     let char_count = text.chars().count();
     if char_count <= max_chars {
         return text.to_string();

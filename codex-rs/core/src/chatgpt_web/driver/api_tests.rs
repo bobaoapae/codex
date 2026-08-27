@@ -505,7 +505,7 @@ fn fingerprint_changes_when_assets_or_thoughts_change() {
 /// Returns canned eval results in order and records every expression.
 struct FakePageEval {
     responses: Mutex<VecDeque<DriverResult<Value>>>,
-    calls: Mutex<Vec<(String, String, u64)>>,
+    calls: Mutex<Vec<(TabId, String, u64)>>,
     evals: AtomicUsize,
 }
 
@@ -531,7 +531,7 @@ impl FakePageEval {
 impl PageEval for FakePageEval {
     fn eval<'a>(
         &'a self,
-        tab_id: &'a str,
+        tab_id: TabId,
         expression: String,
         timeout_ms: u64,
     ) -> BoxFuture<'a, DriverResult<Value>> {
@@ -539,7 +539,7 @@ impl PageEval for FakePageEval {
         self.calls
             .lock()
             .expect("lock")
-            .push((tab_id.to_string(), expression, timeout_ms));
+            .push((tab_id, expression, timeout_ms));
         let next = self
             .responses
             .lock()
@@ -567,7 +567,7 @@ async fn get_conversation_decodes_the_page_response() {
     let raw: Value =
         serde_json::from_str(include_str!("../fixtures/conv_finished.json")).expect("json");
     let eval = FakePageEval::new(vec![http(200, raw)]);
-    let api = ChatGptApi::new(&eval, "tab-7", "");
+    let api = ChatGptApi::new(&eval, 7, "");
     let conv = api
         .get_conversation("22222222-aaaa-4bbb-8ccc-000000000002")
         .await
@@ -582,7 +582,7 @@ async fn get_conversation_decodes_the_page_response() {
     let calls = eval.calls.lock().expect("lock");
     assert_eq!(calls.len(), 1);
     let (tab, expr, timeout) = &calls[0];
-    assert_eq!(tab, "tab-7");
+    assert_eq!(*tab, 7);
     assert_eq!(*timeout, API_EVAL_TIMEOUT_MS);
     assert!(expr.starts_with("() =>"));
     assert!(expr.contains(
@@ -597,7 +597,7 @@ async fn read_conversation_normalizes() {
     let raw: Value =
         serde_json::from_str(include_str!("../fixtures/conv_in_progress.json")).expect("json");
     let eval = FakePageEval::new(vec![http(200, raw)]);
-    let api = ChatGptApi::new(&eval, "tab", "");
+    let api = ChatGptApi::new(&eval, 1, "");
     let conv = api.read_conversation("x").await.expect("ok");
     assert!(conv.is_generating);
 }
@@ -605,9 +605,9 @@ async fn read_conversation_normalizes() {
 #[tokio::test]
 async fn base_url_is_prefixed_to_every_path() {
     let eval = FakePageEval::new(vec![http(200, json!({ "mapping": {} }))]);
-    let api = ChatGptApi::new(&eval, "tab", "https://chatgpt.com/");
+    let api = ChatGptApi::new(&eval, 1, "https://chatgpt.com/");
     assert_eq!(api.base_url(), "https://chatgpt.com");
-    assert_eq!(api.tab_id(), "tab");
+    assert_eq!(api.tab_id(), 1);
     api.get_conversation("abc").await.expect("ok");
     assert!(
         eval.expressions()[0]
@@ -621,18 +621,18 @@ async fn a_string_eval_result_is_decoded_as_json() {
     let eval = FakePageEval::new(vec![Ok(json!(
         "{\"status\":200,\"json\":{\"mapping\":{},\"title\":\"t\"},\"text\":null}"
     ))]);
-    let api = ChatGptApi::new(&eval, "tab", "");
+    let api = ChatGptApi::new(&eval, 1, "");
     let conv = api.get_conversation("abc").await.expect("ok");
     assert_eq!(conv.title, "t");
 
     let eval = FakePageEval::new(vec![Ok(json!("not json"))]);
-    let api = ChatGptApi::new(&eval, "tab", "");
+    let api = ChatGptApi::new(&eval, 1, "");
     let err = api.get_conversation("abc").await.expect_err("err");
     assert_eq!(err.kind, DriverErrorKind::Other);
     assert!(err.message.contains("non-JSON"));
 
     let eval = FakePageEval::new(vec![Ok(json!([1, 2]))]);
-    let api = ChatGptApi::new(&eval, "tab", "");
+    let api = ChatGptApi::new(&eval, 1, "");
     let err = api.get_conversation("abc").await.expect_err("err");
     assert_eq!(err.kind, DriverErrorKind::Other);
 }
@@ -643,7 +643,7 @@ async fn http_404_maps_to_conversation_not_found() {
         404,
         json!({ "detail": "Conversation not found" }),
     )]);
-    let api = ChatGptApi::new(&eval, "tab", "");
+    let api = ChatGptApi::new(&eval, 1, "");
     let err = api.get_conversation("missing").await.expect_err("404");
     assert_eq!(err.kind, DriverErrorKind::ConversationNotFound);
     assert_eq!(
@@ -662,7 +662,7 @@ async fn http_429_retries_with_backoff_then_maps_to_rate_limited() {
         http_text(429, "Too many requests"),
         http_text(429, "Too many requests"),
     ]);
-    let api = ChatGptApi::new(&eval, "tab", "").with_backoff(no_backoff());
+    let api = ChatGptApi::new(&eval, 1, "").with_backoff(no_backoff());
     let err = api.get_conversation("abc").await.expect_err("429");
     assert_eq!(err.kind, DriverErrorKind::RateLimited);
     // 1 initial + 3 backoff retries, then give up.
@@ -676,7 +676,7 @@ async fn http_429_then_200_succeeds() {
         http_text(429, "slow down"),
         http(200, json!({ "title": "ok", "mapping": {} })),
     ]);
-    let api = ChatGptApi::new(&eval, "tab", "").with_backoff(no_backoff());
+    let api = ChatGptApi::new(&eval, 1, "").with_backoff(no_backoff());
     let conv = api.get_conversation("abc").await.expect("ok after retry");
     assert_eq!(conv.title, "ok");
     assert_eq!(eval.evals.load(Ordering::SeqCst), 2);
@@ -694,7 +694,7 @@ async fn other_http_statuses_map_to_driver_error_kinds() {
         (418, DriverErrorKind::Other),
     ] {
         let eval = FakePageEval::new(vec![http_text(status, "nope")]);
-        let api = ChatGptApi::new(&eval, "tab", "").with_backoff(no_backoff());
+        let api = ChatGptApi::new(&eval, 1, "").with_backoff(no_backoff());
         let err = api.get_conversation("abc").await.expect_err("error");
         assert_eq!(err.kind, kind, "status {status}");
         assert!(err.message.contains(&format!("HTTP {status}")));
@@ -707,7 +707,7 @@ async fn page_level_errors_are_reported_and_login_is_detected() {
         "status": 0,
         "error": "Error: not logged in: /api/auth/session returned no accessToken"
     }))]);
-    let api = ChatGptApi::new(&eval, "tab", "");
+    let api = ChatGptApi::new(&eval, 1, "");
     let err = api.get_conversation("abc").await.expect_err("login");
     assert_eq!(err.kind, DriverErrorKind::LoginRequired);
     assert!(
@@ -718,13 +718,13 @@ async fn page_level_errors_are_reported_and_login_is_detected() {
     let eval = FakePageEval::new(vec![Ok(
         json!({ "status": 0, "error": "TypeError: Failed to fetch" }),
     )]);
-    let api = ChatGptApi::new(&eval, "tab", "");
+    let api = ChatGptApi::new(&eval, 1, "");
     let err = api.get_conversation("abc").await.expect_err("fetch");
     assert_eq!(err.kind, DriverErrorKind::Other);
 
     // Eval failures pass through untouched.
     let eval = FakePageEval::new(vec![Err(DriverError::timeout("eval timed out"))]);
-    let api = ChatGptApi::new(&eval, "tab", "");
+    let api = ChatGptApi::new(&eval, 1, "");
     let err = api.get_conversation("abc").await.expect_err("timeout");
     assert_eq!(err.kind, DriverErrorKind::Timeout);
 }
@@ -741,7 +741,7 @@ async fn list_conversations_requests_updated_order_and_decodes_items() {
             "total": 2, "limit": 20, "offset": 40, "has_missing_conversations": false
         }),
     )]);
-    let api = ChatGptApi::new(&eval, "tab", "");
+    let api = ChatGptApi::new(&eval, 1, "");
     let list = api.list_conversations(40, 20).await.expect("ok");
     assert_eq!(list.total, 2);
     assert_eq!(list.items.len(), 2);
@@ -762,7 +762,7 @@ async fn patch_conversation_sends_the_body_and_ignores_the_reply() {
         http(200, json!({ "success": true })),
         http(200, json!({ "success": true })),
     ]);
-    let api = ChatGptApi::new(&eval, "tab", "");
+    let api = ChatGptApi::new(&eval, 1, "");
     api.patch_conversation("abc", json!({ "title": "Novo \"título\"" }))
         .await
         .expect("title");
@@ -798,7 +798,7 @@ async fn models_are_cached_per_base_url_for_five_minutes() {
         "categories": []
     });
     let eval = FakePageEval::new(vec![http(200, payload)]);
-    let api = ChatGptApi::new(&eval, "tab", base);
+    let api = ChatGptApi::new(&eval, 1, base);
     let first = api.models().await.expect("first");
     assert_eq!(first.default_slug.as_deref(), Some("gpt-5-2"));
     assert_eq!(
@@ -823,7 +823,7 @@ async fn models_are_cached_per_base_url_for_five_minutes() {
     ));
 
     // Cache hit: no second eval, even through a fresh ChatGptApi value.
-    let api2 = ChatGptApi::new(&eval, "other-tab", base);
+    let api2 = ChatGptApi::new(&eval, 2, base);
     let second = api2.models().await.expect("cached");
     assert_eq!(second, first);
     assert_eq!(eval.evals.load(Ordering::SeqCst), 1);
@@ -832,7 +832,7 @@ async fn models_are_cached_per_base_url_for_five_minutes() {
     let other = "https://models-cache-test-2.invalid";
     clear_models_cache(other);
     let eval_other = FakePageEval::new(vec![http(200, json!({ "models": [] }))]);
-    let api_other = ChatGptApi::new(&eval_other, "tab", other);
+    let api_other = ChatGptApi::new(&eval_other, 1, other);
     let info = api_other.models().await.expect("other origin");
     assert_eq!(info, ModelsInfo::default());
     assert_eq!(eval_other.evals.load(Ordering::SeqCst), 1);
@@ -840,7 +840,7 @@ async fn models_are_cached_per_base_url_for_five_minutes() {
     // Clearing forces a refetch.
     clear_models_cache(base);
     let eval3 = FakePageEval::new(vec![http_text(500, "boom")]);
-    let api3 = ChatGptApi::new(&eval3, "tab", base);
+    let api3 = ChatGptApi::new(&eval3, 1, base);
     let err = api3.models().await.expect_err("refetched and failed");
     assert_eq!(err.kind, DriverErrorKind::Upstream);
     clear_models_cache(base);

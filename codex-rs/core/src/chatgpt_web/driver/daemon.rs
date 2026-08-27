@@ -52,6 +52,7 @@ use tracing::warn;
 use super::DriverError;
 use super::DriverResult;
 use super::api::PageEval;
+use super::tabs::TabId;
 
 /// Default daemon endpoint (`config.ts:29`).
 pub(crate) const DEFAULT_DAEMON_URL: &str = "http://127.0.0.1:8848/mcp";
@@ -236,15 +237,6 @@ pub(crate) fn is_transport_issue(message: &str) -> bool {
 /// Client-side cap for a tool call: `max(120s, daemon cap + 30s)`.
 pub(crate) fn client_timeout_for(daemon_timeout_ms: u64) -> Duration {
     CALL_TIMEOUT.max(Duration::from_millis(daemon_timeout_ms) + CALL_TIMEOUT_SLACK)
-}
-
-/// The daemon's `tabId` schema is `z.number().int()`; the driver passes ids
-/// around as strings, so a numeric string is sent as a JSON number.
-pub(crate) fn tab_id_value(tab_id: &str) -> Value {
-    match tab_id.trim().parse::<i64>() {
-        Ok(id) => Value::from(id),
-        Err(_) => Value::String(tab_id.to_string()),
-    }
 }
 
 fn initialize_params() -> InitializeRequestParams {
@@ -464,12 +456,12 @@ impl DaemonClient {
     /// 300ms page-side sleep can stretch past 30s of wall clock.
     pub(crate) async fn eval_in(
         &self,
-        tab_id: &str,
+        tab_id: TabId,
         expression: String,
         timeout_ms: u64,
     ) -> DriverResult<Value> {
         let args = json!({
-            "tabId": tab_id_value(tab_id),
+            "tabId": tab_id,
             "expression": expression,
             "world": "MAIN",
             "timeoutMs": timeout_ms,
@@ -487,7 +479,7 @@ impl DaemonClient {
 impl PageEval for DaemonClient {
     fn eval<'a>(
         &'a self,
-        tab_id: &'a str,
+        tab_id: TabId,
         expression: String,
         timeout_ms: u64,
     ) -> BoxFuture<'a, DriverResult<Value>> {

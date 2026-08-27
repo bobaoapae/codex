@@ -83,6 +83,15 @@ impl AgentControl {
                 warn!("failed to inspect agent before close {agent_id}: {err}");
             }
         }
+        // FORK: archive the ChatGPT Web conversations of the agent and its live
+        // descendants before they shut down (an eviction keeps them).
+        if let Ok(descendants) = self.live_thread_spawn_descendants(agent_id).await {
+            for id in std::iter::once(agent_id).chain(descendants) {
+                if let Ok(thread) = state.get_thread(id).await {
+                    thread.session.archive_chatgpt_web_conversation().await;
+                }
+            }
+        }
         match Box::pin(self.shutdown_agent_tree(agent_id)).await {
             Err(err)
                 if known_agent

@@ -103,10 +103,7 @@ impl TabDaemon for DaemonClient {
         expression: String,
         timeout_ms: u64,
     ) -> BoxFuture<'a, DriverResult<Value>> {
-        async move {
-            DaemonClient::eval_in(self, &tab_id.to_string(), expression, timeout_ms).await
-        }
-        .boxed()
+        DaemonClient::eval_in(self, tab_id, expression, timeout_ms).boxed()
     }
 }
 

@@ -36,6 +36,7 @@ use super::DriverError;
 use super::DriverErrorKind;
 use super::DriverResult;
 use super::page_scripts;
+use super::tabs::TabId;
 
 /// `api.ts`: `const backoff = [2000, 5000, 10_000];`
 pub(crate) const RATE_LIMIT_BACKOFF: [Duration; 3] = [
@@ -641,7 +642,7 @@ pub(crate) fn fingerprint(conv: &Conversation) -> u64 {
 pub(crate) trait PageEval: Send + Sync {
     fn eval<'a>(
         &'a self,
-        tab_id: &'a str,
+        tab_id: TabId,
         expression: String,
         timeout_ms: u64,
     ) -> BoxFuture<'a, DriverResult<Value>>;
@@ -725,7 +726,7 @@ pub(crate) fn clear_models_cache(base_url: &str) {
 /// chatgpt.com origin (cookies live in the browser).
 pub(crate) struct ChatGptApi<'a> {
     eval: &'a dyn PageEval,
-    tab_id: &'a str,
+    tab_id: TabId,
     /// Origin prefixed to every path. Empty means "relative to the tab's own
     /// origin", which is what the TS does.
     base_url: String,
@@ -734,11 +735,7 @@ pub(crate) struct ChatGptApi<'a> {
 }
 
 impl<'a> ChatGptApi<'a> {
-    pub(crate) fn new(
-        eval: &'a dyn PageEval,
-        tab_id: &'a str,
-        base_url: impl Into<String>,
-    ) -> Self {
+    pub(crate) fn new(eval: &'a dyn PageEval, tab_id: TabId, base_url: impl Into<String>) -> Self {
         Self {
             eval,
             tab_id,
@@ -758,7 +755,7 @@ impl<'a> ChatGptApi<'a> {
         &self.base_url
     }
 
-    pub(crate) fn tab_id(&self) -> &str {
+    pub(crate) fn tab_id(&self) -> TabId {
         self.tab_id
     }
 

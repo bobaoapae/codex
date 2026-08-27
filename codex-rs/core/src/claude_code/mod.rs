@@ -17,13 +17,17 @@
 //! spends the user's Claude Code subscription rather than an API key.
 
 pub(crate) mod accounts;
+// FORK: shared with the `chatgpt_web` provider.
+pub(crate) mod assembler;
 mod bridge;
 mod control;
-mod history;
+// FORK: shared with the `chatgpt_web` provider.
+pub(crate) mod history;
 mod host;
 mod session_host;
 mod sessions;
-mod state_file;
+// FORK: shared with the `chatgpt_web` provider.
+pub(crate) mod state_file;
 mod tools;
 
 use crate::client_common::Prompt;
@@ -32,9 +36,7 @@ use crate::client_common::ResponseStream;
 use codex_config::config_toml::ClaudeCodeAccountSelection;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result;
-use codex_protocol::models::ContentItem;
 use codex_protocol::models::MessagePhase;
-use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
@@ -58,6 +60,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::debug;
 use tracing::warn;
 
+pub(crate) use assembler::StreamAssembler;
 pub(crate) use history::ClaudeSessionContinuity;
 pub(crate) use host::ClaudeHost;
 pub(crate) use session_host::SessionClaudeHost;
@@ -1633,232 +1636,6 @@ async fn handle_control_request(
                 )
                 .await;
         }
-    }
-}
-
-/// Turns Claude's block stream into Codex items.
-///
-/// Codex's turn loop refuses a delta with no item open (`error_or_panic`) and
-/// closes the open item on `OutputItemDone`. Claude interleaves thinking, tool
-/// calls and answer text freely, so each run of same-kind blocks becomes one
-/// Codex item: open on the first block of a run, close when the kind changes.
-struct StreamAssembler<'a> {
-    tx: &'a mpsc::Sender<Result<ResponseEvent>>,
-    active: Option<ActiveItem>,
-    streamed_any_text: bool,
-    /// FORK: fingerprints of every item this turn produced, so the next request
-    /// can drop them from its tail instead of reading them back to Claude.
-    authored: Vec<u64>,
-    /// FORK: whether the partial stream already painted the block that is being
-    /// completed, so the completed block records without repainting it.
-    painted_via_deltas: bool,
-}
-
-enum ActiveItem {
-    Reasoning(String),
-    Message(String),
-}
-
-impl<'a> StreamAssembler<'a> {
-    fn new(tx: &'a mpsc::Sender<Result<ResponseEvent>>) -> Self {
-        Self {
-            tx,
-            active: None,
-            streamed_any_text: false,
-            authored: Vec::new(),
-            painted_via_deltas: false,
-        }
-    }
-
-    fn streamed_any_text(&self) -> bool {
-        self.streamed_any_text
-    }
-
-    fn take_authored(&mut self) -> Vec<u64> {
-        std::mem::take(&mut self.authored)
-    }
-
-    /// Sends a finished item and remembers it as this turn's own output.
-    async fn send_done(&mut self, item: ResponseItem) -> bool {
-        self.authored.push(history::item_fingerprint(&item));
-        self.send(ResponseEvent::OutputItemDone(item)).await
-    }
-
-    /// FORK: paints streamed assistant text as the CLI produces it.
-    ///
-    /// The completed `assistant` block still arrives afterwards and is what
-    /// records the item; these deltas only paint, so the text is never
-    /// accumulated here. Two things this must get right:
-    ///
-    /// - an item has to be open first. A delta with no active item is a harness
-    ///   invariant violation, and in a debug build it panics outright;
-    /// - the completed block must not repaint what the deltas already showed,
-    ///   which is what `painted_via_deltas` tracks.
-    async fn push_text_delta(&mut self, text: &str) -> bool {
-        if !matches!(self.active, Some(ActiveItem::Message(_))) {
-            if !self.close(MessagePhase::Commentary).await {
-                return false;
-            }
-            if !self
-                .send(ResponseEvent::OutputItemAdded(message_item(
-                    String::new(),
-                    &MessagePhase::Commentary,
-                )))
-                .await
-            {
-                return false;
-            }
-            self.active = Some(ActiveItem::Message(String::new()));
-        }
-        self.painted_via_deltas = true;
-        self.send(ResponseEvent::OutputTextDelta(text.to_string()))
-            .await
-    }
-
-    /// FORK: the same, for thinking.
-    async fn push_reasoning_delta(&mut self, text: &str) -> bool {
-        if !matches!(self.active, Some(ActiveItem::Reasoning(_))) {
-            if !self.close(MessagePhase::Commentary).await {
-                return false;
-            }
-            if !self
-                .send(ResponseEvent::OutputItemAdded(
-                    reasoning_item(String::new()),
-                ))
-                .await
-            {
-                return false;
-            }
-            self.active = Some(ActiveItem::Reasoning(String::new()));
-        }
-        self.painted_via_deltas = true;
-        self.send(ResponseEvent::ReasoningSummaryDelta {
-            delta: text.to_string(),
-            summary_index: 0,
-        })
-        .await
-    }
-
-    /// FORK: forwards a tool the provider already executed.
-    ///
-    /// Its history items are fingerprinted like anything else this turn
-    /// produced, so the next request's tail does not replay Claude's own trace
-    /// back at it.
-    async fn send_provider_tool(&mut self, executed: codex_api::ProviderExecutedTool) -> bool {
-        for item in &executed.history_items {
-            self.authored.push(history::item_fingerprint(item));
-        }
-        self.send(ResponseEvent::ProviderExecutedTool(Box::new(executed)))
-            .await
-    }
-
-    /// Sends one event; `false` means the consumer is gone and we should stop.
-    async fn send(&self, event: ResponseEvent) -> bool {
-        self.tx.send(Ok(event)).await.is_ok()
-    }
-
-    async fn push_text(&mut self, text: &str) -> bool {
-        if !matches!(self.active, Some(ActiveItem::Message(_))) {
-            if !self.close(MessagePhase::Commentary).await {
-                return false;
-            }
-            if !self
-                .send(ResponseEvent::OutputItemAdded(message_item(
-                    String::new(),
-                    &MessagePhase::Commentary,
-                )))
-                .await
-            {
-                return false;
-            }
-            self.active = Some(ActiveItem::Message(String::new()));
-        }
-        if let Some(ActiveItem::Message(buffer)) = self.active.as_mut() {
-            buffer.push_str(text);
-        }
-        self.streamed_any_text = true;
-        // FORK: the partial stream already showed this block character by
-        // character; repeating it here would print it twice.
-        if std::mem::take(&mut self.painted_via_deltas) {
-            return true;
-        }
-        self.send(ResponseEvent::OutputTextDelta(text.to_string()))
-            .await
-    }
-
-    async fn push_reasoning(&mut self, text: &str) -> bool {
-        if !matches!(self.active, Some(ActiveItem::Reasoning(_))) {
-            if !self.close(MessagePhase::Commentary).await {
-                return false;
-            }
-            if !self
-                .send(ResponseEvent::OutputItemAdded(
-                    reasoning_item(String::new()),
-                ))
-                .await
-            {
-                return false;
-            }
-            self.active = Some(ActiveItem::Reasoning(String::new()));
-        }
-        if let Some(ActiveItem::Reasoning(buffer)) = self.active.as_mut() {
-            buffer.push_str(text);
-        }
-        // FORK: as above — the partial stream already painted this block.
-        if std::mem::take(&mut self.painted_via_deltas) {
-            return true;
-        }
-        self.send(ResponseEvent::ReasoningSummaryDelta {
-            delta: text.to_string(),
-            // One summary part per item: Claude's blocks are a single narrative,
-            // not indexed summary sections.
-            summary_index: 0,
-        })
-        .await
-    }
-
-    /// Closes the open item, if any. `phase` applies only to assistant text.
-    async fn close(&mut self, phase: MessagePhase) -> bool {
-        match self.active.take() {
-            None => true,
-            Some(ActiveItem::Reasoning(text)) => self.send_done(reasoning_item(text)).await,
-            Some(ActiveItem::Message(text)) => self.send_done(message_item(text, &phase)).await,
-        }
-    }
-
-    /// Emits a complete assistant message that was never streamed.
-    async fn emit_message(&mut self, text: String, phase: MessagePhase) -> bool {
-        if !self
-            .send(ResponseEvent::OutputItemAdded(message_item(
-                text.clone(),
-                &phase,
-            )))
-            .await
-        {
-            return false;
-        }
-        self.streamed_any_text = true;
-        self.send_done(message_item(text, &phase)).await
-    }
-}
-
-fn message_item(text: String, phase: &MessagePhase) -> ResponseItem {
-    ResponseItem::Message {
-        id: None,
-        role: "assistant".to_string(),
-        content: vec![ContentItem::OutputText { text }],
-        phase: Some(phase.clone()),
-        internal_chat_message_metadata_passthrough: None,
-    }
-}
-
-fn reasoning_item(text: String) -> ResponseItem {
-    ResponseItem::Reasoning {
-        id: None,
-        summary: vec![ReasoningItemReasoningSummary::SummaryText { text }],
-        content: None,
-        encrypted_content: None,
-        internal_chat_message_metadata_passthrough: None,
     }
 }
 
