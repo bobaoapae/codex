@@ -246,3 +246,21 @@ So the driver's `api_tool_requests` detection (assistant msg with `recipient` st
 `api_tool`, matched to a later `tool` msg via `metadata.parent_id`) is correct, and the
 "all api_tool answered" completion gate maps to: every `recipient:"api_tool…"` assistant
 message has a following `tool` message with `parent_id == its id`.
+
+---
+
+## Addendum (C2, 2026-08-27) — create probes the endpoint
+
+Observed while running the Rust registry live (`live_registry_reconciles_a_manual_url`):
+
+- `POST /backend-api/aip/connectors/mcp` with an **unreachable** `mcp_url`
+  (`https://example.invalid/mcp/test`) → **HTTP 424**
+  `{"developer_message":"Connection failed.","kind":"network","mcp_url":"…","type":"mcp_error"}`.
+  ChatGPT connects to the MCP server at create time (that is where the `actions[]` in the
+  create response come from), so a connector is never created for a dead endpoint. The
+  registry maps this to `Failed` with backoff; the tunnel must be `Ready` before reconcile.
+- With a reachable endpoint (spike server behind a cloudflared quick tunnel) the same Rust
+  flow — `settings/user` → `connectors/list_accessible` → `links/list_accessible` → create →
+  `links/noauth` → `GET /connectors/<id>/actions` — verified 6 actions in ~18 s and the
+  server saw the usual `server/discover` (400) → `initialize` → `notifications/initialized`
+  → `tools/list` sequence; delete (link, then connector) left nothing behind.

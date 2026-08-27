@@ -23,7 +23,17 @@ pub(crate) mod stream;
 
 pub(crate) use connector::ConnectorBroker;
 
+use crate::chatgpt_web::connector::BeginTurn;
+use crate::chatgpt_web::connector::ConnectorTurn;
+use crate::chatgpt_web::connector::ToolRequest;
+use crate::chatgpt_web::connector::client::DaemonSessionBroker;
+use crate::chatgpt_web::connector::connector_attach::ConnectorAttach;
+use crate::chatgpt_web::connector::contract::CallTarget;
+use crate::chatgpt_web::connector::contract::ExecTool;
+use crate::chatgpt_web::connector::contract::ToolSummary;
+use crate::chatgpt_web::connector::tool_summaries;
 use crate::claude_code::assembler::StreamAssembler;
+use crate::claude_code::history::item_fingerprint;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
@@ -103,10 +113,8 @@ pub(crate) struct ChatGptWebWorkspace {
     /// Durable conversation record, so an evicted agent resumes its ChatGPT
     /// conversation instead of replaying its transcript.
     pub(crate) sessions_state_path: Option<PathBuf>,
-    /// The connector broker, attached per sampling request when
-    /// `tools = "connector"`; `None` in `tools = "none"`.
-    // TODO(M6): read by the connector turn.
-    #[allow(dead_code)]
+    /// The connector broker, when a test injects one; production self-attaches
+    /// a process-global broker instead. `None` in `tools = "none"`.
     pub(crate) connector: Option<Arc<dyn ConnectorBroker>>,
     /// The summarization prompt Codex appends on a compaction turn, so the
     /// provider can recognise that turn and answer it from a disposable
@@ -196,6 +204,10 @@ struct SessionStore {
 pub(crate) struct ChatGptWebThreadState {
     continuity: StdMutex<ConversationContinuity>,
     store: StdMutex<Option<SessionStore>>,
+    /// FORK: a connector turn suspended between `stream()` calls, waiting for the
+    /// tool outputs Codex is producing. `None` outside connector mode and
+    /// between turns.
+    live_turn: StdMutex<Option<LiveTurn>>,
 }
 
 impl ChatGptWebThreadState {
@@ -259,6 +271,20 @@ impl ChatGptWebThreadState {
         self.record(ConversationContinuity::default());
     }
 
+    fn set_live_turn(&self, live: LiveTurn) {
+        *self
+            .live_turn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(live);
+    }
+
+    fn take_live_turn(&self) -> Option<LiveTurn> {
+        self.live_turn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
     /// The message landed but its reply was not recorded.
     fn mark_unanswered(&self, echoed: Vec<u64>) {
         let snapshot = {
@@ -295,6 +321,9 @@ pub(crate) async fn stream(
 
     let input = prompt.input.clone();
     let model_slug = model_info.slug.clone();
+    // Reduced ahead of the spawn while `prompt` is borrowable; only the
+    // connector turn reads it.
+    let connector_tools = tool_summaries(&prompt.tools);
     let (tx_event, rx_event) = mpsc::channel(EVENT_CHANNEL_SIZE);
     let consumer_dropped = CancellationToken::new();
     let consumer_dropped_for_task = consumer_dropped.clone();
@@ -305,6 +334,8 @@ pub(crate) async fn stream(
             model_slug,
             workspace,
             state,
+            connector_tools,
+            thread_id,
             tx_event,
             consumer_dropped_for_task,
         )
@@ -354,6 +385,9 @@ fn turn_slots(max_parallel_turns: usize) -> Arc<Semaphore> {
 struct SharedDriver {
     daemon: Arc<DaemonClient>,
     ops: Arc<ChatGptOps>,
+    /// Kept for the connector mode's browser-side attach (mention + approval),
+    /// which drives the same pooled tabs as `ops`.
+    tabs: Arc<TabPool>,
 }
 
 fn shared_driver(settings: &ChatGptWebSettings, codex_home: &Path) -> Arc<SharedDriver> {
@@ -388,10 +422,10 @@ fn shared_driver(settings: &ChatGptWebSettings, codex_home: &Path) -> Arc<Shared
     ));
     let ops = Arc::new(ChatGptOps::new(
         Arc::clone(&daemon),
-        tabs,
+        Arc::clone(&tabs),
         settings.base_url.clone(),
     ));
-    let driver = Arc::new(SharedDriver { daemon, ops });
+    let driver = Arc::new(SharedDriver { daemon, ops, tabs });
     drivers.insert(key, Arc::clone(&driver));
     driver
 }
@@ -462,11 +496,14 @@ fn estimate_usage(transcript_chars: usize, reply_chars: usize) -> TokenUsage {
     }
 }
 
+#[allow(clippy::type_complexity)]
 async fn run_turn(
     input: Vec<ResponseItem>,
     model_slug: String,
     workspace: ChatGptWebWorkspace,
     state: Arc<ChatGptWebThreadState>,
+    connector_tools: (Vec<ToolSummary>, ExecTool, bool),
+    thread_id: codex_protocol::ThreadId,
     tx_event: mpsc::Sender<Result<ResponseEvent>>,
     consumer_dropped: CancellationToken,
 ) {
@@ -489,10 +526,17 @@ async fn run_turn(
     };
     let settings = workspace.settings.clone();
     if settings.tools == ChatGptWebTools::Connector {
-        // FORK: M6/C3 attach the broker and drive the connector turn.
-        fail(CodexErr::UnsupportedOperation(
-            "[chatgpt_web] tools = \"connector\" needs the connector daemon, which this build does not wire yet; use tools = \"none\"".to_string(),
-        ))
+        run_connector_turn(
+            input,
+            model_slug,
+            workspace,
+            state,
+            connector_tools,
+            thread_id,
+            line,
+            tx_event,
+            consumer_dropped,
+        )
         .await;
         return;
     }
@@ -569,6 +613,7 @@ async fn run_turn(
             None
         },
         files: rendered.attachments.clone(),
+        mention: None,
     };
     info!(
         "chatgpt_web: sending {} chars ({}; {} attachments) to {}",
@@ -697,6 +742,626 @@ async fn run_turn(
             } else if !plan.is_compaction {
                 state.mark_unanswered(authored);
             }
+            fail(map_driver_error(&err)).await;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FORK: connector mode (`tools = "connector"`) — the session-side turn driver.
+// ---------------------------------------------------------------------------
+
+/// One tool call ChatGPT made that Codex is running; its `respond` is fulfilled
+/// on the next `stream()` once the `FunctionCallOutput` appears.
+#[derive(Debug)]
+struct PendingCall {
+    call_id: String,
+    respond: tokio::sync::oneshot::Sender<codex_protocol::models::FunctionCallOutputPayload>,
+}
+
+/// A connector turn suspended between `stream()` calls, waiting for tool
+/// outputs. Everything needed to resume the poll after the outputs land.
+#[derive(Debug)]
+struct LiveTurn {
+    conversation_id: String,
+    connector_name: String,
+    turn_token: String,
+    requests: mpsc::Receiver<ToolRequest>,
+    pending: Vec<PendingCall>,
+    tracker: stream::ReplyTracker,
+    echoed: Vec<u64>,
+    model_slug: String,
+    delivered_items: usize,
+    delivered_fingerprint: u64,
+    transcript_chars: usize,
+    sent_at: tokio::time::Instant,
+    broker: Arc<dyn ConnectorBroker>,
+}
+
+/// Process-global connector broker, one per `CODEX_HOME`, so every thread in the
+/// process shares a single daemon session (`session_id`).
+async fn connector_broker(
+    codex_home: &Path,
+    settings: &ChatGptWebSettings,
+) -> std::result::Result<Arc<dyn ConnectorBroker>, String> {
+    #[allow(clippy::type_complexity)]
+    static CELLS: OnceLock<
+        StdMutex<HashMap<String, Arc<tokio::sync::OnceCell<Arc<dyn ConnectorBroker>>>>>,
+    > = OnceLock::new();
+    let key = codex_home.to_string_lossy().to_string();
+    let cell = {
+        let mut map = CELLS
+            .get_or_init(|| StdMutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(
+            map.entry(key)
+                .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())),
+        )
+    };
+    let connector_name = settings.connector_name.clone();
+    let codex_home = codex_home.to_path_buf();
+    let broker = cell
+        .get_or_try_init(|| async move {
+            let endpoint = connector::daemon::ensure_daemon(&codex_home)
+                .await
+                .map_err(|err| err.to_string())?;
+            let broker =
+                DaemonSessionBroker::connect(endpoint.control_url, endpoint.token, connector_name)
+                    .await?;
+            Ok::<Arc<dyn ConnectorBroker>, String>(Arc::new(broker))
+        })
+        .await?;
+    Ok(Arc::clone(broker))
+}
+
+/// Maps a connector call target onto the Codex item the turn loop dispatches.
+fn target_to_item(target: &CallTarget, call_id: &str) -> ResponseItem {
+    match target {
+        CallTarget::Function {
+            namespace,
+            name,
+            arguments,
+        } => ResponseItem::FunctionCall {
+            id: None,
+            name: name.clone(),
+            namespace: namespace.clone(),
+            arguments: arguments.to_string(),
+            encrypted_function_args: None,
+            call_id: call_id.to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        CallTarget::Custom { name, input } => ResponseItem::CustomToolCall {
+            id: None,
+            status: None,
+            call_id: call_id.to_string(),
+            name: name.clone(),
+            namespace: None,
+            input: input.clone(),
+            internal_chat_message_metadata_passthrough: None,
+        },
+    }
+}
+
+/// Finds the output Codex produced for one connector call, from the tail of the
+/// next request's input.
+fn extract_output(
+    input: &[ResponseItem],
+    call_id: &str,
+) -> Option<codex_protocol::models::FunctionCallOutputPayload> {
+    input.iter().rev().find_map(|item| match item {
+        ResponseItem::FunctionCallOutput {
+            call_id: Some(id),
+            output,
+            ..
+        } if id == call_id => Some(output.clone()),
+        ResponseItem::CustomToolCallOutput {
+            call_id: id, output, ..
+        } if id == call_id => Some(output.clone()),
+        _ => None,
+    })
+}
+
+/// Collects the tool calls arriving within a ~15ms window into one batch, so the
+/// items are emitted together (the daemon already batches, but a burst can span
+/// two channel sends).
+async fn collect_batch(
+    first: ToolRequest,
+    rx: &mut mpsc::Receiver<ToolRequest>,
+) -> Vec<ToolRequest> {
+    let mut batch = vec![first];
+    while batch.len() < 16 {
+        match tokio::time::timeout(Duration::from_millis(15), rx.recv()).await {
+            Ok(Some(request)) => batch.push(request),
+            Ok(None) | Err(_) => break,
+        }
+    }
+    batch
+}
+
+/// Drives one `tools = "connector"` turn: reattach a suspended turn if Codex
+/// just produced its tool outputs, otherwise open a fresh one.
+#[allow(clippy::too_many_arguments)]
+async fn run_connector_turn(
+    input: Vec<ResponseItem>,
+    model_slug: String,
+    workspace: ChatGptWebWorkspace,
+    state: Arc<ChatGptWebThreadState>,
+    connector_tools: (Vec<ToolSummary>, ExecTool, bool),
+    thread_id: codex_protocol::ThreadId,
+    line: ModelLine,
+    tx_event: mpsc::Sender<Result<ResponseEvent>>,
+    consumer_dropped: CancellationToken,
+) {
+    let settings = workspace.settings.clone();
+    let driver = shared_driver(&settings, &workspace.codex_home);
+    let fail = |err: CodexErr| {
+        let tx = tx_event.clone();
+        async move {
+            let _ = tx.send(Err(err)).await;
+        }
+    };
+
+    // Reattach: does a suspended turn's every pending call now have its output?
+    if let Some(mut live) = state.take_live_turn() {
+        let ready = live
+            .pending
+            .iter()
+            .all(|pending| extract_output(&input, &pending.call_id).is_some());
+        if ready {
+            for pending in std::mem::take(&mut live.pending) {
+                if let Some(payload) = extract_output(&input, &pending.call_id) {
+                    let _ = pending.respond.send(payload);
+                }
+            }
+            connector_loop(live, driver, state, tx_event, consumer_dropped, &settings).await;
+            return;
+        }
+        // The user redirected the turn (the outputs never came): abort it and
+        // fall through to a fresh turn below.
+        live.broker
+            .end_turn(&live.turn_token, "the Codex turn was replaced")
+            .await;
+        stop_generation(&driver.ops, &live.conversation_id).await;
+    }
+
+    // Fresh connector turn.
+    let slots = turn_slots(settings.max_parallel_turns);
+    let _permit = tokio::select! {
+        _ = consumer_dropped.cancelled() => return,
+        permit = slots.acquire_owned() => match permit {
+            Ok(permit) => permit,
+            Err(_) => return,
+        },
+    };
+
+    let continuity = state.snapshot();
+    let plan = history::plan_request(
+        &input,
+        &continuity,
+        &model_slug,
+        Some(workspace.compact_prompt.as_str()),
+    );
+    let image_store = attachments::ImageStore::new(&workspace.codex_home);
+    image_store.cleanup_stale();
+    let transcript_chars = prompt::transcript_chars(&input);
+
+    // A compaction turn never runs tools: answer it from a disposable
+    // conversation like the `tools = "none"` path, with no connector.
+    if plan.is_compaction {
+        run_compaction_turn(
+            &plan,
+            &workspace,
+            &driver,
+            &line,
+            &image_store,
+            transcript_chars,
+            &tx_event,
+            &consumer_dropped,
+        )
+        .await;
+        return;
+    }
+
+    let broker = match workspace.connector.clone() {
+        Some(broker) => broker,
+        None => match connector_broker(&workspace.codex_home, &settings).await {
+            Ok(broker) => broker,
+            Err(reason) => {
+                fail(CodexErr::UnsupportedOperation(format!(
+                    "[chatgpt_web] tools = \"connector\" needs the connector daemon: {reason}"
+                )))
+                .await;
+                return;
+            }
+        },
+    };
+
+    let (tools, exec_tool, apply_patch) = connector_tools;
+    let turn_id = connector::daemon::state::new_token();
+    let begin = BeginTurn {
+        thread_id,
+        turn_id: &turn_id,
+        conversation_id: if plan.restart {
+            None
+        } else {
+            continuity.conversation_id.as_deref()
+        },
+        tools,
+        exec_tool,
+        apply_patch,
+        ttl_ms: settings.turn_ttl.as_millis() as u64,
+        ready_timeout: settings.connector_ready_timeout,
+    };
+    let connector_turn = match broker.begin_turn(begin).await {
+        Ok(turn) => turn,
+        Err(reason) => {
+            fail(CodexErr::UnsupportedOperation(format!(
+                "the ChatGPT connector could not start the turn: {reason}"
+            )))
+            .await;
+            return;
+        }
+    };
+    let contract = broker.prompt_contract(&connector_turn);
+    let connector_name = connector_turn.connector_name.clone();
+    let turn_token = connector_turn.turn_token.clone();
+    let requests = connector_turn.requests;
+
+    let rendered = prompt::render(prompt::RenderRequest {
+        plan: &plan,
+        workspace: &workspace,
+        mode: prompt::PromptMode::Connector(contract),
+        is_pro: line.is_pro,
+        resume_after_interrupt: continuity.message_landed_unanswered && !plan.restart,
+        images: Some(&image_store),
+    });
+
+    match driver.daemon.health().await {
+        Ok(health) if health.ok && health.extension_connected => {}
+        Ok(_) => {
+            broker
+                .end_turn(&turn_token, "chrome-mcp extension not connected")
+                .await;
+            fail(CodexErr::Stream(
+                "chrome-mcp daemon is up but its Chrome extension is not connected".to_string(),
+            ))
+            .await;
+            return;
+        }
+        Err(err) => {
+            broker.end_turn(&turn_token, "chrome-mcp unreachable").await;
+            fail(map_driver_error(&err)).await;
+            return;
+        }
+    }
+
+    // Mention the connector only when the conversation is new; selection is
+    // sticky per conversation (spike S4), so a follow-up needs no pill.
+    let mention = plan.restart.then(|| connector_name.clone());
+    let request = SendRequest {
+        conversation_id: if plan.restart {
+            None
+        } else {
+            continuity.conversation_id.clone()
+        },
+        text: rendered.text.clone(),
+        model: if plan.restart {
+            Some(line.spec.clone())
+        } else {
+            None
+        },
+        files: rendered.attachments.clone(),
+        mention,
+    };
+    info!(
+        "chatgpt_web connector: sending {} chars ({}) with connector \"{connector_name}\"",
+        rendered.text.chars().count(),
+        if plan.restart {
+            "new conversation"
+        } else {
+            "extension"
+        }
+    );
+    let sent_at = tokio::time::Instant::now();
+    let sent = match driver.ops.send(request).await {
+        Ok(sent) => sent,
+        Err(err) => {
+            broker.end_turn(&turn_token, "the send failed").await;
+            if err.kind == DriverErrorKind::MessageTooLong
+                || err.kind == DriverErrorKind::ConversationNotFound
+            {
+                state.invalidate();
+            } else if err.message_landed != Some(false) {
+                state.mark_unanswered(Vec::new());
+            }
+            fail(map_driver_error(&err)).await;
+            return;
+        }
+    };
+    let conversation_id = sent.conversation_id.clone();
+    for note in &sent.notes {
+        info!("chatgpt_web connector: {note}");
+    }
+    // The message is in the conversation; a failed poll must extend it.
+    state.record(ConversationContinuity {
+        conversation_id: Some(conversation_id.clone()),
+        model_slug: Some(model_slug.clone()),
+        delivered_items: plan.delivered_items,
+        delivered_fingerprint: plan.delivered_fingerprint,
+        echoed: continuity.echoed.clone(),
+        message_landed_unanswered: true,
+    });
+
+    let live = LiveTurn {
+        conversation_id,
+        connector_name,
+        turn_token,
+        requests,
+        pending: Vec::new(),
+        tracker: stream::ReplyTracker::new(&rendered.text),
+        echoed: Vec::new(),
+        model_slug,
+        delivered_items: plan.delivered_items,
+        delivered_fingerprint: plan.delivered_fingerprint,
+        transcript_chars,
+        sent_at,
+        broker,
+    };
+    connector_loop(live, driver, state, tx_event, consumer_dropped, &settings).await;
+}
+
+/// The connector poll: streams the reply, parks when ChatGPT calls tools, and
+/// records the outcome. Owns `live`; on a tool batch it moves `live` into the
+/// thread state and returns so the next `stream()` resumes it.
+async fn connector_loop(
+    mut live: LiveTurn,
+    driver: Arc<SharedDriver>,
+    state: Arc<ChatGptWebThreadState>,
+    tx_event: mpsc::Sender<Result<ResponseEvent>>,
+    consumer_dropped: CancellationToken,
+    settings: &ChatGptWebSettings,
+) {
+    let mut assembler = StreamAssembler::new(&tx_event);
+    live.tracker.reset_open();
+    let poll_interval = settings.poll_interval;
+    let idle_timeout = settings.idle_timeout;
+    let auto_always = settings.connector_auto_approve_ui;
+    let mut last_progress = tokio::time::Instant::now();
+    let mut requests_open = true;
+    let mut polls: u32 = 0;
+
+    loop {
+        let stall_deadline = idle_timeout
+            .map(|timeout| last_progress + timeout)
+            .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(365 * 24 * 3600));
+        tokio::select! {
+            biased;
+            _ = consumer_dropped.cancelled() => {
+                live.broker.end_turn(&live.turn_token, "the Codex turn was interrupted").await;
+                stop_generation(&driver.ops, &live.conversation_id).await;
+                state.mark_unanswered(live.echoed);
+                return;
+            }
+            maybe = live.requests.recv(), if requests_open => {
+                let Some(first) = maybe else {
+                    // The daemon retired the turn out from under us.
+                    requests_open = false;
+                    continue;
+                };
+                let batch = collect_batch(first, &mut live.requests).await;
+                if !assembler.close(MessagePhase::Commentary).await {
+                    return;
+                }
+                let mut pending = Vec::new();
+                for request in batch {
+                    let item = target_to_item(&request.target, &request.call_id);
+                    live.echoed.push(item_fingerprint(&item));
+                    if !assembler.send(ResponseEvent::OutputItemAdded(item.clone())).await
+                        || !assembler.send(ResponseEvent::OutputItemDone(item)).await
+                    {
+                        return;
+                    }
+                    pending.push(PendingCall {
+                        call_id: request.call_id,
+                        respond: request.respond,
+                    });
+                }
+                let usage = estimate_usage(live.transcript_chars, live.tracker.text_chars());
+                let _ = assembler
+                    .send(ResponseEvent::Completed {
+                        response_id: live.conversation_id.clone(),
+                        token_usage: Some(usage),
+                        end_turn: Some(false),
+                    })
+                    .await;
+                live.pending = pending;
+                state.set_live_turn(live);
+                return;
+            }
+            _ = tokio::time::sleep(poll_interval) => {
+                let conv = match driver.ops.read_conversation(&live.conversation_id, true).await {
+                    Ok(conv) => conv,
+                    Err(err)
+                        if err.kind == DriverErrorKind::ConversationNotFound
+                            && live.sent_at.elapsed() <= Duration::from_secs(30) =>
+                    {
+                        continue;
+                    }
+                    Err(err) => {
+                        live.broker.end_turn(&live.turn_token, "the conversation could not be read").await;
+                        if err.kind == DriverErrorKind::ConversationNotFound {
+                            state.invalidate();
+                        } else {
+                            state.mark_unanswered(live.echoed.clone());
+                        }
+                        let _ = tx_event.send(Err(map_driver_error(&err))).await;
+                        return;
+                    }
+                };
+                let deltas = live.tracker.observe(&conv, stream::TrackMode::Connector);
+                for delta in deltas {
+                    match stream::apply_delta(&mut assembler, delta, &mut last_progress).await {
+                        stream::DeltaStep::Continue => {}
+                        stream::DeltaStep::Interrupted => {
+                            live.broker.end_turn(&live.turn_token, "interrupted").await;
+                            state.mark_unanswered(live.echoed);
+                            return;
+                        }
+                        stream::DeltaStep::Partial => {
+                            live.broker.end_turn(&live.turn_token, "partial completion").await;
+                            state.mark_unanswered(live.echoed.clone());
+                            let _ = tx_event
+                                .send(Err(CodexErr::Stream(
+                                    "ChatGPT stopped before finishing the answer (partial completion)".to_string(),
+                                )))
+                                .await;
+                            return;
+                        }
+                        stream::DeltaStep::Done(reason) => {
+                            let text_chars = live.tracker.text_chars();
+                            live.broker.end_turn(&live.turn_token, "the Codex turn finished").await;
+                            state.record(ConversationContinuity {
+                                conversation_id: Some(live.conversation_id.clone()),
+                                model_slug: Some(live.model_slug.clone()),
+                                delivered_items: live.delivered_items,
+                                delivered_fingerprint: live.delivered_fingerprint,
+                                echoed: live.echoed.clone(),
+                                message_landed_unanswered: false,
+                            });
+                            let _ = tx_event
+                                .send(Ok(ResponseEvent::Completed {
+                                    response_id: live.conversation_id.clone(),
+                                    token_usage: Some(estimate_usage(live.transcript_chars, text_chars)),
+                                    end_turn: Some(true),
+                                }))
+                                .await;
+                            info!("chatgpt_web connector: reply complete ({reason:?}, {text_chars} chars)");
+                            return;
+                        }
+                    }
+                }
+                polls = polls.wrapping_add(1);
+                if polls % 2 == 0 {
+                    let attach = ConnectorAttach {
+                        daemon: &driver.daemon,
+                        tabs: &driver.tabs,
+                        connector_name: live.connector_name.clone(),
+                        auto_always,
+                    };
+                    if attach.approve_on_conversation(&live.conversation_id).await {
+                        info!("chatgpt_web connector: approved a tool card");
+                    }
+                }
+            }
+            _ = tokio::time::sleep_until(stall_deadline) => {
+                let seconds = idle_timeout.map(|timeout| timeout.as_secs()).unwrap_or_default();
+                live.broker.end_turn(&live.turn_token, "no progress").await;
+                stop_generation(&driver.ops, &live.conversation_id).await;
+                state.mark_unanswered(live.echoed);
+                let _ = tx_event
+                    .send(Err(CodexErr::UnsupportedOperation(format!(
+                        "chatgpt_web connector: no progress for {seconds}s; generation stopped"
+                    ))))
+                    .await;
+                return;
+            }
+        }
+    }
+}
+
+/// A compaction turn in connector mode: rendered with the checkpoint contract,
+/// answered from a disposable conversation with tools off, then archived.
+#[allow(clippy::too_many_arguments)]
+async fn run_compaction_turn(
+    plan: &history::RequestPlan<'_>,
+    workspace: &ChatGptWebWorkspace,
+    driver: &Arc<SharedDriver>,
+    line: &ModelLine,
+    image_store: &attachments::ImageStore,
+    transcript_chars: usize,
+    tx_event: &mpsc::Sender<Result<ResponseEvent>>,
+    consumer_dropped: &CancellationToken,
+) {
+    let fail = |err: CodexErr| {
+        let tx = tx_event.clone();
+        async move {
+            let _ = tx.send(Err(err)).await;
+        }
+    };
+    let rendered = prompt::render(prompt::RenderRequest {
+        plan,
+        workspace,
+        mode: prompt::PromptMode::Compaction,
+        is_pro: line.is_pro,
+        resume_after_interrupt: false,
+        images: Some(image_store),
+    });
+    let mut assembler = StreamAssembler::new(tx_event);
+    if let Err(err) = driver.daemon.health().await {
+        fail(map_driver_error(&err)).await;
+        return;
+    }
+    let sent_at = tokio::time::Instant::now();
+    let sent = match driver
+        .ops
+        .send(SendRequest {
+            conversation_id: None,
+            text: rendered.text.clone(),
+            model: Some(line.spec.clone()),
+            files: rendered.attachments.clone(),
+            mention: None,
+        })
+        .await
+    {
+        Ok(sent) => sent,
+        Err(err) => {
+            fail(map_driver_error(&err)).await;
+            return;
+        }
+    };
+    let conversation_id = sent.conversation_id.clone();
+    let source = OpsSource(&driver.ops);
+    let outcome = stream::PollLoop {
+        source: &source,
+        conversation_id: conversation_id.clone(),
+        tracker: stream::ReplyTracker::new(&rendered.text),
+        mode: stream::TrackMode::None,
+        poll_interval: workspace.settings.poll_interval,
+        idle_timeout: workspace.settings.idle_timeout,
+        sent_at,
+        connector_rx: None,
+    }
+    .run(&mut assembler, consumer_dropped)
+    .await;
+    match outcome {
+        stream::PollOutcome::Done { text_chars, .. } => {
+            archive_conversation(&driver.ops, &conversation_id).await;
+            let _ = tx_event
+                .send(Ok(ResponseEvent::Completed {
+                    response_id: conversation_id,
+                    token_usage: Some(estimate_usage(transcript_chars, text_chars)),
+                    end_turn: Some(true),
+                }))
+                .await;
+        }
+        stream::PollOutcome::Interrupted => {
+            stop_generation(&driver.ops, &conversation_id).await;
+        }
+        stream::PollOutcome::Stalled { seconds } => {
+            stop_generation(&driver.ops, &conversation_id).await;
+            fail(CodexErr::UnsupportedOperation(format!(
+                "chatgpt_web: no progress for {seconds}s; generation stopped"
+            )))
+            .await;
+        }
+        stream::PollOutcome::PartialCompletion => {
+            fail(CodexErr::Stream(
+                "ChatGPT stopped before finishing the compaction summary".to_string(),
+            ))
+            .await;
+        }
+        stream::PollOutcome::Failed(err) => {
             fail(map_driver_error(&err)).await;
         }
     }

@@ -406,6 +406,7 @@ fn new_chat(text: &str, model: Option<ModelSpec>) -> SendRequest {
         text: text.to_string(),
         model,
         files: Vec::new(),
+        mention: None,
     }
 }
 
@@ -415,6 +416,7 @@ fn continuation(conversation_id: &str, text: &str) -> SendRequest {
         text: text.to_string(),
         model: None,
         files: Vec::new(),
+        mention: None,
     }
 }
 
@@ -1183,6 +1185,7 @@ async fn send_with_files_uploads_images_and_documents_on_their_inputs() {
             text: "What is this?".to_string(),
             model: None,
             files: vec![pic.clone(), doc.clone()],
+            mention: None,
         })
         .await
         .expect("send with files");
@@ -1257,6 +1260,7 @@ async fn send_fails_when_a_file_never_gets_a_tile() {
             text: "Read it".to_string(),
             model: None,
             files: vec![doc],
+            mention: None,
         })
         .await
         .expect_err("missing tile");
@@ -1282,6 +1286,7 @@ async fn send_reports_a_missing_file_before_touching_the_page() {
             text: "Read it".to_string(),
             model: None,
             files: vec![PathBuf::from("Z:/definitely/missing.txt")],
+            mention: None,
         })
         .await
         .expect_err("missing file");
@@ -1660,6 +1665,7 @@ mod live {
                     text: "What color is this image? One word.".to_string(),
                     model: Some(ModelSpec::Instant),
                     files: vec![png.clone()],
+                    mention: None,
                 },
                 Duration::from_secs(180),
             )

@@ -433,58 +433,92 @@ impl PollLoop<'_> {
 
             let deltas = self.tracker.observe(&conv, self.mode);
             for delta in deltas {
-                let ok = match delta {
-                    Delta::Progress => {
-                        last_progress = Instant::now();
-                        true
-                    }
-                    Delta::OpenReasoning { .. } => {
-                        assembler.open_reasoning().await
-                            && assembler
-                                .send(ResponseEvent::ReasoningSummaryPartAdded { summary_index: 0 })
-                                .await
-                    }
-                    Delta::Reasoning(text) => assembler.push_reasoning(&text).await,
-                    Delta::OpenText { .. } => assembler.open_message().await,
-                    Delta::Text(text) => assembler.push_text(&text).await,
-                    Delta::Rewrite {
-                        kind, full_text, ..
-                    } => {
-                        assembler.close(MessagePhase::Commentary).await
-                            && match kind {
-                                ItemKind::Reasoning => {
-                                    assembler.open_reasoning().await
-                                        && assembler.push_reasoning(&full_text).await
-                                }
-                                ItemKind::Text => {
-                                    assembler.open_message().await
-                                        && assembler.push_text(&full_text).await
-                                }
-                            }
-                    }
-                    Delta::Note(text) => {
-                        assembler.close(MessagePhase::Commentary).await
-                            && assembler.emit_message(text, MessagePhase::Commentary).await
-                    }
-                    Delta::PartialCompletion { .. } => {
-                        assembler.close(MessagePhase::Commentary).await;
-                        return PollOutcome::PartialCompletion;
-                    }
-                    Delta::Done { reason } => {
-                        if !assembler.close(MessagePhase::FinalAnswer).await {
-                            return PollOutcome::Interrupted;
-                        }
+                match apply_delta(assembler, delta, &mut last_progress).await {
+                    DeltaStep::Continue => {}
+                    DeltaStep::Interrupted => return PollOutcome::Interrupted,
+                    DeltaStep::Partial => return PollOutcome::PartialCompletion,
+                    DeltaStep::Done(reason) => {
                         return PollOutcome::Done {
                             reason,
                             text_chars: self.tracker.text_chars(),
                         };
                     }
-                };
-                if !ok {
-                    return PollOutcome::Interrupted;
                 }
             }
         }
+    }
+}
+
+/// What applying one delta means for the surrounding loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeltaStep {
+    /// Keep going.
+    Continue,
+    /// The consumer stopped polling; end the turn as interrupted.
+    Interrupted,
+    /// ChatGPT stopped short of an answer.
+    Partial,
+    /// The reply is complete.
+    Done(DoneReason),
+}
+
+/// FORK: feeds one observed delta into the assembler.
+///
+/// Shared by the `tools = "none"` poll loop and the connector turn so both map
+/// deltas onto the exact same `ResponseEvent` discipline. `Progress` bumps
+/// `last_progress`, which the caller's stall watchdog reads.
+pub(crate) async fn apply_delta(
+    assembler: &mut StreamAssembler<'_>,
+    delta: Delta,
+    last_progress: &mut Instant,
+) -> DeltaStep {
+    let ok = match delta {
+        Delta::Progress => {
+            *last_progress = Instant::now();
+            true
+        }
+        Delta::OpenReasoning { .. } => {
+            assembler.open_reasoning().await
+                && assembler
+                    .send(ResponseEvent::ReasoningSummaryPartAdded { summary_index: 0 })
+                    .await
+        }
+        Delta::Reasoning(text) => assembler.push_reasoning(&text).await,
+        Delta::OpenText { .. } => assembler.open_message().await,
+        Delta::Text(text) => assembler.push_text(&text).await,
+        Delta::Rewrite {
+            kind, full_text, ..
+        } => {
+            assembler.close(MessagePhase::Commentary).await
+                && match kind {
+                    ItemKind::Reasoning => {
+                        assembler.open_reasoning().await
+                            && assembler.push_reasoning(&full_text).await
+                    }
+                    ItemKind::Text => {
+                        assembler.open_message().await && assembler.push_text(&full_text).await
+                    }
+                }
+        }
+        Delta::Note(text) => {
+            assembler.close(MessagePhase::Commentary).await
+                && assembler.emit_message(text, MessagePhase::Commentary).await
+        }
+        Delta::PartialCompletion { .. } => {
+            assembler.close(MessagePhase::Commentary).await;
+            return DeltaStep::Partial;
+        }
+        Delta::Done { reason } => {
+            if !assembler.close(MessagePhase::FinalAnswer).await {
+                return DeltaStep::Interrupted;
+            }
+            return DeltaStep::Done(reason);
+        }
+    };
+    if ok {
+        DeltaStep::Continue
+    } else {
+        DeltaStep::Interrupted
     }
 }
 

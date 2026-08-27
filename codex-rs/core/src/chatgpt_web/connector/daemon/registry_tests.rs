@@ -1307,12 +1307,10 @@ async fn live_registry_reconciles_a_manual_url() {
     let wanted = DesiredConnector::for_endpoint(name, "Codex live registry test", public(&url));
 
     let outcome = reconcile(&api, &wanted, &path).await;
-    eprintln!("live reconcile: {outcome:?}");
 
     let deleted = delete_recorded(&api, name, &path)
         .await
         .expect("cleanup must work");
-    eprintln!("live cleanup deleted: {deleted:?}");
 
     // Whatever happened, nothing carrying our name may remain.
     api.open().await.expect("open");
@@ -1324,7 +1322,7 @@ async fn live_registry_reconciles_a_manual_url() {
         _ => 0,
     };
     api.close().await;
-    assert_eq!(remaining, 0);
+    assert_eq!(remaining, 0, "cleanup deleted {deleted:?}");
 
     match outcome {
         Ok(record) => {
