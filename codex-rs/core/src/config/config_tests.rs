@@ -12895,3 +12895,57 @@ fn sqlite_home_env_conflict_reports_an_override() -> std::io::Result<()> {
 
     Ok(())
 }
+
+/// FORK: `[chatgpt_web]` resolves over its defaults, and 0 disables the
+/// watchdog the way `None` does downstream.
+#[test]
+fn chatgpt_web_table_resolves_over_defaults() {
+    let cfg: ConfigToml = toml::from_str(
+        r#"
+[chatgpt_web]
+tools = "connector"
+idle_timeout_ms = 0
+max_tabs = 20
+tunnel = "cloudflared"
+connector_call_timeout_ms = 5000
+cloudflared_extra_args = ["--protocol", "http2"]
+"#,
+    )
+    .expect("TOML deserialization should succeed");
+
+    let settings = crate::config::ChatGptWebSettings::from_toml(cfg.chatgpt_web.as_ref());
+    let defaults = crate::config::ChatGptWebSettings::default();
+
+    assert_eq!(
+        settings.tools,
+        codex_config::config_toml::ChatGptWebTools::Connector
+    );
+    assert_eq!(settings.idle_timeout, None);
+    assert_eq!(settings.max_tabs, 8, "max_tabs is clamped to 1..=8");
+    assert_eq!(
+        settings.tunnel,
+        codex_config::config_toml::ChatGptWebTunnel::Cloudflared
+    );
+    assert_eq!(
+        settings.connector_call_timeout,
+        std::time::Duration::from_millis(5_000)
+    );
+    assert_eq!(
+        settings.cloudflared_extra_args,
+        vec!["--protocol".to_string(), "http2".to_string()]
+    );
+    // Untouched keys keep their defaults.
+    assert_eq!(settings.daemon_url, defaults.daemon_url);
+    assert_eq!(settings.poll_interval, defaults.poll_interval);
+    assert_eq!(settings.connector_name, "Codex Native");
+
+    assert_eq!(crate::config::ChatGptWebSettings::from_toml(None), defaults);
+    assert_eq!(
+        defaults.idle_timeout,
+        Some(std::time::Duration::from_millis(1_200_000))
+    );
+    assert_eq!(
+        defaults.tools,
+        codex_config::config_toml::ChatGptWebTools::None
+    );
+}

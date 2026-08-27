@@ -1,0 +1,117 @@
+{
+  "title": "Raciocínio e resposta",
+  "create_time": 1756250000.0,
+  "update_time": 1756250045.25,
+  "mapping": {
+    "client-created-root": {
+      "id": "client-created-root",
+      "message": null,
+      "parent": null,
+      "children": ["33333333-0000-4000-8000-000000000001"]
+    },
+    "33333333-0000-4000-8000-000000000001": {
+      "id": "33333333-0000-4000-8000-000000000001",
+      "message": {
+        "id": "33333333-0000-4000-8000-000000000001",
+        "author": { "role": "user", "name": null, "metadata": {} },
+        "create_time": 1756250001.0,
+        "update_time": null,
+        "content": { "content_type": "text", "parts": ["Quantos primos existem abaixo de 30?"] },
+        "status": "finished_successfully",
+        "end_turn": null,
+        "weight": 1.0,
+        "metadata": { "request_id": "3c4d5e6f7a8b9c0d-GRU", "timestamp_": "absolute" },
+        "recipient": "all",
+        "channel": null
+      },
+      "parent": "client-created-root",
+      "children": ["33333333-0000-4000-8000-000000000002"]
+    },
+    "33333333-0000-4000-8000-000000000002": {
+      "id": "33333333-0000-4000-8000-000000000002",
+      "message": {
+        "id": "33333333-0000-4000-8000-000000000002",
+        "author": { "role": "assistant", "name": null, "metadata": {} },
+        "create_time": 1756250003.0,
+        "update_time": null,
+        "content": {
+          "content_type": "thoughts",
+          "thoughts": [
+            { "summary": "Listando os primos", "content": "" },
+            { "summary": "Contando", "content": "2, 3, 5, 7, 11, 13, 17, 19, 23, 29 — são dez." }
+          ],
+          "source_analysis_msg_id": "33333333-0000-4000-8000-0000000000a2"
+        },
+        "status": "finished_successfully",
+        "end_turn": null,
+        "weight": 1.0,
+        "metadata": {
+          "reasoning_status": "reasoning_ended",
+          "model_slug": "gpt-5-2-thinking",
+          "parent_id": "33333333-0000-4000-8000-000000000001",
+          "request_id": "3c4d5e6f7a8b9c0d-GRU"
+        },
+        "recipient": "all",
+        "channel": "analysis"
+      },
+      "parent": "33333333-0000-4000-8000-000000000001",
+      "children": ["33333333-0000-4000-8000-000000000003"]
+    },
+    "33333333-0000-4000-8000-000000000003": {
+      "id": "33333333-0000-4000-8000-000000000003",
+      "message": {
+        "id": "33333333-0000-4000-8000-000000000003",
+        "author": { "role": "assistant", "name": null, "metadata": {} },
+        "create_time": 1756250004.0,
+        "update_time": null,
+        "content": { "content_type": "reasoning_recap", "content": "Pensou por 12s" },
+        "status": "finished_successfully",
+        "end_turn": null,
+        "weight": 1.0,
+        "metadata": {
+          "model_slug": "gpt-5-2-thinking",
+          "parent_id": "33333333-0000-4000-8000-000000000002",
+          "request_id": "3c4d5e6f7a8b9c0d-GRU"
+        },
+        "recipient": "all",
+        "channel": "analysis"
+      },
+      "parent": "33333333-0000-4000-8000-000000000002",
+      "children": ["33333333-0000-4000-8000-000000000004"]
+    },
+    "33333333-0000-4000-8000-000000000004": {
+      "id": "33333333-0000-4000-8000-000000000004",
+      "message": {
+        "id": "33333333-0000-4000-8000-000000000004",
+        "author": { "role": "assistant", "name": null, "metadata": {} },
+        "create_time": 1756250015.0,
+        "update_time": null,
+        "content": { "content_type": "text", "parts": ["Existem **10** números primos abaixo de 30."] },
+        "status": "finished_successfully",
+        "end_turn": true,
+        "weight": 1.0,
+        "metadata": {
+          "finish_details": { "type": "stop", "stop_tokens": [200002] },
+          "is_complete": true,
+          "model_slug": "gpt-5-2-thinking",
+          "default_model_slug": "gpt-5-2-thinking",
+          "parent_id": "33333333-0000-4000-8000-000000000003",
+          "request_id": "3c4d5e6f7a8b9c0d-GRU"
+        },
+        "recipient": "all",
+        "channel": "final"
+      },
+      "parent": "33333333-0000-4000-8000-000000000003",
+      "children": []
+    }
+  },
+  "moderation_results": [],
+  "current_node": "33333333-0000-4000-8000-000000000004",
+  "conversation_id": "33333333-aaaa-4bbb-8ccc-000000000003",
+  "is_archived": false,
+  "is_starred": null,
+  "safe_urls": [],
+  "default_model_slug": "gpt-5-2-thinking",
+  "async_status": null,
+  "memory_scope": "global_enabled"
+}

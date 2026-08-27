@@ -1,0 +1,105 @@
+{
+  "title": "Geração antiga interrompida",
+  "create_time": 1756280000.0,
+  "update_time": 1756280200.0,
+  "mapping": {
+    "client-created-root": {
+      "id": "client-created-root",
+      "message": null,
+      "parent": null,
+      "children": ["66666666-0000-4000-8000-000000000001"]
+    },
+    "66666666-0000-4000-8000-000000000001": {
+      "id": "66666666-0000-4000-8000-000000000001",
+      "message": {
+        "id": "66666666-0000-4000-8000-000000000001",
+        "author": { "role": "user", "name": null, "metadata": {} },
+        "create_time": 1756280001.0,
+        "update_time": null,
+        "content": { "content_type": "text", "parts": ["Escreva um poema longo."] },
+        "status": "finished_successfully",
+        "end_turn": null,
+        "weight": 1.0,
+        "metadata": { "request_id": "6f7a8b9c0d1e2f3a-GRU", "timestamp_": "absolute" },
+        "recipient": "all",
+        "channel": null
+      },
+      "parent": "client-created-root",
+      "children": ["66666666-0000-4000-8000-000000000002"]
+    },
+    "66666666-0000-4000-8000-000000000002": {
+      "id": "66666666-0000-4000-8000-000000000002",
+      "message": {
+        "id": "66666666-0000-4000-8000-000000000002",
+        "author": { "role": "assistant", "name": null, "metadata": {} },
+        "create_time": 1756280004.0,
+        "update_time": null,
+        "content": { "content_type": "text", "parts": ["No silêncio da madrugada, a cidade"] },
+        "status": "in_progress",
+        "end_turn": null,
+        "weight": 1.0,
+        "metadata": {
+          "model_slug": "gpt-5-2-thinking",
+          "default_model_slug": "gpt-5-2-thinking",
+          "parent_id": "66666666-0000-4000-8000-000000000001",
+          "request_id": "6f7a8b9c0d1e2f3a-GRU"
+        },
+        "recipient": "all",
+        "channel": "final"
+      },
+      "parent": "66666666-0000-4000-8000-000000000001",
+      "children": ["66666666-0000-4000-8000-000000000003"]
+    },
+    "66666666-0000-4000-8000-000000000003": {
+      "id": "66666666-0000-4000-8000-000000000003",
+      "message": {
+        "id": "66666666-0000-4000-8000-000000000003",
+        "author": { "role": "user", "name": null, "metadata": {} },
+        "create_time": 1756280150.0,
+        "update_time": null,
+        "content": { "content_type": "text", "parts": ["Deixa, só um haicai."] },
+        "status": "finished_successfully",
+        "end_turn": null,
+        "weight": 1.0,
+        "metadata": { "request_id": "7a8b9c0d1e2f3a4b-GRU", "timestamp_": "absolute" },
+        "recipient": "all",
+        "channel": null
+      },
+      "parent": "66666666-0000-4000-8000-000000000002",
+      "children": ["66666666-0000-4000-8000-000000000004"]
+    },
+    "66666666-0000-4000-8000-000000000004": {
+      "id": "66666666-0000-4000-8000-000000000004",
+      "message": {
+        "id": "66666666-0000-4000-8000-000000000004",
+        "author": { "role": "assistant", "name": null, "metadata": {} },
+        "create_time": 1756280160.0,
+        "update_time": null,
+        "content": { "content_type": "text", "parts": ["Luz fria no cais —\numa gaivota hesita\nentre dois ventos."] },
+        "status": "finished_successfully",
+        "end_turn": true,
+        "weight": 1.0,
+        "metadata": {
+          "finish_details": { "type": "stop", "stop_tokens": [200002] },
+          "is_complete": true,
+          "model_slug": "gpt-5-2-thinking",
+          "default_model_slug": "gpt-5-2-thinking",
+          "parent_id": "66666666-0000-4000-8000-000000000003",
+          "request_id": "7a8b9c0d1e2f3a4b-GRU"
+        },
+        "recipient": "all",
+        "channel": "final"
+      },
+      "parent": "66666666-0000-4000-8000-000000000003",
+      "children": []
+    }
+  },
+  "moderation_results": [],
+  "current_node": "66666666-0000-4000-8000-000000000004",
+  "conversation_id": "66666666-aaaa-4bbb-8ccc-000000000006",
+  "is_archived": false,
+  "safe_urls": [],
+  "default_model_slug": "gpt-5-2-thinking",
+  "async_status": null,
+  "memory_scope": "global_enabled"
+}

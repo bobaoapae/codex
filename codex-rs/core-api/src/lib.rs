@@ -9,6 +9,7 @@ pub use codex_arg0::Arg0DispatchPaths;
 pub use codex_arg0::arg0_dispatch_or_else;
 pub use codex_config::ConfigLayerStack;
 pub use codex_config::config_toml::ClaudeCodeAccountSelection;
+// FORK: resolved `[chatgpt_web]` settings, for callers that build a `Config` literal.
 pub use codex_config::config_toml::ProjectConfig;
 pub use codex_config::config_toml::RealtimeAudioConfig;
 pub use codex_config::config_toml::RealtimeConfig;
@@ -56,6 +57,7 @@ pub use codex_core::TurnInputSubmission;
 pub use codex_core::TurnStartOptions;
 pub use codex_core::WaitForEnvironmentToolConfig;
 pub use codex_core::build_models_manager;
+pub use codex_core::config::ChatGptWebSettings;
 pub use codex_core::config::Config;
 pub use codex_core::config::Constrained;
 pub use codex_core::config::ExtraConfig;

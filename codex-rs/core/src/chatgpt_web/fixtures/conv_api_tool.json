@@ -1,0 +1,120 @@
+{
+  "title": "Conector com um resultado pendente",
+  "create_time": 1756270000.0,
+  "update_time": 1756270040.0,
+  "mapping": {
+    "client-created-root": {
+      "id": "client-created-root",
+      "message": null,
+      "parent": null,
+      "children": ["55555555-0000-4000-8000-000000000001"]
+    },
+    "55555555-0000-4000-8000-000000000001": {
+      "id": "55555555-0000-4000-8000-000000000001",
+      "message": {
+        "id": "55555555-0000-4000-8000-000000000001",
+        "author": { "role": "user", "name": null, "metadata": {} },
+        "create_time": 1756270001.0,
+        "update_time": null,
+        "content": { "content_type": "text", "parts": ["Leia src/lib.rs e aplique o patch."] },
+        "status": "finished_successfully",
+        "end_turn": null,
+        "weight": 1.0,
+        "metadata": { "request_id": "5e6f7a8b9c0d1e2f-GRU", "timestamp_": "absolute" },
+        "recipient": "all",
+        "channel": null
+      },
+      "parent": "client-created-root",
+      "children": ["55555555-0000-4000-8000-000000000002"]
+    },
+    "55555555-0000-4000-8000-000000000002": {
+      "id": "55555555-0000-4000-8000-000000000002",
+      "message": {
+        "id": "55555555-0000-4000-8000-000000000002",
+        "author": { "role": "assistant", "name": null, "metadata": {} },
+        "create_time": 1756270005.0,
+        "update_time": null,
+        "content": {
+          "content_type": "code",
+          "language": "json",
+          "response_format_name": null,
+          "text": "{\"path\":\"/Codex/link_01/codex_read_file\",\"args\":{\"path\":\"src/lib.rs\"}}"
+        },
+        "status": "finished_successfully",
+        "end_turn": false,
+        "weight": 1.0,
+        "metadata": {
+          "parent_id": "55555555-0000-4000-8000-000000000001",
+          "request_id": "wfr_01a009",
+          "turn_exchange_id": "82f67b26",
+          "tool_icons": ["api_tool"],
+          "model_slug": "gpt-5-2-thinking"
+        },
+        "recipient": "api_tool.call_tool",
+        "channel": "commentary"
+      },
+      "parent": "55555555-0000-4000-8000-000000000001",
+      "children": ["55555555-0000-4000-8000-000000000003"]
+    },
+    "55555555-0000-4000-8000-000000000003": {
+      "id": "55555555-0000-4000-8000-000000000003",
+      "message": {
+        "id": "55555555-0000-4000-8000-000000000003",
+        "author": { "role": "tool", "name": "api_tool.call_tool", "metadata": {} },
+        "create_time": 1756270009.5,
+        "update_time": null,
+        "content": { "content_type": "code", "language": "json", "response_format_name": null, "text": "" },
+        "status": "finished_successfully",
+        "end_turn": null,
+        "weight": 1.0,
+        "metadata": {
+          "parent_id": "55555555-0000-4000-8000-000000000002",
+          "request_id": "wfr_01a009",
+          "invoked_plugin": { "type": "remote", "namespace": "api_tool" },
+          "invoked_resource": { "app_name": "Codex", "resource_uri": "/asdk/link_01/codex_read_file" }
+        },
+        "recipient": "all",
+        "channel": "commentary"
+      },
+      "parent": "55555555-0000-4000-8000-000000000002",
+      "children": ["55555555-0000-4000-8000-000000000004"]
+    },
+    "55555555-0000-4000-8000-000000000004": {
+      "id": "55555555-0000-4000-8000-000000000004",
+      "message": {
+        "id": "55555555-0000-4000-8000-000000000004",
+        "author": { "role": "assistant", "name": null, "metadata": {} },
+        "create_time": 1756270030.0,
+        "update_time": null,
+        "content": {
+          "content_type": "code",
+          "language": "json",
+          "response_format_name": null,
+          "text": "{\"path\":\"/Codex/link_01/codex_apply_patch\",\"args\":{\"patch\":\"*** Begin Patch\\n*** Update File: src/lib.rs\\n@@\\n-old\\n+new\\n*** End Patch\"}}"
+        },
+        "status": "finished_successfully",
+        "end_turn": false,
+        "weight": 1.0,
+        "metadata": {
+          "parent_id": "55555555-0000-4000-8000-000000000003",
+          "request_id": "wfr_01a010",
+          "turn_exchange_id": "82f67b26",
+          "tool_icons": ["api_tool"],
+          "model_slug": "gpt-5-2-thinking"
+        },
+        "recipient": "api_tool.call_tool",
+        "channel": "commentary"
+      },
+      "parent": "55555555-0000-4000-8000-000000000003",
+      "children": []
+    }
+  },
+  "moderation_results": [],
+  "current_node": "55555555-0000-4000-8000-000000000004",
+  "conversation_id": "55555555-aaaa-4bbb-8ccc-000000000005",
+  "is_archived": false,
+  "safe_urls": [],
+  "default_model_slug": "gpt-5-2-thinking",
+  "async_status": null,
+  "memory_scope": "global_enabled"
+}

@@ -1425,6 +1425,10 @@ impl Session {
                 // `run_turn` overrides this with the turn's own layout.
                 .with_claude_code_workspace(
                     crate::claude_code::ClaudeCodeWorkspace::from_config(config.as_ref()),
+                )
+                // FORK: same fallback for the `chatgpt_web` provider.
+                .with_chatgpt_web_workspace(
+                    crate::chatgpt_web::ChatGptWebWorkspace::from_config(config.as_ref()),
                 ),
                 executed_tool_calls,
                 code_mode_service: crate::tools::code_mode::CodeModeService::new(

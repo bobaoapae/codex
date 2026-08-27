@@ -651,3 +651,41 @@ refresh_interval_ms = 0
     assert_eq!(auth.refresh_interval_ms, 0);
     assert_eq!(auth.refresh_interval(), None);
 }
+
+// FORK: the `chatgpt_web` wire API and its built-in provider.
+#[test]
+fn chatgpt_web_wire_api_round_trips_through_serde() {
+    assert_eq!(WireApi::ChatGptWeb.to_string(), "chatgpt_web");
+
+    let provider_toml = r#"
+name = "ChatGPT Web"
+wire_api = "chatgpt_web"
+        "#;
+    let provider: ModelProviderInfo = toml::from_str(provider_toml).expect("parse provider");
+    assert_eq!(provider.wire_api, WireApi::ChatGptWeb);
+    let rendered = toml::to_string(&provider).expect("serialize provider");
+    assert!(
+        rendered.contains("wire_api = \"chatgpt_web\""),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn built_in_model_providers_include_chatgpt_web() {
+    let providers = built_in_model_providers(/*openai_base_url*/ None);
+    let provider = providers
+        .get(CHATGPT_WEB_PROVIDER_ID)
+        .expect("chatgpt_web provider is built in");
+    assert_eq!(provider.wire_api, WireApi::ChatGptWeb);
+    assert_eq!(provider.base_url, None);
+    assert!(!provider.requires_openai_auth);
+    assert!(!provider.supports_websockets);
+    assert!(!provider.supports_standalone_web_search);
+}
+
+#[test]
+fn unknown_wire_api_error_lists_chatgpt_web() {
+    let err = toml::from_str::<ModelProviderInfo>("name = \"x\"\nwire_api = \"nope\"\n")
+        .expect_err("unknown wire api");
+    assert!(err.to_string().contains("chatgpt_web"), "{err}");
+}

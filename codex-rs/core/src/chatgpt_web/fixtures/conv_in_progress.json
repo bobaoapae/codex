@@ -1,0 +1,124 @@
+{
+  "title": "Streaming reply",
+  "create_time": 1756230000.123456,
+  "update_time": 1756230031.654321,
+  "mapping": {
+    "client-created-root": {
+      "id": "client-created-root",
+      "message": null,
+      "parent": null,
+      "children": ["11111111-0000-4000-8000-000000000001"]
+    },
+    "11111111-0000-4000-8000-000000000001": {
+      "id": "11111111-0000-4000-8000-000000000001",
+      "message": {
+        "id": "11111111-0000-4000-8000-000000000001",
+        "author": { "role": "system", "name": null, "metadata": {} },
+        "create_time": null,
+        "update_time": null,
+        "content": { "content_type": "text", "parts": [""] },
+        "status": "finished_successfully",
+        "end_turn": true,
+        "weight": 0.0,
+        "metadata": { "is_visually_hidden_from_conversation": true },
+        "recipient": "all",
+        "channel": null
+      },
+      "parent": "client-created-root",
+      "children": ["11111111-0000-4000-8000-000000000002"]
+    },
+    "11111111-0000-4000-8000-000000000002": {
+      "id": "11111111-0000-4000-8000-000000000002",
+      "message": {
+        "id": "11111111-0000-4000-8000-000000000002",
+        "author": { "role": "user", "name": null, "metadata": {} },
+        "create_time": 1756230001.5,
+        "update_time": null,
+        "content": { "content_type": "text", "parts": ["Explique o que é um mutex."] },
+        "status": "finished_successfully",
+        "end_turn": null,
+        "weight": 1.0,
+        "metadata": {
+          "request_id": "9a1b2c3d4e5f6a7b-GRU",
+          "message_source": null,
+          "timestamp_": "absolute",
+          "message_type": null
+        },
+        "recipient": "all",
+        "channel": null
+      },
+      "parent": "11111111-0000-4000-8000-000000000001",
+      "children": ["11111111-0000-4000-8000-000000000003"]
+    },
+    "11111111-0000-4000-8000-000000000003": {
+      "id": "11111111-0000-4000-8000-000000000003",
+      "message": {
+        "id": "11111111-0000-4000-8000-000000000003",
+        "author": { "role": "assistant", "name": null, "metadata": {} },
+        "create_time": 1756230004.25,
+        "update_time": null,
+        "content": {
+          "content_type": "thoughts",
+          "thoughts": [
+            { "summary": "Definindo mutex", "content": "O usuário quer uma explicação curta sobre exclusão mútua." }
+          ],
+          "source_analysis_msg_id": "11111111-0000-4000-8000-0000000000a3"
+        },
+        "status": "finished_successfully",
+        "end_turn": null,
+        "weight": 1.0,
+        "metadata": {
+          "reasoning_status": "reasoning_ended",
+          "model_slug": "gpt-5-2-thinking",
+          "parent_id": "11111111-0000-4000-8000-000000000002",
+          "request_id": "9a1b2c3d4e5f6a7b-GRU"
+        },
+        "recipient": "all",
+        "channel": "analysis"
+      },
+      "parent": "11111111-0000-4000-8000-000000000002",
+      "children": ["11111111-0000-4000-8000-000000000004"]
+    },
+    "11111111-0000-4000-8000-000000000004": {
+      "id": "11111111-0000-4000-8000-000000000004",
+      "message": {
+        "id": "11111111-0000-4000-8000-000000000004",
+        "author": { "role": "assistant", "name": null, "metadata": {} },
+        "create_time": 1756230010.75,
+        "update_time": null,
+        "content": { "content_type": "text", "parts": ["Um mutex é um objeto de sincronização que garante que apenas uma thread"] },
+        "status": "in_progress",
+        "end_turn": null,
+        "weight": 1.0,
+        "metadata": {
+          "model_slug": "gpt-5-2-thinking",
+          "default_model_slug": "gpt-5-2-thinking",
+          "parent_id": "11111111-0000-4000-8000-000000000003",
+          "request_id": "9a1b2c3d4e5f6a7b-GRU"
+        },
+        "recipient": "all",
+        "channel": "final"
+      },
+      "parent": "11111111-0000-4000-8000-000000000003",
+      "children": []
+    }
+  },
+  "moderation_results": [],
+  "current_node": "11111111-0000-4000-8000-000000000004",
+  "plugin_ids": null,
+  "conversation_id": "11111111-aaaa-4bbb-8ccc-000000000001",
+  "conversation_template_id": null,
+  "gizmo_id": null,
+  "gizmo_type": null,
+  "is_archived": false,
+  "is_starred": null,
+  "safe_urls": [],
+  "blocked_urls": [],
+  "default_model_slug": "gpt-5-2-thinking",
+  "conversation_origin": null,
+  "voice": null,
+  "async_status": 1,
+  "disabled_tool_ids": [],
+  "is_do_not_remember": false,
+  "memory_scope": "global_enabled"
+}

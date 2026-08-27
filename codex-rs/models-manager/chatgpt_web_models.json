@@ -1,0 +1,289 @@
+{
+  "models": [
+    {
+      "slug": "chatgpt-web/instant",
+      "prefer_websockets": false,
+      "support_verbosity": false,
+      "default_verbosity": null,
+      "apply_patch_tool_type": "freeform",
+      "web_search_tool_type": "text",
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "supports_image_detail_original": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": false,
+      "tool_mode": null,
+      "multi_agent_version": "v2",
+      "use_responses_lite": false,
+      "include_skills_usage_instructions": false,
+      "include_plugin_usage_instructions": false,
+      "auto_review_model_override": null,
+      "context_window": 41000,
+      "max_context_window": 41000,
+      "auto_compact_token_limit": 32000,
+      "reasoning_summary_format": "experimental",
+      "default_reasoning_summary": "none",
+      "display_name": "ChatGPT Web Instant",
+      "description": "ChatGPT Instant on chatgpt.com, driven through a real Chrome tab.",
+      "default_reasoning_level": "low",
+      "supported_reasoning_levels": [
+        {
+          "effort": "low",
+          "description": "Fast answers without extended reasoning"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "hide",
+      "minimal_client_version": "0.0.0",
+      "supported_in_api": true,
+      "availability_nux": null,
+      "upgrade": null,
+      "priority": 40,
+      "model_messages": {
+        "instructions_template": "Served by the ChatGPT web app; tools run in Codex.",
+        "instructions_variables": {},
+        "approvals": null
+      },
+      "experimental_supported_tools": [],
+      "available_in_plans": [],
+      "supports_search_tool": false,
+      "default_service_tier": null,
+      "service_tiers": [],
+      "additional_speed_tiers": [],
+      "supports_reasoning_summaries": true
+    },
+    {
+      "slug": "chatgpt-web/thinking",
+      "prefer_websockets": false,
+      "support_verbosity": false,
+      "default_verbosity": null,
+      "apply_patch_tool_type": "freeform",
+      "web_search_tool_type": "text",
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "supports_image_detail_original": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": false,
+      "tool_mode": null,
+      "multi_agent_version": "v2",
+      "use_responses_lite": false,
+      "include_skills_usage_instructions": false,
+      "include_plugin_usage_instructions": false,
+      "auto_review_model_override": null,
+      "context_window": 90000,
+      "max_context_window": 90000,
+      "auto_compact_token_limit": 80000,
+      "reasoning_summary_format": "experimental",
+      "default_reasoning_summary": "none",
+      "display_name": "ChatGPT Web Thinking",
+      "description": "ChatGPT Thinking on chatgpt.com, driven through a real Chrome tab.",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {
+          "effort": "medium",
+          "description": "Standard extended reasoning"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "hide",
+      "minimal_client_version": "0.0.0",
+      "supported_in_api": true,
+      "availability_nux": null,
+      "upgrade": null,
+      "priority": 41,
+      "model_messages": {
+        "instructions_template": "Served by the ChatGPT web app; tools run in Codex.",
+        "instructions_variables": {},
+        "approvals": null
+      },
+      "experimental_supported_tools": [],
+      "available_in_plans": [],
+      "supports_search_tool": false,
+      "default_service_tier": null,
+      "service_tiers": [],
+      "additional_speed_tiers": [],
+      "supports_reasoning_summaries": true
+    },
+    {
+      "slug": "chatgpt-web/high",
+      "prefer_websockets": false,
+      "support_verbosity": false,
+      "default_verbosity": null,
+      "apply_patch_tool_type": "freeform",
+      "web_search_tool_type": "text",
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "supports_image_detail_original": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": false,
+      "tool_mode": null,
+      "multi_agent_version": "v2",
+      "use_responses_lite": false,
+      "include_skills_usage_instructions": false,
+      "include_plugin_usage_instructions": false,
+      "auto_review_model_override": null,
+      "context_window": 90000,
+      "max_context_window": 90000,
+      "auto_compact_token_limit": 80000,
+      "reasoning_summary_format": "experimental",
+      "default_reasoning_summary": "none",
+      "display_name": "ChatGPT Web Thinking (High)",
+      "description": "ChatGPT Thinking at the High effort level on chatgpt.com, driven through a real Chrome tab.",
+      "default_reasoning_level": "high",
+      "supported_reasoning_levels": [
+        {
+          "effort": "high",
+          "description": "Thinking with the High effort level"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "hide",
+      "minimal_client_version": "0.0.0",
+      "supported_in_api": true,
+      "availability_nux": null,
+      "upgrade": null,
+      "priority": 42,
+      "model_messages": {
+        "instructions_template": "Served by the ChatGPT web app; tools run in Codex.",
+        "instructions_variables": {},
+        "approvals": null
+      },
+      "experimental_supported_tools": [],
+      "available_in_plans": [],
+      "supports_search_tool": false,
+      "default_service_tier": null,
+      "service_tiers": [],
+      "additional_speed_tiers": [],
+      "supports_reasoning_summaries": true
+    },
+    {
+      "slug": "chatgpt-web/extra-high",
+      "prefer_websockets": false,
+      "support_verbosity": false,
+      "default_verbosity": null,
+      "apply_patch_tool_type": "freeform",
+      "web_search_tool_type": "text",
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "supports_image_detail_original": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": false,
+      "tool_mode": null,
+      "multi_agent_version": "v2",
+      "use_responses_lite": false,
+      "include_skills_usage_instructions": false,
+      "include_plugin_usage_instructions": false,
+      "auto_review_model_override": null,
+      "context_window": 90000,
+      "max_context_window": 90000,
+      "auto_compact_token_limit": 80000,
+      "reasoning_summary_format": "experimental",
+      "default_reasoning_summary": "none",
+      "display_name": "ChatGPT Web Thinking (Extra High)",
+      "description": "ChatGPT Thinking at the Extra High effort level on chatgpt.com, driven through a real Chrome tab.",
+      "default_reasoning_level": "xhigh",
+      "supported_reasoning_levels": [
+        {
+          "effort": "xhigh",
+          "description": "Thinking with the Extra High effort level"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "hide",
+      "minimal_client_version": "0.0.0",
+      "supported_in_api": true,
+      "availability_nux": null,
+      "upgrade": null,
+      "priority": 43,
+      "model_messages": {
+        "instructions_template": "Served by the ChatGPT web app; tools run in Codex.",
+        "instructions_variables": {},
+        "approvals": null
+      },
+      "experimental_supported_tools": [],
+      "available_in_plans": [],
+      "supports_search_tool": false,
+      "default_service_tier": null,
+      "service_tiers": [],
+      "additional_speed_tiers": [],
+      "supports_reasoning_summaries": true
+    },
+    {
+      "slug": "chatgpt-web/pro",
+      "prefer_websockets": false,
+      "support_verbosity": false,
+      "default_verbosity": null,
+      "apply_patch_tool_type": "freeform",
+      "web_search_tool_type": "text",
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "supports_image_detail_original": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": false,
+      "tool_mode": null,
+      "multi_agent_version": "v2",
+      "use_responses_lite": false,
+      "include_skills_usage_instructions": false,
+      "include_plugin_usage_instructions": false,
+      "auto_review_model_override": null,
+      "context_window": 111193,
+      "max_context_window": 111193,
+      "auto_compact_token_limit": 95000,
+      "reasoning_summary_format": "experimental",
+      "default_reasoning_summary": "none",
+      "display_name": "ChatGPT Web Pro",
+      "description": "ChatGPT Pro on chatgpt.com, driven through a real Chrome tab.",
+      "default_reasoning_level": "max",
+      "supported_reasoning_levels": [
+        {
+          "effort": "max",
+          "description": "ChatGPT Pro: the deepest reasoning, slowest replies"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "hide",
+      "minimal_client_version": "0.0.0",
+      "supported_in_api": true,
+      "availability_nux": null,
+      "upgrade": null,
+      "priority": 44,
+      "model_messages": {
+        "instructions_template": "Served by the ChatGPT web app; tools run in Codex.",
+        "instructions_variables": {},
+        "approvals": null
+      },
+      "experimental_supported_tools": [],
+      "available_in_plans": [],
+      "supports_search_tool": false,
+      "default_service_tier": null,
+      "service_tiers": [],
+      "additional_speed_tiers": [],
+      "supports_reasoning_summaries": true
+    }
+  ]
+}

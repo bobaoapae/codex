@@ -16,6 +16,7 @@ use codex_config::loader::resolve_relative_paths_in_config_toml;
 use codex_exec_server::read_sensitive_file_to_string;
 use codex_features::Feature;
 use codex_features::feature_for_key;
+use codex_model_provider_info::CHATGPT_WEB_PROVIDER_ID;
 use codex_model_provider_info::CLAUDE_CODE_PROVIDER_ID;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary;
@@ -91,12 +92,13 @@ async fn apply_role_to_config_inner(
         model_verbosity: role_config.model_verbosity,
         personality: role_config.personality,
         service_tier: role_config.service_tier,
-        // FORK: a role may point a child at the local Claude Code CLI, and at
-        // nothing else. Every other provider stays parent-owned, so a role can
-        // still never redirect a child at a different endpoint or credential.
+        // FORK: a role may point a child at a locally served provider (the
+        // Claude Code CLI or the ChatGPT web app), and at nothing else. Every
+        // other provider stays parent-owned, so a role can still never redirect
+        // a child at a different endpoint or credential.
         model_provider: role_config
             .model_provider
-            .filter(|provider| provider == CLAUDE_CODE_PROVIDER_ID),
+            .filter(|provider| is_locally_served_provider(provider)),
         ..Default::default()
     };
 
@@ -338,16 +340,19 @@ pub(crate) mod spawn_tool_spec {
                     let service_tier = role_toml
                         .get("service_tier")
                         .and_then(TomlValue::as_str);
-                    // FORK: a Claude-backed role behaves differently enough that
-                    // the orchestrator has to know before it writes the task.
-                    let claude_note = role_toml
-                        .get("model_provider")
-                        .and_then(TomlValue::as_str)
-                        .filter(|provider| *provider == CLAUDE_CODE_PROVIDER_ID)
-                        .map(|_| {
+                    // FORK: a locally served role behaves differently enough
+                    // that the orchestrator has to know before it writes the
+                    // task.
+                    let role_provider = role_toml.get("model_provider").and_then(TomlValue::as_str);
+                    let local_note = match role_provider {
+                        Some(CLAUDE_CODE_PROVIDER_ID) => {
                             "\n- This role runs on the local Claude Code CLI. It starts from the task you send it, without the parent conversation, so the task must be self-contained, and it must be sent as `plaintext_message`."
-                        })
-                        .unwrap_or_default();
+                        }
+                        Some(CHATGPT_WEB_PROVIDER_ID) => {
+                            "\n- This role runs on ChatGPT Web through a browser tab. It starts from the task you send it, without the parent conversation, so the task must be self-contained and sent as `plaintext_message`. It has no access to the local computer unless `[chatgpt_web] tools = \"connector\"` is configured."
+                        }
+                        _ => "",
+                    };
 
                     let model_and_reasoning_note = match (model, reasoning_effort) {
                         (Some(model), Some(reasoning_effort)) => format!(
@@ -369,11 +374,8 @@ pub(crate) mod spawn_tool_spec {
                     // `service_tier` "if supported"; the caller cannot know what
                     // the child model supports, and a locally served child
                     // supports none at all. Say what to do instead.
-                    let is_claude_role = role_toml
-                        .get("model_provider")
-                        .and_then(TomlValue::as_str)
-                        .is_some_and(|provider| provider == CLAUDE_CODE_PROVIDER_ID);
-                    let service_tier_note = if is_claude_role {
+                    let is_local_role = role_provider.is_some_and(is_locally_served_provider);
+                    let service_tier_note = if is_local_role {
                         "\n- Do not pass `service_tier` for this role.".to_string()
                     } else {
                         service_tier
@@ -384,7 +386,7 @@ pub(crate) mod spawn_tool_spec {
                             })
                             .unwrap_or_default()
                     };
-                    format!("{model_and_reasoning_note}{service_tier_note}{claude_note}")
+                    format!("{model_and_reasoning_note}{service_tier_note}{local_note}")
                 })
                 .unwrap_or_default();
             format!("{name}: {{\n{description}{locked_settings_note}\n}}")
@@ -472,6 +474,11 @@ Rules:
             _ => None,
         }
     }
+}
+
+/// FORK: the providers a role may select: those served by a local process.
+fn is_locally_served_provider(provider: &str) -> bool {
+    provider == CLAUDE_CODE_PROVIDER_ID || provider == CHATGPT_WEB_PROVIDER_ID
 }
 
 #[cfg(test)]

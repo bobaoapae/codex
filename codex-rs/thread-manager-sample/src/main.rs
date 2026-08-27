@@ -16,6 +16,7 @@ use codex_core_api::AskForApproval;
 use codex_core_api::AuthCredentialsStoreMode;
 use codex_core_api::AuthManager;
 use codex_core_api::AutoCompactTokenLimitScope;
+use codex_core_api::ChatGptWebSettings;
 use codex_core_api::ClaudeCodeAccountSelection;
 use codex_core_api::CodexAppsToolsCache;
 use codex_core_api::CodexHomeUserInstructionsProvider;
@@ -210,6 +211,7 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
         claude_code_idle_timeout_ms: None,
         claude_code_max_fork_turns: 0,
         claude_code_account_override: None,
+        chatgpt_web: ChatGptWebSettings::default(),
         tools_update_plan_survives_compaction: true,
         approvals_reviewer: ApprovalsReviewer::User,
         enforce_residency: Constrained::allow_any(/*initial_value*/ None),

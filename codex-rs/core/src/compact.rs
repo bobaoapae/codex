@@ -279,6 +279,11 @@ async fn run_compact_task_inner_impl(
     client_session.set_claude_code_workspace(crate::claude_code::ClaudeCodeWorkspace::from_config(
         turn_context.config.as_ref(),
     ));
+    // FORK: a compaction on a ChatGPT Web thread is a ChatGPT turn too, and the
+    // provider needs its settings (daemon, tab pool) to run it.
+    client_session.set_chatgpt_web_workspace(crate::chatgpt_web::ChatGptWebWorkspace::from_config(
+        turn_context.config.as_ref(),
+    ));
     // Reuse one client session so turn-scoped state (sticky routing, websocket incremental
     // request tracking)
     // survives retries within this compact turn.

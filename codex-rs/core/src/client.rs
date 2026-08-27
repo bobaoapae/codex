@@ -111,6 +111,9 @@ use tracing::warn;
 use crate::attestation::AttestationContext;
 use crate::attestation::AttestationProvider;
 use crate::attestation::X_OAI_ATTESTATION_HEADER;
+use crate::chatgpt_web;
+use crate::chatgpt_web::ChatGptWebThreadState;
+use crate::chatgpt_web::ChatGptWebWorkspace;
 use crate::claude_code;
 use crate::claude_code::ClaudeCodeThreadState;
 use crate::claude_code::ClaudeCodeWorkspace;
@@ -226,6 +229,9 @@ struct ModelClientState {
     /// shared state (not the turn-scoped session) so consecutive turns resume the
     /// same Claude session instead of replaying the conversation each time.
     claude_code: Arc<ClaudeCodeThreadState>,
+    /// FORK: ChatGPT conversation continuity for the `chatgpt_web` provider,
+    /// on the shared state for the same reason as `claude_code`.
+    chatgpt_web: Arc<ChatGptWebThreadState>,
 }
 
 /// Resolved API client setup for a single request attempt.
@@ -268,6 +274,8 @@ pub struct ModelClient {
     prompt_cache_key_override: Option<String>,
     /// Workspace for the `claude_code` provider; unused by every other wire API.
     claude_code_workspace: Option<ClaudeCodeWorkspace>,
+    /// FORK: workspace for the `chatgpt_web` provider; likewise unused elsewhere.
+    chatgpt_web_workspace: Option<ChatGptWebWorkspace>,
     http_client_factory: HttpClientFactory,
 }
 
@@ -302,6 +310,8 @@ pub struct ModelClientSession {
     /// Overrides the client-level fallback because roots and approval policy are
     /// materialized per turn.
     claude_code_workspace: Option<ClaudeCodeWorkspace>,
+    /// FORK: the same, for the `chatgpt_web` provider.
+    chatgpt_web_workspace: Option<ChatGptWebWorkspace>,
 }
 
 #[derive(Debug, Clone)]
@@ -489,10 +499,12 @@ impl ModelClient {
                 agent_identity_session_fallback: AgentIdentitySessionFallback::default(),
                 cached_websocket_session: StdMutex::new(WebsocketSession::default()),
                 claude_code: Arc::new(ClaudeCodeThreadState::default()),
+                chatgpt_web: Arc::new(ChatGptWebThreadState::default()),
             }),
             agent_identity_policy,
             prompt_cache_key_override: None,
             claude_code_workspace: None,
+            chatgpt_web_workspace: None,
             http_client_factory,
         }
     }
@@ -511,6 +523,12 @@ impl ModelClient {
     /// from the provider endpoint instead of the filesystem.
     pub(crate) fn with_claude_code_workspace(mut self, workspace: ClaudeCodeWorkspace) -> Self {
         self.claude_code_workspace = Some(workspace);
+        self
+    }
+
+    /// FORK: workspace layout for the `chatgpt_web` provider, read only by it.
+    pub(crate) fn with_chatgpt_web_workspace(mut self, workspace: ChatGptWebWorkspace) -> Self {
+        self.chatgpt_web_workspace = Some(workspace);
         self
     }
 
@@ -538,6 +556,7 @@ impl ModelClient {
             websocket_session: self.take_cached_websocket_session(),
             turn_state: Arc::new(OnceLock::new()),
             claude_code_workspace: None,
+            chatgpt_web_workspace: None,
         }
     }
 
@@ -1986,12 +2005,31 @@ impl ModelClientSession {
                 )
                 .await
             }
+            // FORK: ChatGPT Pro web, driven through a real Chrome tab.
+            WireApi::ChatGptWeb => {
+                chatgpt_web::stream(
+                    prompt,
+                    model_info,
+                    effort,
+                    self.chatgpt_web_workspace
+                        .as_ref()
+                        .or(self.client.chatgpt_web_workspace.as_ref()),
+                    Arc::clone(&self.client.state.chatgpt_web),
+                    self.client.state.thread_id,
+                )
+                .await
+            }
         }
     }
 
     /// Records the workspace layout of the turn this session serves.
     pub(crate) fn set_claude_code_workspace(&mut self, workspace: ClaudeCodeWorkspace) {
         self.claude_code_workspace = Some(workspace);
+    }
+
+    /// FORK: the same, for the `chatgpt_web` provider.
+    pub(crate) fn set_chatgpt_web_workspace(&mut self, workspace: ChatGptWebWorkspace) {
+        self.chatgpt_web_workspace = Some(workspace);
     }
 
     /// FORK: attaches the session that answers the Claude CLI's permission

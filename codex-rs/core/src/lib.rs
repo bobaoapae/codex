@@ -10,6 +10,8 @@ mod apps;
 /// FORK: Claude accounts for callers outside a turn (`codex account claude`).
 pub mod claude_accounts_api;
 mod claude_code;
+// FORK: ChatGPT Pro web as a model backend (`wire_api = "chatgpt_web"`).
+mod chatgpt_web;
 mod client;
 mod client_common;
 mod realtime_context;

@@ -305,9 +305,10 @@ fn proto_string_map(values: HashMap<String, RedactedString>) -> proto::StringMap
 fn proto_wire_api(wire_api: WireApi) -> proto::WireApi {
     match wire_api {
         WireApi::Responses => proto::WireApi::Responses,
-        WireApi::ClaudeCode => {
+        // FORK: locally served providers never appear in remote thread config.
+        WireApi::ClaudeCode | WireApi::ChatGptWeb => {
             unreachable!(
-                "claude_code providers are local-only and never appear in remote thread config"
+                "locally served providers (claude_code, chatgpt_web) never appear in remote thread config"
             )
         }
     }

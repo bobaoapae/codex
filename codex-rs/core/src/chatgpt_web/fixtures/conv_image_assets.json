@@ -1,0 +1,146 @@
+{
+  "title": "Imagem enviada e gerada",
+  "create_time": 1756260000.0,
+  "update_time": 1756260090.0,
+  "mapping": {
+    "client-created-root": {
+      "id": "client-created-root",
+      "message": null,
+      "parent": null,
+      "children": ["44444444-0000-4000-8000-000000000001"]
+    },
+    "44444444-0000-4000-8000-000000000001": {
+      "id": "44444444-0000-4000-8000-000000000001",
+      "message": {
+        "id": "44444444-0000-4000-8000-000000000001",
+        "author": { "role": "user", "name": null, "metadata": {} },
+        "create_time": 1756260001.0,
+        "update_time": null,
+        "content": {
+          "content_type": "multimodal_text",
+          "parts": [
+            {
+              "content_type": "image_asset_pointer",
+              "asset_pointer": "file-service://file-Up1oAdEd1MaGe0000000001",
+              "size_bytes": 48213,
+              "width": 640,
+              "height": 480,
+              "fovea": null,
+              "metadata": { "dalle": null, "gizmo": null, "generation": null, "container_pixel_height": null, "container_pixel_width": null, "emu_omit_glimpse_image": null, "emu_patches_override": null, "lpe_keep_patch_ijhw": null, "sanitized": true, "asset_pointer_link": null, "watermarked_asset_pointer": null }
+            },
+            "Faça uma versão em aquarela desta foto."
+          ]
+        },
+        "status": "finished_successfully",
+        "end_turn": null,
+        "weight": 1.0,
+        "metadata": {
+          "attachments": [
+            { "id": "file-Up1oAdEd1MaGe0000000001", "size": 48213, "name": "foto.png", "mime_type": "image/png", "width": 640, "height": 480 }
+          ],
+          "request_id": "4d5e6f7a8b9c0d1e-GRU",
+          "timestamp_": "absolute"
+        },
+        "recipient": "all",
+        "channel": null
+      },
+      "parent": "client-created-root",
+      "children": ["44444444-0000-4000-8000-000000000002"]
+    },
+    "44444444-0000-4000-8000-000000000002": {
+      "id": "44444444-0000-4000-8000-000000000002",
+      "message": {
+        "id": "44444444-0000-4000-8000-000000000002",
+        "author": { "role": "assistant", "name": null, "metadata": {} },
+        "create_time": 1756260005.0,
+        "update_time": null,
+        "content": { "content_type": "text", "parts": ["{\"prompt\":\"Watercolor version of the attached photo\",\"referenced_image_ids\":[\"file-Up1oAdEd1MaGe0000000001\"]}"] },
+        "status": "finished_successfully",
+        "end_turn": false,
+        "weight": 1.0,
+        "metadata": {
+          "finish_details": { "type": "stop", "stop_tokens": [200012] },
+          "is_complete": true,
+          "model_slug": "gpt-5-2",
+          "parent_id": "44444444-0000-4000-8000-000000000001",
+          "request_id": "4d5e6f7a8b9c0d1e-GRU"
+        },
+        "recipient": "t2uay3k.sj1i4kz",
+        "channel": "commentary"
+      },
+      "parent": "44444444-0000-4000-8000-000000000001",
+      "children": ["44444444-0000-4000-8000-000000000003"]
+    },
+    "44444444-0000-4000-8000-000000000003": {
+      "id": "44444444-0000-4000-8000-000000000003",
+      "message": {
+        "id": "44444444-0000-4000-8000-000000000003",
+        "author": { "role": "tool", "name": "t2uay3k.sj1i4kz", "metadata": {} },
+        "create_time": 1756260080.0,
+        "update_time": null,
+        "content": {
+          "content_type": "multimodal_text",
+          "parts": [
+            {
+              "content_type": "image_asset_pointer",
+              "asset_pointer": "sediment://file_00000000gen0000000000000000000001",
+              "size_bytes": 1532988,
+              "width": 1024,
+              "height": 1024,
+              "fovea": null,
+              "metadata": { "dalle": null, "gizmo": null, "generation": { "gen_id": "gen_01", "gen_size": "xlimage", "seed": 12345, "parent_gen_id": null, "edit_op": null, "serialization_title": "Imagem gerada" }, "container_pixel_height": null, "container_pixel_width": null, "emu_omit_glimpse_image": null, "emu_patches_override": null, "lpe_keep_patch_ijhw": null, "sanitized": true, "asset_pointer_link": null, "watermarked_asset_pointer": null }
+            }
+          ]
+        },
+        "status": "finished_successfully",
+        "end_turn": null,
+        "weight": 1.0,
+        "metadata": {
+          "image_gen_title": "Imagem gerada",
+          "image_results": [{ "id": "file_00000000gen0000000000000000000001", "url": null, "width": 1024, "height": 1024 }],
+          "model_slug": "gpt-5-2",
+          "parent_id": "44444444-0000-4000-8000-000000000002",
+          "request_id": "4d5e6f7a8b9c0d1e-GRU",
+          "async_task_type": "image_gen",
+          "async_task_id": "task_01"
+        },
+        "recipient": "all",
+        "channel": "commentary"
+      },
+      "parent": "44444444-0000-4000-8000-000000000002",
+      "children": ["44444444-0000-4000-8000-000000000004"]
+    },
+    "44444444-0000-4000-8000-000000000004": {
+      "id": "44444444-0000-4000-8000-000000000004",
+      "message": {
+        "id": "44444444-0000-4000-8000-000000000004",
+        "author": { "role": "assistant", "name": null, "metadata": {} },
+        "create_time": 1756260088.0,
+        "update_time": null,
+        "content": { "content_type": "text", "parts": ["Aqui está a versão em aquarela."] },
+        "status": "finished_successfully",
+        "end_turn": true,
+        "weight": 1.0,
+        "metadata": {
+          "finish_details": { "type": "stop", "stop_tokens": [200002] },
+          "is_complete": true,
+          "model_slug": "gpt-5-2",
+          "parent_id": "44444444-0000-4000-8000-000000000003",
+          "request_id": "4d5e6f7a8b9c0d1e-GRU"
+        },
+        "recipient": "all",
+        "channel": "final"
+      },
+      "parent": "44444444-0000-4000-8000-000000000003",
+      "children": []
+    }
+  },
+  "moderation_results": [],
+  "current_node": "44444444-0000-4000-8000-000000000004",
+  "conversation_id": "44444444-aaaa-4bbb-8ccc-000000000004",
+  "is_archived": false,
+  "safe_urls": [],
+  "default_model_slug": "gpt-5-2",
+  "async_status": 0,
+  "memory_scope": "global_enabled"
+}

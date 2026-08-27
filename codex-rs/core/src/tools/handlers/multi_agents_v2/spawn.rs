@@ -165,14 +165,14 @@ async fn handle_spawn_agent(
     // know the child really is Claude-backed.
     apply_spawn_agent_claude_account(&mut config, args.account.as_deref())?;
 
-    // Claude children receive a complete, self-contained plaintext brief through
-    // the inter-agent message. Inheriting parent turns makes the local Claude
-    // session reprocess stale work and Codex-only instructions, so Claude must
-    // always start from task-only context.
+    // Locally served children (Claude, ChatGPT Web) receive a complete,
+    // self-contained plaintext brief through the inter-agent message.
+    // Inheriting parent turns makes the local session reprocess stale work and
+    // Codex-only instructions, so they start from task-only context.
     let (fork_mode, fork_note) = task_fork_mode_for_wire_api(
         config.model_provider.wire_api,
         requested_fork_mode,
-        turn.config.claude_code_max_fork_turns,
+        max_fork_turns_for_wire_api(&turn.config, config.model_provider.wire_api),
     );
     notes.extend(fork_note);
     let is_full_history_fork = matches!(fork_mode, Some(SpawnAgentForkMode::FullHistory));

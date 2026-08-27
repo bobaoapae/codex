@@ -427,6 +427,249 @@
       },
       "type": "object"
     },
+    "ChatGptWebMentionStrategy": {
+      "description": "FORK: how the connector is selected in the ChatGPT composer.",
+      "oneOf": [
+        {
+          "description": "Try in the background, activate the tab only if the menu never mounts.",
+          "enum": [
+            "auto"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Never activate the tab; fail if the mention menu does not mount.",
+          "enum": [
+            "background_only"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Always activate the tab for the mention.",
+          "enum": [
+            "activate"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "ChatGptWebToml": {
+      "additionalProperties": false,
+      "description": "FORK: settings for the `chatgpt_web` provider (`[chatgpt_web]`): ChatGPT Pro web driven through a real Chrome tab via the chrome-mcp daemon.\n\nEvery key is optional; the resolved defaults live in `codex_core::config::ChatGptWebSettings`. The driver also honors the `CHROME_MCP_URL`, `CHROME_MCP_TOKEN` and `CHATGPT_URL` environment variables as overrides for `daemon_url`, the token and `base_url`.",
+      "properties": {
+        "archive_on_shutdown": {
+          "description": "Archive the ChatGPT conversation when its Codex thread shuts down. Defaults to true.",
+          "type": "boolean"
+        },
+        "base_url": {
+          "description": "Base URL of the ChatGPT web app. Defaults to `https://chatgpt.com`.",
+          "type": "string"
+        },
+        "cloudflared_extra_args": {
+          "description": "Extra arguments for `cloudflared tunnel` (e.g. `[\"--protocol\", \"http2\"]`).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "cloudflared_path": {
+          "description": "Explicit `cloudflared` binary; auto-detected when unset.",
+          "type": "string"
+        },
+        "connector_auto_approve_ui": {
+          "description": "Click ChatGPT's \"Allow\" card for connector calls automatically. Defaults to true.",
+          "type": "boolean"
+        },
+        "connector_auto_developer_mode": {
+          "description": "Turn on ChatGPT Developer Mode automatically when a connector is needed. Defaults to true.",
+          "type": "boolean"
+        },
+        "connector_call_timeout_ms": {
+          "description": "How long one connector call may take before the daemon answers with an error. Defaults to 120 s.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "connector_description": {
+          "description": "Description shown for that connector (at most 200 characters).",
+          "type": "string"
+        },
+        "connector_exec_default_yield_ms": {
+          "description": "Default `yield_time_ms` for `codex_exec` when ChatGPT omits it. Defaults to 10 s.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "connector_mention_strategy": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ChatGptWebMentionStrategy"
+            }
+          ],
+          "description": "How the connector is attached to the composer: `auto` (default), `background_only`, or `activate` (bring the tab to the front)."
+        },
+        "connector_name": {
+          "description": "Name of the custom MCP connector registered in ChatGPT. Defaults to `Codex Native`.",
+          "type": "string"
+        },
+        "connector_ready_timeout_ms": {
+          "description": "How long a turn waits for the connector to be registered and reachable. Defaults to 90 s.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "daemon_idle_shutdown_ms": {
+          "description": "Shut the daemon down after this long with no sessions (0 = never).",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "daemon_port": {
+          "description": "Loopback port of the daemon control API (0 = ephemeral).",
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "daemon_url": {
+          "description": "Streamable HTTP endpoint of the chrome-mcp daemon. Defaults to `http://127.0.0.1:8848/mcp`.",
+          "type": "string"
+        },
+        "idle_timeout_ms": {
+          "description": "How long a turn may make no visible progress before it is abandoned and generation is stopped. Defaults to 20 minutes; 0 waits forever.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "manual_mcp_url": {
+          "description": "Public MCP URL of the daemon when `tunnel = \"manual\"`.",
+          "type": "string"
+        },
+        "max_fork_turns": {
+          "description": "Upper bound on how many parent turns a ChatGPT Web child may inherit through `fork_turns`. Defaults to 0 (task-only context).",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "max_parallel_turns": {
+          "description": "How many ChatGPT turns this process runs at the same time. Defaults to 2.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "max_tabs": {
+          "description": "Pool size of dedicated chatgpt.com tabs (clamped to 1..=8). Defaults to 3.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "poll_interval_ms": {
+          "description": "How often the conversation is polled while a reply streams. Defaults to 2500 ms.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "tab_idle_ms": {
+          "description": "Idle time after which a pooled tab is closed. Defaults to 5 minutes.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "token_file": {
+          "description": "File holding the daemon bearer token. Defaults to `~/.chrome-mcp/token.txt`.",
+          "type": "string"
+        },
+        "tools": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ChatGptWebTools"
+            }
+          ],
+          "description": "What the ChatGPT side can reach: `none` (default; it only sees the transcript) or `connector` (Codex tools exposed through a custom MCP connector; requires the shared `codex chatgpt-web daemon`)."
+        },
+        "tunnel": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ChatGptWebTunnel"
+            }
+          ],
+          "description": "How the connector daemon is reached from ChatGPT: the official OpenAI Secure MCP Tunnel (`openai`, default), a cloudflared quick tunnel (`cloudflared`), or a public URL you provide (`manual`)."
+        },
+        "tunnel_client_path": {
+          "description": "Explicit `tunnel-client` binary. When unset the pinned release is downloaded into `CODEX_HOME/chatgpt_web/bin/`, then `PATH` is tried.",
+          "type": "string"
+        },
+        "tunnel_client_version": {
+          "description": "Pinned `tunnel-client` release version.",
+          "type": "string"
+        },
+        "tunnel_id": {
+          "description": "Tunnel id (`tunnel_<32 hex>`) created at platform.openai.com/settings/organization/tunnels. Required with `tunnel = \"openai\"`; written by `codex chatgpt-web setup`.",
+          "type": "string"
+        },
+        "tunnel_key_file": {
+          "description": "File holding the restricted API key (`Tunnels: Read + Use`) that the tunnel client authenticates with. Defaults to `CODEX_HOME/chatgpt_web/tunnel.key`; `CODEX_CHATGPT_WEB_TUNNEL_KEY` in the environment also works.",
+          "type": "string"
+        },
+        "tunnel_port": {
+          "description": "Loopback port of the connector MCP server (0 = ephemeral).",
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "turn_ttl_ms": {
+          "description": "Lifetime of a turn token in the daemon. Defaults to 1 hour.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "ChatGptWebTools": {
+      "description": "FORK: what the ChatGPT side of a `chatgpt_web` turn can reach.",
+      "oneOf": [
+        {
+          "description": "No bridge: ChatGPT only sees the transcript Codex sends it.",
+          "enum": [
+            "none"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Codex tools exposed to ChatGPT through a custom MCP connector.",
+          "enum": [
+            "connector"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "ChatGptWebTunnel": {
+      "description": "FORK: how the connector daemon is exposed to ChatGPT.",
+      "oneOf": [
+        {
+          "description": "The official OpenAI Secure MCP Tunnel (`tunnel-client`): outbound-only, stable `tunnel_id`, no public URL.",
+          "enum": [
+            "openai"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A cloudflared quick tunnel (`*.trycloudflare.com`), new URL per start.",
+          "enum": [
+            "cloudflared"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A public URL the user provides in `manual_mcp_url`.",
+          "enum": [
+            "manual"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "ClaudeCodeAccountSelection": {
       "description": "FORK: account-selection policy for the `claude_code` provider.",
       "oneOf": [
@@ -5543,6 +5786,13 @@
             "claude_code"
           ],
           "type": "string"
+        },
+        {
+          "description": "FORK: the ChatGPT web app (chatgpt.com), driven through a real Chrome tab via the chrome-mcp daemon. No HTTP endpoint and no key: the provider types into the composer of a logged-in browser and reads the reply back from the page's own backend API.",
+          "enum": [
+            "chatgpt_web"
+          ],
+          "type": "string"
         }
       ]
     },
@@ -5631,6 +5881,15 @@
     "chatgpt_base_url": {
       "description": "Base URL for requests to ChatGPT (as opposed to the OpenAI API).",
       "type": "string"
+    },
+    "chatgpt_web": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ChatGptWebToml"
+        }
+      ],
+      "default": null,
+      "description": "FORK: settings for the `chatgpt_web` provider."
     },
     "check_for_update_on_startup": {
       "description": "When `true`, checks for Codex updates on startup and surfaces update prompts. Set to `false` only if your Codex updates are centrally managed. Defaults to `true`.",

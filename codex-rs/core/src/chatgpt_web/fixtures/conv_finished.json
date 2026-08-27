@@ -1,0 +1,167 @@
+{
+  "title": "Duas trocas concluídas",
+  "create_time": 1756240000.0,
+  "update_time": 1756240120.5,
+  "mapping": {
+    "client-created-root": {
+      "id": "client-created-root",
+      "message": null,
+      "parent": null,
+      "children": ["22222222-0000-4000-8000-000000000001"]
+    },
+    "22222222-0000-4000-8000-000000000001": {
+      "id": "22222222-0000-4000-8000-000000000001",
+      "message": {
+        "id": "22222222-0000-4000-8000-000000000001",
+        "author": { "role": "system", "name": null, "metadata": {} },
+        "create_time": null,
+        "update_time": null,
+        "content": { "content_type": "text", "parts": [""] },
+        "status": "finished_successfully",
+        "end_turn": true,
+        "weight": 0.0,
+        "metadata": { "is_visually_hidden_from_conversation": true },
+        "recipient": "all",
+        "channel": null
+      },
+      "parent": "client-created-root",
+      "children": ["22222222-0000-4000-8000-000000000002"]
+    },
+    "22222222-0000-4000-8000-000000000002": {
+      "id": "22222222-0000-4000-8000-000000000002",
+      "message": {
+        "id": "22222222-0000-4000-8000-000000000002",
+        "author": { "role": "user", "name": null, "metadata": {} },
+        "create_time": null,
+        "update_time": null,
+        "content": {
+          "content_type": "user_editable_context",
+          "user_profile": "The user provided the following information about themselves:\nDesenvolvedor Rust.",
+          "user_instructions": "Responda em português."
+        },
+        "status": "finished_successfully",
+        "end_turn": null,
+        "weight": 1.0,
+        "metadata": {
+          "is_visually_hidden_from_conversation": true,
+          "user_context_message_data": { "about_user_message": "Desenvolvedor Rust.", "about_model_message": "Responda em português." },
+          "is_user_system_message": true
+        },
+        "recipient": "all",
+        "channel": null
+      },
+      "parent": "22222222-0000-4000-8000-000000000001",
+      "children": ["22222222-0000-4000-8000-000000000003"]
+    },
+    "22222222-0000-4000-8000-000000000003": {
+      "id": "22222222-0000-4000-8000-000000000003",
+      "message": {
+        "id": "22222222-0000-4000-8000-000000000003",
+        "author": { "role": "user", "name": null, "metadata": {} },
+        "create_time": 1756240001.0,
+        "update_time": null,
+        "content": { "content_type": "text", "parts": ["Olá!"] },
+        "status": "finished_successfully",
+        "end_turn": null,
+        "weight": 1.0,
+        "metadata": { "request_id": "1a2b3c4d5e6f7a8b-GRU", "timestamp_": "absolute" },
+        "recipient": "all",
+        "channel": null
+      },
+      "parent": "22222222-0000-4000-8000-000000000002",
+      "children": ["22222222-0000-4000-8000-000000000004"]
+    },
+    "22222222-0000-4000-8000-000000000004": {
+      "id": "22222222-0000-4000-8000-000000000004",
+      "message": {
+        "id": "22222222-0000-4000-8000-000000000004",
+        "author": { "role": "assistant", "name": null, "metadata": {} },
+        "create_time": 1756240003.5,
+        "update_time": null,
+        "content": { "content_type": "text", "parts": ["Olá! Como posso ajudar?"] },
+        "status": "finished_successfully",
+        "end_turn": true,
+        "weight": 1.0,
+        "metadata": {
+          "finish_details": { "type": "stop", "stop_tokens": [200002] },
+          "is_complete": true,
+          "model_slug": "gpt-5-2-thinking",
+          "default_model_slug": "gpt-5-2-thinking",
+          "parent_id": "22222222-0000-4000-8000-000000000003",
+          "request_id": "1a2b3c4d5e6f7a8b-GRU"
+        },
+        "recipient": "all",
+        "channel": "final"
+      },
+      "parent": "22222222-0000-4000-8000-000000000003",
+      "children": ["22222222-0000-4000-8000-000000000005"]
+    },
+    "22222222-0000-4000-8000-000000000005": {
+      "id": "22222222-0000-4000-8000-000000000005",
+      "message": {
+        "id": "22222222-0000-4000-8000-000000000005",
+        "author": { "role": "user", "name": null, "metadata": {} },
+        "create_time": 1756240100.0,
+        "update_time": null,
+        "content": { "content_type": "text", "parts": ["Resuma o arquivo anexo."] },
+        "status": "finished_successfully",
+        "end_turn": null,
+        "weight": 1.0,
+        "metadata": {
+          "attachments": [
+            { "id": "file-Z9Y8X7W6V5U4T3S2R1Q0", "name": "notas.txt", "mime_type": "text/plain", "size": 2048 }
+          ],
+          "request_id": "2b3c4d5e6f7a8b9c-GRU",
+          "timestamp_": "absolute"
+        },
+        "recipient": "all",
+        "channel": null
+      },
+      "parent": "22222222-0000-4000-8000-000000000004",
+      "children": ["22222222-0000-4000-8000-000000000006"]
+    },
+    "22222222-0000-4000-8000-000000000006": {
+      "id": "22222222-0000-4000-8000-000000000006",
+      "message": {
+        "id": "22222222-0000-4000-8000-000000000006",
+        "author": { "role": "assistant", "name": null, "metadata": {} },
+        "create_time": 1756240118.0,
+        "update_time": null,
+        "content": { "content_type": "text", "parts": ["O arquivo contém três notas curtas sobre Rust."] },
+        "status": "finished_successfully",
+        "end_turn": true,
+        "weight": 1.0,
+        "metadata": {
+          "finish_details": { "type": "stop", "stop_tokens": [200002] },
+          "is_complete": true,
+          "model_slug": "gpt-5-2-thinking",
+          "default_model_slug": "gpt-5-2-thinking",
+          "parent_id": "22222222-0000-4000-8000-000000000005",
+          "request_id": "2b3c4d5e6f7a8b9c-GRU"
+        },
+        "recipient": "all",
+        "channel": "final"
+      },
+      "parent": "22222222-0000-4000-8000-000000000005",
+      "children": []
+    }
+  },
+  "moderation_results": [],
+  "current_node": "22222222-0000-4000-8000-000000000006",
+  "plugin_ids": null,
+  "conversation_id": "22222222-aaaa-4bbb-8ccc-000000000002",
+  "conversation_template_id": null,
+  "gizmo_id": null,
+  "gizmo_type": null,
+  "is_archived": false,
+  "is_starred": null,
+  "safe_urls": [],
+  "blocked_urls": [],
+  "default_model_slug": "gpt-5-2-thinking",
+  "conversation_origin": null,
+  "voice": null,
+  "async_status": null,
+  "disabled_tool_ids": [],
+  "is_do_not_remember": false,
+  "memory_scope": "global_enabled"
+}

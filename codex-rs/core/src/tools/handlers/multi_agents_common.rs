@@ -10,6 +10,7 @@ use crate::session::turn_context::TurnContext;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
+use codex_model_provider_info::CHATGPT_WEB_PROVIDER_ID;
 use codex_model_provider_info::CLAUDE_CODE_PROVIDER_ID;
 use codex_model_provider_info::WireApi;
 use codex_models_manager::manager::RefreshStrategy;
@@ -42,29 +43,31 @@ pub(crate) const MAX_SPAWN_AGENT_MODEL_OVERRIDES: usize = 5;
 /// silently ignoring it, so the caller can hand the model one honest sentence
 /// rather than letting it believe the child inherited history it never saw.
 ///
-/// `max_fork_turns` (`[claude_code] max_fork_turns`, default 0) is the ceiling
-/// on how much of the parent conversation a Claude child may inherit. A
-/// full-history fork is refused at any setting: that mode also inherits the
-/// parent's agent type, which a locally served child cannot honor.
+/// `max_fork_turns` (`[claude_code] max_fork_turns` or
+/// `[chatgpt_web] max_fork_turns`, default 0) is the ceiling on how much of the
+/// parent conversation a locally served child may inherit. A full-history fork
+/// is refused at any setting: that mode also inherits the parent's agent type,
+/// which a locally served child cannot honor.
 pub(crate) fn task_fork_mode_for_wire_api(
     wire_api: WireApi,
     requested_fork_mode: Option<SpawnAgentForkMode>,
     max_fork_turns: usize,
 ) -> (Option<SpawnAgentForkMode>, Option<String>) {
-    if wire_api != WireApi::ClaudeCode {
+    // FORK: `chatgpt_web` children are briefed exactly like Claude children.
+    let Some(config_table) = locally_served_config_table(wire_api) else {
         return (requested_fork_mode, None);
-    }
+    };
     match requested_fork_mode {
         None => (None, None),
-        Some(SpawnAgentForkMode::FullHistory) => (None, Some(CLAUDE_FULL_FORK_NOTE.to_string())),
+        Some(SpawnAgentForkMode::FullHistory) => (None, Some(LOCAL_FULL_FORK_NOTE.to_string())),
         Some(SpawnAgentForkMode::LastNTurns(_)) if max_fork_turns == 0 => {
-            (None, Some(CLAUDE_TASK_ONLY_FORK_NOTE.to_string()))
+            (None, Some(LOCAL_TASK_ONLY_FORK_NOTE.to_string()))
         }
         Some(SpawnAgentForkMode::LastNTurns(requested)) => {
             let allowed = requested.min(max_fork_turns);
             let note = (allowed != requested).then(|| {
                 format!(
-                    "`fork_turns` was reduced from {requested} to {allowed} by `[claude_code] max_fork_turns`."
+                    "`fork_turns` was reduced from {requested} to {allowed} by `[{config_table}] max_fork_turns`."
                 )
             });
             (Some(SpawnAgentForkMode::LastNTurns(allowed)), note)
@@ -72,12 +75,42 @@ pub(crate) fn task_fork_mode_for_wire_api(
     }
 }
 
-/// Said when a Claude child was asked to inherit turns it is not allowed to.
-const CLAUDE_TASK_ONLY_FORK_NOTE: &str = "`fork_turns` was ignored: this Claude agent starts from task-only context, so the brief must be self-contained.";
+/// FORK: the `config.toml` table of a locally served wire API, or `None` for a
+/// provider with a real backend.
+fn locally_served_config_table(wire_api: WireApi) -> Option<&'static str> {
+    match wire_api {
+        WireApi::ClaudeCode => Some("claude_code"),
+        WireApi::ChatGptWeb => Some("chatgpt_web"),
+        WireApi::Responses => None,
+    }
+}
 
-/// Said when a Claude child was asked for a full-history fork, which also
-/// inherits the parent agent type and so can never apply.
-const CLAUDE_FULL_FORK_NOTE: &str = "`fork_turns: \"all\"` is not available for a Claude agent; it started from task-only context. Send a self-contained brief.";
+/// FORK: the `max_fork_turns` ceiling that applies to a child on `wire_api`.
+pub(crate) fn max_fork_turns_for_wire_api(config: &Config, wire_api: WireApi) -> usize {
+    match wire_api {
+        WireApi::ClaudeCode => config.claude_code_max_fork_turns,
+        WireApi::ChatGptWeb => config.chatgpt_web.max_fork_turns,
+        WireApi::Responses => 0,
+    }
+}
+
+/// FORK: whether a child on this provider is served by a local process (the
+/// Claude Code CLI or the ChatGPT web app) rather than a model endpoint.
+pub(crate) fn is_locally_served(config: &Config) -> bool {
+    matches!(
+        config.model_provider.wire_api,
+        WireApi::ClaudeCode | WireApi::ChatGptWeb
+    ) || config.model_provider_id == CLAUDE_CODE_PROVIDER_ID
+        || config.model_provider_id == CHATGPT_WEB_PROVIDER_ID
+}
+
+/// Said when a locally served child was asked to inherit turns it is not
+/// allowed to.
+const LOCAL_TASK_ONLY_FORK_NOTE: &str = "`fork_turns` was ignored: this locally served agent starts from task-only context, so the brief must be self-contained.";
+
+/// Said when a locally served child was asked for a full-history fork, which
+/// also inherits the parent agent type and so can never apply.
+const LOCAL_FULL_FORK_NOTE: &str = "`fork_turns: \"all\"` is not available for a locally served agent; it started from task-only context. Send a self-contained brief.";
 
 pub(crate) fn model_supports_multi_agent_backend(
     model: &ModelPreset,
@@ -342,8 +375,8 @@ pub(crate) fn apply_spawn_agent_claude_account(
     Ok(())
 }
 
-/// FORK: a locally served model (the Claude Code CLI) is only reachable through
-/// the `claude_code` provider.
+/// FORK: a locally served model (the Claude Code CLI, the ChatGPT web app) is
+/// only reachable through the provider that serves it.
 ///
 /// A role names the provider itself, but `spawn_agent(model = "claude-opus-5")`
 /// does not: the slug is accepted by the catalog and the child would inherit the
@@ -353,23 +386,25 @@ fn align_provider_with_locally_served_model(config: &mut Config) -> Result<(), F
     let Some(model) = config.model.as_deref() else {
         return Ok(());
     };
-    let locally_served = codex_models_manager::local_models::locally_served_models()
-        .iter()
-        .any(|local| local.slug == model);
-    if !locally_served || config.model_provider_id == CLAUDE_CODE_PROVIDER_ID {
+    let Some(provider_id) =
+        codex_models_manager::local_models::provider_for_locally_served_model(model)
+    else {
+        return Ok(());
+    };
+    if config.model_provider_id == provider_id {
         return Ok(());
     }
     let provider = config
         .model_providers
-        .get(CLAUDE_CODE_PROVIDER_ID)
+        .get(provider_id)
         .cloned()
         .ok_or_else(|| {
             FunctionCallError::RespondToModel(format!(
-                "model `{model}` is served by the local `{CLAUDE_CODE_PROVIDER_ID}` provider, which is not configured"
+                "model `{model}` is served by the local `{provider_id}` provider, which is not configured"
             ))
         })?;
     config.model_provider = provider;
-    config.model_provider_id = CLAUDE_CODE_PROVIDER_ID.to_string();
+    config.model_provider_id = provider_id.to_string();
     Ok(())
 }
 
@@ -448,11 +483,9 @@ pub(crate) async fn apply_spawn_agent_service_tier(
     // FORK: a locally served child has no backend service tiers at all. The
     // parent's `priority` is inherited by default, so refusing here failed
     // spawns over an argument the caller never wrote.
-    if config.model_provider.wire_api == WireApi::ClaudeCode
-        || config.model_provider_id == CLAUDE_CODE_PROVIDER_ID
-    {
+    if is_locally_served(config) {
         if requested_service_tier.is_some() {
-            notes.push(CLAUDE_SERVICE_TIER_NOTE.to_string());
+            notes.push(LOCAL_SERVICE_TIER_NOTE.to_string());
         }
         config.service_tier = None;
         return Ok(());
@@ -521,8 +554,7 @@ fn unsupported_service_tier_note(model: &str, requested: &str, supported: &[&str
 
 /// FORK: the note for a child served by the local Claude CLI, which has no
 /// backend service tiers of any kind.
-const CLAUDE_SERVICE_TIER_NOTE: &str =
-    "`service_tier` was dropped: a Claude agent runs on the local CLI, which has no service tiers.";
+const LOCAL_SERVICE_TIER_NOTE: &str = "`service_tier` was dropped: a locally served agent (Claude Code CLI, ChatGPT Web) has no service tiers.";
 
 pub(crate) async fn apply_spawn_agent_role(
     session: &Session,
@@ -828,7 +860,7 @@ mod tests {
         let note = unsupported_service_tier_note("gpt-5.6-luna", "priority", &["flex", "default"]);
         assert!(note.contains("flex, default"), "{note}");
 
-        assert!(CLAUDE_SERVICE_TIER_NOTE.contains("service_tier"));
+        assert!(LOCAL_SERVICE_TIER_NOTE.contains("service_tier"));
     }
 
     /// A model that declares no levels at all cannot be clamped into one.
@@ -891,6 +923,68 @@ mod tests {
 
         assert_eq!(config.model_provider_id, CLAUDE_CODE_PROVIDER_ID);
         assert_eq!(config.model_provider.wire_api, WireApi::ClaudeCode);
+    }
+
+    /// FORK: the same routing for the ChatGPT Web bundle, which must land on
+    /// its own provider and not on `claude_code`.
+    #[tokio::test]
+    async fn a_chatgpt_web_model_pulls_the_child_onto_the_chatgpt_web_provider() {
+        let (_home, mut config) = claude_test_config(Vec::new()).await;
+        config.model = Some("chatgpt-web/thinking".to_string());
+        assert_ne!(config.model_provider_id, CHATGPT_WEB_PROVIDER_ID);
+
+        align_provider_with_locally_served_model(&mut config).expect("provider should align");
+
+        assert_eq!(config.model_provider_id, CHATGPT_WEB_PROVIDER_ID);
+        assert_eq!(config.model_provider.wire_api, WireApi::ChatGptWeb);
+    }
+
+    /// FORK: a ChatGPT Web child is briefed like a Claude child: task-only by
+    /// default, capped by its own config table otherwise.
+    #[test]
+    fn chatgpt_web_fork_turns_follow_the_local_rules() {
+        assert_eq!(
+            task_fork_mode_for_wire_api(
+                WireApi::ChatGptWeb,
+                Some(SpawnAgentForkMode::LastNTurns(4)),
+                /*max_fork_turns*/ 0,
+            ),
+            (None, Some(LOCAL_TASK_ONLY_FORK_NOTE.to_string()))
+        );
+        assert_eq!(
+            task_fork_mode_for_wire_api(
+                WireApi::ChatGptWeb,
+                Some(SpawnAgentForkMode::LastNTurns(4)),
+                /*max_fork_turns*/ 2,
+            ),
+            (
+                Some(SpawnAgentForkMode::LastNTurns(2)),
+                Some(
+                    "`fork_turns` was reduced from 4 to 2 by `[chatgpt_web] max_fork_turns`."
+                        .to_string()
+                )
+            )
+        );
+        assert_eq!(
+            task_fork_mode_for_wire_api(
+                WireApi::ChatGptWeb,
+                Some(SpawnAgentForkMode::FullHistory),
+                /*max_fork_turns*/ 8,
+            )
+            .0,
+            None
+        );
+    }
+
+    /// FORK: each locally served provider reads its own `max_fork_turns`.
+    #[tokio::test]
+    async fn max_fork_turns_comes_from_the_matching_config_table() {
+        let (_home, mut config) = claude_test_config(Vec::new()).await;
+        config.claude_code_max_fork_turns = 3;
+        config.chatgpt_web.max_fork_turns = 5;
+        assert_eq!(max_fork_turns_for_wire_api(&config, WireApi::ClaudeCode), 3);
+        assert_eq!(max_fork_turns_for_wire_api(&config, WireApi::ChatGptWeb), 5);
+        assert_eq!(max_fork_turns_for_wire_api(&config, WireApi::Responses), 0);
     }
 
     async fn claude_test_config(

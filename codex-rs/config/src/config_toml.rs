@@ -199,6 +199,171 @@ pub enum ClaudeCodeAccountSelection {
     Config,
 }
 
+/// FORK: settings for the `chatgpt_web` provider (`[chatgpt_web]`): ChatGPT
+/// Pro web driven through a real Chrome tab via the chrome-mcp daemon.
+///
+/// Every key is optional; the resolved defaults live in
+/// `codex_core::config::ChatGptWebSettings`. The driver also honors the
+/// `CHROME_MCP_URL`, `CHROME_MCP_TOKEN` and `CHATGPT_URL` environment variables
+/// as overrides for `daemon_url`, the token and `base_url`.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct ChatGptWebToml {
+    /// What the ChatGPT side can reach: `none` (default; it only sees the
+    /// transcript) or `connector` (Codex tools exposed through a custom MCP
+    /// connector; requires the shared `codex chatgpt-web daemon`).
+    pub tools: Option<ChatGptWebTools>,
+
+    /// How long a turn may make no visible progress before it is abandoned and
+    /// generation is stopped. Defaults to 20 minutes; 0 waits forever.
+    pub idle_timeout_ms: Option<u64>,
+
+    /// How many ChatGPT turns this process runs at the same time. Defaults to 2.
+    pub max_parallel_turns: Option<usize>,
+
+    /// Pool size of dedicated chatgpt.com tabs (clamped to 1..=8). Defaults to 3.
+    pub max_tabs: Option<usize>,
+
+    /// Idle time after which a pooled tab is closed. Defaults to 5 minutes.
+    pub tab_idle_ms: Option<u64>,
+
+    /// Streamable HTTP endpoint of the chrome-mcp daemon. Defaults to
+    /// `http://127.0.0.1:8848/mcp`.
+    pub daemon_url: Option<String>,
+
+    /// File holding the daemon bearer token. Defaults to
+    /// `~/.chrome-mcp/token.txt`.
+    pub token_file: Option<PathBuf>,
+
+    /// Base URL of the ChatGPT web app. Defaults to `https://chatgpt.com`.
+    pub base_url: Option<String>,
+
+    /// How often the conversation is polled while a reply streams. Defaults to
+    /// 2500 ms.
+    pub poll_interval_ms: Option<u64>,
+
+    /// Archive the ChatGPT conversation when its Codex thread shuts down.
+    /// Defaults to true.
+    pub archive_on_shutdown: Option<bool>,
+
+    /// Upper bound on how many parent turns a ChatGPT Web child may inherit
+    /// through `fork_turns`. Defaults to 0 (task-only context).
+    pub max_fork_turns: Option<usize>,
+
+    /// Name of the custom MCP connector registered in ChatGPT. Defaults to
+    /// `Codex Native`.
+    pub connector_name: Option<String>,
+
+    /// Description shown for that connector (at most 200 characters).
+    pub connector_description: Option<String>,
+
+    /// How the connector daemon is reached from ChatGPT: the official OpenAI
+    /// Secure MCP Tunnel (`openai`, default), a cloudflared quick tunnel
+    /// (`cloudflared`), or a public URL you provide (`manual`).
+    pub tunnel: Option<ChatGptWebTunnel>,
+
+    /// Tunnel id (`tunnel_<32 hex>`) created at
+    /// platform.openai.com/settings/organization/tunnels. Required with
+    /// `tunnel = "openai"`; written by `codex chatgpt-web setup`.
+    pub tunnel_id: Option<String>,
+
+    /// File holding the restricted API key (`Tunnels: Read + Use`) that the
+    /// tunnel client authenticates with. Defaults to
+    /// `CODEX_HOME/chatgpt_web/tunnel.key`; `CODEX_CHATGPT_WEB_TUNNEL_KEY` in
+    /// the environment also works.
+    pub tunnel_key_file: Option<PathBuf>,
+
+    /// Explicit `tunnel-client` binary. When unset the pinned release is
+    /// downloaded into `CODEX_HOME/chatgpt_web/bin/`, then `PATH` is tried.
+    pub tunnel_client_path: Option<PathBuf>,
+
+    /// Pinned `tunnel-client` release version.
+    pub tunnel_client_version: Option<String>,
+
+    /// Explicit `cloudflared` binary; auto-detected when unset.
+    pub cloudflared_path: Option<PathBuf>,
+
+    /// Extra arguments for `cloudflared tunnel` (e.g. `["--protocol", "http2"]`).
+    pub cloudflared_extra_args: Option<Vec<String>>,
+
+    /// Loopback port of the connector MCP server (0 = ephemeral).
+    pub tunnel_port: Option<u16>,
+
+    /// Loopback port of the daemon control API (0 = ephemeral).
+    pub daemon_port: Option<u16>,
+
+    /// Shut the daemon down after this long with no sessions (0 = never).
+    pub daemon_idle_shutdown_ms: Option<u64>,
+
+    /// Click ChatGPT's "Allow" card for connector calls automatically.
+    /// Defaults to true.
+    pub connector_auto_approve_ui: Option<bool>,
+
+    /// Turn on ChatGPT Developer Mode automatically when a connector is
+    /// needed. Defaults to true.
+    pub connector_auto_developer_mode: Option<bool>,
+
+    /// How long one connector call may take before the daemon answers with an
+    /// error. Defaults to 120 s.
+    pub connector_call_timeout_ms: Option<u64>,
+
+    /// Default `yield_time_ms` for `codex_exec` when ChatGPT omits it.
+    /// Defaults to 10 s.
+    pub connector_exec_default_yield_ms: Option<u64>,
+
+    /// How long a turn waits for the connector to be registered and reachable.
+    /// Defaults to 90 s.
+    pub connector_ready_timeout_ms: Option<u64>,
+
+    /// Lifetime of a turn token in the daemon. Defaults to 1 hour.
+    pub turn_ttl_ms: Option<u64>,
+
+    /// How the connector is attached to the composer: `auto` (default),
+    /// `background_only`, or `activate` (bring the tab to the front).
+    pub connector_mention_strategy: Option<ChatGptWebMentionStrategy>,
+
+    /// Public MCP URL of the daemon when `tunnel = "manual"`.
+    pub manual_mcp_url: Option<String>,
+}
+
+/// FORK: what the ChatGPT side of a `chatgpt_web` turn can reach.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatGptWebTools {
+    /// No bridge: ChatGPT only sees the transcript Codex sends it.
+    #[default]
+    None,
+    /// Codex tools exposed to ChatGPT through a custom MCP connector.
+    Connector,
+}
+
+/// FORK: how the connector daemon is exposed to ChatGPT.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatGptWebTunnel {
+    /// The official OpenAI Secure MCP Tunnel (`tunnel-client`): outbound-only,
+    /// stable `tunnel_id`, no public URL.
+    #[default]
+    Openai,
+    /// A cloudflared quick tunnel (`*.trycloudflare.com`), new URL per start.
+    Cloudflared,
+    /// A public URL the user provides in `manual_mcp_url`.
+    Manual,
+}
+
+/// FORK: how the connector is selected in the ChatGPT composer.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatGptWebMentionStrategy {
+    /// Try in the background, activate the tab only if the menu never mounts.
+    #[default]
+    Auto,
+    /// Never activate the tab; fail if the mention menu does not mount.
+    BackgroundOnly,
+    /// Always activate the tab for the mention.
+    Activate,
+}
+
 /// Base config deserialized from ~/.codex/config.toml.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
@@ -214,6 +379,10 @@ pub struct ConfigToml {
     /// FORK: settings for the `claude_code` local provider.
     #[serde(default)]
     pub claude_code: Option<ClaudeCodeToml>,
+
+    /// FORK: settings for the `chatgpt_web` provider.
+    #[serde(default)]
+    pub chatgpt_web: Option<ChatGptWebToml>,
 
     /// Size of the context window for the model, in tokens.
     pub model_context_window: Option<i64>,

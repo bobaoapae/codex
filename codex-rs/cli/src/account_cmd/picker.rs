@@ -104,10 +104,7 @@ impl Drop for RawModeGuard {
 
 fn pick_interactive(rows: &[AccountRow]) -> Result<Option<usize>> {
     let mut stderr = std::io::stderr();
-    writeln!(
-        stderr,
-        "Select an account (Enter confirms, Esc cancels):"
-    )?;
+    writeln!(stderr, "Select an account (Enter confirms, Esc cancels):")?;
 
     // First paint; subsequent paints move the cursor back up and redraw.
     let mut selected = rows.iter().position(|row| row.is_active).unwrap_or(0);

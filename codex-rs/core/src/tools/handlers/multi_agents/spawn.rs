@@ -119,12 +119,13 @@ async fn handle_spawn_agent(
     .await?;
     apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
 
-    // Claude children receive a complete plaintext brief and must not inherit
-    // the parent's Codex conversation through the legacy fork flag.
+    // Locally served children (Claude, ChatGPT Web) receive a complete
+    // plaintext brief and must not inherit the parent's Codex conversation
+    // through the legacy fork flag.
     let (fork_mode, _fork_note) = task_fork_mode_for_wire_api(
         config.model_provider.wire_api,
         args.fork_context.then_some(SpawnAgentForkMode::FullHistory),
-        turn.config.claude_code_max_fork_turns,
+        max_fork_turns_for_wire_api(&turn.config, config.model_provider.wire_api),
     );
 
     let result = Box::pin(session.services.agent_control.spawn_agent_with_metadata(

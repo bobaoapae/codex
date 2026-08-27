@@ -24,6 +24,10 @@ use codex_config::ResidencyRequirement;
 use codex_config::SandboxModeRequirement;
 use codex_config::Sourced;
 use codex_config::ThreadConfigLoader;
+use codex_config::config_toml::ChatGptWebMentionStrategy;
+use codex_config::config_toml::ChatGptWebToml;
+use codex_config::config_toml::ChatGptWebTools;
+use codex_config::config_toml::ChatGptWebTunnel;
 use codex_config::config_toml::ClaudeCodeAccountSelection;
 use codex_config::config_toml::ConfigToml;
 use codex_config::config_toml::DEFAULT_PROJECT_DOC_MAX_BYTES;
@@ -141,6 +145,7 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::config::permissions::BUILT_IN_READ_ONLY_PROFILE;
 use crate::config::permissions::BUILT_IN_WORKSPACE_PROFILE;
@@ -243,6 +248,202 @@ pub(crate) const DEFAULT_AGENT_MAX_DEPTH: i32 = 1;
 pub(crate) const DEFAULT_CLAUDE_CODE_STICKY_MIN_HEADROOM_PCT: f64 = 20.0;
 /// FORK: Claude runs long tool loops, but ten silent minutes means it is wedged.
 pub(crate) const DEFAULT_CLAUDE_CODE_IDLE_TIMEOUT_MS: u64 = 10 * 60 * 1000;
+
+/// FORK: resolved `[chatgpt_web]` settings for the `chatgpt_web` provider.
+///
+/// One struct rather than a field per key: the provider reads them as a unit,
+/// and every `Config` literal outside this module stays a single line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatGptWebSettings {
+    /// What the ChatGPT side can reach.
+    pub tools: ChatGptWebTools,
+    /// How long a turn may make no visible progress before it is abandoned.
+    /// `None` waits forever.
+    pub idle_timeout: Option<Duration>,
+    /// ChatGPT turns this process runs concurrently.
+    pub max_parallel_turns: usize,
+    /// Dedicated chatgpt.com tab pool size (1..=8).
+    pub max_tabs: usize,
+    /// Idle time after which a pooled tab is closed.
+    pub tab_idle: Duration,
+    /// Streamable HTTP endpoint of the chrome-mcp daemon. The driver lets
+    /// `CHROME_MCP_URL` override it.
+    pub daemon_url: String,
+    /// Daemon bearer token file; `None` means `~/.chrome-mcp/token.txt`. The
+    /// driver lets `CHROME_MCP_TOKEN` override the value.
+    pub token_file: Option<PathBuf>,
+    /// Base URL of the web app. The driver lets `CHATGPT_URL` override it.
+    pub base_url: String,
+    /// Conversation poll interval while a reply streams.
+    pub poll_interval: Duration,
+    /// Archive the conversation when its thread shuts down.
+    pub archive_on_shutdown: bool,
+    /// Upper bound on parent turns a ChatGPT Web child may inherit.
+    pub max_fork_turns: usize,
+    /// Name of the custom MCP connector in ChatGPT.
+    pub connector_name: String,
+    /// Description of that connector.
+    pub connector_description: String,
+    /// How the connector daemon is exposed to ChatGPT.
+    pub tunnel: ChatGptWebTunnel,
+    /// OpenAI Secure MCP Tunnel id (`tunnel_<32 hex>`).
+    pub tunnel_id: Option<String>,
+    /// Restricted API key file; `None` means `CODEX_HOME/chatgpt_web/tunnel.key`.
+    pub tunnel_key_file: Option<PathBuf>,
+    /// Explicit `tunnel-client` binary.
+    pub tunnel_client_path: Option<PathBuf>,
+    /// Pinned `tunnel-client` release.
+    pub tunnel_client_version: String,
+    /// Explicit `cloudflared` binary.
+    pub cloudflared_path: Option<PathBuf>,
+    /// Extra `cloudflared tunnel` arguments.
+    pub cloudflared_extra_args: Vec<String>,
+    /// Loopback port of the connector MCP server (0 = ephemeral).
+    pub tunnel_port: u16,
+    /// Loopback port of the daemon control API (0 = ephemeral).
+    pub daemon_port: u16,
+    /// Daemon idle shutdown (0 = never).
+    pub daemon_idle_shutdown_ms: u64,
+    /// Click the ChatGPT approval card automatically.
+    pub connector_auto_approve_ui: bool,
+    /// Enable ChatGPT Developer Mode automatically.
+    pub connector_auto_developer_mode: bool,
+    /// Per-call deadline in the daemon.
+    pub connector_call_timeout: Duration,
+    /// Default `yield_time_ms` for `codex_exec`.
+    pub connector_exec_default_yield: Duration,
+    /// How long a turn waits for the connector to be ready.
+    pub connector_ready_timeout: Duration,
+    /// Turn token lifetime in the daemon.
+    pub turn_ttl: Duration,
+    /// How the connector is selected in the composer.
+    pub connector_mention_strategy: ChatGptWebMentionStrategy,
+    /// Public MCP URL when `tunnel = "manual"`.
+    pub manual_mcp_url: Option<String>,
+}
+
+impl Default for ChatGptWebSettings {
+    fn default() -> Self {
+        Self {
+            tools: ChatGptWebTools::None,
+            // Twenty minutes without visible progress: ChatGPT Pro can think
+            // for a long time, but its status indicators keep moving.
+            idle_timeout: Some(Duration::from_millis(1_200_000)),
+            max_parallel_turns: 2,
+            max_tabs: 3,
+            tab_idle: Duration::from_millis(300_000),
+            daemon_url: "http://127.0.0.1:8848/mcp".to_string(),
+            token_file: None,
+            base_url: "https://chatgpt.com".to_string(),
+            poll_interval: Duration::from_millis(2_500),
+            archive_on_shutdown: true,
+            max_fork_turns: 0,
+            connector_name: "Codex Native".to_string(),
+            connector_description:
+                "Codex tools on this machine (exec, patch, images, harness tools).".to_string(),
+            tunnel: ChatGptWebTunnel::Openai,
+            tunnel_id: None,
+            tunnel_key_file: None,
+            tunnel_client_path: None,
+            tunnel_client_version: "0.0.12".to_string(),
+            cloudflared_path: None,
+            cloudflared_extra_args: Vec::new(),
+            tunnel_port: 0,
+            daemon_port: 0,
+            daemon_idle_shutdown_ms: 0,
+            connector_auto_approve_ui: true,
+            connector_auto_developer_mode: true,
+            connector_call_timeout: Duration::from_millis(120_000),
+            connector_exec_default_yield: Duration::from_millis(10_000),
+            connector_ready_timeout: Duration::from_millis(90_000),
+            turn_ttl: Duration::from_millis(3_600_000),
+            connector_mention_strategy: ChatGptWebMentionStrategy::Auto,
+            manual_mcp_url: None,
+        }
+    }
+}
+
+impl ChatGptWebSettings {
+    /// Resolves the `[chatgpt_web]` table over the defaults.
+    pub fn from_toml(toml: Option<&ChatGptWebToml>) -> Self {
+        let defaults = Self::default();
+        let Some(toml) = toml else {
+            return defaults;
+        };
+        let millis = |value: Option<u64>, default: Duration| {
+            value.map(Duration::from_millis).unwrap_or(default)
+        };
+        Self {
+            tools: toml.tools.unwrap_or(defaults.tools),
+            // 0 means "wait forever", which is what `None` does downstream.
+            idle_timeout: match toml.idle_timeout_ms {
+                Some(0) => None,
+                Some(ms) => Some(Duration::from_millis(ms)),
+                None => defaults.idle_timeout,
+            },
+            max_parallel_turns: toml
+                .max_parallel_turns
+                .filter(|turns| *turns > 0)
+                .unwrap_or(defaults.max_parallel_turns),
+            max_tabs: toml.max_tabs.unwrap_or(defaults.max_tabs).clamp(1, 8),
+            tab_idle: millis(toml.tab_idle_ms, defaults.tab_idle),
+            daemon_url: toml.daemon_url.clone().unwrap_or(defaults.daemon_url),
+            token_file: toml.token_file.clone(),
+            base_url: toml.base_url.clone().unwrap_or(defaults.base_url),
+            poll_interval: millis(toml.poll_interval_ms, defaults.poll_interval),
+            archive_on_shutdown: toml
+                .archive_on_shutdown
+                .unwrap_or(defaults.archive_on_shutdown),
+            max_fork_turns: toml.max_fork_turns.unwrap_or(defaults.max_fork_turns),
+            connector_name: toml
+                .connector_name
+                .clone()
+                .unwrap_or(defaults.connector_name),
+            connector_description: toml
+                .connector_description
+                .clone()
+                .unwrap_or(defaults.connector_description),
+            tunnel: toml.tunnel.unwrap_or(defaults.tunnel),
+            tunnel_id: toml.tunnel_id.clone(),
+            tunnel_key_file: toml.tunnel_key_file.clone(),
+            tunnel_client_path: toml.tunnel_client_path.clone(),
+            tunnel_client_version: toml
+                .tunnel_client_version
+                .clone()
+                .unwrap_or(defaults.tunnel_client_version),
+            cloudflared_path: toml.cloudflared_path.clone(),
+            cloudflared_extra_args: toml.cloudflared_extra_args.clone().unwrap_or_default(),
+            tunnel_port: toml.tunnel_port.unwrap_or(defaults.tunnel_port),
+            daemon_port: toml.daemon_port.unwrap_or(defaults.daemon_port),
+            daemon_idle_shutdown_ms: toml
+                .daemon_idle_shutdown_ms
+                .unwrap_or(defaults.daemon_idle_shutdown_ms),
+            connector_auto_approve_ui: toml
+                .connector_auto_approve_ui
+                .unwrap_or(defaults.connector_auto_approve_ui),
+            connector_auto_developer_mode: toml
+                .connector_auto_developer_mode
+                .unwrap_or(defaults.connector_auto_developer_mode),
+            connector_call_timeout: millis(
+                toml.connector_call_timeout_ms,
+                defaults.connector_call_timeout,
+            ),
+            connector_exec_default_yield: millis(
+                toml.connector_exec_default_yield_ms,
+                defaults.connector_exec_default_yield,
+            ),
+            connector_ready_timeout: millis(
+                toml.connector_ready_timeout_ms,
+                defaults.connector_ready_timeout,
+            ),
+            turn_ttl: millis(toml.turn_ttl_ms, defaults.turn_ttl),
+            connector_mention_strategy: toml
+                .connector_mention_strategy
+                .unwrap_or(defaults.connector_mention_strategy),
+            manual_mcp_url: toml.manual_mcp_url.clone(),
+        }
+    }
+}
 const LOCAL_DEV_BUILD_VERSION: &str = "0.0.0";
 
 pub const CONFIG_TOML_FILE: &str = "config.toml";
@@ -920,6 +1121,9 @@ pub struct Config {
     /// Set from `spawn_agent(account = …)` and persisted with the child thread,
     /// so its follow-up turns keep resuming the same Claude session.
     pub claude_code_account_override: Option<PathBuf>,
+
+    /// FORK: resolved `[chatgpt_web]` settings for the `chatgpt_web` provider.
+    pub chatgpt_web: ChatGptWebSettings,
 
     /// Resolved configuration shared by all Codex SQLite databases.
     pub sqlite: codex_state::SqliteConfig,
@@ -4224,6 +4428,8 @@ impl Config {
                 .unwrap_or(0),
             // Only a spawn request sets this; it never comes from config.toml.
             claude_code_account_override: None,
+            // FORK: the `chatgpt_web` provider settings.
+            chatgpt_web: ChatGptWebSettings::from_toml(cfg.chatgpt_web.as_ref()),
             notify: cfg.notify,
             base_instructions,
             base_instructions_provenance,

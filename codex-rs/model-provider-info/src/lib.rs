@@ -44,6 +44,9 @@ const AMAZON_BEDROCK_RUNTIME_PROVIDER_NAME: &str = "Amazon Bedrock Runtime";
 pub const AMAZON_BEDROCK_RUNTIME_PROVIDER_ID: &str = "amazon-bedrock-runtime";
 const CLAUDE_CODE_PROVIDER_NAME: &str = "Claude Code";
 pub const CLAUDE_CODE_PROVIDER_ID: &str = "claude_code";
+// FORK: ChatGPT Pro web (chatgpt.com) driven through a real Chrome tab.
+const CHATGPT_WEB_PROVIDER_NAME: &str = "ChatGPT Web";
+pub const CHATGPT_WEB_PROVIDER_ID: &str = "chatgpt_web";
 pub const AMAZON_BEDROCK_GPT_5_5_MODEL_ID: &str = "openai.gpt-5.5";
 pub const AMAZON_BEDROCK_GPT_5_4_MODEL_ID: &str = "openai.gpt-5.4";
 pub const AMAZON_BEDROCK_GPT_5_6_SOL_MODEL_ID: &str = "openai.gpt-5.6-sol";
@@ -74,6 +77,12 @@ pub enum WireApi {
     // below; `rename_all = "lowercase"` alone would emit `claudecode`.
     #[serde(rename = "claude_code")]
     ClaudeCode,
+    /// FORK: the ChatGPT web app (chatgpt.com), driven through a real Chrome
+    /// tab via the chrome-mcp daemon. No HTTP endpoint and no key: the provider
+    /// types into the composer of a logged-in browser and reads the reply back
+    /// from the page's own backend API.
+    #[serde(rename = "chatgpt_web")]
+    ChatGptWeb,
 }
 
 impl fmt::Display for WireApi {
@@ -81,6 +90,7 @@ impl fmt::Display for WireApi {
         let value = match self {
             Self::Responses => "responses",
             Self::ClaudeCode => "claude_code",
+            Self::ChatGptWeb => "chatgpt_web",
         };
         f.write_str(value)
     }
@@ -95,10 +105,11 @@ impl<'de> Deserialize<'de> for WireApi {
         match value.as_str() {
             "responses" => Ok(Self::Responses),
             "claude_code" => Ok(Self::ClaudeCode),
+            "chatgpt_web" => Ok(Self::ChatGptWeb),
             "chat" => Err(serde::de::Error::custom(CHAT_WIRE_API_REMOVED_ERROR)),
             _ => Err(serde::de::Error::unknown_variant(
                 &value,
-                &["responses", "claude_code"],
+                &["responses", "claude_code", "chatgpt_web"],
             )),
         }
     }
@@ -462,6 +473,34 @@ impl ModelProviderInfo {
         }
     }
 
+    /// FORK: provider backed by the ChatGPT web app in a real Chrome tab.
+    ///
+    /// Like `claude_code` it has no endpoint and no key: the browser is already
+    /// logged in, and the chrome-mcp daemon it is reached through is configured
+    /// under `[chatgpt_web]`, not here. All HTTP-shaped fields stay unset.
+    pub fn create_chatgpt_web_provider() -> ModelProviderInfo {
+        ModelProviderInfo {
+            name: CHATGPT_WEB_PROVIDER_NAME.into(),
+            base_url: None,
+            env_key: None,
+            env_key_instructions: None,
+            experimental_bearer_token: None,
+            auth: None,
+            aws: None,
+            wire_api: WireApi::ChatGptWeb,
+            query_params: None,
+            http_headers: None,
+            env_http_headers: None,
+            request_max_retries: None,
+            stream_max_retries: None,
+            stream_idle_timeout_ms: None,
+            websocket_connect_timeout_ms: None,
+            requires_openai_auth: false,
+            supports_websockets: false,
+            supports_standalone_web_search: false,
+        }
+    }
+
     pub fn create_amazon_bedrock_provider(
         aws: Option<ModelProviderAwsAuthInfo>,
     ) -> ModelProviderInfo {
@@ -570,6 +609,8 @@ pub fn built_in_model_providers(
             create_oss_provider(DEFAULT_LMSTUDIO_PORT, WireApi::Responses),
         ),
         (CLAUDE_CODE_PROVIDER_ID, P::create_claude_code_provider()),
+        // FORK: ChatGPT Pro web as a model backend.
+        (CHATGPT_WEB_PROVIDER_ID, P::create_chatgpt_web_provider()),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))

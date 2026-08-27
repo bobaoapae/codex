@@ -774,6 +774,36 @@ model_provider = "claude_code"
     assert_eq!(config.model_provider.wire_api, WireApi::ClaudeCode);
 }
 
+/// FORK: ChatGPT Web is the other locally served provider a role may select.
+#[tokio::test]
+async fn apply_role_selects_the_chatgpt_web_provider() {
+    let (home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
+    let role_path = write_role_config(
+        &home,
+        "chatgpt-role.toml",
+        r#"model = "chatgpt-web/pro"
+model_provider = "chatgpt_web"
+"#,
+    )
+    .await;
+    config.agent_roles.insert(
+        "chatgpt".to_string(),
+        AgentRoleConfig {
+            description: None,
+            config_file: Some(role_path),
+            nickname_candidates: None,
+        },
+    );
+
+    apply_role_to_config(&mut config, Some("chatgpt"))
+        .await
+        .expect("chatgpt role should apply");
+
+    assert_eq!(config.model.as_deref(), Some("chatgpt-web/pro"));
+    assert_eq!(config.model_provider_id, CHATGPT_WEB_PROVIDER_ID);
+    assert_eq!(config.model_provider.wire_api, WireApi::ChatGptWeb);
+}
+
 /// FORK: every other provider stays parent-owned, exactly as upstream requires.
 #[tokio::test]
 async fn apply_role_ignores_a_non_claude_provider() {
@@ -834,4 +864,36 @@ model_provider = "claude_code"
         "{spec}"
     );
     assert!(spec.contains("`plaintext_message`"), "{spec}");
+}
+
+/// FORK: a ChatGPT Web role is announced the same way, with its own caveat
+/// about local access.
+#[test]
+fn spawn_tool_spec_reports_a_chatgpt_web_role() {
+    let home = TempDir::new().expect("create temp dir");
+    let role_path = home.path().join("chatgpt-role.toml");
+    fs::write(
+        &role_path,
+        r#"model = "chatgpt-web/thinking"
+model_provider = "chatgpt_web"
+"#,
+    )
+    .expect("write role config");
+    let user_defined_roles = BTreeMap::from([(
+        "chatgpt".to_string(),
+        AgentRoleConfig {
+            description: Some("Second opinion.".to_string()),
+            config_file: Some(role_path),
+            nickname_candidates: None,
+        },
+    )]);
+
+    let spec = spawn_tool_spec::build(&user_defined_roles);
+
+    assert!(
+        spec.contains("This role runs on ChatGPT Web through a browser tab"),
+        "{spec}"
+    );
+    assert!(spec.contains("`plaintext_message`"), "{spec}");
+    assert!(spec.contains("Do not pass `service_tier`"), "{spec}");
 }

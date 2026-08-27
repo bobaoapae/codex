@@ -95,8 +95,13 @@ pub(crate) fn require_readable_message_form(
     form: ToolMessageForm,
     tool_name: &str,
 ) -> Result<(), FunctionCallError> {
+    // FORK: `chatgpt_web` children cannot decrypt either.
     if form == ToolMessageForm::Plaintext
-        || config.model_provider.wire_api != codex_model_provider_info::WireApi::ClaudeCode
+        || !matches!(
+            config.model_provider.wire_api,
+            codex_model_provider_info::WireApi::ClaudeCode
+                | codex_model_provider_info::WireApi::ChatGptWeb
+        )
     {
         return Ok(());
     }

@@ -140,6 +140,13 @@ openssl-sys = { workspace = true, features = ["vendored"] }
 [target.'cfg(unix)'.dependencies]
 codex-shell-escalation = { workspace = true }
 
+# FORK: chatgpt_web tab registry needs OpenProcess for cross-process pid liveness.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 assert_cmd = { workspace = true }
 assert_matches = { workspace = true }
