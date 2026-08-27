@@ -375,7 +375,40 @@ pub(crate) enum PollOutcome {
 const NOT_FOUND_GRACE: Duration = Duration::from_secs(30);
 
 /// Consecutive read failures (of any other kind) before the turn fails.
-const MAX_CONSECUTIVE_READ_FAILURES: u32 = 8;
+pub(crate) const MAX_CONSECUTIVE_READ_FAILURES: u32 = 8;
+
+/// FORK (verified live): `GET /backend-api/conversation/<id>` is rate limited
+/// per account, and a 2.5 s poll that also retries 429s three times inside
+/// the driver kept the account in "Too many requests" for minutes — every
+/// read failed, the turn never saw the finished answer, and a single manual
+/// GET from another tab got 429 too. After a 429 the poll backs off from
+/// [`RATE_LIMIT_COOLDOWN_MIN`] doubling to [`RATE_LIMIT_COOLDOWN_MAX`] until a
+/// read succeeds; 429s do not count as read failures (the stall watchdog still
+/// bounds the wait).
+pub(crate) const RATE_LIMIT_COOLDOWN_MIN: Duration = Duration::from_secs(20);
+pub(crate) const RATE_LIMIT_COOLDOWN_MAX: Duration = Duration::from_secs(120);
+
+/// Next cooldown after another 429: doubles, capped.
+pub(crate) fn next_rate_limit_cooldown(current: Duration) -> Duration {
+    (current * 2).min(RATE_LIMIT_COOLDOWN_MAX)
+}
+
+/// After a 429 the account stays close to its limit: for this long after the
+/// last one, polls run no faster than [`RATE_LIMIT_SLOW_POLL`].
+pub(crate) const RATE_LIMIT_SLOW_WINDOW: Duration = Duration::from_secs(300);
+pub(crate) const RATE_LIMIT_SLOW_POLL: Duration = Duration::from_secs(15);
+
+/// The poll interval to use now: the configured one, or the slow one while a
+/// recent 429 is still fresh.
+pub(crate) fn effective_poll_interval(
+    configured: Duration,
+    last_rate_limit: Option<Instant>,
+) -> Duration {
+    match last_rate_limit {
+        Some(at) if at.elapsed() < RATE_LIMIT_SLOW_WINDOW => configured.max(RATE_LIMIT_SLOW_POLL),
+        _ => configured,
+    }
+}
 
 pub(crate) struct PollLoop<'a> {
     pub(crate) source: &'a dyn ConversationSource,
@@ -400,6 +433,8 @@ impl PollLoop<'_> {
     ) -> PollOutcome {
         let mut last_progress = Instant::now();
         let mut read_failures: u32 = 0;
+        let mut rate_limit_cooldown = RATE_LIMIT_COOLDOWN_MIN;
+        let mut last_rate_limit: Option<Instant> = None;
         loop {
             let idle_deadline = self
                 .idle_timeout
@@ -412,13 +447,28 @@ impl PollLoop<'_> {
                     let seconds = self.idle_timeout.map(|timeout| timeout.as_secs()).unwrap_or_default();
                     return PollOutcome::Stalled { seconds };
                 }
-                _ = tokio::time::sleep(self.poll_interval) => {}
+                _ = tokio::time::sleep(effective_poll_interval(self.poll_interval, last_rate_limit)) => {}
             }
 
             let conv = match self.source.read(&self.conversation_id).await {
                 Ok(conv) => {
                     read_failures = 0;
+                    rate_limit_cooldown = RATE_LIMIT_COOLDOWN_MIN;
                     conv
+                }
+                Err(err) if err.kind == DriverErrorKind::RateLimited => {
+                    last_rate_limit = Some(Instant::now());
+                    tracing::warn!(
+                        "chatgpt_web: conversation reads are rate limited; backing off {}s: {err}",
+                        rate_limit_cooldown.as_secs()
+                    );
+                    tokio::select! {
+                        biased;
+                        _ = consumer_dropped.cancelled() => return PollOutcome::Interrupted,
+                        _ = tokio::time::sleep(rate_limit_cooldown) => {}
+                    }
+                    rate_limit_cooldown = next_rate_limit_cooldown(rate_limit_cooldown);
+                    continue;
                 }
                 Err(err) if err.kind == DriverErrorKind::ConversationNotFound => {
                     if self.sent_at.elapsed() <= NOT_FOUND_GRACE {

@@ -321,7 +321,7 @@ pub fn plan(observed: &Observed, desired: &DesiredConnector) -> Result<Vec<Regis
         && !known.iter().any(|known| known == tunnel_id)
     {
         return Err(format!(
-            "tunnel `{tunnel_id}` is not visible to the ChatGPT account logged in Chrome ({} tunnel(s) listed); create it on platform.openai.com while logged in as that account, then run `codex chatgpt-web setup --tunnel-id {tunnel_id} --api-key-file <path>`",
+            "tunnel `{tunnel_id}` is not visible to the ChatGPT account logged in Chrome ({} tunnel(s) listed). On platform.openai.com > Settings > Organization > Tunnels, edit the tunnel and add this ChatGPT account under \"ChatGPT workspaces\" (for a personal account, search its account id — the `account_id` from chatgpt.com/backend-api/accounts/check); then run `codex chatgpt-web registry reconcile` (or `codex chatgpt-web setup --tunnel-id {tunnel_id} --api-key-file <path>` if the key changed)",
             known.len()
         ));
     }

@@ -112,8 +112,12 @@ nothing else to choose.
   `-pro` suffix stripped (`gpt-5-6-pro` in the recorded run).
 - `high` and `extra-high` pick the level through ChatGPT's effort menu, which
   only mounts while the tab is visible: the driver activates the tab, selects
-  the level, reloads and restores focus. Implemented and unit-tested; the
-  recorded live runs exercised Instant, Thinking and Pro, not the menu path.
+  the level, reloads and restores focus. Implemented and unit-tested, but the
+  live `extra-high` run logged `exact level selection via menu failed (submenu
+  not found)` and continued with the Thinking default — the current picker is
+  the slider variant the driver does not yet drive. Until that is ported,
+  `high`/`extra-high` behave like `thinking` (the turn itself, including
+  connector tools, still works).
 - Context figures are measured, not declared by ChatGPT. There is no tokenizer
   for these models, so usage is estimated as `chars / 4` over the **entire**
   rendered history plus an 8 192-token reserve. The meter therefore grows with
@@ -237,22 +241,29 @@ must touch the workspace is the parent's job — or the connector's.
 
 ## `tools = "connector"`
 
-> **Status.** Connector mode works end to end over `tunnel = "cloudflared"`,
-> verified live: `codex exec -m chatgpt-web/instant "...codex_exec... echo
-> CONNECTOR_OK"` produced a real `exec_command` cell run by Codex and an answer
-> containing `CONNECTOR_OK`, and a `codex_apply_patch` turn wrote a file to
-> disk (a `CustomToolCall`). The daemon autostarts with the session's
-> `[chatgpt_web]` settings, registers the "Codex Native" connector, and
-> reconnects a fresh tunnel URL + re-reconciles within ~90 s when cloudflared is
-> killed. The daemon, contract, broker, tunnel supervisor, connector registry
-> and the `codex chatgpt-web` CLI are covered by unit and integration tests.
-> Still unverified live: the `openai` tunnel path (the test account had no
-> tunnel yet, so the pinned `tunnel-client` flags are unconfirmed — run
-> `codex chatgpt-web setup` then check `tunnel-client run --help`); and a
-> follow-up turn issued as a **separate** `codex exec` process (`exec resume`)
-> against the same conversation, where ChatGPT re-prompts its own tool-approval
-> card for the new turn_token and the auto-approver may not click it in time —
-> a single multi-tool turn, and continuation within one process, are fine.
+> **Status.** Connector mode works end to end over both tunnels, verified
+> live. `tunnel = "openai"` (the default): `codex chatgpt-web setup` downloaded
+> the pinned `tunnel-client` v0.0.12 (SHA-256 checked; its `run` flags —
+> `--control-plane.tunnel-id`, `--health.listen-addr`, `--health.url-file`,
+> `--log.format json`, env `CONTROL_PLANE_API_KEY` / `MCP_SERVER_URL=url=…,channel=main`
+> — match the binary's `--help`), the daemon reported the tunnel ready within
+> a second, the registry enabled Developer Mode on a fresh account and created
+> the "Codex Native" connector with `tunnel_id` (6 actions), and a
+> `chatgpt-web/instant` turn ran `codex_apply_patch` (file written) and
+> `codex_exec` (output reported) through it. `tunnel = "cloudflared"`: the same
+> `codex_exec` / `codex_apply_patch` smoke, plus tunnel reconnection and
+> re-reconcile within ~90 s when cloudflared is killed. The daemon, contract,
+> broker, tunnel supervisor, connector registry and the `codex chatgpt-web` CLI
+> are covered by unit and integration tests. Write tools were exercised on all
+> four lines (`instant`, `thinking`, `extra-high`, `pro` each ran
+> `codex_apply_patch` + `codex_exec` through the connector); only `instant`'s
+> final answer was delivered end to end, because the account then hit the
+> per-account rate limit on `GET /backend-api/conversation` for the rest of
+> the session (see *Limits*). Still unverified live: a follow-up turn issued as a **separate**
+> `codex exec` process (`exec resume`) against the same conversation, where
+> ChatGPT re-prompts its own tool-approval card for the new turn_token and the
+> auto-approver may not click it in time — a single multi-tool turn, and
+> continuation within one process, are fine.
 
 In connector mode ChatGPT calls Codex tools as real function calls. Codex
 exposes a custom MCP connector (Developer Mode) named `connector_name`
@@ -339,11 +350,21 @@ it (`tunnel`):
   setup:
 
   1. On `platform.openai.com`, **logged in as the same account that is logged
-     into chatgpt.com** (the connector modal only lists that organization's
-     tunnels), create a Tunnel under *Settings → Organization → Tunnels* and a
-     restricted API key with `Tunnels: Read + Use` under *API keys*. Creating
-     the key is free and does not consume model credits.
-  2. Run:
+     into chatgpt.com**, create a Tunnel under *Settings → Organization →
+     Tunnels* (name and description are both required) and a restricted API
+     key under *API keys*: owner *You*, any project, permissions *Restricted*
+     with `Tunnels` set to both `Read` and `Use` (the row then reads "All
+     selected"), everything else `None`. Creating the key is free and does not
+     consume model credits; the value is shown once — save it to a file.
+  2. **Share the tunnel with the ChatGPT account.** ChatGPT only lists tunnels
+     that name it under the tunnel's *ChatGPT workspaces* field; a fresh
+     tunnel lists nothing (`GET /backend-api/aip/connectors/mcp/tunnels` →
+     `{"tunnels":[]}`) and the registry refuses with "tunnel … is not visible
+     to the ChatGPT account". Edit the tunnel, and in *ChatGPT workspaces*
+     search for the account's id — for a personal (non-workspace) account that
+     is the `account_id` returned by `https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27`
+     (a UUID) — pick it and save. The tunnel shows up in ChatGPT immediately.
+  3. Run:
 
      ```bash
      codex chatgpt-web setup --tunnel-id tunnel_<32 hex> --api-key-file /path/to/key.txt   # or `-` for stdin
@@ -476,6 +497,16 @@ Every key is optional. Durations are milliseconds.
   public host without the secret path.
 
 ## Limits and known caveats
+
+- **Conversation reads are rate limited per account.** The poll loop reads
+  `GET /backend-api/conversation/<id>` every `poll_interval_ms`; after a
+  `429 Too many requests` it backs off 20 s → 120 s and polls no faster than
+  every 15 s for five minutes, and the poll read itself never retries a 429.
+  A heavily used account can still stay throttled for a long time — every
+  read fails, no progress is observed, and the stall watchdog
+  (`idle_timeout_ms`, 20 min) ends the turn even though the ChatGPT side may
+  have finished. Raise `poll_interval_ms` (10 000–15 000) on accounts that show
+  429s, and keep `max_parallel_turns` at 1–2.
 
 - **Calls serialize.** ChatGPT runs connector calls one after another inside a
   single response, so total response time is the sum of the calls. Keep

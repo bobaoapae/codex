@@ -407,6 +407,7 @@ fn new_chat(text: &str, model: Option<ModelSpec>) -> SendRequest {
         model,
         files: Vec::new(),
         mention: None,
+        mention_strategy: MentionStrategy::default(),
     }
 }
 
@@ -417,6 +418,7 @@ fn continuation(conversation_id: &str, text: &str) -> SendRequest {
         model: None,
         files: Vec::new(),
         mention: None,
+        mention_strategy: MentionStrategy::default(),
     }
 }
 
@@ -1186,6 +1188,7 @@ async fn send_with_files_uploads_images_and_documents_on_their_inputs() {
             model: None,
             files: vec![pic.clone(), doc.clone()],
             mention: None,
+            mention_strategy: MentionStrategy::default(),
         })
         .await
         .expect("send with files");
@@ -1261,6 +1264,7 @@ async fn send_fails_when_a_file_never_gets_a_tile() {
             model: None,
             files: vec![doc],
             mention: None,
+            mention_strategy: MentionStrategy::default(),
         })
         .await
         .expect_err("missing tile");
@@ -1287,6 +1291,7 @@ async fn send_reports_a_missing_file_before_touching_the_page() {
             model: None,
             files: vec![PathBuf::from("Z:/definitely/missing.txt")],
             mention: None,
+            mention_strategy: MentionStrategy::default(),
         })
         .await
         .expect_err("missing file");
@@ -1666,6 +1671,7 @@ mod live {
                     model: Some(ModelSpec::Instant),
                     files: vec![png.clone()],
                     mention: None,
+                    mention_strategy: MentionStrategy::default(),
                 },
                 Duration::from_secs(180),
             )

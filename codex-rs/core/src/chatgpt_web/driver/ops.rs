@@ -386,6 +386,32 @@ pub(crate) struct SendRequest {
     /// typing. When set, the text is appended after the connector pill instead
     /// of replacing the whole composer (which would wipe the pill).
     pub(crate) mention: Option<String>,
+    /// FORK (connector mode): whether the mention may activate the tab.
+    pub(crate) mention_strategy: MentionStrategy,
+}
+
+/// FORK: how the connector @mention deals with the popover that Radix only
+/// mounts reliably in a focused tab (spike S2: it usually mounts in a hidden
+/// tab, but a fresh chat sometimes never shows the connector row).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum MentionStrategy {
+    /// Background first; activate the tab (no reload) when the menu row never
+    /// mounts.
+    #[default]
+    Auto,
+    /// Never steal focus; fail when the menu does not mount.
+    BackgroundOnly,
+    /// Always activate the tab for the mention.
+    Activate,
+}
+
+/// Mention failures that a focused tab is known to fix (spike S2).
+fn mention_needs_focus(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("mention menu")
+        || error.contains("highlight the connector row")
+        || error.contains("menu closed")
+        || error.contains("pill did not appear")
 }
 
 /// A message that reached the conversation.
@@ -1369,9 +1395,40 @@ impl ChatGptOps {
             }
             None => page_scripts::set_composer_text(&request.text),
         };
-        let set: OkResult = self
-            .eval_as(tab_id, compose_script(), EVAL_COMPOSE_TIMEOUT_MS)
-            .await?;
+        let mut set: OkResult = match (request.mention.as_deref(), request.mention_strategy) {
+            (Some(_), MentionStrategy::Activate) => {
+                self.tabs
+                    .with_activated_on_keep(tab_id, |id| async move {
+                        self.eval_as(id, compose_script(), EVAL_COMPOSE_TIMEOUT_MS)
+                            .await
+                    })
+                    .await?
+            }
+            _ => {
+                self.eval_as(tab_id, compose_script(), EVAL_COMPOSE_TIMEOUT_MS)
+                    .await?
+            }
+        };
+        // FORK: the mention popover sometimes never mounts in a hidden tab
+        // (spike S2); a focused tab fixes it. Retry once with the tab
+        // activated — and no reload afterwards, which would drop the pill.
+        if !set.ok
+            && request.mention.is_some()
+            && request.mention_strategy == MentionStrategy::Auto
+            && set.error.as_deref().is_some_and(mention_needs_focus)
+        {
+            let first_error = set.error.clone().unwrap_or_default();
+            notes.push(format!(
+                "mention fell back to activating the tab: {first_error}"
+            ));
+            set = self
+                .tabs
+                .with_activated_on_keep(tab_id, |id| async move {
+                    self.eval_as(id, compose_script(), EVAL_COMPOSE_TIMEOUT_MS)
+                        .await
+                })
+                .await?;
+        }
         if !set.ok {
             return Err(DriverError::ui_changed(format!(
                 "could not put the message into the composer: {}. The composer UI may have changed.",
@@ -1872,7 +1929,14 @@ impl ChatGptOps {
         conversation_id: &str,
         include_thoughts: bool,
     ) -> DriverResult<Conversation> {
-        let api = self.api_for(Some(conversation_id)).await?;
+        // FORK (verified live): this is the poll read. Retrying a 429 three
+        // times here (2/5/10 s) turned one throttled poll into a burst of four
+        // requests that kept the account throttled; surface the 429 at once
+        // and let the poll loop back off instead.
+        let api = self
+            .api_for(Some(conversation_id))
+            .await?
+            .with_backoff(Vec::new());
         let raw = api.get_conversation(conversation_id).await?;
         Ok(normalize_with(&raw, NormalizeOptions { include_thoughts }))
     }

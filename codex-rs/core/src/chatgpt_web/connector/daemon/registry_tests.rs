@@ -968,9 +968,16 @@ impl TabDaemon for FakeTabDaemon {
         _timeout_ms: u64,
     ) -> BoxFuture<'a, DriverResult<Value>> {
         let is_probe = expression.contains("readyState");
-        self.evals.lock().expect("evals").push(expression);
+        let is_login_probe = expression.contains("codex-login-probe");
+        // The login probe is a read-only pre-check, not an API call the
+        // tests count.
+        if !is_login_probe {
+            self.evals.lock().expect("evals").push(expression);
+        }
         let next = if is_probe {
-            Some(json!({"ready": true, "path": "/"}))
+            Some(json!({"ready": true, "path": "/", "href": "https://chatgpt.com/"}))
+        } else if is_login_probe {
+            Some(json!({"ok": true}))
         } else {
             self.responses.lock().expect("responses").pop_front()
         };

@@ -52,6 +52,7 @@ use driver::api::Conversation;
 use driver::daemon::DaemonClient;
 use driver::daemon::DaemonConfig;
 use driver::ops::ChatGptOps;
+use driver::ops::MentionStrategy;
 use driver::ops::ModelSpec;
 use driver::ops::SendRequest;
 use driver::tabs::TabPool;
@@ -613,6 +614,7 @@ async fn run_turn(
         },
         files: rendered.attachments.clone(),
         mention: None,
+        mention_strategy: MentionStrategy::default(),
     };
     info!(
         "chatgpt_web: sending {} chars ({}; {} attachments) to {}",
@@ -1050,6 +1052,15 @@ async fn run_connector_turn(
         },
         files: rendered.attachments.clone(),
         mention,
+        mention_strategy: match settings.connector_mention_strategy {
+            codex_config::config_toml::ChatGptWebMentionStrategy::Auto => MentionStrategy::Auto,
+            codex_config::config_toml::ChatGptWebMentionStrategy::BackgroundOnly => {
+                MentionStrategy::BackgroundOnly
+            }
+            codex_config::config_toml::ChatGptWebMentionStrategy::Activate => {
+                MentionStrategy::Activate
+            }
+        },
     };
     info!(
         "chatgpt_web connector: sending {} chars ({}) with connector \"{connector_name}\"",
@@ -1127,6 +1138,9 @@ async fn connector_loop(
     let mut last_progress = tokio::time::Instant::now();
     let mut requests_open = true;
     let mut polls: u32 = 0;
+    let mut read_failures: u32 = 0;
+    let mut rate_limit_cooldown = stream::RATE_LIMIT_COOLDOWN_MIN;
+    let mut last_rate_limit: Option<tokio::time::Instant> = None;
 
     loop {
         let stall_deadline = idle_timeout
@@ -1176,13 +1190,55 @@ async fn connector_loop(
                 state.set_live_turn(live);
                 return;
             }
-            _ = tokio::time::sleep(poll_interval) => {
+            _ = tokio::time::sleep(stream::effective_poll_interval(poll_interval, last_rate_limit)) => {
                 let conv = match driver.ops.read_conversation(&live.conversation_id, true).await {
-                    Ok(conv) => conv,
+                    Ok(conv) => {
+                        read_failures = 0;
+                        rate_limit_cooldown = stream::RATE_LIMIT_COOLDOWN_MIN;
+                        conv
+                    }
+                    // FORK: see `stream::RATE_LIMIT_COOLDOWN_MIN` — polling
+                    // through a 429 only keeps the account rate limited.
+                    Err(err) if err.kind == DriverErrorKind::RateLimited => {
+                        last_rate_limit = Some(tokio::time::Instant::now());
+                        warn!(
+                            "chatgpt_web connector: conversation reads are rate limited; backing off {}s: {err}",
+                            rate_limit_cooldown.as_secs()
+                        );
+                        tokio::select! {
+                            biased;
+                            _ = consumer_dropped.cancelled() => {
+                                live.broker.end_turn(&live.turn_token, "the Codex turn was interrupted").await;
+                                stop_generation(&driver.ops, &live.conversation_id).await;
+                                state.mark_unanswered(live.echoed);
+                                return;
+                            }
+                            _ = tokio::time::sleep(rate_limit_cooldown) => {}
+                        }
+                        rate_limit_cooldown = stream::next_rate_limit_cooldown(rate_limit_cooldown);
+                        continue;
+                    }
                     Err(err)
                         if err.kind == DriverErrorKind::ConversationNotFound
                             && live.sent_at.elapsed() <= Duration::from_secs(30) =>
                     {
+                        continue;
+                    }
+                    // FORK: a transient read failure (an eval timeout in a
+                    // throttled hidden tab, a 5xx) must not end a connector
+                    // turn — ending it retires the turn_token ChatGPT is still
+                    // using, and the retry then starts over. Tolerate a run of
+                    // failures like the `tools = "none"` poll loop does.
+                    Err(err)
+                        if !matches!(
+                            err.kind,
+                            DriverErrorKind::ConversationNotFound | DriverErrorKind::LoginRequired
+                        ) && read_failures + 1 < stream::MAX_CONSECUTIVE_READ_FAILURES =>
+                    {
+                        read_failures += 1;
+                        warn!(
+                            "chatgpt_web connector: reading conversation failed ({read_failures}): {err}"
+                        );
                         continue;
                     }
                     Err(err) => {
@@ -1308,6 +1364,7 @@ async fn run_compaction_turn(
             model: Some(line.spec.clone()),
             files: rendered.attachments.clone(),
             mention: None,
+            mention_strategy: MentionStrategy::default(),
         })
         .await
     {

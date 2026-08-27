@@ -284,3 +284,102 @@ modos Thinking/Extra-high/Pro com tools de escrita (só Instant confirmado); `ex
 processo separado (card de aprovação do token novo). `config_toml.rs` não mudou → schema intocado.
 
 **Gates (C5, `RUST_MIN_STACK=8388608`):** clippy `-p codex-core -p codex-cli -p codex-config -p codex-models-manager -p codex-model-provider-info --lib --bins --tests` limpo (3 avisos residuais de C1 corrigidos: `collapsible_if` em `broker.rs`, `collapsible_match` em `tunnel.rs`, `err().expect()` em `daemon/mod_tests.rs`); `cargo fmt --check` core/cli ok (churn EOL do buildifier nos `.bazel` revertido); `cargo check --workspace` verde; `cargo test`: model-provider-info 29/29, models-manager 54/54, config 284/284, `--test all -- chatgpt_web_connector` 4/4, `chatgpt_web::` + `claude_code::` 316/316 (8 ignored = live), `chatgpt_web::connector` 85/85, `codex-cli --lib` 13/13, `codex-core --lib` **2559 passed / 3 failed / 11 ignored** — as 3 falhas são as pré-existentes do débito conhecido (`agents_md_paths_preserve_symlinked_cwd` privilégio de symlink; `environment_selection::blocking_snapshot_waits_for_starting_environment` e `session::turn::tests::post_sampling_token_estimate_is_disabled_by_always_on_sinks` flakes de execução paralela), nenhuma em `chatgpt_web`.
+
+## Setup `openai` + testes de escrita por modo (conta `joao@joaoborges.dev`) ✅/⚠️
+
+Conta web trocada para `joao@joaoborges.dev` (personal, plano `pro`), logada também no platform.
+
+**Platform (pelo browser, `mcp__chrome`):**
+- *Settings → Organization → Tunnels → Create tunnel*: nome **e descrição** obrigatórios; organização
+  pré-selecionada (`SURFTANk`); criado `tunnel_6a902697a0888191963057ca639226fa` ("Codex Native").
+- *API keys → Create new secret key*: owner *You*, projeto *Default project*, *Restricted* com
+  `Tunnels` = `Read` + `Use` (listbox multi-select; a linha fica "All selected", "2 selected
+  permissions"). O submit disparou duas vezes (dois clicks sintéticos) → duas keys criadas; a
+  duplicada (`key_kpcuEEAmJ2trsu1K`) foi **revogada** pela UI. A key restante
+  (`key_yCwcZ8GyzKysmtbB`, nome `codex-chatgpt-web-tunnel`) está em
+  `%USERPROFILE%\.codex\chatgpt_web\tunnel.key` (164 bytes, sem newline).
+- **Facto novo (bloqueante):** um tunnel recém-criado **não aparece** para a conta ChatGPT
+  (`GET /backend-api/aip/connectors/mcp/tunnels` → `{"tunnels":[]}`, com Developer Mode já ligado
+  automaticamente pelo registry). É preciso **partilhar o tunnel com a conta**: *Edit tunnel →
+  ChatGPT workspaces → procurar o id exato* — para conta personal o id é o `account_id` de
+  `/backend-api/accounts/check/v4-2023-04-27` (`fbf63138-24fb-489e-8c2b-49826f916056`); aparece
+  como opção, *Save*, e o tunnel fica visível de imediato. Mensagem do planner do registry e
+  `docs/chatgpt_web_agents.md` (passo 2) atualizados com este procedimento.
+
+**`codex chatgpt-web setup --tunnel-id … --api-key-file …`** (binário debug):
+- Backup `config.toml.bak-chatgpt-web-20260827-090243`; gravou `[chatgpt_web] tunnel_id` +
+  `tunnel = "openai"`; download de `tunnel-client-v0.0.12-windows-amd64.zip` da release pinada com
+  SHA-256 `2a2804…4356` = `SHA256SUMS.txt` real ✅ (o zip traz também um `cloudflared.exe` bundled,
+  ignorado); binário em `chatgpt_web/bin/tunnel-client-v0.0.12.exe` + manifesto.
+- **Flags confirmadas com `tunnel-client run --help` (0.0.12+881c9a8):** `--control-plane.tunnel-id`,
+  `--health.listen-addr 127.0.0.1:0`, `--health.url-file`, `--log.format json`, `--log.level info`;
+  env `CONTROL_PLANE_API_KEY` (preferido; `OPENAI_API_KEY` como fallback do próprio client),
+  `MCP_SERVER_URL=url=…,channel=main`, `MCP_STARTUP_WAIT_TIMEOUT` (duração Go, ex. `60s`). Nada a
+  mudar em `tunnel.rs`. `tunnel: ready` < 1 s após o spawn; `readyz` local responde.
+- Registry na conta nova: Developer Mode ligado automaticamente (PATCH) ✅; recusa correta enquanto
+  o tunnel não estava partilhado; depois `registry reconcile` → **verified** com `tunnel_id` no
+  body do create (`asdk_app_6a9029caf6dc8191a5910f056eb5d423`, 6 actions) ✅.
+
+**Testes de escrita por modo (`tools = "connector"`, túnel `openai`):**
+
+| modo | resultado |
+|---|---|
+| `chatgpt-web/instant` | ✅ `codex_apply_patch` → `mode.txt = INSTANT` e `codex_exec type mode.txt` → `INSTANT`; resposta "Exact output: INSTANT" entregue ao Codex. 741 s no total por causa da tempestade de 429 (abaixo) — um `ERROR: Reconnecting… 1/5` a meio. |
+| `chatgpt-web/thinking` | ✅ ambas as tools executadas (`mode.txt = THINKING`, `codex_exec` → `THINKING`) e a conversa terminou com `end_turn:true` "THINKING" (verificado por API); a entrega ao Codex ficou presa na tempestade de 429 (run abortado por mim aos ~10 min; conversa escondida). 1.ª tentativa falhou no @mention (`connector row not found`) — fallback de ativação adicionado; 2.ª/3.ª caíram numa janela em que o chatgpt.com deslogou no Chrome (o usuário voltou a entrar). |
+| `chatgpt-web/extra-high` | ✅ tools (`mode.txt = EXTRAHIGH`, `codex_exec` chamado). ⚠️ `exact level selection via menu failed (submenu not found)` → correu com o default do slug thinking (o picker atual é a variante slider que o `menu_select` não conduz); label do composer lido como "Pro". Entrega final também presa nos 429 (run abortado). |
+| `chatgpt-web/pro` | ✅ tools (`mode.txt = PRO`, `codex_exec` chamado em ~1 min); ⚠️ entrega final ao Codex falhou com `no progress for 1200s; generation stopped` (watchdog) porque as leituras da conversa ficaram em 429 o run inteiro (cooldown 20→40 s a funcionar, mas a conta continuou limitada mesmo a 1 pedido/min). Estado final da conversa não pôde ser confirmado por API (429 também num GET manual). |
+| `exec resume --last` em processo separado | ⏸ não executado: a conta ficou limitada (429) no endpoint da conversa no fim da sessão, o que dominaria o resultado. Script pronto em `%TEMP%\cgw-modesun_resume.sh` (turno instant com `archive_on_shutdown=false` + `exec resume --last`). |
+
+**Tempestade de 429 (facto novo, verificado):** `GET /backend-api/conversation/<id>` é limitado por conta;
+o poll a 2,5 s + 3 retries internos (2/5/10 s) por leitura manteve a conta em "Too many requests"
+durante minutos — até um GET manual de outra aba dava 429 — e o turno nunca via a resposta
+final (no modo instant o loop chegou a 8 falhas seguidas → `Stream` → "Reconnecting"). Correções:
+leitura de poll sem retries internos (`read_conversation` com `with_backoff(vec![])`), cooldown
+20→120 s após 429 sem contar como falha de leitura, e janela lenta (poll ≥ 15 s durante 5 min após
+o último 429) em ambos os loops (`stream::PollLoop` e `connector_loop`).
+
+**Bugs corrigidos nesta fase:**
+1. `connector/daemon/mod.rs::spawn_detached` — no Windows o daemon destacado herdava os handles de
+   pipe do CLI (`Stdio::null()` só troca os std handles; `CreateProcess` copia todos os herdáveis),
+   por isso `codex chatgpt-web setup | tail` (ou qualquer agente/CI) ficava pendurado até o daemon
+   morrer — o "hang" único que o C5 viu. Agora `SetHandleInformation(HANDLE_FLAG_INHERIT, 0)` nos
+   três std handles antes do spawn (`detach_std_handles_from_inheritance`). Reproduzido: o `setup`
+   pendurado terminou no instante em que o daemon foi parado.
+2. `driver/ops.rs` + `driver/tabs.rs` — fallback de ativação do @mention (plano C4 (1)): novo
+   `SendRequest.mention_strategy: MentionStrategy{Auto,BackgroundOnly,Activate}` (mapeado de
+   `[chatgpt_web] connector_mention_strategy`); em `Auto`, falhas do menu (`connector row not
+   found`, `could not highlight`, `menu closed`, `pill did not appear`) re-tentam dentro de
+   `TabPool::with_activated_on_keep` (ativa → compose → restaura foco, **sem reload** para não
+   perder a pill); `Activate` ativa sempre; `BackgroundOnly` nunca.
+3. `chatgpt_web/mod.rs::connector_loop` — erros transitórios de `read_conversation` (timeout de
+   eval em aba oculta, 5xx) já não terminam o turno (o que retirava o `turn_token` que o ChatGPT
+   ainda usa e forçava um "Reconnecting"); tolera até `MAX_CONSECUTIVE_READ_FAILURES` (8) como o
+   poll loop do modo `none`.
+4. `connector/daemon/registry_api.rs` — (a) uma aba `chatgpt.com` emprestada pode não estar logada
+   (outra janela/perfil do mesmo Chrome responde `/api/auth/session` sem token) e o reconcile
+   falhava com "not logged in" repetidamente: agora cada candidata é sondada (`codex-login-probe`)
+   e as sem sessão são saltadas; uma aba emprestada que perde a sessão solta o lease; (b) a aba
+   dedicada criada reportava `readyState === "complete"` ainda em `about:blank` e o `fetch`
+   relativo falhava com "Failed to parse URL" — `wait_loaded` exige agora `location.href` na
+   nossa origem.
+5. `connector/daemon/registry.rs` — mensagem do "tunnel não visível" explica o passo de partilha
+   com a ChatGPT workspace/account id.
+6. `driver/ops.rs::read_conversation` + `stream.rs` + `mod.rs::connector_loop` — tratamento de
+   429 (acima): `RATE_LIMIT_COOLDOWN_{MIN,MAX}`, `RATE_LIMIT_SLOW_{WINDOW,POLL}`,
+   `effective_poll_interval`, `next_rate_limit_cooldown`.
+7. Limitação registada (não corrigida): `set_level_via_menu` não encontra o submenu de esforço na
+   UI atual (slider) → `high`/`extra-high` correm como `thinking`; documentado em
+   `docs/chatgpt_web_agents.md` (Model lines).
+
+**Gates:** `cargo test -p codex-core --lib chatgpt_web::` **248 passed / 0 failed / 8 ignored**;
+`cargo clippy -p codex-core -p codex-cli --lib --bins --tests` limpo; rustfmt nos ficheiros
+alterados; integração `--test all -- chatgpt_web_connector` **4/4**; `cargo fmt --check` core/cli ok.
+
+**Estado final / pendente do usuário:** o usuário voltou a entrar no chatgpt.com a meio (a sessão
+tinha caído às ~12:27 UTC); no fim da sessão a conta está **limitada (429)** em
+`GET /backend-api/conversation/<id>` — deixar arrefecer antes de novos turnos. Ficam por verificar ao
+vivo: a entrega final em Thinking/Extra-high/Pro sem 429 (as tools de escrita funcionam nos 4
+modos), o `exec resume` como processo separado, e o picker de esforço (slider) para `high`/`extra-high`.
+Conversas dos testes: instant arquivada pelo Codex; thinking escondida; extra-high e pro ficaram
+visíveis (PATCH deu 429) — esconder à mão ou deixar. O daemon ficou parado (autostart no próximo
+turno com o binário novo). Abas dedicadas dos testes fechadas.

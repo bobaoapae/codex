@@ -43,6 +43,7 @@ use std::time::Duration;
 
 /// Page-side timeout of one API fetch.
 const API_EVAL_TIMEOUT_MS: u64 = 30_000;
+const LOGIN_PROBE_TIMEOUT_MS: u64 = 8_000;
 /// How long a freshly created tab may take to finish loading.
 const TAB_LOAD_TIMEOUT: Duration = Duration::from_secs(25);
 /// 429 backoff, as in `api.ts`.
@@ -165,15 +166,26 @@ impl ChromeMcpPageApi {
             .json()
             .and_then(|value| serde_json::from_value(value).ok())
             .unwrap_or_default();
-        if let Some(tab_id) = tabs
+        // FORK (verified live): a chatgpt.com tab is not necessarily logged in
+        // — another Chrome window/profile in the same browser answers
+        // `/api/auth/session` without a token — and borrowing it made every
+        // reconcile fail with "not logged in" while the driver's own tab was
+        // fine. Probe each candidate first; fall back to a dedicated tab.
+        for tab_id in tabs
             .iter()
             .filter(|tab| {
                 tab.url
                     .as_deref()
                     .is_some_and(|url| self.is_our_origin(url))
             })
-            .find_map(|tab| tab.id)
+            .filter_map(|tab| tab.id)
         {
+            if !self.tab_logged_in(tab_id).await {
+                tracing::debug!(
+                    "chatgpt_web registry: skipping chatgpt.com tab {tab_id} (no session token)"
+                );
+                continue;
+            }
             let lease = TabLease {
                 tab_id,
                 created: false,
@@ -212,6 +224,31 @@ impl ChromeMcpPageApi {
         self.set_lease(Some(lease.clone()));
         self.wait_loaded(tab_id).await?;
         Ok(lease)
+    }
+
+    /// Whether `tab_id` holds a logged-in chatgpt.com session (a token from
+    /// `/api/auth/session`). Read-only; never navigates the tab.
+    async fn tab_logged_in(&self, tab_id: TabId) -> bool {
+        const PROBE: &str = r#"/* codex-login-probe */ () => fetch('/api/auth/session', { credentials: 'include' })
+  .then((r) => r.json())
+  .then((s) => JSON.stringify({ ok: !!(s && s.accessToken) }))
+  .catch(() => JSON.stringify({ ok: false }))"#;
+        match self
+            .daemon
+            .eval_in(tab_id, PROBE.to_string(), LOGIN_PROBE_TIMEOUT_MS)
+            .await
+        {
+            Ok(value) => decode_page_json(value)
+                .get("ok")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            Err(error) => {
+                tracing::debug!(
+                    "chatgpt_web registry: login probe on tab {tab_id} failed: {error}"
+                );
+                false
+            }
+        }
     }
 
     /// Records the dedicated tab in the shared registry under our pid.
@@ -259,14 +296,23 @@ impl ChromeMcpPageApi {
                 .daemon
                 .eval_in(
                     tab_id,
-                    "() => JSON.stringify({ ready: document.readyState === 'complete', path: location.pathname })".to_string(),
+                    "() => JSON.stringify({ ready: document.readyState === 'complete', path: location.pathname, href: location.href })".to_string(),
                     5_000,
                 )
                 .await;
             match probe {
                 Ok(value) => {
                     let value = decode_page_json(value);
-                    if value.get("ready").and_then(Value::as_bool) == Some(true) {
+                    // FORK (verified live): a freshly created tab reports
+                    // `readyState === "complete"` while it is still
+                    // `about:blank`, and a relative `fetch` there fails with
+                    // "Failed to parse URL". Wait until it is actually on our
+                    // origin.
+                    let on_origin = value
+                        .get("href")
+                        .and_then(Value::as_str)
+                        .is_some_and(|href| self.is_our_origin(href));
+                    if value.get("ready").and_then(Value::as_bool) == Some(true) && on_origin {
                         return Ok(());
                     }
                 }
@@ -316,6 +362,10 @@ impl ChromeMcpPageApi {
                 })?;
             if let Some(error) = response.error.as_deref().filter(|e| !e.is_empty()) {
                 let login_required = error.contains("not logged in");
+                if login_required && !lease.created {
+                    // The borrowed tab lost its session; pick again next time.
+                    self.set_lease(None);
+                }
                 return Err(ApiError {
                     status: None,
                     message: format!("ChatGPT API {method} {path} failed in page: {error}"),

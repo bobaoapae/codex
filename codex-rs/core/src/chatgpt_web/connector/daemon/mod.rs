@@ -703,6 +703,14 @@ pub fn spawn_detached(codex_home: &Path, overrides: &[String]) -> anyhow::Result
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+        // FORK: `Stdio::null()` only replaces the child's *standard* handles.
+        // `CreateProcess` still copies every other inheritable handle, and when
+        // this CLI runs under a shell pipe (`codex chatgpt-web setup | tail`,
+        // an agent, CI) our own stdout/stderr pipe ends are inheritable — so
+        // the daemon kept the pipe open and the caller waited on EOF for as
+        // long as the daemon lived. Strip inheritance from our std handles
+        // before spawning; they are ours, the child never needs them.
+        detach_std_handles_from_inheritance();
     }
     #[cfg(not(windows))]
     {
@@ -711,6 +719,31 @@ pub fn spawn_detached(codex_home: &Path, overrides: &[String]) -> anyhow::Result
     }
     let child = command.spawn().context("spawning the chatgpt-web daemon")?;
     Ok(child.id())
+}
+
+/// FORK: marks this process's stdin/stdout/stderr handles non-inheritable so a
+/// detached child cannot hold a caller's pipe open (see `spawn_detached`).
+#[cfg(windows)]
+fn detach_std_handles_from_inheritance() {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE_FLAG_INHERIT;
+    use windows_sys::Win32::Foundation::SetHandleInformation;
+    let handles = [
+        std::io::stdin().as_raw_handle(),
+        std::io::stdout().as_raw_handle(),
+        std::io::stderr().as_raw_handle(),
+    ];
+    for handle in handles {
+        if handle.is_null() {
+            continue;
+        }
+        // Best effort: a console handle or an already non-inheritable handle
+        // fails or no-ops harmlessly.
+        // SAFETY: `handle` is a live standard handle owned by this process.
+        unsafe {
+            SetHandleInformation(handle as _, HANDLE_FLAG_INHERIT, 0);
+        }
+    }
 }
 
 /// Uses the running daemon or starts one, waiting until it answers.

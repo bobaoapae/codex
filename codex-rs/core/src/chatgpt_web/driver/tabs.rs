@@ -698,6 +698,31 @@ impl TabPool {
         F: FnOnce(TabId) -> Fut,
         Fut: Future<Output = DriverResult<T>>,
     {
+        self.activated(tab_id, /*reload*/ true, f).await
+    }
+
+    /// FORK: like [`Self::with_activated_on`] but WITHOUT the post-menu reload.
+    ///
+    /// The connector @mention leaves a pill in the composer that a reload
+    /// would wipe, so the activate-fallback of the mention path keeps the page
+    /// as `f` left it and only restores the user's focus.
+    pub(crate) async fn with_activated_on_keep<T, F, Fut>(
+        &self,
+        tab_id: TabId,
+        f: F,
+    ) -> DriverResult<T>
+    where
+        F: FnOnce(TabId) -> Fut,
+        Fut: Future<Output = DriverResult<T>>,
+    {
+        self.activated(tab_id, /*reload*/ false, f).await
+    }
+
+    async fn activated<T, F, Fut>(&self, tab_id: TabId, reload: bool, f: F) -> DriverResult<T>
+    where
+        F: FnOnce(TabId) -> Fut,
+        Fut: Future<Output = DriverResult<T>>,
+    {
         let inner = &self.inner;
         let _focus = inner
             .focus
@@ -720,14 +745,15 @@ impl TabPool {
         let result = f(tab_id).await;
         // Menus opened by synthetic events never unmount on their own; a reload
         // leaves the page pristine for the next operation.
-        if let Err(error) = inner
-            .daemon
-            .call(
-                "browser_navigate",
-                json!({"tabId": tab_id, "action": "reload", "timeoutMs": RELOAD_TIMEOUT_MS}),
-                RELOAD_TIMEOUT_MS,
-            )
-            .await
+        if reload
+            && let Err(error) = inner
+                .daemon
+                .call(
+                    "browser_navigate",
+                    json!({"tabId": tab_id, "action": "reload", "timeoutMs": RELOAD_TIMEOUT_MS}),
+                    RELOAD_TIMEOUT_MS,
+                )
+                .await
         {
             warn!("[chatgpt_web tab] post-menu reload failed: {error}");
         }
