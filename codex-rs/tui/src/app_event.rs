@@ -204,6 +204,13 @@ pub(crate) enum ThreadTitleDestination {
     RenameSuggestion { request_id: Uuid },
 }
 
+/// Identifies the policy that initiated a recap request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecapTrigger {
+    Automatic,
+    Manual,
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, IntoStaticStr)]
 pub(crate) enum AppEvent {
@@ -1324,6 +1331,38 @@ pub(crate) enum AppEvent {
     KeymapCleared {
         context: String,
         action: String,
+    },
+
+    /// Generate a recap for the displayed idle thread at the user's request.
+    GenerateRecap {
+        thread_id: ThreadId,
+    },
+
+    /// Recheck whether an unfocused thread is ready for an automatic recap.
+    CheckRecap {
+        thread_id: ThreadId,
+    },
+
+    /// Deliver the result of starting a recap's temporary thread.
+    RecapStarted {
+        thread_id: ThreadId,
+        request_id: Uuid,
+        trigger: RecapTrigger,
+        completed_turn_count: usize,
+        turn_revision: usize,
+        history: String,
+        result: Result<String, String>,
+    },
+
+    /// Deliver the generated recap from a temporary structured turn.
+    RecapGenerated {
+        thread_id: ThreadId,
+        request_id: Uuid,
+        trigger: RecapTrigger,
+        temporary_thread_id: ThreadId,
+        completed_turn_count: usize,
+        turn_revision: usize,
+        result: Result<String, String>,
     },
 }
 

@@ -530,6 +530,14 @@ impl App {
             &mut snapshot,
         )
         .await;
+        // Refreshing can merge restored turns into the store, so recap progress must be read only
+        // after the refresh while the activated thread channel is still retained.
+        let Some(channel) = self.thread_event_channels.get(&thread_id) else {
+            self.chat_widget
+                .add_error_message(format!("Agent thread {thread_id} is no longer available."));
+            return Ok(());
+        };
+        let recap_progress = channel.store.lock().await.recap_progress();
         if snapshot.input_state.is_none() {
             snapshot.input_state = self.agents_overview.input_states.remove(&thread_id);
         }
@@ -537,6 +545,17 @@ impl App {
 
         self.active_thread_id = Some(thread_id);
         self.active_thread_rx = Some(receiver);
+
+        self.recap.note_focus_gained();
+        self.recap = recap::RecapState::default();
+
+        if !tui.is_terminal_focused() {
+            self.recap.note_focus_lost(Instant::now());
+        }
+        let now = Instant::now();
+        self.recap.seed_from_progress(recap_progress, now);
+        self.recap
+            .schedule_check(thread_id, self.app_event_tx.clone(), now);
 
         let init = self.chatwidget_init_for_forked_or_resumed_thread(
             tui,

@@ -144,6 +144,17 @@ pub(crate) fn build_tool_router(
     add_core_tool_sources(&context, &mut registry);
 
     let hosted_specs = if crate::guardian::is_basic_session_source(&turn_context.session_source) {
+        if let Some(history_tools) = session
+            .services
+            .thread_extension_data
+            .get::<crate::codex_delegate::GuardianReadOnlyHistoryTools>()
+        {
+            append_extension_tool_executors(
+                turn_context,
+                history_tools.0.iter().cloned(),
+                &mut registry,
+            );
+        }
         Vec::new()
     } else {
         let registered_mcp_tools = session.services.mcp_handler_cache.append_mcp_tools(
@@ -309,7 +320,9 @@ pub(crate) fn append_source_tools(
     turn_context: &TurnContext,
     registry: &mut ToolRegistry,
     mcp_tools: Vec<RegisteredTool>,
-    extension_tool_executors: impl IntoIterator<Item = Arc<dyn ToolExecutor<ExtensionToolCall>>>,
+    extension_tool_executors: impl IntoIterator<
+        Item = Arc<dyn for<'call> ToolExecutor<ExtensionToolCall<'call>>>,
+    >,
     dynamic_tools: &[DynamicToolSpec],
 ) -> Vec<ToolSpec> {
     if crate::guardian::is_basic_session_source(&turn_context.session_source) {
@@ -329,7 +342,7 @@ pub(crate) fn append_source_tools(
 pub(crate) fn extension_tool_executors<'a>(
     session: &'a Session,
     step_store: &'a ExtensionData,
-) -> impl Iterator<Item = Arc<dyn ToolExecutor<ExtensionToolCall>>> + 'a {
+) -> impl Iterator<Item = Arc<dyn for<'call> ToolExecutor<ExtensionToolCall<'call>>>> + 'a {
     session
         .services
         .extensions
@@ -1320,7 +1333,7 @@ fn append_tool_search_executor(
 
 fn append_extension_tool_executors(
     turn_context: &TurnContext,
-    executors: impl IntoIterator<Item = Arc<dyn ToolExecutor<ExtensionToolCall>>>,
+    executors: impl IntoIterator<Item = Arc<dyn for<'call> ToolExecutor<ExtensionToolCall<'call>>>>,
     registry: &mut ToolRegistry,
 ) -> Option<ToolName> {
     let standalone_web_search_enabled = standalone_web_search_enabled(turn_context);
@@ -1393,7 +1406,10 @@ impl ToolExecutor<ToolInvocation> for MultiAgentV2NamespaceOverride {
         self.handler.search_info()
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         self.handler.handle(invocation)
     }
 }

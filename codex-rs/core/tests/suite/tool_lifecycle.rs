@@ -6,29 +6,75 @@ use std::sync::Mutex;
 use anyhow::Context;
 use anyhow::Result;
 use codex_core::config::Config;
+use codex_extension_api::ExtensionFuture;
 use codex_extension_api::ExtensionRegistryBuilder;
+use codex_extension_api::McpServerContribution;
+use codex_extension_api::McpServerContributionContext;
+use codex_extension_api::McpServerContributor;
+use codex_extension_api::McpToolSource;
 use codex_extension_api::ResponseItem;
 use codex_extension_api::ToolLifecycleContributor;
 use codex_extension_api::ToolLifecycleFuture;
 use codex_extension_api::ToolStartInput;
+use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_protocol::models::ContentItem;
+use codex_utils_path_uri::PathUri;
+use core_test_support::apps_test_server::AppsTestServer;
+use core_test_support::apps_test_server::SEARCH_CALENDAR_LIST_TOOL;
+use core_test_support::apps_test_server::SEARCH_CALENDAR_NAMESPACE;
+use core_test_support::apps_test_server::apps_enabled_builder;
+use core_test_support::apps_test_server::recorded_apps_tool_call_by_call_id;
 use core_test_support::hooks::trust_discovered_hooks;
 use core_test_support::responses;
 use core_test_support::skip_if_no_network;
 use core_test_support::skip_if_wine_exec;
 use core_test_support::test_codex::test_codex;
+use core_test_support::wait_for_mcp_server;
 use pretty_assertions::assert_eq;
+use serde_json::Value;
 use serde_json::json;
+use test_case::test_case;
 
 struct RecordedHistory {
     call_id: String,
     arguments: String,
     items: Vec<ResponseItem>,
+    mcp_tool: Option<(String, Option<String>, McpToolSource)>,
 }
 
 #[derive(Default)]
 struct ConversationHistoryRecorder {
     histories: Mutex<Vec<RecordedHistory>>,
+}
+
+#[derive(Clone, Copy)]
+enum AppsServerOwner {
+    Host,
+    Extension,
+}
+
+struct ExtensionOwnedAppsServer {
+    url: String,
+}
+
+impl McpServerContributor<Config> for ExtensionOwnedAppsServer {
+    fn id(&self) -> &'static str {
+        "extension_owned_apps_lifecycle_test"
+    }
+
+    fn contribute<'a>(
+        &'a self,
+        _context: McpServerContributionContext<'a, Config>,
+    ) -> ExtensionFuture<'a, Vec<McpServerContribution>> {
+        Box::pin(async move {
+            let config = serde_json::from_value(json!({ "url": self.url }))
+                .expect("test Apps MCP server config should be valid");
+            vec![McpServerContribution::Set {
+                name: CODEX_APPS_MCP_SERVER_NAME.to_string(),
+                config: Box::new(config),
+            }]
+        })
+    }
 }
 
 impl ToolLifecycleContributor for ConversationHistoryRecorder {
@@ -41,6 +87,13 @@ impl ToolLifecycleContributor for ConversationHistoryRecorder {
                     call_id: input.call_id.to_owned(),
                     arguments: input.payload.log_payload().into_owned(),
                     items: input.conversation_history.items().cloned().collect(),
+                    mcp_tool: input.mcp_tool.map(|tool| {
+                        (
+                            tool.tool_info().server_name.clone(),
+                            tool.tool_info().connector_id.clone(),
+                            tool.source().clone(),
+                        )
+                    }),
                 });
         })
     }
@@ -151,6 +204,148 @@ async fn tool_start_receives_conversation_history() -> Result<()> {
         item,
         ResponseItem::FunctionCall { call_id, .. } if call_id == second_call_id
     )));
+
+    Ok(())
+}
+
+#[test_case(AppsServerOwner::Host, McpToolSource::Connector; "host_owned_apps")]
+#[test_case(AppsServerOwner::Extension, McpToolSource::Other; "extension_owned_apps")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_start_receives_executed_mcp_call_for_connector(
+    owner: AppsServerOwner,
+    expected_source: McpToolSource,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let apps_server = AppsTestServer::mount(&server).await?;
+    let call_id = "calendar-lifecycle-call";
+    responses::mount_sse_sequence(
+        &server,
+        vec![
+            responses::sse(vec![
+                responses::ev_function_call_with_namespace(
+                    call_id,
+                    SEARCH_CALENDAR_NAMESPACE,
+                    SEARCH_CALENDAR_LIST_TOOL,
+                    "{}",
+                ),
+                responses::ev_completed("first-response"),
+            ]),
+            responses::sse(vec![
+                responses::ev_assistant_message("assistant-1", "done"),
+                responses::ev_completed("second-response"),
+            ]),
+        ],
+    )
+    .await;
+
+    let recorder = Arc::new(ConversationHistoryRecorder::default());
+    let mut extensions = ExtensionRegistryBuilder::<Config>::new();
+    extensions.tool_lifecycle_contributor(recorder.clone());
+    if matches!(owner, AppsServerOwner::Extension) {
+        extensions.mcp_server_contributor(Arc::new(ExtensionOwnedAppsServer {
+            url: format!("{}/api/codex/ps/mcp", apps_server.chatgpt_base_url),
+        }));
+    }
+    let test = apps_enabled_builder(apps_server.chatgpt_base_url)
+        .with_extensions(Arc::new(extensions.build()))
+        .build_with_auto_env(&server)
+        .await?;
+    wait_for_mcp_server(&test.codex, CODEX_APPS_MCP_SERVER_NAME).await?;
+
+    test.submit_text_turn("List my calendar events.").await?;
+
+    {
+        let histories = recorder
+            .histories
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let [history] = histories.as_slice() else {
+            panic!("expected one tool start, got {}", histories.len());
+        };
+        assert_eq!(history.call_id, call_id);
+        assert_eq!(
+            history.mcp_tool,
+            Some((
+                CODEX_APPS_MCP_SERVER_NAME.to_string(),
+                Some("calendar".to_string()),
+                expected_source,
+            )),
+        );
+    }
+
+    let executed_call = recorded_apps_tool_call_by_call_id(&server, call_id).await;
+    assert_eq!(
+        executed_call
+            .pointer("/params/name")
+            .and_then(Value::as_str),
+        Some("calendar_list_events")
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_start_receives_frozen_host_plugin_root() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    skip_if_wine_exec!(Ok(()), "requires a native test_stdio_server");
+
+    let server = responses::start_mock_server().await;
+    let codex_home = Arc::new(tempfile::tempdir()?);
+    let plugin_root = super::plugins::write_sample_plugin_manifest_and_config(codex_home.as_ref());
+    let server_config = json!({
+        "command": super::rmcp_client::remote_aware_stdio_server_bin()?,
+        "environment_id": super::rmcp_client::remote_aware_environment_id(),
+    });
+    fs::write(
+        plugin_root.join(".mcp.json"),
+        serde_json::to_vec(&json!({"mcpServers": {"sample": server_config}}))?,
+    )?;
+
+    let recorder = Arc::new(ConversationHistoryRecorder::default());
+    let mut extensions = ExtensionRegistryBuilder::<Config>::new();
+    extensions.tool_lifecycle_contributor(recorder.clone());
+    let test = test_codex()
+        .with_home(codex_home)
+        .with_extensions(Arc::new(extensions.build()))
+        .with_model_info_override("gpt-5.4", |model| model.supports_search_tool = false)
+        .build_with_auto_env(&server)
+        .await?;
+    wait_for_mcp_server(&test.codex, "sample").await?;
+    responses::mount_sse_sequence(
+        &server,
+        vec![
+            responses::sse(vec![
+                responses::ev_function_call_with_namespace(
+                    "plugin-lifecycle-call",
+                    "mcp__sample",
+                    "echo",
+                    r#"{"message":"ping"}"#,
+                ),
+                responses::ev_completed("first-response"),
+            ]),
+            responses::sse(vec![responses::ev_completed("second-response")]),
+        ],
+    )
+    .await;
+    test.submit_text_turn("Call the sample echo tool.").await?;
+
+    let histories = recorder
+        .histories
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let [history] = histories.as_slice() else {
+        panic!("expected one tool start, got {}", histories.len());
+    };
+    let expected_source = McpToolSource::Plugin {
+        id: "sample@test".to_string(),
+        root: PathUri::from_host_native_path(&plugin_root)?,
+    };
+    assert_eq!(
+        history.mcp_tool,
+        Some(("sample".to_string(), None, expected_source)),
+    );
 
     Ok(())
 }

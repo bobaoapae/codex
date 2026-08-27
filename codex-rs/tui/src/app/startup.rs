@@ -539,7 +539,11 @@ See the Codex keymap documentation for supported actions and examples."
             rate_limit_hard_stop_generation: 0,
             pending_plugin_enabled_writes: HashMap::new(),
             pending_hook_enabled_writes: HashMap::new(),
+            recap: recap::RecapState::default(),
         };
+        if !tui.is_terminal_focused() {
+            app.recap.note_focus_lost(Instant::now());
+        }
         if start_in_agents_overview {
             app.open_agents_overview(&app_server);
         }
@@ -607,6 +611,7 @@ See the Codex keymap documentation for supported actions and examples."
                     env_map,
                     logs_base_dir,
                     startup_permission_profile,
+                    app.session_telemetry.clone(),
                     tx,
                     /*startup_scan*/ true,
                 );

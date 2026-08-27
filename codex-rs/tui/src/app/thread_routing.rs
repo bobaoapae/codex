@@ -77,11 +77,13 @@ impl App {
             return;
         };
         let input_state = self.chat_widget.capture_thread_input_state();
+        let recap_progress = self.recap.progress();
         if let Some(channel) = self.thread_event_channels.get_mut(&active_id) {
             let receiver = self.active_thread_rx.take();
             let mut store = channel.store.lock().await;
             store.active = false;
             store.input_state = input_state;
+            store.merge_recap_progress(recap_progress);
             if let Some(receiver) = receiver {
                 channel.receiver = Some(receiver);
             }
@@ -218,6 +220,7 @@ impl App {
                 let proposed_network_policy_amendments =
                     params.proposed_network_policy_amendments.clone();
                 let approval = ExecApprovalRequest {
+                    kind: params.kind,
                     thread_id,
                     thread_label,
                     id: params
@@ -959,6 +962,16 @@ impl App {
         if self.abandoned_side_threads.contains(&thread_id) {
             return Ok(());
         }
+        if self.current_displayed_thread_id() == Some(thread_id)
+            && let ServerNotification::TurnCompleted(notification) = &notification
+        {
+            let now = Instant::now();
+            let app_event_tx = self.app_event_tx.clone();
+
+            self.recap
+                .note_turn_finished(&notification.turn.status, now);
+            self.recap.schedule_check(thread_id, app_event_tx, now);
+        }
         let misalignment_policy_violation =
             match &notification {
                 ServerNotification::Error(notification) if !notification.will_retry => {
@@ -1286,6 +1299,9 @@ impl App {
         self.config.approvals_reviewer = session.approvals_reviewer;
 
         let thread_id = session.thread_id;
+        if self.primary_thread_id != Some(thread_id) {
+            self.recap.reset_for_new_thread(Instant::now());
+        }
         self.primary_thread_id = Some(thread_id);
         self.primary_session_configured = Some(session.clone());
         self.upsert_agent_picker_thread(
@@ -1316,6 +1332,12 @@ impl App {
             self.app_event_tx
                 .send(AppEvent::BeginInitialHistoryReplayBuffer);
         }
+        let now = Instant::now();
+        let app_event_tx = self.app_event_tx.clone();
+
+        self.recap.seed_from_turns(&turns, now);
+        self.recap.schedule_check(thread_id, app_event_tx, now);
+
         self.chat_widget
             .replay_thread_turns(turns, ReplayKind::ResumeInitialMessages);
         if should_buffer_initial_replay {

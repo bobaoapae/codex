@@ -141,6 +141,7 @@ use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::ConversationAudioParams;
 use codex_protocol::protocol::CreditsSnapshot;
 use codex_protocol::protocol::GranularApprovalConfig;
+use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::NetworkApprovalProtocol;
@@ -169,6 +170,7 @@ use core_test_support::PathExt;
 use core_test_support::context_snapshot;
 use core_test_support::context_snapshot::ContextSnapshotOptions;
 use core_test_support::context_snapshot::ContextSnapshotRenderMode;
+use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_once;
@@ -238,6 +240,11 @@ impl StepContext {
         });
         settings.service_tier = turn.config.service_tier.clone();
         Arc::new(Self {
+            token_budget: token_budget::resolve_token_budget(
+                turn.configured_token_budget.as_ref(),
+                turn.use_model_token_budget_defaults,
+                settings.model_info.as_ref(),
+            ),
             settings: Arc::new(settings),
             session_telemetry: turn.session_telemetry.clone(),
             turn: Arc::clone(&turn),
@@ -1431,8 +1438,6 @@ async fn danger_full_access_tool_attempts_do_not_enforce_managed_network() -> an
                 .primary()
                 .expect("turn should have a primary environment"),
             &tool_ctx,
-            turn.as_ref(),
-            AskForApproval::Never,
         )
         .await
         .expect("probe runtime should succeed");
@@ -4725,9 +4730,14 @@ fn falls_back_to_content_when_structured_is_null() {
 
     let got = ctr.into_function_call_output_payload();
     let expected = FunctionCallOutputPayload {
-        body: FunctionCallOutputBody::Text(
-            serde_json::to_string(&vec![text_block("hello"), text_block("world")]).unwrap(),
-        ),
+        body: FunctionCallOutputBody::ContentItems(vec![
+            FunctionCallOutputContentItem::InputText {
+                text: "hello".to_string(),
+            },
+            FunctionCallOutputContentItem::InputText {
+                text: "world".to_string(),
+            },
+        ]),
         success: Some(true),
     };
 
@@ -4765,9 +4775,11 @@ fn success_flag_true_with_no_error_and_content_used() {
 
     let got = ctr.into_function_call_output_payload();
     let expected = FunctionCallOutputPayload {
-        body: FunctionCallOutputBody::Text(
-            serde_json::to_string(&vec![text_block("alpha")]).unwrap(),
-        ),
+        body: FunctionCallOutputBody::ContentItems(vec![
+            FunctionCallOutputContentItem::InputText {
+                text: "alpha".to_string(),
+            },
+        ]),
         success: Some(true),
     };
 
@@ -5144,6 +5156,8 @@ pub(crate) async fn make_session_configuration_for_tests() -> SessionConfigurati
 
 #[tokio::test]
 async fn emit_subagent_session_started_includes_fork_lineage_and_originator() {
+    use codex_app_server_protocol::ServerNotification;
+    use codex_app_server_protocol::ThreadArchivedNotification;
     use wiremock::Mock;
     use wiremock::MockServer;
     use wiremock::ResponseTemplate;
@@ -5218,6 +5232,59 @@ async fn emit_subagent_session_started_includes_fork_lineage_and_originator() {
     assert_eq!(
         event["event_params"]["app_server_client"]["product_client_id"],
         "test_originator"
+    );
+
+    let prewarmed_thread_id = ThreadId::new();
+    emit_subagent_session_started(
+        &analytics_events_client,
+        AppServerClientMetadata {
+            client_name: None,
+            client_version: None,
+        },
+        SessionId::from(parent_thread_id),
+        prewarmed_thread_id,
+        Some(parent_thread_id),
+        session_configuration.thread_config_snapshot(Vec::new()),
+        SubAgentSource::Other(crate::guardian::GUARDIAN_REVIEWER_NAME.to_string()),
+    );
+    // Archive analytics exposes retained lineage even before a parent connection exists.
+    analytics_events_client.track_notification(&ServerNotification::ThreadArchived(
+        ThreadArchivedNotification {
+            thread_id: prewarmed_thread_id.to_string(),
+        },
+    ));
+    analytics_events_client.flush().await;
+    let events = server
+        .received_requests()
+        .await
+        .expect("analytics requests")
+        .into_iter()
+        .flat_map(|request| {
+            let payload: serde_json::Value =
+                serde_json::from_slice(&request.body).expect("valid analytics payload");
+            payload["events"]
+                .as_array()
+                .expect("analytics events")
+                .clone()
+        })
+        .collect::<Vec<_>>();
+    let [initialization, archive] = events.as_slice() else {
+        panic!("expected one complete initialization and one archive: {events:?}");
+    };
+    assert_eq!(initialization, &event);
+    assert_eq!(
+        json!([
+            archive["event_type"],
+            archive["event_params"]["thread_id"],
+            archive["event_params"]["thread_source"],
+            archive["event_params"]["parent_thread_id"],
+        ]),
+        json!([
+            "codex_thread_archive_event",
+            prewarmed_thread_id.to_string(),
+            "guardian_review",
+            parent_thread_id.to_string(),
+        ])
     );
 }
 
@@ -6274,10 +6341,11 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
             /*attestation_provider*/ None,
             config.http_client_factory(),
         ),
-        executed_tool_calls,
+        executed_tool_calls: executed_tool_calls.clone(),
         code_mode_service: crate::tools::code_mode::CodeModeService::new(
             Arc::new(codex_code_mode::DisabledCodeModeSessionProvider),
             &config.code_mode,
+            executed_tool_calls,
         ),
         tool_search_handler_cache: Default::default(),
         turn_environments: Arc::clone(&turn_environments),
@@ -6308,6 +6376,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         services,
         git_enrichment_policy: GitEnrichmentPolicy::Fresh,
         fork_persistence: ForkPersistence::Copied,
+        forked_from_ordinal_exclusive: None,
         next_internal_sub_id: AtomicU64::new(0),
         is_subagent: false,
         last_plan: std::sync::Mutex::new(None),
@@ -6707,6 +6776,52 @@ async fn resumed_subagent_session_restores_persisted_session_id() {
 }
 
 #[tokio::test]
+async fn resumed_copied_fork_ignores_source_history_base() {
+    let ancestor_thread_id = ThreadId::new();
+    let parent_thread_id = ThreadId::new();
+    let thread_id = ThreadId::new();
+    let history = vec![
+        RolloutItem::SessionMeta(SessionMetaLine {
+            meta: SessionMeta {
+                id: thread_id,
+                session_id: SessionId::from(thread_id),
+                forked_from_id: Some(parent_thread_id),
+                ..SessionMeta::default()
+            },
+            git: None,
+        }),
+        RolloutItem::SessionMeta(SessionMetaLine {
+            meta: SessionMeta {
+                id: parent_thread_id,
+                session_id: SessionId::from(parent_thread_id),
+                forked_from_id: Some(ancestor_thread_id),
+                history_base: Some(HistoryPosition {
+                    thread_id: ancestor_thread_id,
+                    end_ordinal_exclusive: 42,
+                    end_byte_offset: 100,
+                }),
+                ..SessionMeta::default()
+            },
+            git: None,
+        }),
+    ];
+    let (session, _rx_event) = make_session_with_history_source_and_agent_control_and_rx(
+        InitialHistory::Resumed(ResumedHistory {
+            conversation_id: thread_id,
+            history: Arc::new(history),
+            rollout_path: None,
+        }),
+        SessionSource::Exec,
+        AgentControl::default(),
+    )
+    .await
+    .expect("resume should succeed");
+
+    assert_eq!(session.thread_id(), thread_id);
+    assert_eq!(session.forked_from_ordinal_exclusive, None);
+}
+
+#[tokio::test]
 async fn notify_request_permissions_response_ignores_unmatched_call_id() {
     let (session, _turn_context) = make_session_and_context().await;
     *session.active_turn.lock().await = Some(ActiveTurn::default());
@@ -6944,7 +7059,7 @@ async fn request_permissions_emits_event_when_granular_policy_allows_requests() 
                 .selection();
             session
                 .request_permissions_for_environment(
-                    turn_context.as_ref(),
+                    &StepContext::for_test(Arc::clone(turn_context.as_ref())),
                     call_id,
                     codex_protocol::request_permissions::RequestPermissionsArgs {
                         environment_id: None,
@@ -7198,7 +7313,7 @@ async fn request_permissions_response_materializes_session_cwd_grants_before_rec
                 .selection();
             session
                 .request_permissions_for_environment(
-                    turn_context.as_ref(),
+                    &StepContext::for_test(Arc::clone(turn_context.as_ref())),
                     call_id,
                     codex_protocol::request_permissions::RequestPermissionsArgs {
                         environment_id: None,
@@ -7290,7 +7405,7 @@ async fn request_permissions_is_auto_denied_when_granular_policy_blocks_tool_req
         .selection();
     let response = session
         .request_permissions_for_environment(
-            turn_context.as_ref(),
+            &StepContext::for_test(Arc::clone(turn_context.as_ref())),
             call_id,
             codex_protocol::request_permissions::RequestPermissionsArgs {
                 environment_id: None,
@@ -8277,7 +8392,7 @@ async fn shutdown_and_wait_shuts_down_tracked_ephemeral_guardian_review() {
         .expect("ephemeral guardian review should receive a shutdown op");
 }
 
-async fn make_session_and_context_with_auth_and_config_and_rx<F>(
+pub(crate) async fn make_session_and_context_with_auth_and_config_and_rx<F>(
     auth: CodexAuth,
     dynamic_tools: Vec<DynamicToolSpec>,
     configure_config: F,
@@ -8508,10 +8623,11 @@ where
             /*attestation_provider*/ None,
             config.http_client_factory(),
         ),
-        executed_tool_calls,
+        executed_tool_calls: executed_tool_calls.clone(),
         code_mode_service: crate::tools::code_mode::CodeModeService::new(
             Arc::new(codex_code_mode::DisabledCodeModeSessionProvider),
             &config.code_mode,
+            executed_tool_calls,
         ),
         tool_search_handler_cache: Default::default(),
         turn_environments: Arc::clone(&turn_environments),
@@ -8542,6 +8658,7 @@ where
         services,
         git_enrichment_policy: GitEnrichmentPolicy::Fresh,
         fork_persistence: ForkPersistence::Copied,
+        forked_from_ordinal_exclusive: None,
         next_internal_sub_id: AtomicU64::new(0),
         is_subagent: false,
         last_plan: std::sync::Mutex::new(None),
@@ -8783,7 +8900,33 @@ async fn refreshed_mcp_binding_captures_current_approval_authority() {
 
 #[tokio::test]
 async fn mcp_elicitation_reviewer_uses_latest_runtime_authority() {
-    let (session, old_turn, rx) = make_session_and_context_with_rx().await;
+    let guardian_server = start_mock_server().await;
+    mount_sse_once(
+        &guardian_server,
+        sse(vec![
+            ev_response_created("guardian-review"),
+            ev_assistant_message("guardian-review", r#"{"outcome":"allow"}"#),
+            ev_completed("guardian-review"),
+        ]),
+    )
+    .await;
+    let (session, old_turn, rx) = make_session_and_context_with_auth_and_config_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        |config| {
+            config.model_provider.base_url = Some(format!("{}/v1", guardian_server.uri()));
+            config
+                .mcp_servers
+                .set(
+                    serde_json::from_value(json!({
+                        "browser-use": { "command": "missing-test-mcp-server" }
+                    }))
+                    .expect("test MCP server configuration should deserialize"),
+                )
+                .expect("test MCP server should be configurable");
+        },
+    )
+    .await;
     assert_eq!(old_turn.config.approvals_reviewer, ApprovalsReviewer::User);
     session
         .spawn_task(
@@ -8876,13 +9019,46 @@ async fn mcp_elicitation_reviewer_uses_latest_runtime_authority() {
     assert_eq!(
         session
             .mcp_elicitation_reviewer()
-            .review(request)
+            .review(request.clone())
             .await
             .expect("elicitation review should succeed"),
         Some(ElicitationResponse {
             action: ElicitationAction::Accept,
             content: Some(json!({})),
             meta: None,
+        })
+    );
+
+    let selection = session
+        .services
+        .turn_environments
+        .selections()
+        .into_iter()
+        .next()
+        .expect("session should select its executor environment");
+    let mut owner_config = old_turn
+        .environments
+        .primary()
+        .expect("ready environment")
+        .config()
+        .clone();
+    owner_config.permission_profile =
+        PermissionProfileSnapshot::legacy(PermissionProfile::read_only());
+    session
+        .environment_ready(&selection, owner_config)
+        .await
+        .expect("attachment owner should install its restricted permissions");
+    session.refresh_mcp_if_dirty().await;
+    assert_eq!(
+        session
+            .mcp_elicitation_reviewer()
+            .review(request)
+            .await
+            .expect("elicitation review should succeed"),
+        Some(ElicitationResponse {
+            action: ElicitationAction::Decline,
+            content: None,
+            meta: Some(json!({ "approvals_reviewer": "auto_review" })),
         })
     );
 
@@ -9375,6 +9551,7 @@ async fn record_context_updates_use_environment_permission_profile_and_workspace
     let cwd = environment.cwd().clone();
     let workspace_root = current_context.config.cwd.join("selected-workspace");
     let mut environment_config = environment.config().clone();
+    environment_config.workspace_roots = vec![PathUri::from_abs_path(&workspace_root)];
     environment_config.permission_profile =
         PermissionProfileSnapshot::legacy(PermissionProfile::workspace_write());
     current_context.environments.environments[0] =

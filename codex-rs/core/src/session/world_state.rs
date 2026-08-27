@@ -17,6 +17,7 @@ use crate::context::world_state::ModelInstructionsState;
 use crate::context::world_state::MultiAgentModeState;
 use crate::context::world_state::MultiAgentUsageHintState;
 use crate::context::world_state::PermissionsState;
+use crate::context::world_state::PersistentModeState;
 use crate::context::world_state::PersonalityState;
 use crate::context::world_state::PluginsInstructionsState;
 use crate::context::world_state::RealtimeState;
@@ -104,9 +105,13 @@ impl Session {
                 personality_is_baked,
             ));
         }
-        if turn_context.config.features.enabled(Feature::TokenBudget)
-            && turn_context.model_context_window().is_some()
-        {
+        let token_budget_enabled = turn_context.config.features.enabled(Feature::TokenBudget)
+            && step_context
+                .settings
+                .model_info
+                .resolved_context_window()
+                .is_some();
+        if token_budget_enabled {
             let window_ids = self.state.lock().await.auto_compact_window_ids();
             world_state.add_section(TokenBudgetContext::new(
                 turn_context
@@ -118,16 +123,13 @@ impl Session {
                 window_ids.window_id,
                 /*thread_hint*/ None,
             ));
-            if let Some(guidance) = turn_context
-                .config
-                .token_budget
-                .as_ref()
-                .and_then(|config| config.guidance_message.as_deref())
-                .filter(|message| !message.trim().is_empty())
-            {
-                world_state.add_section(ContextWindowGuidanceState::new(guidance));
-            }
         }
+        let guidance = step_context
+            .token_budget
+            .as_ref()
+            .and_then(|config| config.guidance_message.as_deref())
+            .filter(|_| token_budget_enabled);
+        world_state.add_section(ContextWindowGuidanceState::new(guidance));
         let realtime_mode_instructions = self.conversation.mode_instructions().await;
         world_state.add_section(RealtimeState::new(
             turn_context.realtime_active,
@@ -187,6 +189,26 @@ impl Session {
                     .model_messages
                     .as_ref()
                     .and_then(|messages| messages.collaboration_modes.as_ref()),
+            ));
+        }
+        if !crate::guardian::is_basic_session_source(&turn_context.session_source) {
+            let send_user_message_async_available =
+                !turn_context.session_source.is_non_root_agent()
+                    && step_context
+                        .settings
+                        .model_info
+                        .experimental_supported_tools
+                        .iter()
+                        .any(|tool| tool == "send_user_message_async");
+            world_state.add_section(PersistentModeState::new(
+                step_context.settings.effective_reasoning_effort().as_ref(),
+                step_context
+                    .settings
+                    .model_info
+                    .model_messages
+                    .as_ref()
+                    .and_then(|messages| messages.persistent_instructions.as_deref()),
+                send_user_message_async_available,
             ));
         }
         if turn_context.config.include_environment_context {

@@ -41,6 +41,7 @@ use crate::image_preparation::unified_image_budget_enabled;
 use crate::parse_turn_item;
 use crate::realtime_conversation::RealtimeConversationManager;
 use crate::session::step_context::StepContext;
+use crate::session::step_settings::ResolvedStepSettings;
 use crate::session::step_settings::StepSettings;
 use crate::session::turn_context::TurnEnvironment;
 use crate::session_prefix::format_inter_agent_completion_message;
@@ -1773,7 +1774,7 @@ impl Session {
             .clone()
     }
 
-    pub(crate) async fn user_instructions(&self) -> Option<codex_extension_api::UserInstructions> {
+    pub(crate) async fn user_instructions(&self) -> Option<codex_extension_api::Instructions> {
         self.services.agents_md_manager.user_instructions()
     }
 
@@ -1992,6 +1993,24 @@ impl Session {
             id: turn_context.sub_id.clone(),
             msg,
         };
+        // Private reviewers have no app-server listener; publicly resumed Guardian threads do.
+        if matches!(
+            &turn_context.session_source,
+            SessionSource::SubAgent(SubAgentSource::Other(name))
+                if name == crate::guardian::GUARDIAN_REVIEWER_NAME
+        ) && self.services.analytics_events_client.is_enabled()
+            && turn_context.parent_thread_id.is_some()
+            && self
+                .state
+                .lock()
+                .await
+                .session_configuration
+                .trusted_guardian_reviewer
+        {
+            self.services
+                .analytics_events_client
+                .track_guardian_session_event(self.thread_id, &event);
+        }
         self.send_event_raw(event).await;
         self.maybe_notify_parent_of_terminal_turn(turn_context, &legacy_source)
             .await;
@@ -2507,11 +2526,12 @@ impl Session {
     pub async fn request_command_approval(
         &self,
         turn_context: &TurnContext,
+        kind: ExecApprovalKind,
         call_id: String,
         approval_id: Option<String>,
         environment_id: Option<String>,
         command: Vec<String>,
-        cwd: AbsolutePathBuf,
+        cwd: PathUri,
         reason: Option<String>,
         network_approval_context: Option<NetworkApprovalContext>,
         proposed_execpolicy_amendment: Option<ExecPolicyAmendment>,
@@ -2521,7 +2541,7 @@ impl Session {
     ) -> ReviewDecision {
         let _elicitation = self.services.elicitations.register();
         //  command-level approvals use `call_id`.
-        // `approval_id` is only present for subcommand callbacks (execve intercept)
+        // `approval_id` identifies subcommand callbacks and stdin writes.
         let effective_approval_id = approval_id.clone().unwrap_or_else(|| call_id.clone());
         // Add the tx_approve callback to the map before sending the request.
         let (tx_approve, rx_approve) = oneshot::channel();
@@ -2560,14 +2580,17 @@ impl Session {
                 additional_permissions.as_ref(),
             )
         });
-        let plugin_attribution = plugin_attribution_override
-            .or_else(|| turn_context.plugin_attribution_for_command(&command, &cwd));
+        let plugin_attribution = plugin_attribution_override.or_else(|| {
+            cwd.to_abs_path()
+                .ok()
+                .and_then(|cwd| turn_context.plugin_attribution_for_command(&command, &cwd))
+        });
         let (plugin_id, script_path) = plugin_attribution
             .as_ref()
             .map(PluginCommandAttribution::serialized_fields)
             .unzip();
         let event = EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
-            kind: ExecApprovalKind::Command,
+            kind,
             call_id,
             plugin_id,
             script_path,
@@ -2576,7 +2599,7 @@ impl Session {
             environment_id,
             started_at_ms: now_unix_timestamp_ms(),
             command,
-            cwd,
+            cwd: cwd.into(),
             reason,
             network_approval_context,
             proposed_execpolicy_amendment,
@@ -2637,15 +2660,16 @@ impl Session {
     )]
     pub(crate) async fn request_permissions_for_environment(
         self: &Arc<Self>,
-        review_context: impl Into<crate::guardian::GuardianReviewContext>,
+        step_context: &Arc<StepContext>,
         call_id: String,
         args: RequestPermissionsArgs,
         environment: TurnEnvironmentSelection,
         cancellation_token: CancellationToken,
     ) -> Option<RequestPermissionsResponse> {
-        let review_context = review_context.into();
-        let turn_context = review_context.turn();
-        match turn_context.as_ref().approval_policy() {
+        let turn_context = &step_context.turn;
+        let approval_policy = step_context.settings.approval_policy();
+        let approvals_reviewer = step_context.settings.approvals_reviewer();
+        match approval_policy {
             AskForApproval::Never => {
                 return Some(RequestPermissionsResponse {
                     permissions: RequestPermissionProfile::default(),
@@ -2681,7 +2705,8 @@ impl Session {
             });
         };
 
-        if crate::guardian::routes_approval_to_guardian(turn_context.as_ref()) {
+        if crate::guardian::routes_approval_policy_to_guardian(approval_policy, approvals_reviewer)
+        {
             let originating_turn_state = {
                 let active = self.active_turn.lock().await;
                 active.as_ref().map(|active| Arc::clone(&active.turn_state))
@@ -2693,7 +2718,7 @@ impl Session {
                 permissions: requested_permissions.clone(),
             };
             let approval_context = ApprovalContext {
-                review_context: review_context.clone(),
+                review_context: crate::guardian::GuardianReviewContext::from(step_context),
                 cancellation_token: Some(cancellation_token.clone()),
                 call_id,
                 tool_name: ToolName::plain("request_permissions"),
@@ -3015,12 +3040,14 @@ impl Session {
     )]
     pub(crate) async fn active_turn_context_and_strict_auto_review(
         &self,
-    ) -> Option<(Arc<TurnContext>, bool)> {
+    ) -> Option<(Arc<TurnContext>, Arc<ResolvedStepSettings>, bool)> {
         let active = self.active_turn.lock().await;
         let active = active.as_ref()?;
-        let turn_context = Arc::clone(&active.task.as_ref()?.turn_context);
+        let task = active.task.as_ref()?;
+        let turn_context = Arc::clone(&task.turn_context);
+        let step_settings = turn_context.current_settings.load_full();
         let ts = active.turn_state.lock().await;
-        Some((turn_context, ts.strict_auto_review_enabled()))
+        Some((turn_context, step_settings, ts.strict_auto_review_enabled()))
     }
 
     pub(crate) async fn granted_session_permissions(
@@ -3325,6 +3352,11 @@ impl Session {
         // Capture once before asynchronous planning; all request consumers
         // retain this immutable settings version even if the turn is updated.
         let settings = turn_context.current_settings.load_full();
+        let token_budget = token_budget::resolve_token_budget(
+            turn_context.configured_token_budget.as_ref(),
+            turn_context.use_model_token_budget_defaults,
+            settings.model_info.as_ref(),
+        );
         let session_telemetry = settings.telemetry(&turn_context.session_telemetry);
         // Keep selections fixed for the turn while allowing their startup work to finish.
         let environments = turn_context.environments.refresh_readiness();
@@ -3408,6 +3440,7 @@ impl Session {
         .await??;
         Ok(Arc::new(StepContext {
             settings,
+            token_budget,
             session_telemetry,
             turn: turn_context,
             environments,
@@ -3912,12 +3945,16 @@ impl Session {
         self.current_window().await.0
     }
 
-    pub(crate) async fn current_window(&self) -> (String, Uuid) {
+    pub(crate) async fn current_window(&self) -> (String, u64, Uuid) {
         let state = self.state.lock().await;
         let thread_id = self.thread_id;
         let window_number = state.auto_compact_window_number();
         let context_window_id = state.auto_compact_window_ids().window_id;
-        (format!("{thread_id}:{window_number}"), context_window_id)
+        (
+            format!("{thread_id}:{window_number}"),
+            window_number,
+            context_window_id,
+        )
     }
 
     pub(crate) async fn advance_auto_compact_window(&self) -> (u64, AutoCompactWindowIds) {
@@ -4349,10 +4386,12 @@ pub(crate) fn emit_subagent_session_started(
         client_name,
         client_version,
     } = client_metadata;
-    let (Some(client_name), Some(client_version)) = (client_name, client_version) else {
+    if (client_name.is_none() || client_version.is_none())
+        && subagent_source.kind() != crate::guardian::GUARDIAN_REVIEWER_NAME
+    {
         tracing::warn!("skipping subagent thread analytics: missing inherited client metadata");
         return;
-    };
+    }
     let created_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

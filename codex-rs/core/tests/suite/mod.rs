@@ -63,6 +63,7 @@ mod context_annotations;
 mod current_time_reminder;
 mod cyber_access_program;
 mod cyber_exec_policy;
+mod daybreak_access;
 mod deprecation_notice;
 mod exec;
 mod exec_policy;
@@ -170,6 +171,7 @@ mod turn_input_submission;
 mod turn_state;
 mod unified_exec;
 mod unified_exec_process_events;
+mod unified_exec_stdin_review_size;
 #[cfg(unix)]
 mod unified_exec_zsh_fork_approvals;
 mod unstable_features_warning;

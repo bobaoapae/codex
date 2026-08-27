@@ -30,6 +30,7 @@ use crate::original_image_detail::sanitize_original_image_detail as sanitize_ima
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
+use crate::tools::ExecutedToolCallRecorder;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::context::ToolPayload;
@@ -80,8 +81,9 @@ impl CodeModeService {
     pub(crate) fn new(
         session_provider: Arc<dyn CodeModeSessionProvider>,
         config: &CodeModeConfig,
+        executed_tool_calls: Option<Arc<ExecutedToolCallRecorder>>,
     ) -> Self {
-        let dispatch_broker = Arc::new(CodeModeDispatchBroker::new());
+        let dispatch_broker = Arc::new(CodeModeDispatchBroker::new(executed_tool_calls));
         let availability = session_provider.availability();
         Self {
             session: OnceCell::new(),
@@ -176,8 +178,20 @@ impl CodeModeService {
         }
     }
 
-    pub(crate) fn mark_cell_ready_for_dispatch(&self, cell_id: &codex_code_mode::CellId) {
-        self.dispatch_broker.mark_cell_ready_for_dispatch(cell_id);
+    pub(crate) fn mark_cell_ready_for_dispatch(
+        &self,
+        cell_id: &codex_code_mode::CellId,
+        originating_item_id: Option<codex_protocol::ResponseItemId>,
+    ) {
+        self.dispatch_broker
+            .mark_cell_ready_for_dispatch(cell_id, originating_item_id);
+    }
+
+    pub(crate) fn cell_originating_item_id(
+        &self,
+        cell_id: &codex_code_mode::CellId,
+    ) -> Option<codex_protocol::ResponseItemId> {
+        self.dispatch_broker.cell_originating_item_id(cell_id)
     }
 
     pub(crate) fn finish_cell_dispatch(&self, cell_id: &CellId) {
@@ -329,12 +343,16 @@ fn truncate_code_mode_result(
     truncate_function_output_items_with_policy(&items, policy, estimate_audio_token_count)
 }
 
-async fn call_nested_tool(
+// Submit synchronously so the recorder sees the call before the cell's dispatch gate closes.
+fn submit_nested_tool(
     exec: ExecContext,
     tool_runtime: ToolCallRuntime,
     invocation: CodeModeNestedToolCall,
     cancellation_token: CancellationToken,
-) -> Result<JsonValue, FunctionCallError> {
+) -> Result<
+    impl std::future::Future<Output = Result<JsonValue, FunctionCallError>> + Send + 'static,
+    FunctionCallError,
+> {
     let CodeModeNestedToolCall {
         cell_id,
         runtime_tool_call_id,
@@ -368,17 +386,15 @@ async fn call_nested_tool(
             call_id: call.call_id.clone(),
             cell_id: cell_id.to_string(),
         });
-    let result = tool_runtime
-        .handle_tool_call_with_source(
-            call,
-            ToolCallSource::CodeMode {
-                cell_id: cell_id.to_string(),
-                runtime_tool_call_id,
-            },
-            cancellation_token,
-        )
-        .await?;
-    Ok(result.code_mode_result())
+    let result = tool_runtime.handle_tool_call_with_source(
+        call,
+        ToolCallSource::CodeMode {
+            cell_id: cell_id.to_string(),
+            runtime_tool_call_id,
+        },
+        cancellation_token,
+    );
+    Ok(async move { Ok(result.await?.code_mode_result()) })
 }
 
 fn build_nested_tool_payload(

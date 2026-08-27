@@ -953,7 +953,7 @@ async fn spawn_internal_session_preserves_parent_lineage_without_forking_history
         }
     }
 
-    struct ParentInstructionsProvider(codex_extension_api::UserInstructions);
+    struct ParentInstructionsProvider(codex_extension_api::Instructions);
 
     impl codex_extension_api::UserInstructionsProvider for ParentInstructionsProvider {
         fn load_user_instructions(&self) -> codex_extension_api::LoadUserInstructionsFuture<'_> {
@@ -999,7 +999,7 @@ async fn spawn_internal_session_preserves_parent_lineage_without_forking_history
     )
     .expect("managed requirements stack");
 
-    let parent_instructions = codex_extension_api::UserInstructions {
+    let parent_instructions = codex_extension_api::Instructions {
         text: "parent user instructions must not be inherited".to_string(),
         source: config.codex_home.join("AGENTS.md"),
     };
@@ -1062,6 +1062,7 @@ async fn spawn_internal_session_preserves_parent_lineage_without_forking_history
     reviewer_environment.config =
         EnvironmentConfigState::Ready(codex_protocol::protocol::EnvironmentConfig {
             allow_login_shell: true,
+            workspace_roots: reviewer_environment.workspace_roots.clone(),
             permission_profile: config.permissions.permission_profile_state().snapshot(),
             shell_environment_policy: Default::default(),
             windows_sandbox_level: WindowsSandboxLevel::from_config(&config),

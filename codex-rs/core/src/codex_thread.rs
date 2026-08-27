@@ -205,6 +205,7 @@ impl GuardianAuthorizationVersion {
 pub struct GuardianRootSnapshot {
     pub authorization_version: GuardianAuthorizationVersion,
     pub messages: Vec<GuardianRootMessage>,
+    pub trusted_skill_paths: Vec<String>,
 }
 
 pub struct CodexThread {
@@ -341,8 +342,8 @@ impl CodexThread {
     /// Submits turn input without requiring the caller to inspect thread state.
     ///
     /// The result describes whether Core started a turn, steered an active
-    /// turn, or declined it without recording or enqueueing the input. Only
-    /// user input is accepted.
+    /// turn, or declined it without recording or enqueueing the input.
+    /// User input and named standalone function-call outputs are accepted.
     pub async fn start_or_steer_turn(
         &self,
         request: TurnInputRequest,

@@ -37,8 +37,8 @@ use tokio::task::JoinHandle;
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
 
-type RecordedRequests = Arc<Mutex<Vec<JSONRPCRequest>>>;
-type RecordingAppServer = (AppServerSession, RecordedRequests, JoinHandle<Result<()>>);
+pub(super) type RecordedRequests = Arc<Mutex<Vec<JSONRPCRequest>>>;
+pub(super) type RecordingAppServer = (AppServerSession, RecordedRequests, JoinHandle<Result<()>>);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HistoryCapabilities {
@@ -75,6 +75,20 @@ pub(super) async fn start_recording_app_server(
         HistoryCapabilities::Current,
         blocked_thread_list,
         failed_thread_name,
+        crate::app_server_session::ThreadParamsMode::Embedded,
+    )
+    .await
+}
+
+pub(super) async fn start_recording_remote_app_server(
+    config: &Config,
+) -> Result<RecordingAppServer> {
+    start_recording_app_server_with_history(
+        config,
+        HistoryCapabilities::Current,
+        /*blocked_thread_list*/ None,
+        /*failed_thread_name*/ None,
+        crate::app_server_session::ThreadParamsMode::Remote,
     )
     .await
 }
@@ -85,6 +99,7 @@ async fn start_recording_app_server_with_history(
     history_capabilities: HistoryCapabilities,
     mut blocked_thread_list: Option<(ThreadId, oneshot::Sender<()>, oneshot::Receiver<()>)>,
     failed_thread_name: Option<&'static str>,
+    thread_params_mode: crate::app_server_session::ThreadParamsMode,
 ) -> Result<RecordingAppServer> {
     let state_db =
         crate::init_state_db_for_app_server_target(config, &crate::AppServerTarget::Embedded)
@@ -299,11 +314,7 @@ async fn start_recording_app_server_with_history(
     .await?;
 
     Ok((
-        AppServerSession::new(
-            app_server,
-            crate::app_server_session::ThreadParamsMode::Embedded,
-        )
-        .with_startup_config(config),
+        AppServerSession::new(app_server, thread_params_mode).with_startup_config(config),
         requests,
         proxy,
     ))
@@ -330,7 +341,7 @@ fn create_history_rollout(
     Ok(ThreadId::from_string(&thread_id)?)
 }
 
-fn recorded_params(requests: &RecordedRequests, method: &str) -> Vec<serde_json::Value> {
+pub(super) fn recorded_params(requests: &RecordedRequests, method: &str) -> Vec<serde_json::Value> {
     requests
         .lock()
         .expect("request recorder lock")
@@ -930,6 +941,7 @@ async fn older_external_server_starts_without_unsupported_dynamic_tools_or_histo
         HistoryCapabilities::LegacyDynamicToolsAndHistory,
         /*blocked_thread_list*/ None,
         /*failed_thread_name*/ None,
+        crate::app_server_session::ThreadParamsMode::Embedded,
     )
     .await?;
 
@@ -1272,14 +1284,18 @@ async fn dynamic_tool_requests_ignore_other_namespaces_and_dispatch_tui_namespac
     let turn = recorded_params(&requests, "turn/start")
         .pop()
         .expect("background task turn request");
+    assert_eq!(turn["input"], serde_json::json!([]));
     assert_eq!(
-        turn["input"][0]["text"],
-        format!(
-            "<codex_delegation>\n  <source_thread_id>{creation_source}</source_thread_id>\n  <input>Check &lt;main&gt; &amp; report</input>\n</codex_delegation>"
-        )
+        turn["toolOutput"],
+        serde_json::json!({
+            "name": "create_thread",
+            "namespace": "codex_tui",
+            "output": format!(
+                "<codex_delegation>\n  <source_thread_id>{creation_source}</source_thread_id>\n  <input>Check &lt;main&gt; &amp; report</input>\n</codex_delegation>"
+            )
+        })
     );
     assert_eq!(turn["sandboxPolicy"], source_sandbox);
-
     app.handle_app_server_event(
         &app_server,
         codex_app_server_client::AppServerEvent::ServerRequest(Box::new(exec_approval_request(
@@ -1341,11 +1357,17 @@ async fn dynamic_tool_requests_ignore_other_namespaces_and_dispatch_tui_namespac
         panic!("expected a follow-up task completion event")
     };
     assert!(response.success, "{response:?}");
+    let turn = &recorded_params(&requests, "turn/start")[1];
+    assert_eq!(turn["input"], serde_json::json!([]));
     assert_eq!(
-        recorded_params(&requests, "turn/start")[1]["input"][0]["text"],
-        format!(
-            "<codex_delegation>\n  <source_thread_id>{thread_id}</source_thread_id>\n  <input>Follow &lt;up&gt; &amp; report</input>\n</codex_delegation>"
-        )
+        turn["toolOutput"],
+        serde_json::json!({
+            "name": "send_message_to_thread",
+            "namespace": "codex_tui",
+            "output": format!(
+                "<codex_delegation>\n  <source_thread_id>{thread_id}</source_thread_id>\n  <input>Follow &lt;up&gt; &amp; report</input>\n</codex_delegation>"
+            )
+        })
     );
 
     app.dynamic_tool_tasks.insert(
@@ -1762,6 +1784,7 @@ async fn remote_legacy_history_start_negotiates_once_for_resume_and_fork() -> Re
         HistoryCapabilities::LegacyOnly,
         /*blocked_thread_list*/ None,
         /*failed_thread_name*/ None,
+        crate::app_server_session::ThreadParamsMode::Embedded,
     )
     .await?;
 
@@ -1852,6 +1875,7 @@ async fn remote_legacy_history_start_retries_unsupported_paginated_variant() -> 
         HistoryCapabilities::LegacyOnlyUnsupportedVariant,
         /*blocked_thread_list*/ None,
         /*failed_thread_name*/ None,
+        crate::app_server_session::ThreadParamsMode::Embedded,
     )
     .await?;
 
@@ -1882,6 +1906,7 @@ async fn assert_remote_legacy_history_retry(request: LegacyHistoryRequest) -> Re
         HistoryCapabilities::LegacyOnly,
         /*blocked_thread_list*/ None,
         /*failed_thread_name*/ None,
+        crate::app_server_session::ThreadParamsMode::Embedded,
     )
     .await?;
 
@@ -1947,6 +1972,7 @@ async fn paginated_fork_survives_post_response_hydration_failure() -> Result<()>
         HistoryCapabilities::ForkHydrationFails,
         /*blocked_thread_list*/ None,
         /*failed_thread_name*/ None,
+        crate::app_server_session::ThreadParamsMode::Embedded,
     )
     .await?;
 
@@ -2243,6 +2269,92 @@ async fn paginated_workflows_never_request_full_thread_history() -> Result<()> {
         .map(|params| params["includeTurns"].as_bool().unwrap_or(false))
         .collect::<Vec<_>>();
     assert_eq!(legacy_include_turns, vec![false, true]);
+
+    app_server.shutdown().await?;
+    proxy.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn agents_overview_stop_uses_history_mode_for_turn_lookup() -> Result<()> {
+    let (mut app, _codex_home) = make_history_test_app().await?;
+    let paginated_thread_id = create_history_rollout(
+        &app.config,
+        ThreadHistoryMode::Paginated,
+        "paginated background task",
+    )?;
+    let cases = [
+        (paginated_thread_id, vec![false], 1),
+        (
+            create_history_rollout(
+                &app.config,
+                ThreadHistoryMode::Legacy,
+                "legacy background task",
+            )?,
+            vec![false, true],
+            0,
+        ),
+    ];
+    let (mut app_server, requests, proxy) = start_recording_app_server_with_history(
+        &app.config,
+        HistoryCapabilities::Current,
+        /*blocked_thread_list*/ None,
+        /*failed_thread_name*/ None,
+        crate::app_server_session::ThreadParamsMode::Embedded,
+    )
+    .await?;
+
+    for (thread_id, expected_include_turns, expected_turn_page_count) in cases {
+        let previous_reads = recorded_params(&requests, "thread/read");
+        let previous_turn_page_count = recorded_params(&requests, "thread/turns/list").len();
+
+        app.stop_agents_overview_thread(&mut app_server, thread_id)
+            .await;
+
+        let reads = recorded_params(&requests, "thread/read");
+        let include_turns = reads[previous_reads.len()..]
+            .iter()
+            .map(|params| params["includeTurns"].as_bool().unwrap_or(false))
+            .collect::<Vec<_>>();
+        assert_eq!(include_turns, expected_include_turns);
+        assert_eq!(
+            recorded_params(&requests, "thread/turns/list").len() - previous_turn_page_count,
+            expected_turn_page_count
+        );
+    }
+
+    app_server.shutdown().await?;
+    proxy.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn agents_overview_stop_uses_full_history_after_legacy_negotiation() -> Result<()> {
+    let (mut app, _codex_home) = make_history_test_app().await?;
+    let thread_id = create_history_rollout(
+        &app.config,
+        ThreadHistoryMode::Paginated,
+        "paginated background task",
+    )?;
+    let (mut app_server, requests, proxy) = start_recording_app_server_with_history(
+        &app.config,
+        HistoryCapabilities::LegacyOnly,
+        /*blocked_thread_list*/ None,
+        /*failed_thread_name*/ None,
+        crate::app_server_session::ThreadParamsMode::Embedded,
+    )
+    .await?;
+    app_server.start_thread(&app.config).await?;
+
+    app.stop_agents_overview_thread(&mut app_server, thread_id)
+        .await;
+
+    let include_turns = recorded_params(&requests, "thread/read")
+        .into_iter()
+        .map(|params| params["includeTurns"].as_bool().unwrap_or(false))
+        .collect::<Vec<_>>();
+    assert_eq!(include_turns, vec![false, true]);
+    assert!(recorded_params(&requests, "thread/turns/list").is_empty());
 
     app_server.shutdown().await?;
     proxy.await??;

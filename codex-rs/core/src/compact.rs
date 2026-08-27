@@ -837,6 +837,7 @@ async fn drain_to_completed(
             Ok(ResponseEvent::Completed {
                 response_id,
                 token_usage,
+                usage_metadata,
                 ..
             }) => {
                 sess.send_event(
@@ -844,6 +845,7 @@ async fn drain_to_completed(
                     EventMsg::RawResponseCompleted(RawResponseCompletedEvent {
                         response_id,
                         token_usage: token_usage.clone(),
+                        usage_metadata,
                     }),
                 )
                 .await;

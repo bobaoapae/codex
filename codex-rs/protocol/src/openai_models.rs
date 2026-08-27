@@ -57,6 +57,7 @@ pub enum ReasoningEffort {
     XHigh,
     Max,
     Ultra,
+    Persistent,
     /// A model-defined effort value that this client does not know yet.
     Custom(String),
 }
@@ -73,6 +74,7 @@ impl ReasoningEffort {
             Self::XHigh => "xhigh",
             Self::Max => "max",
             Self::Ultra => "ultra",
+            Self::Persistent => "persistent",
             Self::Custom(effort) => effort,
         }
     }
@@ -139,6 +141,7 @@ impl FromStr for ReasoningEffort {
             "xhigh" => Ok(Self::XHigh),
             "max" => Ok(Self::Max),
             "ultra" => Ok(Self::Ultra),
+            "persistent" => Ok(Self::Persistent),
             "" => Err("reasoning_effort must not be empty".to_string()),
             effort => Ok(Self::Custom(effort.to_string())),
         }
@@ -483,6 +486,13 @@ impl ModelInfo {
         self.context_window.or(self.max_context_window)
     }
 
+    /// Context available to inference after reserving this model's configured headroom.
+    pub fn usable_context_window(&self) -> Option<i64> {
+        self.resolved_context_window().map(|context_window| {
+            context_window.saturating_mul(self.effective_context_window_percent) / 100
+        })
+    }
+
     pub fn auto_compact_token_limit(&self) -> Option<i64> {
         let context_limit = self
             .resolved_context_window()
@@ -529,6 +539,10 @@ impl ModelInfo {
 /// When variables are present but incomplete, missing values render as empty strings.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
 pub struct ModelMessages {
+    /// Additional developer instructions for persistent mode. Missing or null uses the built-in
+    /// instructions; an empty string disables them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistent_instructions: Option<String>,
     pub instructions_template: Option<String>,
     pub instructions_variables: Option<ModelInstructionsVariables>,
     pub approvals: Option<ApprovalMessages>,
@@ -540,6 +554,20 @@ pub struct ModelMessages {
     pub token_budget: Option<ModelTokenBudgetConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guardian_v2: Option<GuardianV2ModelConfig>,
+    /// Replacement confirmation-policy documents forwarded in actor MCP request metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmation_policies: Option<ConfirmationPolicies>,
+}
+
+/// Model-owned confirmation-policy Markdown, forwarded unchanged to actor tools.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
+pub struct ConfirmationPolicies {
+    /// Replacement Markdown for the Browser Use confirmation-policy document.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_use: Option<String>,
+    /// Replacement Markdown for the native Computer Use confirmation policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub computer_use: Option<String>,
 }
 
 /// Model-owned defaults for the context-window token-budget feature.
@@ -758,6 +786,7 @@ where
                     .is_none()
             {
                 let messages = model.model_messages.get_or_insert(ModelMessages {
+                    persistent_instructions: None,
                     instructions_template: None,
                     instructions_variables: None,
                     approvals: None,
@@ -766,6 +795,7 @@ where
                     permissions: None,
                     multi_agent: None,
                     token_budget: None,
+                    confirmation_policies: None,
                     guardian_v2: None,
                 });
                 messages.instructions_template = Some(base_instructions);
@@ -956,13 +986,15 @@ mod tests {
 
     #[test]
     fn model_messages_deserialize_without_optional_sections() {
-        let messages: ModelMessages =
-            from_str(r#"{"instructions_template":null,"instructions_variables":null}"#)
-                .expect("model messages should deserialize");
+        let messages: ModelMessages = from_str(
+            r#"{"instructions_template":null,"instructions_variables":null,"persistent_instructions":null}"#,
+        )
+        .expect("model messages should deserialize");
 
         assert_eq!(
             messages,
             ModelMessages {
+                persistent_instructions: None,
                 instructions_template: None,
                 instructions_variables: None,
                 approvals: None,
@@ -971,6 +1003,7 @@ mod tests {
                 permissions: None,
                 multi_agent: None,
                 token_budget: None,
+                confirmation_policies: None,
                 guardian_v2: None,
             }
         );
@@ -1108,6 +1141,7 @@ mod tests {
         assert_eq!(
             messages,
             ModelMessages {
+                persistent_instructions: None,
                 instructions_template: None,
                 instructions_variables: None,
                 approvals: None,
@@ -1119,6 +1153,7 @@ mod tests {
                 permissions: None,
                 multi_agent: None,
                 token_budget: None,
+                confirmation_policies: None,
                 guardian_v2: None,
             }
         );
@@ -1132,28 +1167,34 @@ mod tests {
         let serialized = to_string(&custom).expect("custom reasoning effort should serialize");
         let serialized_max = to_string(&ReasoningEffort::Max).expect("Max should serialize");
         let serialized_ultra = to_string(&ReasoningEffort::Ultra).expect("Ultra should serialize");
+        let serialized_persistent =
+            to_string(&ReasoningEffort::Persistent).expect("Persistent should serialize");
 
         assert_eq!(
             (
                 "high".parse(),
                 "max".parse(),
                 "ultra".parse(),
+                "persistent".parse(),
                 "future".parse(),
                 deserialized,
                 serialized,
                 serialized_max,
                 serialized_ultra,
+                serialized_persistent,
                 custom.to_string(),
             ),
             (
                 Ok(ReasoningEffort::High),
                 Ok(ReasoningEffort::Max),
                 Ok(ReasoningEffort::Ultra),
+                Ok(ReasoningEffort::Persistent),
                 Ok(custom.clone()),
                 custom,
                 r#""future""#.to_string(),
                 r#""max""#.to_string(),
                 r#""ultra""#.to_string(),
+                r#""persistent""#.to_string(),
                 "future".to_string(),
             )
         );
@@ -1193,6 +1234,7 @@ mod tests {
     #[test]
     fn get_model_instructions_uses_template_when_placeholder_present() {
         let model = test_model(Some(ModelMessages {
+            persistent_instructions: None,
             instructions_template: Some("Hello {{ personality }}".to_string()),
             instructions_variables: Some(personality_variables()),
             approvals: None,
@@ -1201,6 +1243,7 @@ mod tests {
             permissions: None,
             multi_agent: None,
             token_budget: None,
+            confirmation_policies: None,
             guardian_v2: None,
         }));
 
@@ -1212,6 +1255,7 @@ mod tests {
     #[test]
     fn get_model_instructions_strips_placeholder_with_incomplete_variables() {
         let model = test_model(Some(ModelMessages {
+            persistent_instructions: None,
             instructions_template: Some("Hello\n{{ personality }}".to_string()),
             instructions_variables: Some(ModelInstructionsVariables {
                 personality_default: None,
@@ -1224,6 +1268,7 @@ mod tests {
             permissions: None,
             multi_agent: None,
             token_budget: None,
+            confirmation_policies: None,
             guardian_v2: None,
         }));
         assert_eq!(
@@ -1236,6 +1281,7 @@ mod tests {
         );
 
         let model_no_personality = test_model(Some(ModelMessages {
+            persistent_instructions: None,
             instructions_template: Some("Hello\n{{ personality }}".to_string()),
             instructions_variables: Some(ModelInstructionsVariables {
                 personality_default: None,
@@ -1248,6 +1294,7 @@ mod tests {
             permissions: None,
             multi_agent: None,
             token_budget: None,
+            confirmation_policies: None,
             guardian_v2: None,
         }));
         assert_eq!(
@@ -1271,6 +1318,7 @@ mod tests {
     #[test]
     fn get_model_instructions_is_empty_when_template_is_missing() {
         let model = test_model(Some(ModelMessages {
+            persistent_instructions: None,
             instructions_template: None,
             instructions_variables: Some(ModelInstructionsVariables {
                 personality_default: None,
@@ -1283,6 +1331,7 @@ mod tests {
             permissions: None,
             multi_agent: None,
             token_budget: None,
+            confirmation_policies: None,
             guardian_v2: None,
         }));
 
@@ -1316,6 +1365,7 @@ mod tests {
         assert_eq!(
             model.model_messages,
             Some(ModelMessages {
+                persistent_instructions: None,
                 instructions_template: Some("legacy instructions".to_string()),
                 instructions_variables: None,
                 approvals: None,
@@ -1324,6 +1374,7 @@ mod tests {
                 permissions: None,
                 multi_agent: None,
                 token_budget: None,
+                confirmation_policies: None,
                 guardian_v2: None,
             })
         );
@@ -1364,6 +1415,7 @@ mod tests {
     fn models_response_serializes_rendered_legacy_base_instructions() {
         let response = ModelsResponse {
             models: vec![test_model(Some(ModelMessages {
+                persistent_instructions: None,
                 instructions_template: Some("before {{ personality }} after".to_string()),
                 instructions_variables: Some(ModelInstructionsVariables {
                     personality_default: Some("default".to_string()),
@@ -1376,6 +1428,7 @@ mod tests {
                 permissions: None,
                 multi_agent: None,
                 token_budget: None,
+                confirmation_policies: None,
                 guardian_v2: None,
             }))],
         };
@@ -1391,6 +1444,7 @@ mod tests {
     #[test]
     fn models_response_prefers_template_and_preserves_message_siblings() {
         let messages = ModelMessages {
+            persistent_instructions: Some("Persistent catalog instructions".to_string()),
             instructions_template: None,
             instructions_variables: None,
             approvals: Some(ApprovalMessages {
@@ -1416,6 +1470,14 @@ mod tests {
             }),
             multi_agent: None,
             token_budget: None,
+            confirmation_policies: Some(ConfirmationPolicies {
+                browser_use: Some(
+                    "# Browser confirmations\n\nKeep {{literal_markdown}}.\n".to_string(),
+                ),
+                computer_use: Some(
+                    "  # Native confirmations\r\n\nKeep ${native_markdown}.\n".to_string(),
+                ),
+            }),
             guardian_v2: Some(GuardianV2ModelConfig {
                 classifier_instructions: Some("Guardian classification".to_string()),
                 review_threshold_basis_points: Some(7_500),
@@ -1432,6 +1494,13 @@ mod tests {
             models: vec![test_model(Some(messages.clone()))],
         })
         .expect("serialize models response");
+        assert_eq!(
+            value["models"][0]["model_messages"]["confirmation_policies"],
+            serde_json::json!({
+                "browser_use": "# Browser confirmations\n\nKeep {{literal_markdown}}.\n",
+                "computer_use": "  # Native confirmations\r\n\nKeep ${native_markdown}.\n",
+            })
+        );
         value["models"][0]["base_instructions"] = serde_json::json!("legacy instructions");
 
         let response: ModelsResponse =
@@ -1441,6 +1510,7 @@ mod tests {
         assert_eq!(response.models[0].model_messages, Some(expected_messages));
 
         let canonical_messages = ModelMessages {
+            persistent_instructions: Some(String::new()),
             instructions_template: Some("canonical instructions".to_string()),
             instructions_variables: None,
             approvals: None,
@@ -1449,6 +1519,7 @@ mod tests {
             permissions: None,
             multi_agent: None,
             token_budget: None,
+            confirmation_policies: None,
             guardian_v2: None,
         };
         let mut value = serde_json::to_value(ModelsResponse {
@@ -1764,7 +1835,28 @@ mod tests {
         };
 
         assert_eq!(model.resolved_context_window(), Some(400_000));
+        assert_eq!(model.usable_context_window(), Some(380_000));
         assert_eq!(model.auto_compact_token_limit(), Some(360_000));
+    }
+
+    #[test]
+    fn model_context_window_limits_preserve_their_distinct_meanings() {
+        let model = ModelInfo {
+            context_window: Some(272_000),
+            max_context_window: Some(400_000),
+            auto_compact_token_limit: Some(250_000),
+            effective_context_window_percent: 95,
+            ..test_model(/*spec*/ None)
+        };
+
+        assert_eq!(
+            (
+                model.resolved_context_window(),
+                model.usable_context_window(),
+                model.auto_compact_token_limit(),
+            ),
+            (Some(272_000), Some(258_400), Some(244_800))
+        );
     }
 
     #[test]
