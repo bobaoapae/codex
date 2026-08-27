@@ -373,8 +373,21 @@ impl ChatGptWebSettings {
         let millis = |value: Option<u64>, default: Duration| {
             value.map(Duration::from_millis).unwrap_or(default)
         };
+        // FORK: once the connector is set up (`codex chatgpt-web setup`
+        // wrote a `tunnel_id`, or a public tunnel was chosen explicitly),
+        // agents should get the tools without one more key to remember. An
+        // explicit `tools = "none"` still wins.
+        let connector_configured = toml.tunnel_id.is_some()
+            || matches!(
+                toml.tunnel,
+                Some(ChatGptWebTunnel::Cloudflared | ChatGptWebTunnel::Manual)
+            );
         Self {
-            tools: toml.tools.unwrap_or(defaults.tools),
+            tools: toml.tools.unwrap_or(if connector_configured {
+                ChatGptWebTools::Connector
+            } else {
+                defaults.tools
+            }),
             // 0 means "wait forever", which is what `None` does downstream.
             idle_timeout: match toml.idle_timeout_ms {
                 Some(0) => None,

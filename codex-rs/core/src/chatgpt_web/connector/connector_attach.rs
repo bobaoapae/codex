@@ -34,6 +34,10 @@ pub(crate) struct ApprovalResult {
     pub(crate) found: bool,
     pub(crate) clicked: bool,
     pub(crate) button: Option<String>,
+    /// Buttons of a card that matched no known label (for the log).
+    pub(crate) buttons: Vec<String>,
+    /// First characters of that card's text.
+    pub(crate) text: Option<String>,
 }
 
 /// Selects the connector (if needed) and appends `text` after its pill, in one
@@ -145,7 +149,7 @@ pub(crate) fn approval_script(connector_name: &str, prefer_always: bool) -> Stri
     const once = byText(/^(permitir uma vez|allow once|permitir)$/i);
     const target = (PREFER_ALWAYS && always) ? always : (once || always);
     if (!target) {{
-      return JSON.stringify({{ found: true, clicked: false, buttons: buttons.map((b) => (b.innerText || '').trim()) }});
+      return JSON.stringify({{ found: true, clicked: false, buttons: buttons.map((b) => (b.innerText || '').trim()), text: (card.innerText || '').replace(/\s+/g, ' ').slice(0, 200) }});
     }}
     const r = target.getBoundingClientRect();
     const opts = {{ bubbles: true, cancelable: true, clientX: r.x + r.width / 2, clientY: r.y + r.height / 2, button: 0 }};
@@ -199,9 +203,18 @@ async fn approve_once(
         )
         .await
     {
-        Ok(value) => serde_json::from_value::<ApprovalResult>(value)
-            .map(|result| result.clicked)
-            .unwrap_or(false),
+        Ok(value) => match serde_json::from_value::<ApprovalResult>(value) {
+            Ok(result) => {
+                if result.found && !result.clicked {
+                    warn!(
+                        "chatgpt_web connector: approval card found but no known button (buttons: {:?}; text: {:?})",
+                        result.buttons, result.text
+                    );
+                }
+                result.clicked
+            }
+            Err(_) => false,
+        },
         Err(err) => {
             warn!("chatgpt_web connector: approval probe failed: {err}");
             false

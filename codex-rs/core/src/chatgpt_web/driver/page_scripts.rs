@@ -478,6 +478,61 @@ pub(super) fn dom_turns(max_turns: u64) -> String {
     )
 }
 
+/// Shape returned by [`dom_progress`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(default, rename_all = "camelCase")]
+pub(crate) struct DomProgress {
+    pub(crate) url: String,
+    /// The stop button is showing.
+    pub(crate) generating: bool,
+    /// Elements still carrying `data-streaming-response-status`.
+    pub(crate) streaming: u64,
+    /// First 120 chars (trimmed) of the last user message on the page.
+    pub(crate) last_user_text: String,
+    /// Assistant turns rendered after the last user message.
+    pub(crate) assistant_turns: u64,
+    /// Total rendered characters of those assistant turns.
+    pub(crate) assistant_chars: u64,
+    /// The last assistant turn has its copy button (ChatGPT renders it only
+    /// once the message finished).
+    pub(crate) last_assistant_done: bool,
+    pub(crate) last_assistant_id: Option<String>,
+}
+
+/// FORK (verified live): progress of the current reply read from the DOM —
+/// no backend request at all.
+///
+/// `GET /backend-api/conversation/<id>` is rate limited per account, so the
+/// poll loop watches the page instead and only reads the API when the page
+/// says the reply finished (or on a slow safety cadence). The rendered text is
+/// used for change detection only: `innerText` loses the markdown the API
+/// returns, so it is never emitted as answer text.
+pub(super) fn dom_progress() -> String {
+    r#"() => {
+    const msgs = Array.from(document.querySelectorAll('[data-message-author-role]'));
+    let lastUser = -1;
+    msgs.forEach((m, i) => { if (m.getAttribute('data-message-author-role') === 'user') lastUser = i; });
+    const after = lastUser >= 0 ? msgs.slice(lastUser + 1) : [];
+    const assistants = after.filter((m) => m.getAttribute('data-message-author-role') !== 'user');
+    const last = assistants.length ? assistants[assistants.length - 1] : null;
+    const turnOf = (m) => m.closest('[data-turn-id]') || m.closest('article') || m;
+    const lastUserText = lastUser >= 0 ? (msgs[lastUser].innerText || '').trim().slice(0, 240) : '';
+    let chars = 0;
+    assistants.forEach((m) => { chars += (m.innerText || '').length; });
+    return JSON.stringify({
+      url: location.href,
+      generating: !!document.querySelector('[data-testid="stop-button"]'),
+      streaming: document.querySelectorAll('[data-streaming-response-status]').length,
+      lastUserText,
+      assistantTurns: assistants.length,
+      assistantChars: chars,
+      lastAssistantDone: !!(last && turnOf(last).querySelector('[data-testid="copy-turn-action-button"]')),
+      lastAssistantId: last ? last.getAttribute('data-message-id') : null,
+    });
+  }"#
+    .to_string()
+}
+
 /// Open the composer model menu and read both submenus (model + reasoning
 /// level). Requires a VISIBLE tab. Leaves stale menu overlays behind — the
 /// caller reloads the tab afterwards.
@@ -575,8 +630,17 @@ pub(super) fn menu_select(kind: MenuKind, label_regex_source: &str) -> String {
         if (v || Date.now() - t0 > ms) { clearInterval(iv); res(v || null); }
       }, 150);
     });
-    const form = document.querySelector('#prompt-textarea') ? document.querySelector('#prompt-textarea').closest('form') : null;
-    const trigger = form ? form.querySelector('button[aria-haspopup="menu"]:not([data-testid="composer-plus-btn"]):not(#composer-plus-btn)') : null;
+    const findTrigger = () => {
+      const ed = document.querySelector('#prompt-textarea');
+      const form = ed ? ed.closest('form') : null;
+      const t = form ? form.querySelector('button[aria-haspopup="menu"]:not([data-testid="composer-plus-btn"]):not(#composer-plus-btn)') : null;
+      // The picker mounts a beat after the composer and renders its label
+      // later still; an unlabeled trigger opens an empty menu.
+      return t && (t.textContent || '').trim() ? t : null;
+    };
+    // FORK (verified live): right after a navigation the trigger is not there
+    // yet; failing at once inherited whatever level the account last used.
+    return wait(findTrigger, 6000).then((trigger) => {
     if (!trigger) return JSON.stringify({ ok: false, error: 'model menu trigger not found' });
     const seen = new Set(Array.from(document.querySelectorAll('[role="menu"]')).map((m) => m.id));
     synthClick(trigger);
@@ -585,6 +649,54 @@ pub(super) fn menu_select(kind: MenuKind, label_regex_source: &str) -> String {
       return menus.find((m) => m.querySelectorAll('[role^="menuitem"]').length > 0) || null;
     }, 4000).then((root) => {
       if (!root) return JSON.stringify({ ok: false, error: 'menu did not mount (tab must be visible)', visibility: document.visibilityState });
+      // FORK (verified live 2026-08-27): the current picker is a slider
+      // (`data-animated-slider-trigger`): one `menuitem` with
+      // `aria-keyshortcuts="ArrowLeft ArrowRight"` whose sibling text reads
+      // "<label>, <n> de 5." (Instantâneo, Médio, Alto, Extra alto, Pro).
+      // Synthetic ArrowLeft/ArrowRight keydowns on the focused item move it
+      // and the trigger label follows; the selection persists across the
+      // reload the caller performs.
+      const sliderItem = () => root.querySelector('[role="menuitem"][aria-keyshortcuts]');
+      if (sliderItem()) {
+        const labelOf = () => {
+          const it = sliderItem();
+          const text = it && it.parentElement ? (it.parentElement.innerText || '') : '';
+          return text.split(',')[0].replace(/\s+/g, ' ').trim();
+        };
+        const press = (k) => {
+          const it = sliderItem();
+          if (!it) return false;
+          it.focus();
+          const o = { key: k, code: k, bubbles: true, cancelable: true };
+          it.dispatchEvent(new KeyboardEvent('keydown', o));
+          it.dispatchEvent(new KeyboardEvent('keyup', o));
+          return true;
+        };
+        const settle = () => new Promise((r) => setTimeout(r, 250));
+        const seenLabels = [];
+        const walk = (k, steps) => {
+          const label = labelOf();
+          if (seenLabels.indexOf(label) < 0) seenLabels.push(label);
+          if (TARGET.test(label)) {
+            return settle().then(() => JSON.stringify({
+              ok: true,
+              selected: labelOf(),
+              triggerLabel: (trigger.textContent || '').trim(),
+              slider: true,
+            }));
+          }
+          if (steps >= 12) return Promise.resolve(JSON.stringify({ ok: false, error: 'option not found', available: seenLabels, slider: true }));
+          if (!press(k)) return Promise.resolve(JSON.stringify({ ok: false, error: 'slider item vanished', slider: true }));
+          return settle().then(() => {
+            const next = labelOf();
+            // Hitting the left end: turn around and scan rightwards.
+            if (next === label && k === 'ArrowLeft') return walk('ArrowRight', steps + 1);
+            if (next === label && k === 'ArrowRight') return Promise.resolve(JSON.stringify({ ok: false, error: 'option not found', available: seenLabels, slider: true }));
+            return walk(k, steps + 1);
+          });
+        };
+        return walk('ArrowLeft', 0);
+      }
       const sub = Array.from(root.querySelectorAll('[role="menuitem"][aria-haspopup="menu"]'))
         .find((x) => SUB.test((x.textContent || '').trim()));
       if (!sub) return JSON.stringify({
@@ -613,6 +725,7 @@ pub(super) fn menu_select(kind: MenuKind, label_regex_source: &str) -> String {
           triggerLabel: (trigger.textContent || '').trim(),
         }));
       });
+    });
     });
   }"#,
         &[

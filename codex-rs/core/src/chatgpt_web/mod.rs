@@ -442,6 +442,15 @@ impl stream::ConversationSource for OpsSource<'_> {
     }
 }
 
+impl stream::DomSource for OpsSource<'_> {
+    fn read_dom<'a>(
+        &'a self,
+        conversation_id: &'a str,
+    ) -> BoxFuture<'a, driver::DriverResult<Option<driver::page_scripts::DomProgress>>> {
+        Box::pin(async move { self.0.dom_progress(conversation_id).await })
+    }
+}
+
 /// Maps a driver failure onto the Codex error that decides retry vs. stop.
 fn map_driver_error(err: &DriverError) -> CodexErr {
     let phase = err
@@ -683,7 +692,8 @@ async fn run_turn(
         poll_interval: settings.poll_interval,
         idle_timeout: settings.idle_timeout,
         sent_at,
-        connector_rx: None,
+        dom: Some(&source),
+        anchor: rendered.text.clone(),
     }
     .run(&mut assembler, &consumer_dropped)
     .await;
@@ -1141,6 +1151,10 @@ async fn connector_loop(
     let mut read_failures: u32 = 0;
     let mut rate_limit_cooldown = stream::RATE_LIMIT_COOLDOWN_MIN;
     let mut last_rate_limit: Option<tokio::time::Instant> = None;
+    // FORK: the page is the cheap source of progress; the API is read only
+    // when the scheduler says so (see `stream::PollScheduler`).
+    let mut scheduler = stream::PollScheduler::new(live.sent_at);
+    let anchor = live.tracker.anchor().to_string();
 
     loop {
         let stall_deadline = idle_timeout
@@ -1191,6 +1205,34 @@ async fn connector_loop(
                 return;
             }
             _ = tokio::time::sleep(stream::effective_poll_interval(poll_interval, last_rate_limit)) => {
+                polls = polls.wrapping_add(1);
+                if polls.is_multiple_of(2) {
+                    let attach = ConnectorAttach {
+                        daemon: &driver.daemon,
+                        tabs: &driver.tabs,
+                        connector_name: live.connector_name.clone(),
+                        auto_always,
+                    };
+                    if attach.approve_on_conversation(&live.conversation_id).await {
+                        info!("chatgpt_web connector: approved a tool card");
+                        last_progress = tokio::time::Instant::now();
+                    }
+                }
+                let progress = match driver.ops.dom_progress(&live.conversation_id).await {
+                    Ok(progress) => progress,
+                    Err(err) => {
+                        tracing::debug!("chatgpt_web connector: DOM progress read failed: {err}");
+                        None
+                    }
+                };
+                let step = scheduler.on_dom(progress, &anchor, tokio::time::Instant::now());
+                if step.changed {
+                    last_progress = tokio::time::Instant::now();
+                }
+                if !step.read_api {
+                    continue;
+                }
+                scheduler.on_api_read(tokio::time::Instant::now());
                 let conv = match driver.ops.read_conversation(&live.conversation_id, true).await {
                     Ok(conv) => {
                         read_failures = 0;
@@ -1294,18 +1336,6 @@ async fn connector_loop(
                         }
                     }
                 }
-                polls = polls.wrapping_add(1);
-                if polls.is_multiple_of(2) {
-                    let attach = ConnectorAttach {
-                        daemon: &driver.daemon,
-                        tabs: &driver.tabs,
-                        connector_name: live.connector_name.clone(),
-                        auto_always,
-                    };
-                    if attach.approve_on_conversation(&live.conversation_id).await {
-                        info!("chatgpt_web connector: approved a tool card");
-                    }
-                }
             }
             _ = tokio::time::sleep_until(stall_deadline) => {
                 let seconds = idle_timeout.map(|timeout| timeout.as_secs()).unwrap_or_default();
@@ -1384,7 +1414,8 @@ async fn run_compaction_turn(
         poll_interval: workspace.settings.poll_interval,
         idle_timeout: workspace.settings.idle_timeout,
         sent_at,
-        connector_rx: None,
+        dom: Some(&source),
+        anchor: rendered.text.clone(),
     }
     .run(&mut assembler, consumer_dropped)
     .await;

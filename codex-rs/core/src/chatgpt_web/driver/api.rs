@@ -30,6 +30,7 @@ use serde::Deserialize;
 use serde::Deserializer;
 use serde::Serialize;
 use serde_json::Value;
+use tokio::sync::Semaphore;
 use tracing::info;
 
 use super::DriverError;
@@ -720,6 +721,55 @@ struct RawModels {
 
 /// Port of `private modelsCache`, shared process-wide and keyed by `base_url`
 /// (one entry per ChatGPT origin), since `ChatGptApi` values are short-lived.
+/// FORK (verified live): the ChatGPT backend rate limits `/backend-api/…`
+/// per account, and several turns polling at once kept the account in "Too
+/// many requests" for minutes. Every request routed through
+/// [`ChatGptApi::with_backend_limiter`] waits its turn here so the whole
+/// process never exceeds one backend call per [`BACKEND_MIN_INTERVAL`].
+pub(crate) const BACKEND_MIN_INTERVAL: Duration = Duration::from_secs(3);
+
+pub(crate) struct BackendLimiter {
+    gate: Semaphore,
+    last: Mutex<Option<Instant>>,
+    min_interval: Duration,
+}
+
+impl BackendLimiter {
+    pub(crate) fn new(min_interval: Duration) -> Self {
+        Self {
+            gate: Semaphore::new(1),
+            last: Mutex::new(None),
+            min_interval,
+        }
+    }
+
+    /// Waits until a request may be issued, then records it. Callers are
+    /// served in arrival order (one permit), so a burst spreads evenly.
+    pub(crate) async fn acquire(&self) {
+        let Ok(_permit) = self.gate.acquire().await else {
+            return;
+        };
+        let wait = {
+            let last = self.last.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            last.map(|at| self.min_interval.saturating_sub(at.elapsed()))
+        };
+        if let Some(wait) = wait
+            && !wait.is_zero()
+        {
+            tokio::time::sleep(wait).await;
+        }
+        let mut last = self.last.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        *last = Some(Instant::now());
+    }
+}
+
+/// The process-wide limiter (one account per Chrome, one Chrome per process).
+pub(crate) fn backend_limiter() -> &'static BackendLimiter {
+    static LIMITER: LazyLock<BackendLimiter> =
+        LazyLock::new(|| BackendLimiter::new(BACKEND_MIN_INTERVAL));
+    &LIMITER
+}
+
 static MODELS_CACHE: LazyLock<Mutex<HashMap<String, (Instant, ModelsInfo)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -742,6 +792,8 @@ pub(crate) struct ChatGptApi<'a> {
     base_url: String,
     backoff: Vec<Duration>,
     eval_timeout_ms: u64,
+    /// When set, every call waits on the process-wide backend limiter.
+    limiter: Option<&'static BackendLimiter>,
 }
 
 impl<'a> ChatGptApi<'a> {
@@ -751,6 +803,7 @@ impl<'a> ChatGptApi<'a> {
             tab_id,
             base_url: base_url.into().trim_end_matches('/').to_string(),
             backoff: RATE_LIMIT_BACKOFF.to_vec(),
+            limiter: None,
             eval_timeout_ms: API_EVAL_TIMEOUT_MS,
         }
     }
@@ -758,6 +811,13 @@ impl<'a> ChatGptApi<'a> {
     /// Override the 429 backoff schedule (tests use zero delays).
     pub(crate) fn with_backoff(mut self, backoff: Vec<Duration>) -> Self {
         self.backoff = backoff;
+        self
+    }
+
+    /// Route every call through the process-wide backend limiter (the
+    /// production driver does; tests and the registry keep their own pacing).
+    pub(crate) fn with_backend_limiter(mut self) -> Self {
+        self.limiter = Some(backend_limiter());
         self
     }
 
@@ -786,6 +846,10 @@ impl<'a> ChatGptApi<'a> {
         body: Option<&Value>,
     ) -> DriverResult<ApiResponse> {
         let script = page_scripts::api_call(&self.url(path), method, body);
+        if let Some(limiter) = self.limiter {
+            limiter.acquire().await;
+        }
+        tracing::debug!("chatgpt_web backend call: {method} {path}");
         let raw = self
             .eval
             .eval(self.tab_id, script, self.eval_timeout_ms)

@@ -12949,3 +12949,44 @@ cloudflared_extra_args = ["--protocol", "http2"]
         codex_config::config_toml::ChatGptWebTools::None
     );
 }
+
+/// FORK: a configured tunnel makes `connector` the effective default, and an
+/// explicit `tools = "none"` still wins.
+#[test]
+fn chatgpt_web_tools_default_to_connector_once_a_tunnel_is_configured() {
+    let with_tunnel: ConfigToml = toml::from_str(
+        r#"
+[chatgpt_web]
+tunnel = "openai"
+tunnel_id = "tunnel_00000000000000000000000000000000"
+"#,
+    )
+    .expect("parses");
+    let settings = crate::config::ChatGptWebSettings::from_toml(with_tunnel.chatgpt_web.as_ref());
+    assert_eq!(
+        settings.tools,
+        codex_config::config_toml::ChatGptWebTools::Connector
+    );
+
+    let explicit_none: ConfigToml = toml::from_str(
+        r#"
+[chatgpt_web]
+tools = "none"
+tunnel = "cloudflared"
+"#,
+    )
+    .expect("parses");
+    let settings = crate::config::ChatGptWebSettings::from_toml(explicit_none.chatgpt_web.as_ref());
+    assert_eq!(
+        settings.tools,
+        codex_config::config_toml::ChatGptWebTools::None
+    );
+
+    let bare: ConfigToml =
+        toml::from_str("[chatgpt_web]\npoll_interval_ms = 5000\n").expect("parses");
+    let settings = crate::config::ChatGptWebSettings::from_toml(bare.chatgpt_web.as_ref());
+    assert_eq!(
+        settings.tools,
+        codex_config::config_toml::ChatGptWebTools::None
+    );
+}

@@ -37,7 +37,7 @@ Every key is optional. Durations are milliseconds. The driver also honors
 
 | key | default | meaning |
 |---|---|---|
-| `tools` | `"none"` | `none`: ChatGPT only sees the transcript Codex sends it. `connector`: Codex tools are exposed to ChatGPT through a custom MCP connector; requires the shared `codex chatgpt-web daemon`. |
+| `tools` | follows the tunnel setup | `none`: ChatGPT only sees the transcript Codex sends it. `connector`: Codex tools are exposed to ChatGPT through a custom MCP connector; requires the shared `codex chatgpt-web daemon`. Unset: `connector` once `tunnel_id` is configured (or `tunnel` is `cloudflared`/`manual`), else `none`. |
 | `idle_timeout_ms` | `1200000` | Abandon a turn with no visible progress for this long and stop the generation. `0` waits forever. |
 | `max_parallel_turns` | `2` | ChatGPT turns this process runs at the same time. |
 | `max_tabs` | `3` | Pool of dedicated chatgpt.com tabs, clamped to 1..8. |

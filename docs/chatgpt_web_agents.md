@@ -42,8 +42,10 @@ not steal each other's tabs.
 ```toml
 # ~/.codex/config.toml
 [chatgpt_web]
-# none (default) | connector — see the two sections below.
-tools = "none"
+# none | connector — see the two sections below. When unset, the mode follows
+# the tunnel setup: `connector` once `codex chatgpt-web setup` wrote a
+# `tunnel_id` (or `tunnel` is cloudflared/manual), `none` otherwise.
+# tools = "connector"
 
 # Abandon a turn that has shown no visible progress for this long, stopping the
 # generation. 0 waits forever. ChatGPT Pro thinks for a long time, but its
@@ -110,14 +112,15 @@ nothing else to choose.
 
 - `<base>` is the account's default model slug with any `-instant`/`-thinking`/
   `-pro` suffix stripped (`gpt-5-6-pro` in the recorded run).
-- `high` and `extra-high` pick the level through ChatGPT's effort menu, which
-  only mounts while the tab is visible: the driver activates the tab, selects
-  the level, reloads and restores focus. Implemented and unit-tested, but the
-  live `extra-high` run logged `exact level selection via menu failed (submenu
-  not found)` and continued with the Thinking default — the current picker is
-  the slider variant the driver does not yet drive. Until that is ported,
-  `high`/`extra-high` behave like `thinking` (the turn itself, including
-  connector tools, still works).
+- `high` and `extra-high` pick the level through ChatGPT's effort picker,
+  which only mounts while the tab is visible: the driver activates the tab,
+  selects the level, reloads and restores focus (the selection persists across
+  the reload; a `?model=` URL resets it, which is why every new chat navigates
+  first and selects second). The current picker is a slider (`Instantâneo`,
+  `Médio`, `Alto`, `Extra alto`, `Pro` — 5 positions) driven with
+  ArrowLeft/ArrowRight on its focused item; the older submenu (`Esforço` /
+  `Reasoning`) remains as the fallback. The composer label is verified after
+  the reload and a mismatch is reported as a note on the turn.
 - Context figures are measured, not declared by ChatGPT. There is no tokenizer
   for these models, so usage is estimated as `chars / 4` over the **entire**
   rendered history plus an 8 192-token reserve. The meter therefore grows with
@@ -215,9 +218,11 @@ from it instead of resending it.
   search remain available.` It is authored on the Codex side and never sent to
   ChatGPT.
 - Thinking and Pro thoughts arrive as reasoning summaries; the reply as the
-  final message. Both are refreshed every `poll_interval_ms` (2.5 s) from the
-  conversation API — there is no token stream from ChatGPT, and a rewrite
-  (regenerate, retry) replaces the item rather than appending.
+  final message. Progress is watched in the page every `poll_interval_ms`
+  (2.5 s, no backend request); the text itself is refreshed from the
+  conversation API at most every 30 s while it streams and once more when the
+  page shows the reply finished — there is no token stream from ChatGPT, and a
+  rewrite (regenerate, retry) replaces the item rather than appending.
 - ChatGPT-side tool activity that produces assets (web search, image
   generation) shows as a short note.
 - The turn ends when ChatGPT marks the latest text message `end_turn` and
@@ -242,28 +247,22 @@ must touch the workspace is the parent's job — or the connector's.
 ## `tools = "connector"`
 
 > **Status.** Connector mode works end to end over both tunnels, verified
-> live. `tunnel = "openai"` (the default): `codex chatgpt-web setup` downloaded
-> the pinned `tunnel-client` v0.0.12 (SHA-256 checked; its `run` flags —
-> `--control-plane.tunnel-id`, `--health.listen-addr`, `--health.url-file`,
-> `--log.format json`, env `CONTROL_PLANE_API_KEY` / `MCP_SERVER_URL=url=…,channel=main`
-> — match the binary's `--help`), the daemon reported the tunnel ready within
-> a second, the registry enabled Developer Mode on a fresh account and created
-> the "Codex Native" connector with `tunnel_id` (6 actions), and a
-> `chatgpt-web/instant` turn ran `codex_apply_patch` (file written) and
-> `codex_exec` (output reported) through it. `tunnel = "cloudflared"`: the same
-> `codex_exec` / `codex_apply_patch` smoke, plus tunnel reconnection and
-> re-reconcile within ~90 s when cloudflared is killed. The daemon, contract,
-> broker, tunnel supervisor, connector registry and the `codex chatgpt-web` CLI
-> are covered by unit and integration tests. Write tools were exercised on all
-> four lines (`instant`, `thinking`, `extra-high`, `pro` each ran
-> `codex_apply_patch` + `codex_exec` through the connector); only `instant`'s
-> final answer was delivered end to end, because the account then hit the
-> per-account rate limit on `GET /backend-api/conversation` for the rest of
-> the session (see *Limits*). Still unverified live: a follow-up turn issued as a **separate**
-> `codex exec` process (`exec resume`) against the same conversation, where
-> ChatGPT re-prompts its own tool-approval card for the new turn_token and the
-> auto-approver may not click it in time — a single multi-tool turn, and
-> continuation within one process, are fine.
+> live with the config as written by `codex chatgpt-web setup` (no other
+> `[chatgpt_web]` keys): `tunnel = "openai"` with the pinned `tunnel-client`
+> v0.0.12, Developer Mode enabled automatically, the "Codex Native" connector
+> created with `tunnel_id`, and `codex_apply_patch` + `codex_exec` driven on
+> `instant`, `thinking` and `pro`, a follow-up turn issued as a **separate**
+> `codex exec resume --last` process (same conversation, tool executed), and a
+> `spawn_agent` child on the `chatgpt-pro` role creating a file through the
+> connector. `tunnel = "cloudflared"` was verified earlier (same smoke plus
+> tunnel reconnection). Backend reads are now driven by the page (see
+> *Limits*): a short turn costs about three backend calls.
+>
+> Two things to know: OpenAI's own connector safety layer sometimes refuses a
+> call ("Esta ferramenta foi bloqueada pelas configurações de segurança da
+> OpenAI") — the call never reaches Codex, the model reports it and the turn
+> ends normally; rerunning usually passes. And a resumed session keeps the
+> model it was started with, so pass `-m chatgpt-web/…` on `resume` too.
 
 In connector mode ChatGPT calls Codex tools as real function calls. Codex
 exposes a custom MCP connector (Developer Mode) named `connector_name`
@@ -498,35 +497,44 @@ Every key is optional. Durations are milliseconds.
 
 ## Limits and known caveats
 
-- **Conversation reads are rate limited per account.** The poll loop reads
-  `GET /backend-api/conversation/<id>` every `poll_interval_ms`; after a
-  `429 Too many requests` it backs off 20 s → 120 s and polls no faster than
-  every 15 s for five minutes, and the poll read itself never retries a 429.
-  A heavily used account can still stay throttled for a long time — every
-  read fails, no progress is observed, and the stall watchdog
-  (`idle_timeout_ms`, 20 min) ends the turn even though the ChatGPT side may
-  have finished. Raise `poll_interval_ms` (10 000–15 000) on accounts that show
-  429s, and keep `max_parallel_turns` at 1–2.
+- **Conversation reads are rate limited per account**, so the driver reads
+  the backend as little as it can: progress comes from the DOM of the tab
+  (stop button, streaming markers, rendered length, the copy button that
+  appears when a message finishes) every `poll_interval_ms`, and
+  `GET /backend-api/conversation/<id>` is called only when the page shows the
+  reply finished, every 30 s while text is still growing (to refresh the
+  answer), every 60 s as a safety check when nothing moves, and every 10 s
+  after the page says "done" until the API confirms `end_turn`. All backend
+  calls of the process share one limiter (one call per 3 s). A short turn costs
+  about three backend calls (send, completion read, archive) whatever its
+  duration. After a `429 Too many requests` the loop still backs off 20 s →
+  120 s and polls the API no faster than every 15 s for five minutes.
 
 - **Calls serialize.** ChatGPT runs connector calls one after another inside a
   single response, so total response time is the sum of the calls. Keep
   `yield_time_ms` at or below 30 s (the contract clamps it) and poll long
   commands with `codex_write_stdin`; three 30 s calls already approach the
   ~100 s idle cutoff of the cloudflared path.
-- **Write tools are verified on Instant only.** `codex_exec` and
-  `codex_apply_patch` were driven end to end on Instant; Thinking, Extra-high
-  and Pro were not re-run, and the claim that Pro is read-only for custom
-  connectors is unverified. Treat all five lines as connector-capable until a
-  smoke run says otherwise.
+- **Write tools run on every line.** `codex_apply_patch` and `codex_exec`
+  were driven through the connector on Instant, Thinking, Extra-high and Pro
+  (the "Pro is read-only for custom connectors" claim did not hold).
+- **OpenAI's connector safety layer can refuse a call.** In about half of
+  the recorded connector turns one call (`codex_exec` with `type mode.txt`,
+  or `codex_apply_patch` with a two-line patch) came back to ChatGPT as
+  "Esta ferramenta foi bloqueada pelas configurações de segurança da OpenAI"
+  without ever reaching the daemon; the other tools of the same turn ran and
+  the same call passed on a rerun. This is server-side and non-deterministic;
+  the model reports it honestly and the turn completes.
 - **The `@`-mention can flake in a hidden tab** on a freshly opened chat (the
   menu sometimes lists recent prompts instead of the connector). `auto`
   activates the tab and retries; expect an occasional focus steal.
 - **Rate limits.** Three concurrent turns on one account trigger "too many
   requests". Keep `max_parallel_turns` small; on a 429 the driver waits 30 s
   and retries once before failing the turn as retryable.
-- **No streaming beyond polling.** Text and thoughts are refreshed every
-  `poll_interval_ms`; `idle_timeout_ms` is measured by visible progress, not
-  by tokens.
+- **No streaming beyond polling.** Text and thoughts are refreshed from the
+  API on the cadence above (≈30 s chunks while a long answer streams);
+  `idle_timeout_ms` is measured by visible progress in the page, not by
+  tokens.
 - **The web UI is the API.** Composer, send button, effort menu and consent
   card are located by DOM selectors captured in August 2026 and matched with
   Portuguese and English labels. A UI change surfaces as a `UiChanged` error
@@ -557,7 +565,7 @@ itself. `codex chatgpt-web status` shows the live registry and tunnel state.
 | `model … is not a ChatGPT Web model line` | Use one of the five `chatgpt-web/*` slugs. |
 | `UiChanged` naming a phase | A selector no longer matches chatgpt.com. Look at the tab; the driver does not guess. |
 | `MessageTooLong` → `ContextWindowExceeded` | The composer rejected the replay. Codex compacts and retries in a new conversation. |
-| `tools = "connector" needs the connector daemon, which this build does not wire yet` | The provider-side connector loop is not in this build; use `tools = "none"`. |
+| `[chatgpt_web] tools = "connector" needs the connector daemon: …` | The daemon could not be started or reached; run `codex chatgpt-web doctor` and `codex chatgpt-web daemon --foreground`. |
 | `the chatgpt-web daemon did not come up within 15s` | Run `codex chatgpt-web daemon --foreground` to see why; check `$CODEX_HOME/chatgpt_web/daemon.log`. |
 | registry `developer_mode_off` | Automatic enabling failed. Turn Developer Mode on in ChatGPT settings, then `codex chatgpt-web registry reconcile`. |
 | registry `browser_unavailable` | The daemon could not reach chrome-mcp to register the connector. Fix the daemon, reconcile. |

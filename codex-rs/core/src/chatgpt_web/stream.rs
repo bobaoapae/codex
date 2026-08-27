@@ -12,6 +12,7 @@ use super::driver::DriverResult;
 use super::driver::api;
 use super::driver::api::Conversation;
 use super::driver::api::Turn;
+use super::driver::page_scripts::DomProgress;
 use crate::claude_code::assembler::StreamAssembler;
 use crate::client_common::ResponseEvent;
 use codex_protocol::models::MessagePhase;
@@ -125,6 +126,11 @@ impl ReplyTracker {
         self.text_chars
     }
 
+    /// The (normalized) user text this tracker anchors on.
+    pub(crate) fn anchor(&self) -> &str {
+        &self.anchor
+    }
+
     /// FORK: forgets which item is open, without forgetting what was emitted.
     ///
     /// The connector turn spans several `stream()` calls, each with a fresh
@@ -140,7 +146,7 @@ impl ReplyTracker {
         let Some(index) = conv.last_user_turn_index() else {
             return false;
         };
-        anchor_of(&conv.turns[index].text) == self.anchor
+        anchor_matches(&conv.turns[index].text, &self.anchor)
     }
 
     /// Diffs one snapshot against what was already emitted.
@@ -189,14 +195,22 @@ impl ReplyTracker {
             deltas.push(Delta::Progress);
         }
 
-        let idle = !conv.is_generating && matches!(conv.async_status, None | Some(0));
-        if !idle {
-            return deltas;
-        }
         let newest_text = reply
             .iter()
             .rev()
             .find(|turn| matches!(classify(turn), Classified::Text(_)));
+        // FORK (verified live): a finished Pro conversation keeps
+        // `async_status: 4` after its final message landed with
+        // `end_turn: true`; waiting for the status to clear held the turn
+        // until the watchdog. A newest text that says the turn ended is the
+        // turn ending, whatever the async flag says.
+        let ended = newest_text.is_some_and(|turn| {
+            turn.end_turn == Some(true) && turn.status == "finished_successfully"
+        });
+        let idle = !conv.is_generating && (matches!(conv.async_status, None | Some(0)) || ended);
+        if !idle {
+            return deltas;
+        }
         if let Some(turn) = newest_text
             && turn.status == "finished_partial_completion"
             && turn.end_turn != Some(true)
@@ -285,6 +299,20 @@ impl ReplyTracker {
 
 fn anchor_of(text: &str) -> String {
     text.trim().chars().take(120).collect()
+}
+
+/// FORK (verified live): whether `shown` (the last user message as the API or
+/// the page renders it) is the message we sent. The rendered text may carry a
+/// leading `@Codex Native ` mention (connector mode) or trailing UI chrome, so
+/// the check is "contains the start of what we sent", not equality.
+fn anchor_matches(shown: &str, anchor: &str) -> bool {
+    let shown: String = shown.split_whitespace().collect::<Vec<_>>().join(" ");
+    let needle: String = anchor.split_whitespace().collect::<Vec<_>>().join(" ");
+    let needle: String = needle.chars().take(80).collect();
+    if needle.is_empty() {
+        return false;
+    }
+    shown.contains(&needle)
 }
 
 fn open_delta(kind: ItemKind, message_id: &str) -> Delta {
@@ -410,6 +438,146 @@ pub(crate) fn effective_poll_interval(
     }
 }
 
+/// Where the DOM view of the conversation comes from (the driver in
+/// production, canned progress in tests). `Ok(None)` = no tab shows the
+/// conversation right now.
+pub(crate) trait DomSource: Send + Sync {
+    fn read_dom<'a>(
+        &'a self,
+        conversation_id: &'a str,
+    ) -> BoxFuture<'a, DriverResult<Option<DomProgress>>>;
+}
+
+/// FORK (verified live): API reads are the scarce resource. While the reply
+/// streams, the answer text is refreshed from the API at most every
+/// [`API_STREAM_INTERVAL`]; while the DOM shows nothing changing the API is
+/// still consulted every [`API_SAFETY_INTERVAL`] (a Pro run continues
+/// server-side even if the tab navigated away); once the DOM says the reply
+/// finished the API is read right away and then every
+/// [`API_AFTER_FINISH_INTERVAL`] until it confirms `end_turn`.
+pub(crate) const API_STREAM_INTERVAL: Duration = Duration::from_secs(30);
+pub(crate) const API_SAFETY_INTERVAL: Duration = Duration::from_secs(60);
+pub(crate) const API_AFTER_FINISH_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Decides, tick by tick, whether the backend must be read. Pure; the loops
+/// feed it what the DOM showed and when the API was last read.
+#[derive(Debug)]
+pub(crate) struct PollScheduler {
+    last_api: Option<Instant>,
+    last_dom: Option<DomProgress>,
+    /// Whether the DOM claims the reply is finished (kept until the API
+    /// confirms or contradicts it).
+    dom_finished: bool,
+    stream_interval: Duration,
+    safety_interval: Duration,
+    after_finish_interval: Duration,
+}
+
+/// What one DOM tick decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DomStep {
+    /// The page changed since the previous tick (feeds the stall watchdog).
+    pub(crate) changed: bool,
+    /// The backend must be read now.
+    pub(crate) read_api: bool,
+}
+
+impl PollScheduler {
+    /// `sent_at` counts as the last backend contact: the send itself already
+    /// touched the API, and the first streaming read waits a full interval.
+    pub(crate) fn new(sent_at: Instant) -> Self {
+        Self {
+            last_api: Some(sent_at),
+            last_dom: None,
+            dom_finished: false,
+            stream_interval: API_STREAM_INTERVAL,
+            safety_interval: API_SAFETY_INTERVAL,
+            after_finish_interval: API_AFTER_FINISH_INTERVAL,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_intervals(
+        sent_at: Instant,
+        stream: Duration,
+        safety: Duration,
+        after_finish: Duration,
+    ) -> Self {
+        Self {
+            stream_interval: stream,
+            safety_interval: safety,
+            after_finish_interval: after_finish,
+            ..Self::new(sent_at)
+        }
+    }
+
+    fn since_api(&self, now: Instant) -> Duration {
+        self.last_api
+            .map(|at| now.saturating_duration_since(at))
+            .unwrap_or(Duration::MAX)
+    }
+
+    /// Whether the DOM progress describes our reply: the last user message on
+    /// the page is the one we sent.
+    fn anchored(progress: &DomProgress, anchor: &str) -> bool {
+        anchor_matches(&progress.last_user_text, anchor)
+    }
+
+    /// Feeds one DOM observation (`None` = the tab does not show the
+    /// conversation) and returns what to do.
+    pub(crate) fn on_dom(
+        &mut self,
+        progress: Option<DomProgress>,
+        anchor: &str,
+        now: Instant,
+    ) -> DomStep {
+        let Some(progress) = progress else {
+            // No page to watch: the API is the only source, on the slow cadence.
+            let read_api = self.since_api(now) >= self.stream_interval;
+            self.last_dom = None;
+            return DomStep {
+                changed: false,
+                read_api,
+            };
+        };
+        if !Self::anchored(&progress, anchor) {
+            // The page has not caught up with our message yet (or shows
+            // another reply); nothing to learn from it.
+            self.last_dom = None;
+            return DomStep {
+                changed: false,
+                read_api: self.since_api(now) >= self.stream_interval,
+            };
+        }
+        let changed = self.last_dom.as_ref() != Some(&progress);
+        let grew = self.last_dom.as_ref().is_none_or(|previous| {
+            progress.assistant_chars > previous.assistant_chars
+                || progress.assistant_turns > previous.assistant_turns
+        });
+        let finished = !progress.generating
+            && progress.streaming == 0
+            && progress.assistant_turns > 0
+            && progress.last_assistant_done;
+        let just_finished = finished && !self.dom_finished;
+        self.dom_finished = finished;
+        self.last_dom = Some(progress);
+        let since_api = self.since_api(now);
+        let read_api = if finished {
+            just_finished || since_api >= self.after_finish_interval
+        } else if grew {
+            since_api >= self.stream_interval
+        } else {
+            since_api >= self.safety_interval
+        };
+        DomStep { changed, read_api }
+    }
+
+    /// The API was just read.
+    pub(crate) fn on_api_read(&mut self, now: Instant) {
+        self.last_api = Some(now);
+    }
+}
+
 pub(crate) struct PollLoop<'a> {
     pub(crate) source: &'a dyn ConversationSource,
     pub(crate) conversation_id: String,
@@ -419,10 +587,10 @@ pub(crate) struct PollLoop<'a> {
     /// `None` = wait forever.
     pub(crate) idle_timeout: Option<Duration>,
     pub(crate) sent_at: Instant,
-    /// FORK: reserved for the connector mode (M6): a tool request arriving
-    /// here suspends the poll. Never fires in `tools = "none"`.
-    #[allow(dead_code)]
-    pub(crate) connector_rx: Option<tokio::sync::mpsc::Receiver<()>>,
+    /// FORK: the DOM reader; `None` polls the API alone (tests, no tab).
+    pub(crate) dom: Option<&'a dyn DomSource>,
+    /// The user text we sent, to anchor the DOM view on our reply.
+    pub(crate) anchor: String,
 }
 
 impl PollLoop<'_> {
@@ -435,6 +603,8 @@ impl PollLoop<'_> {
         let mut read_failures: u32 = 0;
         let mut rate_limit_cooldown = RATE_LIMIT_COOLDOWN_MIN;
         let mut last_rate_limit: Option<Instant> = None;
+        let mut scheduler = PollScheduler::new(self.sent_at);
+        let anchor = anchor_of(&self.anchor);
         loop {
             let idle_deadline = self
                 .idle_timeout
@@ -449,6 +619,26 @@ impl PollLoop<'_> {
                 }
                 _ = tokio::time::sleep(effective_poll_interval(self.poll_interval, last_rate_limit)) => {}
             }
+
+            // FORK: the page is the cheap source of progress; the API is read
+            // only when the scheduler says so (see `PollScheduler`).
+            if let Some(dom) = self.dom {
+                let progress = match dom.read_dom(&self.conversation_id).await {
+                    Ok(progress) => progress,
+                    Err(err) => {
+                        tracing::debug!("chatgpt_web: DOM progress read failed: {err}");
+                        None
+                    }
+                };
+                let step = scheduler.on_dom(progress, &anchor, Instant::now());
+                if step.changed {
+                    last_progress = Instant::now();
+                }
+                if !step.read_api {
+                    continue;
+                }
+            }
+            scheduler.on_api_read(Instant::now());
 
             let conv = match self.source.read(&self.conversation_id).await {
                 Ok(conv) => {

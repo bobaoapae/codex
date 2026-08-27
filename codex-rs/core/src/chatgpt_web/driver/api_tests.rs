@@ -852,3 +852,18 @@ async fn models_are_cached_per_base_url_for_five_minutes() {
     clear_models_cache(base);
     clear_models_cache(other);
 }
+
+/// FORK: the process-wide limiter spaces backend calls.
+#[tokio::test]
+async fn the_backend_limiter_spaces_calls_by_the_minimum_interval() {
+    let limiter = BackendLimiter::new(Duration::from_millis(40));
+    let started = Instant::now();
+    limiter.acquire().await;
+    limiter.acquire().await;
+    limiter.acquire().await;
+    assert!(
+        started.elapsed() >= Duration::from_millis(80),
+        "three calls must span two intervals, took {:?}",
+        started.elapsed()
+    );
+}

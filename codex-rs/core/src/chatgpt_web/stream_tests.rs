@@ -285,7 +285,8 @@ fn poll_loop<'a>(source: &'a dyn ConversationSource, anchor: &str) -> PollLoop<'
         poll_interval: Duration::from_millis(5),
         idle_timeout: Some(Duration::from_secs(5)),
         sent_at: Instant::now(),
-        connector_rx: None,
+        dom: None,
+        anchor: anchor.to_string(),
     }
 }
 
@@ -419,5 +420,265 @@ async fn a_404_after_the_grace_window_fails_the_turn() {
     let outcome = looped.run(&mut assembler, &consumer_dropped).await;
     assert!(
         matches!(outcome, PollOutcome::Failed(err) if err.kind == DriverErrorKind::ConversationNotFound)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// FORK: DOM-driven scheduling (the 429 fix).
+// ---------------------------------------------------------------------------
+
+fn dom(anchor: &str, chars: u64, generating: bool, done: bool) -> DomProgress {
+    DomProgress {
+        url: "https://chatgpt.com/c/conv".to_string(),
+        generating,
+        streaming: u64::from(generating),
+        last_user_text: anchor.to_string(),
+        assistant_turns: u64::from(chars > 0),
+        assistant_chars: chars,
+        last_assistant_done: done,
+        last_assistant_id: (chars > 0).then(|| "m1".to_string()),
+    }
+}
+
+#[test]
+fn the_scheduler_reads_the_api_only_when_the_page_finishes_or_an_interval_elapses() {
+    let t0 = Instant::now();
+    let mut scheduler = PollScheduler::with_intervals(
+        t0,
+        Duration::from_secs(30),
+        Duration::from_secs(60),
+        Duration::from_secs(10),
+    );
+    let anchor = anchor_of("hello there");
+
+    // Streaming: the page changes every tick but the API is left alone.
+    let step = scheduler.on_dom(
+        Some(dom("hello there", 10, true, false)),
+        &anchor,
+        t0 + Duration::from_secs(3),
+    );
+    assert_eq!(
+        step,
+        DomStep {
+            changed: true,
+            read_api: false
+        }
+    );
+    let step = scheduler.on_dom(
+        Some(dom("hello there", 20, true, false)),
+        &anchor,
+        t0 + Duration::from_secs(6),
+    );
+    assert_eq!(
+        step,
+        DomStep {
+            changed: true,
+            read_api: false
+        }
+    );
+    // Unchanged page: no progress, still no read.
+    let step = scheduler.on_dom(
+        Some(dom("hello there", 20, true, false)),
+        &anchor,
+        t0 + Duration::from_secs(9),
+    );
+    assert_eq!(
+        step,
+        DomStep {
+            changed: false,
+            read_api: false
+        }
+    );
+    // Growth past the stream interval: one read to refresh the text.
+    let step = scheduler.on_dom(
+        Some(dom("hello there", 30, true, false)),
+        &anchor,
+        t0 + Duration::from_secs(31),
+    );
+    assert_eq!(
+        step,
+        DomStep {
+            changed: true,
+            read_api: true
+        }
+    );
+    scheduler.on_api_read(t0 + Duration::from_secs(31));
+    // Finished on the page: read right away (well within the interval).
+    let step = scheduler.on_dom(
+        Some(dom("hello there", 30, false, true)),
+        &anchor,
+        t0 + Duration::from_secs(33),
+    );
+    assert_eq!(
+        step,
+        DomStep {
+            changed: true,
+            read_api: true
+        }
+    );
+    scheduler.on_api_read(t0 + Duration::from_secs(33));
+    // Still finished but the API did not confirm yet: re-read on the
+    // after-finish cadence only.
+    let step = scheduler.on_dom(
+        Some(dom("hello there", 30, false, true)),
+        &anchor,
+        t0 + Duration::from_secs(36),
+    );
+    assert_eq!(
+        step,
+        DomStep {
+            changed: false,
+            read_api: false
+        }
+    );
+    let step = scheduler.on_dom(
+        Some(dom("hello there", 30, false, true)),
+        &anchor,
+        t0 + Duration::from_secs(44),
+    );
+    assert_eq!(
+        step,
+        DomStep {
+            changed: false,
+            read_api: true
+        }
+    );
+}
+
+#[test]
+fn the_scheduler_falls_back_to_slow_api_polls_without_a_page() {
+    let t0 = Instant::now();
+    let mut scheduler = PollScheduler::with_intervals(
+        t0,
+        Duration::from_secs(30),
+        Duration::from_secs(60),
+        Duration::from_secs(10),
+    );
+    let anchor = anchor_of("hello there");
+    assert!(
+        !scheduler
+            .on_dom(None, &anchor, t0 + Duration::from_secs(5))
+            .read_api
+    );
+    assert!(
+        scheduler
+            .on_dom(None, &anchor, t0 + Duration::from_secs(31))
+            .read_api
+    );
+    // A page showing someone else's message is as good as no page.
+    scheduler.on_api_read(t0 + Duration::from_secs(31));
+    let foreign = dom("another prompt", 50, false, true);
+    assert_eq!(
+        scheduler.on_dom(Some(foreign), &anchor, t0 + Duration::from_secs(40)),
+        DomStep {
+            changed: false,
+            read_api: false
+        }
+    );
+    // A quiet, unfinished page is re-checked on the safety cadence.
+    scheduler.on_dom(
+        Some(dom("hello there", 5, true, false)),
+        &anchor,
+        t0 + Duration::from_secs(41),
+    );
+    assert!(
+        !scheduler
+            .on_dom(
+                Some(dom("hello there", 5, true, false)),
+                &anchor,
+                t0 + Duration::from_secs(80)
+            )
+            .read_api
+    );
+    assert!(
+        scheduler
+            .on_dom(
+                Some(dom("hello there", 5, true, false)),
+                &anchor,
+                t0 + Duration::from_secs(92)
+            )
+            .read_api
+    );
+}
+
+/// Counts API reads and serves canned progress from the page.
+struct Counted<'a> {
+    api: &'a Snapshots,
+    reads: std::sync::atomic::AtomicUsize,
+    dom: Mutex<Vec<Option<DomProgress>>>,
+}
+
+impl ConversationSource for Counted<'_> {
+    fn read<'a>(&'a self, id: &'a str) -> BoxFuture<'a, DriverResult<Conversation>> {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.api.read(id)
+    }
+}
+
+impl DomSource for Counted<'_> {
+    fn read_dom<'a>(&'a self, _: &'a str) -> BoxFuture<'a, DriverResult<Option<DomProgress>>> {
+        Box::pin(async move {
+            let mut steps = self.dom.lock().unwrap();
+            Ok(if steps.len() > 1 {
+                steps.remove(0)
+            } else {
+                steps[0].clone()
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn with_a_page_the_loop_reads_the_api_once_when_the_reply_finishes() {
+    let finished = fixture("finished");
+    let anchor = last_user_text(&finished);
+    let api = Snapshots(Mutex::new(vec![Ok(finished)]));
+    let source = Counted {
+        api: &api,
+        reads: std::sync::atomic::AtomicUsize::new(0),
+        dom: Mutex::new(vec![
+            Some(dom(&anchor, 0, true, false)),
+            Some(dom(&anchor, 40, true, false)),
+            Some(dom(&anchor, 80, true, false)),
+            Some(dom(&anchor, 80, false, true)),
+        ]),
+    };
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    let mut assembler = StreamAssembler::new(&tx);
+    let consumer_dropped = CancellationToken::new();
+    let mut lp = poll_loop(&source, &anchor);
+    lp.dom = Some(&source);
+
+    let outcome = lp.run(&mut assembler, &consumer_dropped).await;
+
+    assert!(matches!(outcome, PollOutcome::Done { .. }), "{outcome:?}");
+    assert_eq!(source.reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    drop(tx);
+    let mut saw_text = false;
+    while let Some(event) = rx.recv().await {
+        if matches!(event.expect("ok"), ResponseEvent::OutputTextDelta(_)) {
+            saw_text = true;
+        }
+    }
+    assert!(saw_text);
+}
+
+/// FORK (verified live on Pro): `async_status: 4` lingers after the final
+/// message; `end_turn: true` on the newest text still completes the turn.
+#[test]
+fn a_finished_pro_reply_completes_despite_a_lingering_async_status() {
+    let mut finished = fixture("finished");
+    finished.async_status = Some(4);
+    finished.is_generating = false;
+    let mut tracker = ReplyTracker::new(&last_user_text(&finished));
+    let deltas = tracker.observe(&finished, TrackMode::None);
+    assert!(
+        matches!(
+            deltas.last(),
+            Some(Delta::Done {
+                reason: DoneReason::EndTurn
+            })
+        ),
+        "{deltas:?}"
     );
 }

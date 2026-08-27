@@ -232,3 +232,36 @@ fn composer_state_decodes_the_script_result_shape() {
     let state: ComposerState = serde_json::from_value(json!({})).expect("decodes");
     assert_eq!(state, ComposerState::default());
 }
+
+/// FORK: the DOM progress reader is synchronous (hidden tabs throttle timers)
+/// and never touches the backend.
+#[test]
+fn dom_progress_is_a_synchronous_function_expression_without_fetch() {
+    let script = dom_progress();
+    assert!(script.trim_start().starts_with("() =>"));
+    assert!(!script.contains("async "));
+    assert!(!script.contains("await "));
+    assert!(!script.contains("fetch("));
+    assert!(!script.contains("setTimeout"));
+    for key in [
+        "generating",
+        "streaming",
+        "lastUserText",
+        "assistantChars",
+        "lastAssistantDone",
+    ] {
+        assert!(script.contains(key), "missing {key}");
+    }
+}
+
+/// FORK: the level picker drives the slider variant first and keeps the
+/// submenu path as the fallback.
+#[test]
+fn menu_select_handles_the_slider_picker_and_the_legacy_submenu() {
+    let script = menu_select(MenuKind::Level, "^Alto$|^High$");
+    assert!(script.contains("aria-keyshortcuts"));
+    assert!(script.contains("ArrowLeft"));
+    assert!(script.contains("ArrowRight"));
+    assert!(script.contains("submenu not found"));
+    assert!(!script.contains("async "));
+}

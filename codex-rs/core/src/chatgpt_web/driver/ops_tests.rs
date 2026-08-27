@@ -1335,12 +1335,18 @@ async fn send_selects_the_level_via_the_menu_for_effort_specs() {
         .filter(|args| args["action"] == "reload")
         .count();
     assert_eq!(reloads, 1);
-    // The label "Instant" from the fake composer does not match the requested level.
-    assert_eq!(sent.notes.len(), 1);
+    // The picker reports what it selected, and the label "Instant" from the
+    // fake composer does not match the requested level.
+    assert_eq!(sent.notes.len(), 2, "{:?}", sent.notes);
     assert!(
-        sent.notes[0].contains("composer label is 'Instant'"),
+        sent.notes[0].contains("effort level set through the picker"),
         "{}",
         sent.notes[0]
+    );
+    assert!(
+        sent.notes[1].contains("composer label is 'Instant'"),
+        "{}",
+        sent.notes[1]
     );
 }
 

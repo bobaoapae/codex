@@ -55,6 +55,7 @@ use super::daemon::DEFAULT_TOOL_TIMEOUT_MS;
 use super::daemon::DaemonClient;
 use super::page_scripts;
 use super::page_scripts::ComposerState;
+use super::page_scripts::DomProgress;
 use super::page_scripts::MenuKind;
 use super::tabs::TabDaemon;
 use super::tabs::TabId;
@@ -1018,7 +1019,30 @@ impl ChatGptOps {
     /// The backend API bound to `tab_id` (page-side fetches with the browser's
     /// cookies; relative paths, as the TS does).
     pub(crate) fn api_on(&self, tab_id: TabId) -> ChatGptApi<'_> {
-        ChatGptApi::new(&self.eval, tab_id, "")
+        // FORK: every backend call of the driver is paced process-wide; see
+        // `api::BackendLimiter`.
+        ChatGptApi::new(&self.eval, tab_id, "").with_backend_limiter()
+    }
+
+    /// FORK: reads the reply's progress from the DOM of the tab bound to
+    /// `conversation_id` — no backend request. `None` when no tab of this
+    /// pool shows that conversation (the reader then falls back to the API).
+    pub(crate) async fn dom_progress(
+        &self,
+        conversation_id: &str,
+    ) -> DriverResult<Option<DomProgress>> {
+        let Some(tab_id) = self.tabs.bound_tab_id(conversation_id) else {
+            return Ok(None);
+        };
+        let progress: DomProgress = self
+            .eval_as(
+                tab_id,
+                page_scripts::dom_progress(),
+                DEFAULT_TOOL_TIMEOUT_MS,
+            )
+            .await?;
+        let on_page = conversation_id_from_url(&progress.url).as_deref() == Some(conversation_id);
+        Ok(on_page.then_some(progress))
     }
 
     /// The backend API on the best read tab for `conversation_id`.
@@ -1295,7 +1319,12 @@ impl ChatGptOps {
             self.tabs.goto_on(tab_id, &url).await?;
             if let Some(level) = resolved.menu_level.as_deref() {
                 let selection = self.set_level_via_menu_on(tab_id, level).await?;
-                if !selection.ok {
+                if selection.ok {
+                    notes.push(format!(
+                        "effort level set through the picker: {}",
+                        selection.selected.as_deref().unwrap_or("?")
+                    ));
+                } else {
                     notes.push(format!(
                         "exact level selection via menu failed ({}); continuing with the model slug default",
                         selection.error.as_deref().unwrap_or("unknown")
@@ -1488,6 +1517,41 @@ impl ChatGptOps {
                     )
                     .await?;
             }
+        }
+        // FORK (verified live): right after the effort-picker reload the first
+        // synthetic click on an enabled send button can be swallowed while the
+        // composer finishes hydrating — no stop button, no URL flip, and the
+        // text still sits in the composer. That state is provably "nothing
+        // sent" for a new chat, so clicking again is safe.
+        // On an existing conversation the URL already has `/c/`, so `ok` is
+        // true even when nothing was sent; the composer still holding the
+        // text is the reliable signal there (a sent message empties it).
+        let mut resend_attempts = 0u8;
+        while !(sent.ok && sent.generating) && sent.error.is_none() && resend_attempts < 2 {
+            let state = self.composer_state_on(tab_id).await?;
+            let nothing_sent = state.has_composer
+                && !state.generating
+                && (request.conversation_id.is_some()
+                    || conversation_id_from_url(&state.url).is_none())
+                && state
+                    .text
+                    .as_deref()
+                    .is_some_and(|text| !text.trim().is_empty());
+            if !nothing_sent {
+                break;
+            }
+            resend_attempts += 1;
+            warn!(
+                "[chatgpt_web ops] the send click was swallowed (composer still full); clicking again ({resend_attempts}/2)"
+            );
+            tokio::time::sleep(self.timings.composer_reset_settle).await;
+            sent = self
+                .eval_as(
+                    tab_id,
+                    page_scripts::click_send(CLICK_SEND_PAGE_TIMEOUT_MS),
+                    EVAL_SUBMIT_TIMEOUT_MS,
+                )
+                .await?;
         }
         if !sent.ok {
             let detail = sent

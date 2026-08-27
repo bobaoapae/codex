@@ -635,6 +635,18 @@ impl TabPool {
         self.ensure().await
     }
 
+    /// The tab bound to `conversation_id`, if this pool has one (no I/O).
+    ///
+    /// FORK: the DOM progress reader only makes sense on the tab that shows
+    /// the conversation; any other tab would report a different page.
+    pub(crate) fn bound_tab_id(&self, conversation_id: &str) -> Option<TabId> {
+        self.inner
+            .snapshot()
+            .iter()
+            .find(|tab| tab.bound_conversation().as_deref() == Some(conversation_id))
+            .map(|tab| tab.id)
+    }
+
     /// Chrome's view of the primary tab, if the pool has one.
     pub(crate) async fn info(&self) -> DriverResult<Option<TabInfo>> {
         let Some(primary) = self.primary_id() else {

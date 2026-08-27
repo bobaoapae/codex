@@ -209,9 +209,11 @@ pub enum ClaudeCodeAccountSelection {
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct ChatGptWebToml {
-    /// What the ChatGPT side can reach: `none` (default; it only sees the
-    /// transcript) or `connector` (Codex tools exposed through a custom MCP
-    /// connector; requires the shared `codex chatgpt-web daemon`).
+    /// What the ChatGPT side can reach: `none` (it only sees the transcript)
+    /// or `connector` (Codex tools exposed through a custom MCP connector;
+    /// requires the shared `codex chatgpt-web daemon`). When unset, the mode
+    /// follows the tunnel setup: `connector` once `tunnel_id` is configured
+    /// (or `tunnel` is `cloudflared`/`manual`), `none` otherwise.
     pub tools: Option<ChatGptWebTools>,
 
     /// How long a turn may make no visible progress before it is abandoned and
