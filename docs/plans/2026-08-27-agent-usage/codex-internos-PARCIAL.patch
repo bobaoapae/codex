@@ -1,0 +1,1191 @@
+diff --git a/codex-rs/config/src/config_toml.rs b/codex-rs/config/src/config_toml.rs
+index 82e57c1e4..552e8f4f3 100644
+--- a/codex-rs/config/src/config_toml.rs
++++ b/codex-rs/config/src/config_toml.rs
+@@ -918,6 +918,18 @@ pub struct AgentsToml {
+     /// Defaults to true.
+     pub interrupt_message: Option<bool>,
+ 
++    /// FORK: `fork_turns` used by `spawn_agent` when the call omits it: `"all"`
++    /// (upstream default), `"none"`, or a positive integer string such as `"3"`.
++    /// A full-history fork copies the whole parent transcript into every child;
++    /// on long sessions that is the dominant cost of each spawn.
++    pub default_fork_turns: Option<String>,
++
++    /// FORK: ceiling on `fork_turns` for children served by a model endpoint
++    /// (locally served providers have their own `max_fork_turns`). A request
++    /// above it — including `"all"` — is clamped to this many turns and the
++    /// tool result says so. Unset = no cap.
++    pub max_fork_turns: Option<usize>,
++
+     /// User-defined role declarations keyed by role name.
+     ///
+     /// Example:
+diff --git a/codex-rs/core/src/agent/role.rs b/codex-rs/core/src/agent/role.rs
+index 204c4853b..1e99c1f6d 100644
+--- a/codex-rs/core/src/agent/role.rs
++++ b/codex-rs/core/src/agent/role.rs
+@@ -307,6 +307,25 @@ pub(crate) mod spawn_tool_spec {
+         let mut formatted_roles = Vec::new();
+         for (name, declaration) in user_defined_roles {
+             if seen.insert(name.as_str()) {
++                // FORK: a user role that shadows a built-in of the same name
++                // (`explorer`) used to drop the built-in's usage guidance
++                // ("spawn several in parallel", "trust their results"); the
++                // user's text is about identity, the built-in's about when.
++                let merged;
++                let declaration = match (
++                    built_in_roles.get(name).and_then(|role| role.description.as_deref()),
++                    declaration.description.as_deref(),
++                ) {
++                    (Some(built_in), Some(user)) if built_in != user => {
++                        merged = AgentRoleConfig {
++                            description: Some(format!("{built_in}\n{user}")),
++                            config_file: declaration.config_file.clone(),
++                            nickname_candidates: declaration.nickname_candidates.clone(),
++                        };
++                        &merged
++                    }
++                    _ => declaration,
++                };
+                 formatted_roles.push(format_role(name, declaration));
+             }
+         }
+@@ -346,10 +365,10 @@ pub(crate) mod spawn_tool_spec {
+                     let role_provider = role_toml.get("model_provider").and_then(TomlValue::as_str);
+                     let local_note = match role_provider {
+                         Some(CLAUDE_CODE_PROVIDER_ID) => {
+-                            "\n- This role runs on the local Claude Code CLI. It starts from the task you send it, without the parent conversation, so the task must be self-contained, and it must be sent as `plaintext_message`."
++                            "\n- This role runs on the local Claude Code CLI. It starts from the task you send it, without the parent conversation, so the task must be self-contained, and it must be sent as `plaintext_message`. Turns take minutes; wait with a long `wait_agent` instead of polling."
+                         }
+                         Some(CHATGPT_WEB_PROVIDER_ID) => {
+-                            "\n- This role runs on ChatGPT Web through a browser tab. It starts from the task you send it, without the parent conversation, so the task must be self-contained and sent as `plaintext_message`. It has no access to the local computer unless `[chatgpt_web] tools = \"connector\"` is configured."
++                            "\n- This role runs on ChatGPT Web through a browser tab. It starts from the task you send it, without the parent conversation, so the task must be self-contained and sent as `plaintext_message`. It has no access to the local computer unless `[chatgpt_web] tools = \"connector\"` is configured. Replies take 5-20 minutes; wait with `wait_agent` at 600000 ms or more, and never start a second conversation for the same question."
+                         }
+                         _ => "",
+                     };
+diff --git a/codex-rs/core/src/agent/role_tests.rs b/codex-rs/core/src/agent/role_tests.rs
+index 4c66e0fef..4a8d5738a 100644
+--- a/codex-rs/core/src/agent/role_tests.rs
++++ b/codex-rs/core/src/agent/role_tests.rs
+@@ -636,9 +636,31 @@ fn spawn_tool_spec_build_deduplicates_user_defined_built_in_roles() {
+     let spec = spawn_tool_spec::build(&user_defined_roles);
+ 
+     assert!(spec.contains("researcher: no description"));
+-    assert!(spec.contains("explorer: {\nuser override\n}"));
++    // FORK: the built-in's usage guidance survives the shadowing, ahead of the
++    // user's own text, and the role is listed once.
++    assert!(spec.contains("explorer: {\nUse `explorer` for specific codebase questions."));
++    assert!(spec.contains("Explorers are fast and authoritative."));
++    assert!(spec.contains("- Reuse existing explorers for related questions.\nuser override\n}"));
++    assert_eq!(spec.matches("explorer: {").count(), 1);
+     assert!(spec.contains("default: {\nDefault agent.\n}"));
+-    assert!(!spec.contains("Explorers are fast and authoritative."));
++}
++
++/// FORK: shadowing with the identical text does not duplicate it.
++#[test]
++fn spawn_tool_spec_does_not_repeat_an_identical_shadowed_description() {
++    let user_defined_roles = BTreeMap::from([(
++        "default".to_string(),
++        AgentRoleConfig {
++            description: Some("Default agent.".to_string()),
++            config_file: None,
++            nickname_candidates: None,
++        },
++    )]);
++
++    let spec = spawn_tool_spec::build(&user_defined_roles);
++
++    assert!(spec.contains("default: {\nDefault agent.\n}"), "{spec}");
++    assert!(!spec.contains("Default agent.\nDefault agent."), "{spec}");
+ }
+ 
+ #[test]
+@@ -864,6 +886,8 @@ model_provider = "claude_code"
+         "{spec}"
+     );
+     assert!(spec.contains("`plaintext_message`"), "{spec}");
++    // FORK: the latency note keeps the root from polling or interrupting.
++    assert!(spec.contains("Turns take minutes"), "{spec}");
+ }
+ 
+ /// FORK: a ChatGPT Web role is announced the same way, with its own caveat
+@@ -896,4 +920,7 @@ model_provider = "chatgpt_web"
+     );
+     assert!(spec.contains("`plaintext_message`"), "{spec}");
+     assert!(spec.contains("Do not pass `service_tier`"), "{spec}");
++    // FORK: the root gave up on a 5-20 minute reply and opened a second chat.
++    assert!(spec.contains("Replies take 5-20 minutes"), "{spec}");
++    assert!(spec.contains("600000 ms"), "{spec}");
+ }
+diff --git a/codex-rs/core/src/config/mod.rs b/codex-rs/core/src/config/mod.rs
+index a6f66fdc3..915477322 100644
+--- a/codex-rs/core/src/config/mod.rs
++++ b/codex-rs/core/src/config/mod.rs
+@@ -29,6 +29,7 @@ use codex_config::config_toml::ChatGptWebToml;
+ use codex_config::config_toml::ChatGptWebTools;
+ use codex_config::config_toml::ChatGptWebTunnel;
+ use codex_config::config_toml::ClaudeCodeAccountSelection;
++use codex_features::MultiAgentProactiveDelegation;
+ use codex_config::config_toml::ConfigToml;
+ use codex_config::config_toml::DEFAULT_PROJECT_DOC_MAX_BYTES;
+ use codex_config::config_toml::ProjectConfig;
+@@ -1100,6 +1101,12 @@ pub struct Config {
+     /// Maximum nesting depth for V1 agent threads. Ignored by V2.
+     pub agent_max_depth: i32,
+ 
++    /// FORK: `fork_turns` applied when a `spawn_agent` call omits it.
++    pub agent_default_fork_turns: AgentForkTurns,
++
++    /// FORK: cap on `fork_turns` for endpoint-served children; `None` = no cap.
++    pub agent_max_fork_turns: Option<usize>,
++
+     /// User-defined role declarations keyed by role name.
+     pub agent_roles: BTreeMap<String, AgentRoleConfig>,
+ 
+@@ -1503,6 +1510,50 @@ impl Default for CurrentTimeReminderConfig {
+     }
+ }
+ 
++/// FORK: a `fork_turns` value as configured (`[agents] default_fork_turns`).
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
++#[serde(rename_all = "snake_case")]
++pub enum AgentForkTurns {
++    /// Full-history fork (`"all"`).
++    All,
++    /// Task-only context (`"none"`).
++    None,
++    /// The most recent `n` turns (a positive integer string).
++    LastN(usize),
++}
++
++impl AgentForkTurns {
++    /// Parses the same vocabulary `spawn_agent` accepts for `fork_turns`.
++    pub fn parse(value: &str) -> Option<Self> {
++        let value = value.trim();
++        if value.eq_ignore_ascii_case("all") {
++            return Some(Self::All);
++        }
++        if value.eq_ignore_ascii_case("none") {
++            return Some(Self::None);
++        }
++        match value.parse::<usize>() {
++            Ok(turns) if turns > 0 => Some(Self::LastN(turns)),
++            _ => Option::None,
++        }
++    }
++
++    /// The `fork_turns` string the tool description should advertise.
++    pub fn as_tool_value(self) -> String {
++        match self {
++            Self::All => "all".to_string(),
++            Self::None => "none".to_string(),
++            Self::LastN(turns) => turns.to_string(),
++        }
++    }
++}
++
++impl Default for AgentForkTurns {
++    fn default() -> Self {
++        Self::All
++    }
++}
++
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+ pub struct MultiAgentV2Config {
+     pub max_concurrent_threads_per_session: usize,
+@@ -1518,6 +1569,11 @@ pub struct MultiAgentV2Config {
+     pub subagent_usage_hint_suffix: Option<String>,
+     /// FORK: append the delivery-discipline hint to the root agent.
+     pub delivery_discipline_hint: bool,
++    /// FORK: when the proactive multi-agent mode applies, independent of the
++    /// reasoning effort (`ultra` = upstream rule).
++    pub proactive: MultiAgentProactiveDelegation,
++    /// FORK: append the delegation playbook to the root hint while proactive.
++    pub delegation_playbook_hint: bool,
+     /// FORK: Desktop threads created in one session before the result starts
+     /// warning about it. 0 disables the warning.
+     pub max_desktop_threads_per_session: usize,
+@@ -1543,6 +1599,8 @@ impl MultiAgentV2Config {
+             root_agent_usage_hint_suffix: None,
+             subagent_usage_hint_suffix: None,
+             delivery_discipline_hint: true,
++            proactive: MultiAgentProactiveDelegation::Ultra,
++            delegation_playbook_hint: true,
+             max_desktop_threads_per_session: 4,
+             subagent_developer_instructions: None,
+             multi_agent_mode_hint_text: None,
+@@ -2993,6 +3051,12 @@ fn resolve_multi_agent_v2_config(config_toml: &ConfigToml) -> MultiAgentV2Config
+     let delivery_discipline_hint = base
+         .and_then(|config| config.delivery_discipline_hint)
+         .unwrap_or(default.delivery_discipline_hint);
++    let proactive = base
++        .and_then(|config| config.proactive)
++        .unwrap_or(default.proactive);
++    let delegation_playbook_hint = base
++        .and_then(|config| config.delegation_playbook_hint)
++        .unwrap_or(default.delegation_playbook_hint);
+     let max_desktop_threads_per_session = base
+         .and_then(|config| config.max_desktop_threads_per_session)
+         .unwrap_or(default.max_desktop_threads_per_session);
+@@ -3025,6 +3089,8 @@ fn resolve_multi_agent_v2_config(config_toml: &ConfigToml) -> MultiAgentV2Config
+         root_agent_usage_hint_suffix,
+         subagent_usage_hint_suffix,
+         delivery_discipline_hint,
++        proactive,
++        delegation_playbook_hint,
+         max_desktop_threads_per_session,
+         subagent_developer_instructions,
+         multi_agent_mode_hint_text,
+@@ -4065,6 +4131,21 @@ impl Config {
+             .agents
+             .as_ref()
+             .and_then(|agents| agents.default_subagent_model.clone());
++        // FORK: spawn-time fork defaults for endpoint-served children.
++        let agent_default_fork_turns = match cfg
++            .agents
++            .as_ref()
++            .and_then(|agents| agents.default_fork_turns.as_deref())
++        {
++            None => AgentForkTurns::All,
++            Some(value) => AgentForkTurns::parse(value).ok_or_else(|| {
++                std::io::Error::new(
++                    std::io::ErrorKind::InvalidData,
++                    "agents.default_fork_turns must be `none`, `all`, or a positive integer string",
++                )
++            })?,
++        };
++        let agent_max_fork_turns = cfg.agents.as_ref().and_then(|agents| agents.max_fork_turns);
+         let agent_default_subagent_reasoning_effort = cfg
+             .agents
+             .as_ref()
+@@ -4512,6 +4593,8 @@ impl Config {
+             agent_default_subagent_model,
+             agent_default_subagent_reasoning_effort,
+             agent_max_depth,
++            agent_default_fork_turns,
++            agent_max_fork_turns,
+             agent_roles,
+             max_goal_token_budget: cfg
+                 .goals
+diff --git a/codex-rs/core/src/context/world_state/multi_agent_mode.rs b/codex-rs/core/src/context/world_state/multi_agent_mode.rs
+index bb63e0252..dca96e4f9 100644
+--- a/codex-rs/core/src/context/world_state/multi_agent_mode.rs
++++ b/codex-rs/core/src/context/world_state/multi_agent_mode.rs
+@@ -10,7 +10,9 @@ use codex_utils_output_truncation::truncate_text;
+ use serde::Deserialize;
+ use serde::Serialize;
+ 
+-const MULTI_AGENT_MODE_MAX_TOKENS: usize = 400;
++// FORK: 400 truncated a configured `multi_agent_mode_hint_text` that carried a
++// delegation policy; the built-in texts are far below either bound.
++const MULTI_AGENT_MODE_MAX_TOKENS: usize = 800;
+ 
+ /// Effective multi-agent mode currently visible to the model.
+ #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+diff --git a/codex-rs/core/src/context/world_state/multi_agent_mode_tests.rs b/codex-rs/core/src/context/world_state/multi_agent_mode_tests.rs
+index fa73781bc..0ee6aad32 100644
+--- a/codex-rs/core/src/context/world_state/multi_agent_mode_tests.rs
++++ b/codex-rs/core/src/context/world_state/multi_agent_mode_tests.rs
+@@ -145,3 +145,12 @@ fn custom_mode_is_bounded_before_snapshot_and_rendering() {
+         .render();
+     assert!(approx_token_count(&rendered) < 1_000);
+ }
++
++/// FORK: a configured policy of a few hundred tokens must survive intact.
++#[test]
++fn a_medium_length_custom_mode_is_not_truncated() {
++    let text = "delegate by default ".repeat(120);
++    assert!(approx_token_count(&text) > 400, "{}", approx_token_count(&text));
++    let state = state(Some(MultiAgentMode::Custom(text.clone())));
++    assert_eq!(state.snapshot().mode, Some(MultiAgentMode::Custom(text)));
++}
+diff --git a/codex-rs/core/src/session/multi_agents.rs b/codex-rs/core/src/session/multi_agents.rs
+index 082c005a6..feb847d26 100644
+--- a/codex-rs/core/src/session/multi_agents.rs
++++ b/codex-rs/core/src/session/multi_agents.rs
+@@ -1,4 +1,5 @@
+ use crate::config::MultiAgentV2Config;
++use codex_features::MultiAgentProactiveDelegation;
+ use crate::context::MultiAgentRoleInstructions;
+ use crate::session::turn_context::TurnContext;
+ use codex_protocol::config_types::MultiAgentMode;
+@@ -86,7 +87,17 @@ pub(super) fn usage_hint_text(
+         | SessionSource::Exec
+         | SessionSource::Mcp
+         | SessionSource::Custom(_)
+-        | SessionSource::Unknown => snapshot.root,
++        | SessionSource::Unknown => {
++            // FORK: the playbook is per turn, because the mode is per turn.
++            let playbook: Vec<String> = playbook_section(
++                &turn_context.config.multi_agent_v2,
++                proactive_delegation(turn_context),
++            )
++            .map(str::to_string)
++            .into_iter()
++            .collect();
++            append_sections(snapshot.root, &playbook)
++        }
+         SessionSource::Internal(_) | SessionSource::SubAgent(_) => None,
+     }
+ }
+@@ -133,6 +144,20 @@ Task IDs stay at most two levels deep. If a third level seems necessary, the tas
+ 
+ Do not ask what the plan, the request, or the code already answers. Ask only when two readings would lead to materially different work."#;
+ 
++/// FORK: how to delegate, for the root only, while proactive delegation is on.
++///
++/// Measured problem: the bundled root hint describes the *mechanism* (mailbox,
++/// `followup_task`) and never says when to delegate. Sessions below `ultra`
++/// spawned nothing at all and even proactive ones ran 100+ tool-call turns
++/// locally over three independent fronts.
++const FORK_MULTI_AGENT_V2_PLAYBOOK_HINT_TEXT: &str = r#"## Delegation playbook
++
++Delegation is the default, not the exception. Plan executions, changes touching several files, work with independent fronts (platforms, repositories, modules, questions), open investigations, and independent verification are team work; keep local only the immediate blocking step, questions for the user, git operations the user asked for, and one-file fixes.
++
++Shape: investigate first (one explorer per open question, in parallel), then one implementer per task with a disjoint write set stated in its brief, then one independent verifier per finished task, then documentation once at the end. One agent per platform or device. For a second opinion, spawn two different model families in parallel with the same self-contained brief and reconcile.
++
++Always pass `agent_type`: pick the role whose description matches the task; a role-less spawn is only a full-history fork of yourself. Slow providers (browser- or CLI-backed roles) answer in minutes: wait with one long `wait_agent` rather than polling, and never open a second agent for the same question."#;
++
+ pub(crate) fn resolve_usage_hints(
+     config: &MultiAgentV2Config,
+     catalog: Option<&MultiAgentRoleMessages>,
+@@ -264,13 +289,22 @@ pub(crate) fn effective_multi_agent_mode(turn_context: &TurnContext) -> Option<M
+     // of an effort-derived built-in policy.
+     let multi_agent_mode = match mode_hint_text {
+         Some(hint_text) => MultiAgentMode::Custom(hint_text.to_string()),
+-        None => match turn_context.effective_reasoning_effort() {
+-            Some(ReasoningEffort::Ultra) => MultiAgentMode::Proactive,
+-            _ => catalog_mode
+-                .and_then(|messages| messages.explicit.clone())
+-                .map(MultiAgentMode::Custom)
+-                .unwrap_or(MultiAgentMode::ExplicitRequestOnly),
+-        },
++        // FORK: `[features.multi_agent_v2] proactive` decides instead of the
++        // effort alone; `ultra` keeps the upstream rule and adds `max`, which
++        // sits above `ultra` in the picker and was silently non-proactive.
++        None => {
++            if proactive_for(
++                turn_context.config.multi_agent_v2.proactive,
++                turn_context.effective_reasoning_effort(),
++            ) {
++                MultiAgentMode::Proactive
++            } else {
++                catalog_mode
++                    .and_then(|messages| messages.explicit.clone())
++                    .map(MultiAgentMode::Custom)
++                    .unwrap_or(MultiAgentMode::ExplicitRequestOnly)
++            }
++        }
+     };
+ 
+     match &turn_context.session_source {
+@@ -285,6 +319,42 @@ pub(crate) fn effective_multi_agent_mode(turn_context: &TurnContext) -> Option<M
+     }
+ }
+ 
++/// FORK: the effort-independent proactive rule.
++pub(crate) fn proactive_for(
++    knob: MultiAgentProactiveDelegation,
++    effort: Option<ReasoningEffort>,
++) -> bool {
++    match knob {
++        MultiAgentProactiveDelegation::Always => true,
++        MultiAgentProactiveDelegation::Never => false,
++        MultiAgentProactiveDelegation::Ultra => {
++            matches!(effort, Some(ReasoningEffort::Ultra | ReasoningEffort::Max))
++        }
++    }
++}
++
++/// FORK: whether this turn delegates proactively.
++///
++/// True for the built-in proactive mode, and for a configured custom mode
++/// when `[features.multi_agent_v2] proactive = "always"` — a custom hint text
++/// replaces the mode wording but says nothing about the tool descriptions and
++/// the playbook, which key off this.
++pub(crate) fn proactive_delegation(turn_context: &TurnContext) -> bool {
++    match effective_multi_agent_mode(turn_context) {
++        Some(MultiAgentMode::Proactive) => true,
++        Some(MultiAgentMode::Custom(_)) => matches!(
++            turn_context.config.multi_agent_v2.proactive,
++            MultiAgentProactiveDelegation::Always
++        ),
++        Some(MultiAgentMode::ExplicitRequestOnly) | None => false,
++    }
++}
++
++/// FORK: the playbook section appended to a root hint while proactive.
++fn playbook_section(config: &MultiAgentV2Config, proactive: bool) -> Option<&'static str> {
++    (proactive && config.delegation_playbook_hint).then_some(FORK_MULTI_AGENT_V2_PLAYBOOK_HINT_TEXT)
++}
++
+ #[cfg(test)]
+ mod fork_hint_tests {
+     use super::*;
+@@ -372,6 +442,46 @@ mod fork_hint_tests {
+         );
+     }
+ 
++    /// `ultra` is the upstream rule plus `max`; `always`/`never` ignore effort.
++    #[test]
++    fn proactive_rule_follows_the_knob_then_the_effort() {
++        use MultiAgentProactiveDelegation as Knob;
++        for effort in [
++            None,
++            Some(ReasoningEffort::Medium),
++            Some(ReasoningEffort::High),
++            Some(ReasoningEffort::Ultra),
++            Some(ReasoningEffort::Max),
++        ] {
++            assert!(proactive_for(Knob::Always, effort.clone()));
++            assert!(!proactive_for(Knob::Never, effort.clone()));
++        }
++        assert!(proactive_for(Knob::Ultra, Some(ReasoningEffort::Ultra)));
++        assert!(proactive_for(Knob::Ultra, Some(ReasoningEffort::Max)));
++        assert!(!proactive_for(Knob::Ultra, Some(ReasoningEffort::High)));
++        assert!(!proactive_for(Knob::Ultra, None));
++    }
++
++    /// The playbook is appended to a root hint only while proactive, and only
++    /// when the knob allows it.
++    #[test]
++    fn playbook_section_follows_the_proactive_flag_and_the_knob() {
++        let mut config = config();
++        assert_eq!(
++            playbook_section(&config, /*proactive*/ true),
++            Some(FORK_MULTI_AGENT_V2_PLAYBOOK_HINT_TEXT)
++        );
++        assert_eq!(playbook_section(&config, /*proactive*/ false), None);
++        config.delegation_playbook_hint = false;
++        assert_eq!(playbook_section(&config, /*proactive*/ true), None);
++        // Kept short: the root reads it every turn.
++        assert!(
++            codex_utils_output_truncation::approx_token_count(
++                FORK_MULTI_AGENT_V2_PLAYBOOK_HINT_TEXT
++            ) <= 260
++        );
++    }
++
+     /// The fork sections are recognizable, so a forked child can strip a hint
+     /// recorded by a build whose sections differ.
+     #[test]
+diff --git a/codex-rs/core/src/tools/handlers/multi_agents_common.rs b/codex-rs/core/src/tools/handlers/multi_agents_common.rs
+index eee11f6e0..45ffeea97 100644
+--- a/codex-rs/core/src/tools/handlers/multi_agents_common.rs
++++ b/codex-rs/core/src/tools/handlers/multi_agents_common.rs
+@@ -75,6 +75,44 @@ pub(crate) fn task_fork_mode_for_wire_api(
+     }
+ }
+ 
++/// FORK: applies `[agents] max_fork_turns` to a child served by a model endpoint.
++///
++/// Locally served children have their own ceiling (above). For everyone else
++/// a full-history fork copies the entire parent transcript into the child,
++/// which on long sessions is the dominant cost of a spawn; the cap turns it
++/// into a recent-turns fork and says so.
++pub(crate) fn apply_endpoint_fork_cap(
++    wire_api: WireApi,
++    fork_mode: Option<SpawnAgentForkMode>,
++    max_fork_turns: Option<usize>,
++) -> (Option<SpawnAgentForkMode>, Option<String>) {
++    let (WireApi::Responses, Some(cap)) = (wire_api, max_fork_turns) else {
++        return (fork_mode, None);
++    };
++    let capped = |turns: usize| {
++        if cap == 0 {
++            None
++        } else {
++            Some(SpawnAgentForkMode::LastNTurns(turns))
++        }
++    };
++    match fork_mode {
++        Some(SpawnAgentForkMode::FullHistory) => (
++            capped(cap),
++            Some(format!(
++                "`fork_turns: \"all\"` was reduced to {cap} by `[agents] max_fork_turns`; the child saw only the most recent turns."
++            )),
++        ),
++        Some(SpawnAgentForkMode::LastNTurns(requested)) if requested > cap => (
++            capped(cap),
++            Some(format!(
++                "`fork_turns` was reduced from {requested} to {cap} by `[agents] max_fork_turns`."
++            )),
++        ),
++        other => (other, None),
++    }
++}
++
+ /// FORK: the `config.toml` table of a locally served wire API, or `None` for a
+ /// provider with a real backend.
+ fn locally_served_config_table(wire_api: WireApi) -> Option<&'static str> {
+@@ -714,6 +752,72 @@ mod tests {
+     use super::*;
+     use std::path::PathBuf;
+ 
++    #[test]
++    fn endpoint_fork_cap_turns_a_full_fork_into_recent_turns() {
++        let (mode, note) = apply_endpoint_fork_cap(
++            WireApi::Responses,
++            Some(SpawnAgentForkMode::FullHistory),
++            Some(3),
++        );
++        assert_eq!(mode, Some(SpawnAgentForkMode::LastNTurns(3)));
++        assert!(note.is_some_and(|note| note.contains("reduced to 3")));
++
++        let (mode, note) = apply_endpoint_fork_cap(
++            WireApi::Responses,
++            Some(SpawnAgentForkMode::LastNTurns(10)),
++            Some(3),
++        );
++        assert_eq!(mode, Some(SpawnAgentForkMode::LastNTurns(3)));
++        assert!(note.is_some_and(|note| note.contains("from 10 to 3")));
++    }
++
++    #[test]
++    fn endpoint_fork_cap_leaves_small_forks_and_other_providers_alone() {
++        let (mode, note) = apply_endpoint_fork_cap(
++            WireApi::Responses,
++            Some(SpawnAgentForkMode::LastNTurns(2)),
++            Some(3),
++        );
++        assert_eq!(mode, Some(SpawnAgentForkMode::LastNTurns(2)));
++        assert_eq!(note, None);
++
++        let (mode, note) =
++            apply_endpoint_fork_cap(WireApi::Responses, Some(SpawnAgentForkMode::FullHistory), None);
++        assert_eq!(mode, Some(SpawnAgentForkMode::FullHistory));
++        assert_eq!(note, None);
++
++        // Locally served children are governed by their own ceiling.
++        let (mode, note) = apply_endpoint_fork_cap(
++            WireApi::ClaudeCode,
++            Some(SpawnAgentForkMode::FullHistory),
++            Some(3),
++        );
++        assert_eq!(mode, Some(SpawnAgentForkMode::FullHistory));
++        assert_eq!(note, None);
++    }
++
++    #[test]
++    fn endpoint_fork_cap_of_zero_means_task_only() {
++        let (mode, note) = apply_endpoint_fork_cap(
++            WireApi::Responses,
++            Some(SpawnAgentForkMode::FullHistory),
++            Some(0),
++        );
++        assert_eq!(mode, None);
++        assert!(note.is_some());
++    }
++
++    #[test]
++    fn agent_fork_turns_parses_the_tool_vocabulary() {
++        use crate::config::AgentForkTurns;
++        assert_eq!(AgentForkTurns::parse("all"), Some(AgentForkTurns::All));
++        assert_eq!(AgentForkTurns::parse("NONE"), Some(AgentForkTurns::None));
++        assert_eq!(AgentForkTurns::parse(" 3 "), Some(AgentForkTurns::LastN(3)));
++        assert_eq!(AgentForkTurns::parse("0"), None);
++        assert_eq!(AgentForkTurns::parse("banana"), None);
++        assert_eq!(AgentForkTurns::LastN(4).as_tool_value(), "4");
++    }
++
+     #[test]
+     fn native_claude_fork_is_always_task_only() {
+         assert_eq!(
+diff --git a/codex-rs/core/src/tools/handlers/multi_agents_spec.rs b/codex-rs/core/src/tools/handlers/multi_agents_spec.rs
+index 8eac6112d..4dc9622ac 100644
+--- a/codex-rs/core/src/tools/handlers/multi_agents_spec.rs
++++ b/codex-rs/core/src/tools/handlers/multi_agents_spec.rs
+@@ -43,6 +43,12 @@ pub struct SpawnAgentToolOptions {
+     /// `[claude_code].account_dirs` is set, which is what gates the `account`
+     /// argument existing at all.
+     pub claude_accounts: Vec<String>,
++    /// FORK: whether this turn delegates proactively. Swaps the v2 tool's
++    /// "otherwise continue locally" sentence for a short delegation guide.
++    pub proactive_delegation: bool,
++    /// FORK: the `fork_turns` applied when the call omits it
++    /// (`[agents] default_fork_turns`), advertised in the parameter description.
++    pub default_fork_turns: String,
+ }
+ 
+ impl Default for SpawnAgentToolOptions {
+@@ -56,6 +62,8 @@ impl Default for SpawnAgentToolOptions {
+             multi_agent_version: MultiAgentVersion::Disabled,
+             usage_hint_text: None,
+             claude_accounts: Vec::new(),
++            proactive_delegation: false,
++            default_fork_turns: "all".to_string(),
+         }
+     }
+ }
+@@ -119,7 +127,10 @@ pub fn create_spawn_agent_tool_v2(options: SpawnAgentToolOptions) -> ToolSpec {
+     let inherited_model_guidance = (options.expose_spawn_agent_model_overrides
+         && !options.hide_agent_type_model_reasoning)
+         .then_some(SPAWN_AGENT_INHERITED_MODEL_GUIDANCE);
+-    let mut properties = spawn_agent_common_properties_v2(&options.agent_type_description);
++    let mut properties = spawn_agent_common_properties_v2(
++        &options.agent_type_description,
++        &options.default_fork_turns,
++    );
+     if !options.expose_agent_type {
+         properties.remove("agent_type");
+     }
+@@ -155,6 +166,7 @@ pub fn create_spawn_agent_tool_v2(options: SpawnAgentToolOptions) -> ToolSpec {
+             available_models_description.as_deref(),
+             inherited_model_guidance,
+             options.usage_hint_text,
++            options.proactive_delegation,
+         ),
+         strict: false,
+         defer_loading: None,
+@@ -711,7 +723,10 @@ fn spawn_agent_common_properties_v1(agent_type_description: &str) -> BTreeMap<St
+     ])
+ }
+ 
+-fn spawn_agent_common_properties_v2(agent_type_description: &str) -> BTreeMap<String, JsonSchema> {
++fn spawn_agent_common_properties_v2(
++    agent_type_description: &str,
++    default_fork_turns: &str,
++) -> BTreeMap<String, JsonSchema> {
+     BTreeMap::from([
+         (
+             "message".to_string(),
+@@ -726,16 +741,19 @@ fn spawn_agent_common_properties_v2(agent_type_description: &str) -> BTreeMap<St
+         ),
+         (
+             "agent_type".to_string(),
++            // FORK: "omit unless explicitly asked" produced role-less spawns
++            // (13% of a week's spawns) that forked the whole transcript and
++            // carried no specialist instructions.
+             JsonSchema::string(Some(format!(
+-                "Agent type override for the new agent. Omit unless explicitly asked. The selected role applies regardless of how much parent history is inherited.\n{agent_type_description}"
++                "Agent type for the new agent. Choose the role whose description matches the task; omit only for a full-history fork of yourself. The selected role applies regardless of how much parent history is inherited.\n{agent_type_description}"
+             ))),
+         ),
+         (
+             "fork_turns".to_string(),
+-            JsonSchema::string(Some(
+-                "Optional number of turns to fork. Defaults to `all`. Use `none`, `all`, or a positive integer string such as `3` to fork only the most recent turns."
+-                    .to_string(),
+-            )),
++            // FORK: the default is configurable (`[agents] default_fork_turns`).
++            JsonSchema::string(Some(format!(
++                "Optional number of turns to fork. Defaults to `{default_fork_turns}`. Use `none`, `all`, or a positive integer string such as `3` to fork only the most recent turns."
++            ))),
+         ),
+         (
+             "model".to_string(),
+@@ -833,13 +851,26 @@ Requests for depth, thoroughness, research, investigation, or detailed codebase
+     )
+ }
+ 
++const SPAWN_AGENT_PROACTIVE_DELEGATION_GUIDANCE_V2: &str = r#"Delegate by default: hand off every concrete, bounded subtask that can run on its own, and keep only the immediate blocking step local.
++- Run independent questions as parallel explorers and distinct write scopes as parallel implementers; verification runs in parallel with the next piece of work.
++- Give each agent a self-contained brief: objective, files it owns, acceptance criteria, and a note that it shares the working tree with others.
++- Do not redo delegated work; integrate results and take the next non-overlapping piece while agents run."#;
++const SPAWN_AGENT_EXPLICIT_DELEGATION_GUIDANCE_V2: &str = "Only call this tool for a concrete, bounded subtask that can run independently alongside useful local work; otherwise continue locally.";
++
+ fn spawn_agent_tool_description_v2(
+     available_models_description: Option<&str>,
+     inherited_model_guidance: Option<&str>,
+     usage_hint_text: Option<String>,
++    proactive_delegation: bool,
+ ) -> String {
+     let agent_role_guidance = available_models_description.unwrap_or_default();
+     let inherited_model_guidance = inherited_model_guidance.unwrap_or_default();
++    // FORK: in proactive mode the tool must not talk the model out of using it.
++    let delegation_guidance = if proactive_delegation {
++        SPAWN_AGENT_PROACTIVE_DELEGATION_GUIDANCE_V2
++    } else {
++        SPAWN_AGENT_EXPLICIT_DELEGATION_GUIDANCE_V2
++    };
+ 
+     let tool_description = format!(
+         r#"
+@@ -848,7 +879,7 @@ fn spawn_agent_tool_description_v2(
+ You are then able to refer to this agent as `task_3` or `/root/task1/task_3` interchangeably. However an agent `/root/task2/task_3` would only be able to communicate with this agent via its canonical name `/root/task1/task_3`.
+ The spawned agent will have the same tools as you and the ability to spawn its own subagents.
+ {inherited_model_guidance}
+-Only call this tool for a concrete, bounded subtask that can run independently alongside useful local work; otherwise continue locally.
++{delegation_guidance}
+ It will be able to send you and other running agents messages, and its final answer will be provided to you when it finishes.
+ The new agent's canonical task name will be provided to it along with the message.
+ 
+diff --git a/codex-rs/core/src/tools/handlers/multi_agents_spec_tests.rs b/codex-rs/core/src/tools/handlers/multi_agents_spec_tests.rs
+index 1348f4f99..6326b4b72 100644
+--- a/codex-rs/core/src/tools/handlers/multi_agents_spec_tests.rs
++++ b/codex-rs/core/src/tools/handlers/multi_agents_spec_tests.rs
+@@ -58,6 +58,8 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
+         multi_agent_version: MultiAgentVersion::V2,
+         usage_hint_text: None,
+         claude_accounts: Vec::new(),
++        proactive_delegation: false,
++        default_fork_turns: "all".to_string(),
+     });
+ 
+     let ToolSpec::Function(ResponsesApiTool {
+@@ -144,6 +146,8 @@ fn spawn_agent_tool_v1_keeps_legacy_fork_context_field() {
+         multi_agent_version: MultiAgentVersion::V1,
+         usage_hint_text: None,
+         claude_accounts: Vec::new(),
++        proactive_delegation: false,
++        default_fork_turns: "all".to_string(),
+     });
+ 
+     let ToolSpec::Namespace(namespace) = tool else {
+@@ -210,6 +214,8 @@ fn spawn_agent_tool_caps_visible_model_summaries() {
+         multi_agent_version: MultiAgentVersion::V2,
+         usage_hint_text: None,
+         claude_accounts: Vec::new(),
++        proactive_delegation: false,
++        default_fork_turns: "all".to_string(),
+     });
+ 
+     let ToolSpec::Function(ResponsesApiTool { description, .. }) = tool else {
+@@ -257,6 +263,8 @@ fn spawn_agent_tool_keeps_model_controls_when_spawn_metadata_is_hidden() {
+         multi_agent_version: MultiAgentVersion::V2,
+         usage_hint_text: None,
+         claude_accounts: Vec::new(),
++        proactive_delegation: false,
++        default_fork_turns: "all".to_string(),
+     });
+ 
+     let ToolSpec::Function(ResponsesApiTool {
+@@ -291,6 +299,8 @@ fn spawn_agent_tool_hides_model_controls_without_override_exposure() {
+         multi_agent_version: MultiAgentVersion::V2,
+         usage_hint_text: None,
+         claude_accounts: Vec::new(),
++        proactive_delegation: false,
++        default_fork_turns: "all".to_string(),
+     });
+ 
+     let ToolSpec::Function(ResponsesApiTool {
+@@ -539,3 +549,60 @@ fn spawn_agent_v2_exposes_account_only_with_configured_claude_accounts() {
+     assert!(description.contains("1: a@example.com"), "{description}");
+     assert!(description.contains("2: b@example.com"), "{description}");
+ }
++
++/// FORK: in proactive mode the v2 description stops telling the model to
++/// "otherwise continue locally" and names the parallel patterns instead; the
++/// `agent_type` parameter asks for a role; `fork_turns` advertises the
++/// configured default.
++#[test]
++fn spawn_agent_tool_v2_describes_delegation_by_mode() {
++    let explicit = create_spawn_agent_tool_v2(SpawnAgentToolOptions {
++        multi_agent_version: MultiAgentVersion::V2,
++        ..SpawnAgentToolOptions::default()
++    });
++    let proactive = create_spawn_agent_tool_v2(SpawnAgentToolOptions {
++        multi_agent_version: MultiAgentVersion::V2,
++        proactive_delegation: true,
++        default_fork_turns: "3".to_string(),
++        ..SpawnAgentToolOptions::default()
++    });
++    let describe = |tool: ToolSpec| -> (String, BTreeMap<String, JsonSchema>) {
++        let ToolSpec::Function(ResponsesApiTool {
++            description,
++            parameters,
++            ..
++        }) = tool
++        else {
++            panic!("spawn_agent should be a function tool");
++        };
++        (
++            description,
++            parameters
++                .properties
++                .expect("spawn_agent should use object params"),
++        )
++    };
++    let (explicit_description, explicit_properties) = describe(explicit);
++    let (proactive_description, proactive_properties) = describe(proactive);
++
++    assert!(explicit_description.contains("otherwise continue locally"));
++    assert!(!explicit_description.contains("Delegate by default"));
++    assert!(proactive_description.contains("Delegate by default"));
++    assert!(!proactive_description.contains("otherwise continue locally"));
++
++    let agent_type = explicit_properties
++        .get("agent_type")
++        .and_then(|schema| schema.description.as_deref())
++        .expect("agent_type description");
++    assert!(agent_type.contains("Choose the role whose description matches the task"));
++    assert!(!agent_type.contains("Omit unless explicitly asked"));
++
++    let fork_turns = |properties: &BTreeMap<String, JsonSchema>| {
++        properties
++            .get("fork_turns")
++            .and_then(|schema| schema.description.clone())
++            .expect("fork_turns description")
++    };
++    assert!(fork_turns(&explicit_properties).contains("Defaults to `all`."));
++    assert!(fork_turns(&proactive_properties).contains("Defaults to `3`."));
++}
+diff --git a/codex-rs/core/src/tools/handlers/multi_agents_tests.rs b/codex-rs/core/src/tools/handlers/multi_agents_tests.rs
+index fc4376ac5..3b60cd51a 100644
+--- a/codex-rs/core/src/tools/handlers/multi_agents_tests.rs
++++ b/codex-rs/core/src/tools/handlers/multi_agents_tests.rs
+@@ -4676,3 +4676,62 @@ async fn build_agent_resume_config_clears_base_instructions() {
+         .expect("approval policy set");
+     assert_eq!(config, expected);
+ }
++
++/// FORK: a wait that expires in silence makes the next wait on the same turn
++/// twice as long, up to the configured maximum, and says so.
++#[tokio::test]
++async fn multi_agent_v2_wait_agent_backs_off_after_a_silent_timeout() {
++    let (session, mut turn) = make_session_and_context().await;
++    let mut config = (*turn.config).clone();
++    config
++        .features
++        .enable(Feature::MultiAgentV2)
++        .expect("test config should allow feature update");
++    config.multi_agent_v2.min_wait_timeout_ms = 50;
++    config.multi_agent_v2.max_wait_timeout_ms = 150;
++    config.multi_agent_v2.default_wait_timeout_ms = 50;
++    set_turn_config(&mut turn, config);
++    let session = Arc::new(session);
++    let turn = Arc::new(turn);
++    let handler = WaitAgentHandlerV2::default();
++
++    tokio::time::pause();
++    let mut elapsed = Vec::new();
++    let mut messages = Vec::new();
++    for _ in 0..3 {
++        let started_at = tokio::time::Instant::now();
++        let output = handler
++            .handle(invocation(
++                Arc::clone(&session),
++                Arc::clone(&turn),
++                "wait_agent",
++                function_payload(json!({"timeout_ms": 50})),
++            ))
++            .await
++            .expect("wait_agent should succeed");
++        elapsed.push(started_at.elapsed());
++        let (content, _) = expect_text_output(output);
++        let result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
++            serde_json::from_str(&content).expect("wait_agent result should be json");
++        assert!(result.timed_out);
++        messages.push(result.message);
++    }
++    tokio::time::resume();
++
++    let within = |actual: Duration, expected_ms: u64| {
++        actual >= Duration::from_millis(expected_ms)
++            && actual <= Duration::from_millis(expected_ms + 1)
++    };
++    assert!(within(elapsed[0], 50), "first wait: {:?}", elapsed[0]);
++    assert!(within(elapsed[1], 100), "second wait doubled: {:?}", elapsed[1]);
++    // Capped at max_wait_timeout_ms, not 200.
++    assert!(within(elapsed[2], 150), "third wait capped: {:?}", elapsed[2]);
++    assert!(messages[0].starts_with("Wait timed out."), "{}", messages[0]);
++    assert!(!messages[0].contains("previous wait expired"), "{}", messages[0]);
++    assert!(
++        messages[1].contains("The previous wait expired with no activity, so this one waited 100ms."),
++        "{}",
++        messages[1]
++    );
++    assert!(messages[2].contains("waited 150ms."), "{}", messages[2]);
++}
+diff --git a/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs b/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs
+index 41ba42d0b..2c8836364 100644
+--- a/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs
++++ b/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs
+@@ -111,7 +111,8 @@ async fn handle_spawn_agent(
+     let turn = &step_context.turn;
+     let arguments = function_arguments(payload)?;
+     let args: SpawnAgentArgs = parse_arguments(&arguments)?;
+-    let requested_fork_mode = args.fork_mode()?;
++    // FORK: an omitted `fork_turns` takes the configured default.
++    let requested_fork_mode = args.fork_mode(turn.config.agent_default_fork_turns)?;
+     let (message, message_form) = tool_message_argument(
+         args.message.clone(),
+         args.plaintext_message.clone(),
+@@ -178,6 +179,13 @@ async fn handle_spawn_agent(
+         max_fork_turns_for_wire_api(&turn.config, config.model_provider.wire_api),
+     );
+     notes.extend(fork_note);
++    // FORK: `[agents] max_fork_turns` caps endpoint-served children.
++    let (fork_mode, cap_note) = apply_endpoint_fork_cap(
++        config.model_provider.wire_api,
++        fork_mode,
++        turn.config.agent_max_fork_turns,
++    );
++    notes.extend(cap_note);
+     let is_full_history_fork = matches!(fork_mode, Some(SpawnAgentForkMode::FullHistory));
+ 
+     // Remember an applied configured default so cold reload reapplies its restrictions.
+@@ -328,19 +336,24 @@ struct SpawnAgentArgs {
+ }
+ 
+ impl SpawnAgentArgs {
+-    fn fork_mode(&self) -> Result<Option<SpawnAgentForkMode>, FunctionCallError> {
++    fn fork_mode(
++        &self,
++        default_fork_turns: crate::config::AgentForkTurns,
++    ) -> Result<Option<SpawnAgentForkMode>, FunctionCallError> {
+         if self.fork_context.is_some() {
+             return Err(FunctionCallError::RespondToModel(
+                 "fork_context is not supported in MultiAgentV2; use fork_turns instead".to_string(),
+             ));
+         }
+ 
++        // FORK: the fallback used to be a hard-coded `all`.
++        let default_fork_turns = default_fork_turns.as_tool_value();
+         let fork_turns = self
+             .fork_turns
+             .as_deref()
+             .map(str::trim)
+             .filter(|fork_turns| !fork_turns.is_empty())
+-            .unwrap_or("all");
++            .unwrap_or(default_fork_turns.as_str());
+ 
+         if fork_turns.eq_ignore_ascii_case("none") {
+             return Ok(None);
+diff --git a/codex-rs/core/src/tools/handlers/multi_agents_v2/wait.rs b/codex-rs/core/src/tools/handlers/multi_agents_v2/wait.rs
+index ed21175d9..bc02f4375 100644
+--- a/codex-rs/core/src/tools/handlers/multi_agents_v2/wait.rs
++++ b/codex-rs/core/src/tools/handlers/multi_agents_v2/wait.rs
+@@ -11,11 +11,44 @@ use tokio::time::timeout_at;
+ #[derive(Default)]
+ pub(crate) struct Handler {
+     options: WaitAgentTimeoutOptions,
++    /// FORK: the effective timeout of the last `wait_agent` on this handler
++    /// that expired without any mailbox activity; `None` once something
++    /// arrived. The registry is rebuilt per turn, so this is per-turn state.
++    ///
++    /// Measured problem: 81% of a week's waits expired because the model kept
++    /// asking for 30 s. Doubling on silence converges without the model
++    /// having to choose well.
++    last_silent_timeout_ms: std::sync::Mutex<Option<i64>>,
+ }
+ 
+ impl Handler {
+     pub(crate) fn new(options: WaitAgentTimeoutOptions) -> Self {
+-        Self { options }
++        Self {
++            options,
++            last_silent_timeout_ms: std::sync::Mutex::new(None),
++        }
++    }
++
++    /// FORK: the timeout to use after a silent expiry: double the last one,
++    /// never below what was computed for this call, never above the cap.
++    fn backed_off_timeout_ms(&self, timeout_ms: i64, max_timeout_ms: i64) -> Option<i64> {
++        let last = *self
++            .last_silent_timeout_ms
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        let doubled = last?.saturating_mul(2).min(max_timeout_ms);
++        (doubled > timeout_ms).then_some(doubled)
++    }
++
++    fn record_outcome(&self, outcome: WaitOutcome, timeout_ms: i64) {
++        let mut last = self
++            .last_silent_timeout_ms
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        *last = match outcome {
++            WaitOutcome::TimedOut => Some(timeout_ms),
++            WaitOutcome::MailboxActivity | WaitOutcome::Steered => None,
++        };
+     }
+ }
+ 
+@@ -63,6 +96,9 @@ impl Handler {
+             Some(ms) => ms.max(min_timeout_ms),
+             None => default_timeout_ms,
+         };
++        // FORK: silence last time means a longer wait this time.
++        let backed_off_ms = self.backed_off_timeout_ms(timeout_ms, max_timeout_ms);
++        let timeout_ms = backed_off_ms.unwrap_or(timeout_ms);
+ 
+         let turn_state = session
+             .input_queue
+@@ -104,9 +140,15 @@ impl Handler {
+             outcome =
+                 wait_for_activity(&mut activity_rx, /*pending_activity*/ None, deadline).await;
+         }
++        self.record_outcome(outcome, timeout_ms);
+         let agents = live_agent_snapshots(&session, &turn).await;
+-        let result =
+-            WaitAgentResult::from_outcome(outcome, requested_timeout_ms, timeout_ms, agents);
++        let result = WaitAgentResult::from_outcome(
++            outcome,
++            requested_timeout_ms,
++            timeout_ms,
++            backed_off_ms,
++            agents,
++        );
+ 
+         session
+             .emit_turn_item_completed(
+@@ -210,6 +252,7 @@ impl WaitAgentResult {
+         outcome: WaitOutcome,
+         requested_timeout_ms: Option<i64>,
+         timeout_ms: i64,
++        backed_off_ms: Option<i64>,
+         agents: Vec<WaitAgentSnapshot>,
+     ) -> Self {
+         let message = match outcome {
+@@ -217,11 +260,15 @@ impl WaitAgentResult {
+             WaitOutcome::Steered => "Wait interrupted by new input.",
+             WaitOutcome::TimedOut => "Wait timed out.",
+         };
+-        let message = match requested_timeout_ms {
+-            Some(requested_timeout_ms) if requested_timeout_ms < timeout_ms => format!(
++        // FORK: a backed-off wait explains itself; a plain clamp reads as before.
++        let message = match (backed_off_ms, requested_timeout_ms) {
++            (Some(backed_off_ms), _) => format!(
++                "{message}\n\nThe previous wait expired with no activity, so this one waited {backed_off_ms}ms."
++            ),
++            (None, Some(requested_timeout_ms)) if requested_timeout_ms < timeout_ms => format!(
+                 "{message}\n\nRequested timeout of {requested_timeout_ms}ms was clamped to the minimum of {timeout_ms}ms."
+             ),
+-            Some(_) | None => message.to_string(),
++            (None, Some(_) | None) => message.to_string(),
+         };
+         // On a timeout, say what the agents are actually doing rather than
+         // leaving the parent to guess.
+diff --git a/codex-rs/core/src/tools/spec_plan.rs b/codex-rs/core/src/tools/spec_plan.rs
+index 539375690..1a4167b22 100644
+--- a/codex-rs/core/src/tools/spec_plan.rs
++++ b/codex-rs/core/src/tools/spec_plan.rs
+@@ -1219,6 +1219,12 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
+                         claude_accounts: crate::claude_code::account_options(
+                             &turn_context.config.claude_code_account_dirs,
+                         ),
++                        proactive_delegation:
++                            crate::session::multi_agents::proactive_delegation(turn_context),
++                        default_fork_turns: turn_context
++                            .config
++                            .agent_default_fork_turns
++                            .as_tool_value(),
+                     }),
+                     tool_namespace,
+                 ),
+@@ -1267,6 +1273,8 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
+                     multi_agent_version: turn_context.multi_agent_version,
+                     usage_hint_text: turn_context.config.multi_agent_v2.usage_hint_text.clone(),
+                     claude_accounts: Vec::new(),
++                    proactive_delegation: false,
++                    default_fork_turns: "all".to_string(),
+                 }),
+                 exposure,
+             );
+diff --git a/codex-rs/features/src/feature_configs.rs b/codex-rs/features/src/feature_configs.rs
+index 0e163750c..3c49af01e 100644
+--- a/codex-rs/features/src/feature_configs.rs
++++ b/codex-rs/features/src/feature_configs.rs
+@@ -289,6 +289,19 @@ pub struct MultiAgentV2ConfigToml {
+     pub subagent_developer_instructions: Option<String>,
+     #[serde(skip_serializing_if = "Option::is_none")]
+     pub multi_agent_mode_hint_text: Option<String>,
++    /// FORK: when proactive delegation is on, independent of reasoning effort.
++    ///
++    /// Upstream ties the proactive multi-agent mode to `ultra` effort alone; at
++    /// every other effort the model is told not to spawn unless asked. `always`
++    /// makes delegation the default in every turn (plan mode included), `never`
++    /// turns it off, `ultra` keeps the upstream rule (plus `max`, which sits
++    /// above `ultra` in the picker). Defaults to `ultra`.
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub proactive: Option<MultiAgentProactiveDelegation>,
++    /// FORK: whether the root hint gets a "Delegation playbook" section while
++    /// proactive delegation is active. Defaults to true.
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub delegation_playbook_hint: Option<bool>,
+     #[serde(skip_serializing_if = "Option::is_none")]
+     #[schemars(length(min = 1, max = 64), regex(pattern = r"^[a-zA-Z0-9_-]+$"))]
+     pub tool_namespace: Option<String>,
+@@ -305,6 +318,19 @@ pub struct MultiAgentV2ConfigToml {
+     pub non_code_mode_only: Option<bool>,
+ }
+ 
++/// FORK: when the proactive multi-agent mode applies (`[features.multi_agent_v2] proactive`).
++#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, JsonSchema)]
++#[serde(rename_all = "snake_case")]
++pub enum MultiAgentProactiveDelegation {
++    /// Proactive delegation in every turn, at any reasoning effort, plan mode included.
++    Always,
++    /// Upstream rule: proactive only at `ultra` (and `max`) reasoning effort.
++    #[default]
++    Ultra,
++    /// Never proactive: spawn only when the user or AGENTS.md asks.
++    Never,
++}
++
+ impl FeatureConfig for MultiAgentV2ConfigToml {
+     fn enabled(&self) -> Option<bool> {
+         self.enabled
+diff --git a/codex-rs/features/src/lib.rs b/codex-rs/features/src/lib.rs
+index 17a75bda3..849a5a744 100644
+--- a/codex-rs/features/src/lib.rs
++++ b/codex-rs/features/src/lib.rs
+@@ -21,6 +21,7 @@ pub use feature_configs::CodeModeHostConfigToml;
+ pub use feature_configs::CurrentTimeReminderConfigToml;
+ pub use feature_configs::CurrentTimeReminderDeliveryMode;
+ pub use feature_configs::CurrentTimeSource;
++pub use feature_configs::MultiAgentProactiveDelegation;
+ pub use feature_configs::GuardianV2ConfigToml;
+ pub use feature_configs::GuardianV2ReviewScopeConfigToml;
+ pub use feature_configs::GuardianV2TranscriptConfigToml;
+diff --git a/codex-rs/features/src/tests.rs b/codex-rs/features/src/tests.rs
+index ebb4911fa..f6d26876f 100644
+--- a/codex-rs/features/src/tests.rs
++++ b/codex-rs/features/src/tests.rs
+@@ -674,6 +674,8 @@ non_code_mode_only = true
+             root_agent_usage_hint_suffix: None,
+             subagent_usage_hint_suffix: None,
+             delivery_discipline_hint: None,
++            proactive: None,
++            delegation_playbook_hint: None,
+             max_desktop_threads_per_session: None,
+             subagent_developer_instructions: Some("Delegate carefully.".to_string()),
+             multi_agent_mode_hint_text: Some("Custom mode guidance.".to_string()),
+@@ -686,6 +688,31 @@ non_code_mode_only = true
+     );
+ }
+ 
++/// FORK: the proactive knob and the playbook toggle parse from the table.
++#[test]
++fn multi_agent_v2_feature_config_deserializes_proactive_knob() {
++    let features: FeaturesToml = toml::from_str(
++        r#"
++[multi_agent_v2]
++proactive = "always"
++delegation_playbook_hint = false
++"#,
++    )
++    .expect("features table should deserialize");
++
++    let Some(crate::FeatureToml::Config(config)) = features.multi_agent_v2 else {
++        panic!("expected a multi_agent_v2 table");
++    };
++    assert_eq!(
++        config.proactive,
++        Some(crate::MultiAgentProactiveDelegation::Always)
++    );
++    assert_eq!(config.delegation_playbook_hint, Some(false));
++    assert!(toml::from_str::<FeaturesToml>("[multi_agent_v2]
++proactive = \"sometimes\"
++").is_err());
++}
++
+ #[test]
+ fn non_prefixed_mcp_tool_names_feature_config_deserializes_boolean_toggle() {
+     let features: FeaturesToml = toml::from_str("non_prefixed_mcp_tool_names = true")
+diff --git a/codex-rs/thread-manager-sample/src/main.rs b/codex-rs/thread-manager-sample/src/main.rs
+index f128b1b1a..59e1314d1 100644
+--- a/codex-rs/thread-manager-sample/src/main.rs
++++ b/codex-rs/thread-manager-sample/src/main.rs
+@@ -267,6 +267,8 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
+         agent_default_subagent_reasoning_effort: None,
+         agent_interrupt_message_enabled: false,
+         agent_max_depth: 1,
++        agent_default_fork_turns: codex_core::config::AgentForkTurns::All,
++        agent_max_fork_turns: None,
+         agent_roles: BTreeMap::new(),
+         memories: MemoriesConfig::default(),
+         sqlite: SqliteConfig::from_sqlite_home(codex_home.clone()),
