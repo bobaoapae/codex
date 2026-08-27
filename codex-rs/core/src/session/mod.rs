@@ -2266,9 +2266,42 @@ impl Session {
         if let Some(status) = agent_status_from_event(&event.msg) {
             self.agent_status.send_replace(status);
         }
+        // FORK: remember what this agent was last seen doing, so its parent can
+        // tell "compiling" from "wedged" before reaching for `interrupt_agent`.
+        // Only for subagents: the root's activity is on screen already.
+        if self.is_subagent
+            && let Some(label) = crate::session::turn::fork_activity_label(&event.msg)
+        {
+            self.services
+                .agent_control
+                .record_agent_activity(self.thread_id, label);
+        }
         if let Err(e) = self.tx_event.send(event).await {
             debug!("dropping event because channel is closed: {e}");
         }
+    }
+
+    /// FORK: counts one Desktop thread creation and returns the running total.
+    pub(crate) fn record_desktop_thread_created(&self) -> usize {
+        self.desktop_threads_created
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize
+            + 1
+    }
+
+    /// FORK: remembers the checklist so a compaction can carry it forward.
+    pub(crate) fn record_last_plan(&self, plan: codex_protocol::plan_tool::UpdatePlanArgs) {
+        *self
+            .last_plan
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(plan);
+    }
+
+    /// FORK: the checklist to re-inject after a compaction, if there is one.
+    pub(crate) fn last_plan(&self) -> Option<codex_protocol::plan_tool::UpdatePlanArgs> {
+        self.last_plan
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     pub(crate) async fn emit_turn_item_started(&self, turn_context: &TurnContext, item: &TurnItem) {

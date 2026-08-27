@@ -1994,6 +1994,21 @@ impl ModelClientSession {
         self.claude_code_workspace = Some(workspace);
     }
 
+    /// FORK: attaches the session that answers the Claude CLI's permission
+    /// requests.
+    ///
+    /// Set per sampling request rather than per turn: the host needs the live
+    /// `Session` and step context, which only exist there. A no-op when this
+    /// session is not serving a Claude-backed thread.
+    pub(crate) fn set_claude_code_host(
+        &mut self,
+        host: std::sync::Arc<dyn crate::claude_code::ClaudeHost>,
+    ) {
+        if let Some(workspace) = self.claude_code_workspace.as_mut() {
+            workspace.host = Some(host);
+        }
+    }
+
     /// Permanently disables WebSockets for this Codex session and resets WebSocket state.
     ///
     /// This is used after exhausting the provider retry budget, to force subsequent requests onto

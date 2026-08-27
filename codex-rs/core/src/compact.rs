@@ -120,6 +120,15 @@ pub(crate) async fn run_inline_auto_compact_task(
     reason: CompactionReason,
     phase: CompactionPhase,
 ) -> CodexResult<()> {
+    // FORK: the Claude CLI compacts its own session, and Codex's compaction
+    // rewrites the history prefix — which invalidates the fingerprint the
+    // adapter uses to extend that session, forcing a full replay of the
+    // conversation into a fresh one. Two compactions fighting each other cost
+    // the prompt cache and buy nothing.
+    if turn_context.provider.info().wire_api == codex_model_provider_info::WireApi::ClaudeCode {
+        tracing::debug!("skipping Codex auto-compaction: the Claude CLI compacts its own session");
+        return Ok(());
+    }
     let prompt = turn_context
         .config
         .compact_prompt
@@ -263,6 +272,13 @@ async fn run_compact_task_inner_impl(
     let max_retries = turn_context.provider.info().stream_max_retries();
     let mut retries = 0;
     let mut client_session = sess.services.model_client.new_session();
+    // FORK: a compaction on a Claude-backed thread is still a Claude turn, and
+    // without the workspace the adapter falls back to the process cwd with no
+    // roots and no account pin — so the summarization ran somewhere else than
+    // the conversation did.
+    client_session.set_claude_code_workspace(crate::claude_code::ClaudeCodeWorkspace::from_config(
+        turn_context.config.as_ref(),
+    ));
     // Reuse one client session so turn-scoped state (sticky routing, websocket incremental
     // request tracking)
     // survives retries within this compact turn.
@@ -356,7 +372,19 @@ async fn run_compact_task_inner_impl(
     let summary_text = format!("{SUMMARY_PREFIX}\n{summary_suffix}");
     let user_messages = collect_annotated_user_messages(history_items);
 
-    let mut new_history = build_compacted_history(Vec::new(), &user_messages, &summary_text);
+    // FORK: carry the checklist forward, so the model does not restart a plan
+    // it was partway through.
+    let carried_plan = turn_context
+        .config
+        .tools_update_plan_survives_compaction
+        .then(|| sess.last_plan())
+        .flatten();
+    let mut new_history = build_compacted_history_with_plan(
+        Vec::new(),
+        &user_messages,
+        &summary_text,
+        carried_plan.as_ref(),
+    );
     if let Some(summary_item) = new_history.last_mut() {
         // This replacement history skips `record_conversation_items`; only the appended summary
         // belongs to this compaction turn.
@@ -651,6 +679,28 @@ pub(crate) fn build_compacted_history(
         user_messages,
         summary_text,
         COMPACT_USER_MESSAGE_MAX_TOKENS,
+        /*carried_plan*/ None,
+    )
+}
+
+/// FORK: as [`build_compacted_history`], but re-injecting the current
+/// `update_plan` checklist after the summary.
+///
+/// The plan lived only in the transcript, which this function rewrites, so the
+/// model came out the other side not knowing which step it was on — observed as
+/// an agent restarting a six-step list it was four steps into.
+pub(crate) fn build_compacted_history_with_plan(
+    initial_context: Vec<ResponseItemEnvelope>,
+    user_messages: &[CompactedUserMessage],
+    summary_text: &str,
+    carried_plan: Option<&codex_protocol::plan_tool::UpdatePlanArgs>,
+) -> Vec<ResponseItemEnvelope> {
+    build_compacted_history_with_limit(
+        initial_context,
+        user_messages,
+        summary_text,
+        COMPACT_USER_MESSAGE_MAX_TOKENS,
+        carried_plan,
     )
 }
 
@@ -659,6 +709,7 @@ fn build_compacted_history_with_limit(
     user_messages: &[CompactedUserMessage],
     summary_text: &str,
     max_tokens: usize,
+    carried_plan: Option<&codex_protocol::plan_tool::UpdatePlanArgs>,
 ) -> Vec<ResponseItemEnvelope> {
     let mut selected_messages: Vec<CompactedUserMessage> = Vec::new();
     if max_tokens > 0 {
@@ -728,6 +779,13 @@ fn build_compacted_history_with_limit(
     history.push(ResponseItemEnvelope::new(ContextualUserFragment::into(
         CompactionSummary::new(summary_text),
     )));
+
+    // FORK: after the summary, so it is the last thing the model reads.
+    if let Some(carried_plan) = carried_plan.and_then(crate::context::CarriedPlan::new) {
+        history.push(ResponseItemEnvelope::new(ContextualUserFragment::into(
+            carried_plan,
+        )));
+    }
 
     history
 }

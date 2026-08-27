@@ -91,6 +91,48 @@ pub(super) fn usage_hint_text(
     }
 }
 
+/// FORK: how agents report, for both roles.
+///
+/// Measured problem: subagents were reaching for the Desktop's
+/// `send_message_to_thread` to report progress, which lands in the *user's* own
+/// thread as a "sent from another task" card and prompts for permission on every
+/// call. The inter-agent channel already exists; it just was not named here.
+const FORK_MULTI_AGENT_V2_REPORTING_HINT_TEXT: &str = r#"## Reporting
+
+Report through the agent channel only: your final answer for the turn, or `send_message` with `target: ".."` when you must say something before you are done.
+
+Never use the Desktop thread tools (`send_message_to_thread`, `create_thread`, `fork_thread`, `handoff_thread`, `automation_update`) to report. They post into the user's own thread and ask for permission on every call. Creating and forking threads is the user's business, not yours.
+
+## Git state
+
+The working tree is shared with the other agents and is dirty by design. Never run `git reset`, `checkout`, `clean`, `stash`, or `commit` unless the user asked for it by name: those discard uncommitted work that is not yours and cannot be recovered."#;
+
+/// FORK: how the root should wait, for the root only.
+///
+/// Measured problem: 28,986 `wait`/`wait_agent` calls in 30 days, 13,942 of them
+/// timing out, and 593 `interrupt_agent` calls — 70% of them aimed at children
+/// that were still working. Impatience, not deadlock.
+const FORK_MULTI_AGENT_V2_PATIENCE_HINT_TEXT: &str = r#"## Waiting on agents
+
+Call `wait_agent` once per round with a generous timeout and treat a timeout as "still working", not as "stuck". Tight polling burns your context and tells you nothing new.
+
+Before `interrupt_agent`, check `list_agents`: an agent with recent activity is working. Interrupting loses everything it has not yet reported."#;
+
+/// FORK: what "done" means, for the root only.
+///
+/// Measured problem: the same corrections pasted into 47 prompts in 30 days —
+/// stop inventing audit/certification/fingerprint gates, follow the plan, do not
+/// re-ask what the plan already answers.
+const FORK_MULTI_AGENT_V2_DELIVERY_HINT_TEXT: &str = r#"## Delivery discipline
+
+The approved plan is the contract. Execute its tasks in order; do not insert audit, certification, re-baseline, or publication-gate tasks it does not contain. If verification is genuinely missing, propose one bounded item instead of starting it.
+
+Validation per task is the existing focused tests plus at most one broad gate, using the repository's own runner. Do not build a new harness, a result parser, or a repetition matrix for routine work. Hash or fingerprint only for release/signature/provenance or an explicit acceptance criterion.
+
+Task IDs stay at most two levels deep. If a third level seems necessary, the task is mis-scoped: re-plan instead.
+
+Do not ask what the plan, the request, or the code already answers. Ask only when two readings would lead to materially different work."#;
+
 pub(crate) fn resolve_usage_hints(
     config: &MultiAgentV2Config,
     catalog: Option<&MultiAgentRoleMessages>,
@@ -128,18 +170,76 @@ pub(crate) fn resolve_usage_hints(
         })
     };
 
+    // FORK: these sections are appended after whatever `resolve_role` produced,
+    // including a fully configured hint text. Configuring a hint replaces the
+    // bundled one, and losing this guidance with it is exactly the failure the
+    // sections describe.
+    let mut root_suffix = vec![FORK_MULTI_AGENT_V2_REPORTING_HINT_TEXT.to_string()];
+    root_suffix.push(FORK_MULTI_AGENT_V2_PATIENCE_HINT_TEXT.to_string());
+    if config.delivery_discipline_hint {
+        root_suffix.push(FORK_MULTI_AGENT_V2_DELIVERY_HINT_TEXT.to_string());
+    }
+    root_suffix.extend(config.root_agent_usage_hint_suffix.clone());
+
+    let mut subagent_suffix = vec![FORK_MULTI_AGENT_V2_REPORTING_HINT_TEXT.to_string()];
+    subagent_suffix.extend(config.subagent_usage_hint_suffix.clone());
+
     ResolvedMultiAgentV2UsageHints {
-        root: resolve_role(
-            config.root_agent_usage_hint_text.as_deref(),
-            catalog.and_then(|messages| messages.root.as_deref()),
-            DEFAULT_MULTI_AGENT_V2_ROOT_AGENT_USAGE_HINT_TEXT,
+        root: append_sections(
+            resolve_role(
+                config.root_agent_usage_hint_text.as_deref(),
+                catalog.and_then(|messages| messages.root.as_deref()),
+                DEFAULT_MULTI_AGENT_V2_ROOT_AGENT_USAGE_HINT_TEXT,
+            ),
+            &root_suffix,
         ),
-        subagent: resolve_role(
-            config.subagent_usage_hint_text.as_deref(),
-            catalog.and_then(|messages| messages.subagent.as_deref()),
-            DEFAULT_MULTI_AGENT_V2_SUBAGENT_USAGE_HINT_TEXT,
+        subagent: append_sections(
+            resolve_role(
+                config.subagent_usage_hint_text.as_deref(),
+                catalog.and_then(|messages| messages.subagent.as_deref()),
+                DEFAULT_MULTI_AGENT_V2_SUBAGENT_USAGE_HINT_TEXT,
+            ),
+            &subagent_suffix,
         ),
     }
+}
+
+/// FORK: where the fork-owned sections begin inside a resolved usage hint.
+///
+/// A forked child strips its parent's stale hints by comparing text exactly, so
+/// a hint recorded by a build whose sections differ would otherwise survive the
+/// fork and reach the child as someone else's instructions. Splitting here lets
+/// that comparison also try the text without them.
+const FORK_HINT_SECTIONS_MARKER: &str = "\n\n## Reporting\n";
+
+/// FORK: the portion of a usage hint before the fork-owned sections.
+pub(crate) fn without_fork_hint_sections(hint: &str) -> &str {
+    match hint.find(FORK_HINT_SECTIONS_MARKER) {
+        Some(index) => &hint[..index],
+        None => hint,
+    }
+}
+
+/// FORK: appends fork-owned sections to a resolved role hint.
+///
+/// An explicitly emptied hint stays empty: that is the user saying "say nothing
+/// here", and this is not the place to overrule it.
+fn append_sections(
+    hint: Option<MultiAgentRoleInstructions>,
+    sections: &[String],
+) -> Option<MultiAgentRoleInstructions> {
+    let sections: Vec<&str> = sections
+        .iter()
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|section| !section.is_empty())
+        .collect();
+    if sections.is_empty() {
+        return hint;
+    }
+    let hint = hint?;
+    let combined = format!("{}\n\n{}", hint.text().trim_end(), sections.join("\n\n"));
+    Some(hint.with_text(combined))
 }
 
 pub(crate) fn effective_multi_agent_mode(turn_context: &TurnContext) -> Option<MultiAgentMode> {
@@ -182,5 +282,107 @@ pub(crate) fn effective_multi_agent_mode(turn_context: &TurnContext) -> Option<M
         | SessionSource::Custom(_)
         | SessionSource::Unknown => Some(multi_agent_mode),
         SessionSource::Internal(_) | SessionSource::SubAgent(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod fork_hint_tests {
+    use super::*;
+    use crate::config::MultiAgentV2Config;
+
+    fn config() -> MultiAgentV2Config {
+        MultiAgentV2Config::default()
+    }
+
+    fn body(hint: Option<MultiAgentRoleInstructions>) -> String {
+        use crate::context::ContextualUserFragment;
+        hint.expect("a usage hint should resolve").body()
+    }
+
+    /// FORK: the `*_usage_hint_text` keys *replace* the bundled text, so a user
+    /// who configures one silently loses everything the harness needed to say.
+    /// The fork's own sections are appended instead.
+    #[test]
+    fn fork_reporting_hint_survives_a_configured_usage_hint_text() {
+        let mut config = config();
+        config.root_agent_usage_hint_text = Some("Only this.".to_string());
+        config.subagent_usage_hint_text = Some("And this.".to_string());
+
+        let hints = resolve_usage_hints(&config, /*catalog*/ None);
+        let root = body(hints.root);
+        let subagent = body(hints.subagent);
+
+        assert!(root.starts_with("Only this."), "{root}");
+        assert!(root.contains("send_message_to_thread"), "{root}");
+        assert!(subagent.starts_with("And this."), "{subagent}");
+        assert!(subagent.contains("send_message_to_thread"), "{subagent}");
+    }
+
+    /// Waiting and delivery discipline are the orchestrator's problem; a worker
+    /// reading them would only spend context on advice it cannot act on.
+    #[test]
+    fn patience_hint_is_root_only() {
+        let hints = resolve_usage_hints(&config(), /*catalog*/ None);
+        let root = body(hints.root);
+        let subagent = body(hints.subagent);
+
+        assert!(root.contains("## Waiting on agents"), "{root}");
+        assert!(root.contains("## Delivery discipline"), "{root}");
+        assert!(!subagent.contains("## Waiting on agents"), "{subagent}");
+        assert!(!subagent.contains("## Delivery discipline"), "{subagent}");
+    }
+
+    /// The delivery hint is the one piece of this a user may not want.
+    #[test]
+    fn delivery_discipline_hint_can_be_turned_off() {
+        let mut config = config();
+        config.delivery_discipline_hint = false;
+
+        let root = body(resolve_usage_hints(&config, /*catalog*/ None).root);
+
+        assert!(!root.contains("## Delivery discipline"), "{root}");
+        // Turning it off must not take the rest with it.
+        assert!(root.contains("## Reporting"), "{root}");
+        assert!(root.contains("## Waiting on agents"), "{root}");
+    }
+
+    /// A configured suffix is appended after the fork's own sections.
+    #[test]
+    fn a_configured_suffix_is_appended_last() {
+        let mut config = config();
+        config.root_agent_usage_hint_suffix = Some("House rule.".to_string());
+        config.subagent_usage_hint_suffix = Some("Worker rule.".to_string());
+
+        let hints = resolve_usage_hints(&config, /*catalog*/ None);
+        assert!(body(hints.root).ends_with("House rule."));
+        assert!(body(hints.subagent).ends_with("Worker rule."));
+    }
+
+    /// An explicitly emptied hint means "say nothing here"; that is the user's
+    /// call, not something to overrule.
+    #[test]
+    fn an_emptied_hint_stays_empty() {
+        let mut config = config();
+        config.root_agent_usage_hint_text = Some(String::new());
+
+        assert!(
+            resolve_usage_hints(&config, /*catalog*/ None)
+                .root
+                .is_none()
+        );
+    }
+
+    /// The fork sections are recognizable, so a forked child can strip a hint
+    /// recorded by a build whose sections differ.
+    #[test]
+    fn fork_sections_can_be_split_back_off() {
+        let mut config = config();
+        config.root_agent_usage_hint_text = Some("Only this.".to_string());
+
+        let root = body(resolve_usage_hints(&config, /*catalog*/ None).root);
+
+        assert_eq!(without_fork_hint_sections(&root), "Only this.");
+        // A hint that never carried them is returned unchanged.
+        assert_eq!(without_fork_hint_sections("plain"), "plain");
     }
 }

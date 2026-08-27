@@ -88,6 +88,11 @@ impl PlanHandler {
         }
 
         let args = parse_update_plan_arguments(&arguments)?;
+        // FORK: keep it, so a compaction can carry it across instead of leaving
+        // the model to guess which step it was on.
+        if turn.config.tools_update_plan_survives_compaction {
+            session.record_last_plan(args.clone());
+        }
         session
             .send_event(turn.as_ref(), EventMsg::PlanUpdate(args))
             .await;

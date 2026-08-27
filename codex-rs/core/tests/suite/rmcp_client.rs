@@ -354,6 +354,8 @@ fn insert_mcp_server(
             default_tools_approval_mode: None,
             enabled_tools: None,
             disabled_tools: None,
+            root_only_tools: None,
+            tool_approval_overrides: Default::default(),
             scopes: None,
             oauth: None,
             oauth_resource: None,

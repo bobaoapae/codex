@@ -7,6 +7,8 @@
 
 mod apply_patch;
 mod apps;
+/// FORK: Claude accounts for callers outside a turn (`codex account claude`).
+pub mod claude_accounts_api;
 mod claude_code;
 mod client;
 mod client_common;

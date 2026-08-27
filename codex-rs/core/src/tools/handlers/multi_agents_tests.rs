@@ -407,7 +407,7 @@ async fn multi_agent_v2_spawn_fork_turns_all_applies_agent_type_override() {
 }
 
 #[tokio::test]
-async fn spawn_agent_service_tier_override_validates_the_effective_child_model() {
+async fn spawn_agent_service_tier_override_drops_a_tier_the_child_model_cannot_use() {
     #[derive(Debug, Deserialize)]
     struct SpawnAgentResult {
         agent_id: String,
@@ -452,9 +452,19 @@ async fn spawn_agent_service_tier_override_validates_the_effective_child_model()
         );
     }
 
+    // FORK: an unsupported tier is a bad argument, not a reason to lose the
+    // spawn. It is dropped and the child runs without it.
     {
-        let (session, turn) = make_session_and_context().await;
-        let err = SpawnAgentHandler::default()
+        let (mut session, turn) = make_session_and_context().await;
+        let manager = thread_manager();
+        let root = manager
+            .start_thread(StartThreadOptions::new((*turn.config).clone()))
+            .await
+            .expect("root thread should start");
+        session.services.agent_control = manager.agent_control();
+        session.thread_id = root.thread_id;
+
+        let output = SpawnAgentHandler::default()
             .handle(invocation(
                 Arc::new(session),
                 Arc::new(turn),
@@ -466,21 +476,32 @@ async fn spawn_agent_service_tier_override_validates_the_effective_child_model()
                 })),
             ))
             .await
-            .err()
-            .expect("unknown service tier should be rejected");
+            .expect("an unknown service tier is dropped, not fatal");
+        let (content, _) = expect_text_output(output);
+        let result: SpawnAgentResult =
+            serde_json::from_str(&content).expect("spawn_agent result should be json");
+        let snapshot = manager
+            .get_thread(parse_agent_id(&result.agent_id))
+            .await
+            .expect("spawned agent thread should exist")
+            .config_snapshot()
+            .await;
 
-        assert_eq!(
-            err,
-            FunctionCallError::RespondToModel(
-                "Service tier `turbo` is not supported for model `gpt-5.4`. Supported service tiers: priority"
-                    .to_string()
-            )
-        );
+        assert_ne!(snapshot.service_tier, Some("turbo".to_string()));
     }
 
+    // A model that supports no tiers at all also spawns; it simply gets none.
     {
-        let (session, turn) = make_session_and_context().await;
-        let err = SpawnAgentHandler::default()
+        let (mut session, turn) = make_session_and_context().await;
+        let manager = thread_manager();
+        let root = manager
+            .start_thread(StartThreadOptions::new((*turn.config).clone()))
+            .await
+            .expect("root thread should start");
+        session.services.agent_control = manager.agent_control();
+        session.thread_id = root.thread_id;
+
+        let output = SpawnAgentHandler::default()
             .handle(invocation(
                 Arc::new(session),
                 Arc::new(turn),
@@ -492,16 +513,18 @@ async fn spawn_agent_service_tier_override_validates_the_effective_child_model()
                 })),
             ))
             .await
-            .err()
-            .expect("tier unsupported by the final child model should be rejected");
+            .expect("a tier the final child model cannot use is dropped, not fatal");
+        let (content, _) = expect_text_output(output);
+        let result: SpawnAgentResult =
+            serde_json::from_str(&content).expect("spawn_agent result should be json");
+        let snapshot = manager
+            .get_thread(parse_agent_id(&result.agent_id))
+            .await
+            .expect("spawned agent thread should exist")
+            .config_snapshot()
+            .await;
 
-        assert_eq!(
-            err,
-            FunctionCallError::RespondToModel(
-                "Service tier `priority` is not supported for model `gpt-5.4-mini`. Supported service tiers: none"
-                    .to_string()
-            )
-        );
+        assert_eq!(snapshot.service_tier, None);
     }
 }
 
@@ -734,7 +757,7 @@ service_tier = "turbo"
 }
 
 #[tokio::test]
-async fn spawn_agent_role_service_tier_does_not_hide_invalid_spawn_request() {
+async fn spawn_agent_role_service_tier_survives_an_invalid_spawn_request() {
     let (session, mut turn) = make_session_and_context().await;
     tokio::fs::create_dir_all(&turn.config.codex_home)
         .await
@@ -761,7 +784,16 @@ service_tier = "priority"
     );
     turn.config = Arc::new(config);
 
-    let result = SpawnAgentHandler::default()
+    let manager = thread_manager();
+    let root = manager
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .await
+        .expect("root thread should start");
+    let mut session = session;
+    session.services.agent_control = manager.agent_control();
+    session.thread_id = root.thread_id;
+
+    let output = SpawnAgentHandler::default()
         .handle(invocation(
             Arc::new(session),
             Arc::new(turn),
@@ -772,14 +804,27 @@ service_tier = "priority"
                 "service_tier": "turbo"
             })),
         ))
+        .await
+        .expect("an invalid requested tier is dropped, not fatal");
+
+    #[derive(Debug, Deserialize)]
+    struct SpawnAgentResult {
+        agent_id: String,
+    }
+    let (content, _) = expect_text_output(output);
+    let result: SpawnAgentResult =
+        serde_json::from_str(&content).expect("spawn_agent result should be json");
+    let snapshot = manager
+        .get_thread(parse_agent_id(&result.agent_id))
+        .await
+        .expect("spawned agent thread should exist")
+        .config_snapshot()
         .await;
 
+    // FORK: the bad request is discarded; the role's own supported tier stands.
     assert_eq!(
-        result.err(),
-        Some(FunctionCallError::RespondToModel(
-            "Service tier `turbo` is not supported for model `gpt-5.4`. Supported service tiers: priority"
-                .to_string()
-        ))
+        snapshot.service_tier,
+        Some(ServiceTier::Fast.request_value().to_string())
     );
 }
 
@@ -3030,13 +3075,12 @@ async fn multi_agent_v2_wait_agent_accepts_timeout_only_argument() {
     let (content, success) = expect_text_output(output);
     let result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
         serde_json::from_str(&content).expect("wait_agent result should be json");
-    assert_eq!(
-        result,
-        crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
-            message: "Wait completed.".to_string(),
-            timed_out: false,
-        }
+    assert!(
+        result.message.starts_with("Wait completed."),
+        "{}",
+        result.message
     );
+    assert_eq!(result.timed_out, false);
     assert_eq!(success, None);
 }
 
@@ -3075,15 +3119,14 @@ async fn multi_agent_v2_wait_agent_clamps_timeout_below_configured_min() {
     let (content, success) = expect_text_output(output);
     let result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
         serde_json::from_str(&content).expect("wait_agent result should be json");
-    assert_eq!(
-        result,
-        crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
-            message:
-                "Wait timed out.\n\nRequested timeout of 1ms was clamped to the minimum of 50ms."
-                    .to_string(),
-            timed_out: true,
-        }
+    assert!(
+        result.message.starts_with(
+            "Wait timed out.\n\nRequested timeout of 1ms was clamped to the minimum of 50ms."
+        ),
+        "{}",
+        result.message
     );
+    assert_eq!(result.timed_out, true);
     assert_eq!(success, None);
 }
 
@@ -3112,13 +3155,12 @@ async fn multi_agent_v2_wait_agent_accepts_explicit_timeout_at_configured_min() 
     let (content, success) = expect_text_output(output);
     let result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
         serde_json::from_str(&content).expect("wait_agent result should be json");
-    assert_eq!(
-        result,
-        crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
-            message: "Wait timed out.".to_string(),
-            timed_out: true,
-        }
+    assert!(
+        result.message.starts_with("Wait timed out."),
+        "{}",
+        result.message
     );
+    assert_eq!(result.timed_out, true);
     assert_eq!(success, None);
 }
 
@@ -3167,13 +3209,12 @@ async fn multi_agent_v2_wait_agent_uses_configured_default_timeout() {
     let (content, success) = expect_text_output(output);
     let result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
         serde_json::from_str(&content).expect("wait_agent result should be json");
-    assert_eq!(
-        result,
-        crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
-            message: "Wait timed out.".to_string(),
-            timed_out: true,
-        }
+    assert!(
+        result.message.starts_with("Wait timed out."),
+        "{}",
+        result.message
     );
+    assert_eq!(result.timed_out, true);
     assert_eq!(success, None);
 }
 
@@ -3207,13 +3248,12 @@ async fn multi_agent_v2_wait_agent_allows_zero_configured_timeout() {
     let (content, success) = expect_text_output(output);
     let result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
         serde_json::from_str(&content).expect("wait_agent result should be json");
-    assert_eq!(
-        result,
-        crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
-            message: "Wait timed out.".to_string(),
-            timed_out: true,
-        }
+    assert!(
+        result.message.starts_with("Wait timed out."),
+        "{}",
+        result.message
     );
+    assert_eq!(result.timed_out, true);
     assert_eq!(success, None);
 }
 
@@ -3272,13 +3312,12 @@ async fn multi_agent_v2_wait_agent_accepts_explicit_timeout_at_configured_max() 
     let (content, success) = expect_text_output(output);
     let result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
         serde_json::from_str(&content).expect("wait_agent result should be json");
-    assert_eq!(
-        result,
-        crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
-            message: "Wait timed out.".to_string(),
-            timed_out: true,
-        }
+    assert!(
+        result.message.starts_with("Wait timed out."),
+        "{}",
+        result.message
     );
+    assert_eq!(result.timed_out, true);
     assert_eq!(success, None);
 }
 
@@ -3534,13 +3573,12 @@ async fn multi_agent_v2_wait_agent_returns_summary_for_mailbox_activity() {
     let (content, success) = expect_text_output(wait_output);
     let result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
         serde_json::from_str(&content).expect("wait_agent result should be json");
-    assert_eq!(
-        result,
-        crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
-            message: "Wait completed.".to_string(),
-            timed_out: false,
-        }
+    assert!(
+        result.message.starts_with("Wait completed."),
+        "{}",
+        result.message
     );
+    assert_eq!(result.timed_out, false);
     assert_eq!(success, None);
 }
 
@@ -3618,13 +3656,12 @@ async fn multi_agent_v2_wait_agent_returns_for_already_queued_mail() {
     let (content, success) = expect_text_output(output);
     let result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
         serde_json::from_str(&content).expect("wait_agent result should be json");
-    assert_eq!(
-        result,
-        crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
-            message: "Wait completed.".to_string(),
-            timed_out: false,
-        }
+    assert!(
+        result.message.starts_with("Wait completed."),
+        "{}",
+        result.message
     );
+    assert_eq!(result.timed_out, false);
     assert_eq!(success, None);
 }
 
@@ -3712,13 +3749,12 @@ async fn multi_agent_v2_wait_agent_wakes_on_any_mailbox_notification() {
     let (content, success) = expect_text_output(output);
     let result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
         serde_json::from_str(&content).expect("wait_agent result should be json");
-    assert_eq!(
-        result,
-        crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
-            message: "Wait completed.".to_string(),
-            timed_out: false,
-        }
+    assert!(
+        result.message.starts_with("Wait completed."),
+        "{}",
+        result.message
     );
+    assert_eq!(result.timed_out, false);
     assert_eq!(success, None);
 }
 
@@ -3803,13 +3839,12 @@ async fn multi_agent_v2_wait_agent_does_not_return_completed_content() {
     let (content, success) = expect_text_output(output);
     let result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
         serde_json::from_str(&content).expect("wait_agent result should be json");
-    assert_eq!(
-        result,
-        crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
-            message: "Wait completed.".to_string(),
-            timed_out: false,
-        }
+    assert!(
+        result.message.starts_with("Wait completed."),
+        "{}",
+        result.message
     );
+    assert_eq!(result.timed_out, false);
     assert!(!content.contains("sensitive child output"));
     assert_eq!(success, None);
 }

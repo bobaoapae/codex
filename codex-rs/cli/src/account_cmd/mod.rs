@@ -57,6 +57,41 @@ pub enum AccountSubcommand {
     Switch(SwitchArgs),
     /// Remove a stored account.
     Remove(RemoveArgs),
+    /// FORK: inspect and choose among the Claude Code accounts that back
+    /// `claude-*` agents.
+    ///
+    /// These are a different thing from the ChatGPT accounts above: they are
+    /// config directories for the local `claude` CLI, listed in
+    /// `[claude_code].account_dirs`, and they are what a Claude subagent spends.
+    /// Until now they were only visible from inside an agent turn.
+    #[command(subcommand)]
+    Claude(ClaudeSubcommand),
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub enum ClaudeSubcommand {
+    /// List configured Claude accounts and their usage windows.
+    List(ClaudeListArgs),
+    /// Choose which Claude account new agents should try first.
+    Use(ClaudeUseArgs),
+}
+
+#[derive(Debug, clap::Parser)]
+pub struct ClaudeListArgs {
+    /// Output as JSON.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Skip fetching current usage (faster, offline-friendly).
+    #[arg(long)]
+    pub no_usage: bool,
+}
+
+#[derive(Debug, clap::Parser)]
+pub struct ClaudeUseArgs {
+    /// Account to prefer: an index from `list`, a config-dir path, or part of
+    /// the account email. `auto` clears the preference.
+    pub account: String,
 }
 
 #[derive(Debug, clap::Parser)]
@@ -113,6 +148,10 @@ impl AccountCli {
             AccountSubcommand::Add(args) => run_add(&config, args).await,
             AccountSubcommand::Switch(args) => run_switch(&config, args).await,
             AccountSubcommand::Remove(args) => run_remove(&config, args).await,
+            AccountSubcommand::Claude(subcommand) => match subcommand {
+                ClaudeSubcommand::List(args) => run_claude_list(&config, args).await,
+                ClaudeSubcommand::Use(args) => run_claude_use(&config, args),
+            },
         }
     }
 }
@@ -296,7 +335,9 @@ async fn refresh_if_expiring(
         .is_some_and(|expiry| expiry <= chrono::Utc::now() + chrono::Duration::seconds(60));
 
     if expires_soon {
-        vault.refresh_entry(&entry.session_id, auth_route_config).await
+        vault
+            .refresh_entry(&entry.session_id, auth_route_config)
+            .await
     } else {
         Ok(entry.clone())
     }
@@ -325,6 +366,34 @@ async fn run_list(config: &Config, args: ListArgs) -> Result<()> {
         );
     } else {
         print!("{}", render::render_table(&rows));
+    }
+    Ok(())
+}
+
+/// FORK: `codex account claude list`.
+async fn run_claude_list(config: &Config, args: ClaudeListArgs) -> Result<()> {
+    let accounts = codex_core::claude_accounts_api::list(config, !args.no_usage)
+        .await
+        .map_err(|err| anyhow::anyhow!("{err}"))?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&accounts)?);
+        return Ok(());
+    }
+    if accounts.is_empty() {
+        println!("No Claude accounts configured. Set `[claude_code].account_dirs` in config.toml.");
+        return Ok(());
+    }
+    print!("{}", render::render_claude_table(&accounts));
+    Ok(())
+}
+
+/// FORK: `codex account claude use`.
+fn run_claude_use(config: &Config, args: ClaudeUseArgs) -> Result<()> {
+    match codex_core::claude_accounts_api::select(config, &args.account)
+        .map_err(|err| anyhow::anyhow!("{err}"))?
+    {
+        Some(label) => println!("New Claude agents will try {label} first."),
+        None => println!("Cleared the Claude account preference; selection is automatic again."),
     }
     Ok(())
 }
@@ -384,7 +453,10 @@ async fn run_add(config: &Config, args: AddArgs) -> Result<()> {
             .map(|email| format!(" ({email})"))
             .unwrap_or_default()
     );
-    println!("The active account was not changed. Run `codex account switch {}` to use it.", entry.label);
+    println!(
+        "The active account was not changed. Run `codex account switch {}` to use it.",
+        entry.label
+    );
     Ok(())
 }
 

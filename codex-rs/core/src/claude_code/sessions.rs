@@ -17,7 +17,6 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
-use tracing::warn;
 
 /// File name under `CODEX_HOME`.
 pub(crate) const SESSIONS_STATE_FILE_NAME: &str = "claude_code_sessions.json";
@@ -66,30 +65,7 @@ fn now_ms() -> u64 {
 }
 
 fn load_file(path: &Path) -> SessionsFile {
-    match std::fs::read(path) {
-        Ok(raw) => serde_json::from_slice(&raw).unwrap_or_default(),
-        Err(_) => SessionsFile::default(),
-    }
-}
-
-fn save_file(path: &Path, file: &SessionsFile) {
-    let Ok(raw) = serde_json::to_vec_pretty(file) else {
-        return;
-    };
-    // Per-process temp name: agents write this file concurrently.
-    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
-    let write_result = std::fs::write(&tmp, raw).and_then(|()| match std::fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(_) if path.exists() => {
-            std::fs::remove_file(path)?;
-            std::fs::rename(&tmp, path)
-        }
-        Err(err) => Err(err),
-    });
-    if let Err(err) = write_result {
-        let _ = std::fs::remove_file(&tmp);
-        warn!("claude_code: failed to persist session continuity: {err}");
-    }
+    super::state_file::read(path)
 }
 
 /// Drops expired and surplus entries, oldest first.
@@ -135,20 +111,24 @@ pub(super) fn store(
     pinned_account: Option<&Path>,
 ) {
     let now = now_ms();
-    let mut file = load_file(path);
-    file.version = 1;
-    let record = file.threads.entry(thread_key.to_string()).or_default();
-    record.session_id = continuity.session_id.clone();
-    record.delivered_items = continuity.delivered_items;
-    record.delivered_fingerprint = continuity.delivered_fingerprint;
-    record.account_dir = continuity.account_dir.clone();
-    record.echoed = continuity.echoed.clone();
-    if let Some(pinned_account) = pinned_account {
-        record.pinned_account = Some(pinned_account.to_path_buf());
-    }
-    record.updated_at_ms = now;
-    prune(&mut file, now);
-    save_file(path, &file);
+    // FORK: one locked read-modify-write. Loading, mutating and writing
+    // separately meant a sibling agent's `store` landing in between was
+    // overwritten, and the thread it belonged to replayed its whole transcript
+    // on its next turn.
+    super::state_file::update(path, |file: &mut SessionsFile| {
+        file.version = 1;
+        let record = file.threads.entry(thread_key.to_string()).or_default();
+        record.session_id = continuity.session_id.clone();
+        record.delivered_items = continuity.delivered_items;
+        record.delivered_fingerprint = continuity.delivered_fingerprint;
+        record.account_dir = continuity.account_dir.clone();
+        record.echoed = continuity.echoed.clone();
+        if let Some(pinned_account) = pinned_account {
+            record.pinned_account = Some(pinned_account.to_path_buf());
+        }
+        record.updated_at_ms = now;
+        prune(file, now);
+    });
 }
 
 #[cfg(test)]
@@ -224,7 +204,9 @@ mod tests {
                 ..ThreadRecord::default()
             },
         );
-        save_file(&path, &file);
+        super::super::state_file::update(&path, |on_disk: &mut SessionsFile| {
+            *on_disk = file;
+        });
 
         store(&path, "thread-1", &continuity("claude-1", &account), None);
 

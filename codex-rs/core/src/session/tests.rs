@@ -6309,6 +6309,9 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         git_enrichment_policy: GitEnrichmentPolicy::Fresh,
         fork_persistence: ForkPersistence::Copied,
         next_internal_sub_id: AtomicU64::new(0),
+        is_subagent: false,
+        last_plan: std::sync::Mutex::new(None),
+        desktop_threads_created: AtomicU64::new(0),
     };
     let per_turn_config =
         session.build_per_turn_config(&session_configuration, session_configuration.cwd().clone());
@@ -8540,6 +8543,9 @@ where
         git_enrichment_policy: GitEnrichmentPolicy::Fresh,
         fork_persistence: ForkPersistence::Copied,
         next_internal_sub_id: AtomicU64::new(0),
+        is_subagent: false,
+        last_plan: std::sync::Mutex::new(None),
+        desktop_threads_created: AtomicU64::new(0),
     });
     let per_turn_config =
         session.build_per_turn_config(&session_configuration, session_configuration.cwd().clone());
@@ -9169,6 +9175,8 @@ async fn step_context_keeps_its_mcp_runtime_for_tools() -> anyhow::Result<()> {
             default_tools_approval_mode: None,
             enabled_tools: None,
             disabled_tools: None,
+            root_only_tools: None,
+            tool_approval_overrides: Default::default(),
             scopes: None,
             oauth: None,
             oauth_resource: None,
@@ -9760,16 +9768,26 @@ async fn build_initial_context_adds_multi_agent_v2_root_usage_hint_as_developer_
     let initial_context = build_initial_context(&session, &turn_context).await;
 
     let developer_messages = developer_message_texts(&initial_context);
-    assert!(
-        developer_messages
-            .iter()
-            .any(|message| message.as_slice() == ["Root guidance."]),
-        "expected standalone root usage hint developer message, got {developer_messages:?}"
-    );
+    // FORK: the configured text is kept verbatim, then the fork's own sections
+    // are appended. Configuring a hint replaces the bundled one, and losing the
+    // reporting and patience guidance with it is exactly the failure they exist
+    // to prevent.
+    let root_hint = developer_messages
+        .iter()
+        .filter_map(|message| match message.as_slice() {
+            [only] if only.starts_with("Root guidance.") => Some(only),
+            _ => None,
+        })
+        .next()
+        .unwrap_or_else(|| panic!("expected a root usage hint, got {developer_messages:?}"));
+    assert!(root_hint.contains("## Reporting"), "{root_hint}");
+    assert!(root_hint.contains("## Waiting on agents"), "{root_hint}");
+    assert!(root_hint.contains("## Delivery discipline"), "{root_hint}");
     assert!(
         !developer_messages
             .iter()
-            .any(|message| message.as_slice() == ["Subagent guidance."]),
+            .any(|message| matches!(message.as_slice(), [only] if only
+                .starts_with("Subagent guidance."))),
         "did not expect subagent usage hint for root thread, got {developer_messages:?}"
     );
 }
@@ -9811,16 +9829,25 @@ async fn build_initial_context_adds_multi_agent_v2_subagent_usage_hint_as_develo
             .any(|text| text.contains("<context_window>\nAgent name: /root/worker\n")),
         "expected subagent context window to include its canonical name, got {developer_messages:?}"
     );
+    let subagent_hint = developer_messages
+        .iter()
+        .filter_map(|message| match message.as_slice() {
+            [only] if only.starts_with("Subagent guidance.") => Some(only),
+            _ => None,
+        })
+        .next()
+        .unwrap_or_else(|| panic!("expected a subagent usage hint, got {developer_messages:?}"));
+    assert!(subagent_hint.contains("## Reporting"), "{subagent_hint}");
+    // Patience and delivery discipline are the root's job, not a worker's.
     assert!(
-        developer_messages
-            .iter()
-            .any(|message| message.as_slice() == ["Subagent guidance."]),
-        "expected standalone subagent usage hint developer message, got {developer_messages:?}"
+        !subagent_hint.contains("## Waiting on agents"),
+        "{subagent_hint}"
     );
     assert!(
         !developer_messages
             .iter()
-            .any(|message| message.as_slice() == ["Root guidance."]),
+            .any(|message| matches!(message.as_slice(), [only] if only
+                .starts_with("Root guidance."))),
         "did not expect root usage hint for subagent thread, got {developer_messages:?}"
     );
 }

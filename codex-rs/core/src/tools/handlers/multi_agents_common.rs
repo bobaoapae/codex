@@ -1,6 +1,7 @@
 use crate::agent::control::SpawnAgentForkMode;
 use crate::agent::role::apply_role_to_config;
 use crate::config::Config;
+use crate::config::DEFAULT_MULTI_AGENT_V2_DEFAULT_WAIT_TIMEOUT_MS;
 use crate::config::DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS;
 use crate::config::HARD_MAX_MULTI_AGENT_V2_TIMEOUT_MS;
 use crate::function_tool::FunctionCallError;
@@ -30,22 +31,53 @@ use serde_json::Value as JsonValue;
 
 /// Minimum wait timeout to prevent tight polling loops from burning CPU.
 pub(crate) const MIN_WAIT_TIMEOUT_MS: i64 = DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS;
-pub(crate) const DEFAULT_WAIT_TIMEOUT_MS: i64 = 30_000;
+pub(crate) const DEFAULT_WAIT_TIMEOUT_MS: i64 = DEFAULT_MULTI_AGENT_V2_DEFAULT_WAIT_TIMEOUT_MS;
 pub(crate) const MAX_WAIT_TIMEOUT_MS: i64 = HARD_MAX_MULTI_AGENT_V2_TIMEOUT_MS;
 pub(crate) const MAX_SPAWN_AGENT_MODEL_OVERRIDES: usize = 5;
 
 /// Native Claude children receive their task through the inter-agent brief and must not inherit
 /// the parent's Codex conversation. Other child providers retain the requested fork semantics.
+///
+/// FORK: returns the note explaining an adjusted `fork_turns` instead of
+/// silently ignoring it, so the caller can hand the model one honest sentence
+/// rather than letting it believe the child inherited history it never saw.
+///
+/// `max_fork_turns` (`[claude_code] max_fork_turns`, default 0) is the ceiling
+/// on how much of the parent conversation a Claude child may inherit. A
+/// full-history fork is refused at any setting: that mode also inherits the
+/// parent's agent type, which a locally served child cannot honor.
 pub(crate) fn task_fork_mode_for_wire_api(
     wire_api: WireApi,
     requested_fork_mode: Option<SpawnAgentForkMode>,
-) -> Option<SpawnAgentForkMode> {
-    if wire_api == WireApi::ClaudeCode {
-        None
-    } else {
-        requested_fork_mode
+    max_fork_turns: usize,
+) -> (Option<SpawnAgentForkMode>, Option<String>) {
+    if wire_api != WireApi::ClaudeCode {
+        return (requested_fork_mode, None);
+    }
+    match requested_fork_mode {
+        None => (None, None),
+        Some(SpawnAgentForkMode::FullHistory) => (None, Some(CLAUDE_FULL_FORK_NOTE.to_string())),
+        Some(SpawnAgentForkMode::LastNTurns(_)) if max_fork_turns == 0 => {
+            (None, Some(CLAUDE_TASK_ONLY_FORK_NOTE.to_string()))
+        }
+        Some(SpawnAgentForkMode::LastNTurns(requested)) => {
+            let allowed = requested.min(max_fork_turns);
+            let note = (allowed != requested).then(|| {
+                format!(
+                    "`fork_turns` was reduced from {requested} to {allowed} by `[claude_code] max_fork_turns`."
+                )
+            });
+            (Some(SpawnAgentForkMode::LastNTurns(allowed)), note)
+        }
     }
 }
+
+/// Said when a Claude child was asked to inherit turns it is not allowed to.
+const CLAUDE_TASK_ONLY_FORK_NOTE: &str = "`fork_turns` was ignored: this Claude agent starts from task-only context, so the brief must be self-contained.";
+
+/// Said when a Claude child was asked for a full-history fork, which also
+/// inherits the parent agent type and so can never apply.
+const CLAUDE_FULL_FORK_NOTE: &str = "`fork_turns: \"all\"` is not available for a Claude agent; it started from task-only context. Send a self-contained brief.";
 
 pub(crate) fn model_supports_multi_agent_backend(
     model: &ModelPreset,
@@ -347,6 +379,8 @@ pub(crate) async fn apply_requested_spawn_agent_model_overrides(
     config: &mut Config,
     requested_model: Option<&str>,
     requested_reasoning_effort: Option<ReasoningEffort>,
+    // FORK: notes accumulate the arguments we adjusted instead of rejecting.
+    notes: &mut Vec<String>,
 ) -> Result<(), FunctionCallError> {
     let requested_model = requested_model.or(turn.config.agent_default_subagent_model.as_deref());
     let requested_reasoning_effort = requested_reasoning_effort
@@ -374,12 +408,13 @@ pub(crate) async fn apply_requested_spawn_agent_model_overrides(
 
         config.model = Some(selected_model_name.clone());
         if let Some(reasoning_effort) = requested_reasoning_effort {
-            validate_spawn_agent_reasoning_effort(
+            let (effort, note) = clamp_spawn_agent_reasoning_effort(
                 &selected_model_name,
                 &selected_model_info.supported_reasoning_levels,
                 &reasoning_effort,
-            )?;
-            config.model_reasoning_effort = Some(reasoning_effort);
+            );
+            notes.extend(note);
+            config.model_reasoning_effort = effort.or(selected_model_info.default_reasoning_level);
         } else {
             config.model_reasoning_effort = selected_model_info.default_reasoning_level;
         }
@@ -388,12 +423,15 @@ pub(crate) async fn apply_requested_spawn_agent_model_overrides(
     }
 
     if let Some(reasoning_effort) = requested_reasoning_effort {
-        validate_spawn_agent_reasoning_effort(
+        let (effort, note) = clamp_spawn_agent_reasoning_effort(
             &turn.model_info().slug,
             &turn.model_info().supported_reasoning_levels,
             &reasoning_effort,
-        )?;
-        config.model_reasoning_effort = Some(reasoning_effort);
+        );
+        notes.extend(note);
+        if let Some(effort) = effort {
+            config.model_reasoning_effort = Some(effort);
+        }
     }
 
     Ok(())
@@ -404,7 +442,22 @@ pub(crate) async fn apply_spawn_agent_service_tier(
     config: &mut Config,
     parent_service_tier: Option<&str>,
     requested_service_tier: Option<&str>,
+    // FORK: notes accumulate the arguments we adjusted instead of rejecting.
+    notes: &mut Vec<String>,
 ) -> Result<(), FunctionCallError> {
+    // FORK: a locally served child has no backend service tiers at all. The
+    // parent's `priority` is inherited by default, so refusing here failed
+    // spawns over an argument the caller never wrote.
+    if config.model_provider.wire_api == WireApi::ClaudeCode
+        || config.model_provider_id == CLAUDE_CODE_PROVIDER_ID
+    {
+        if requested_service_tier.is_some() {
+            notes.push(CLAUDE_SERVICE_TIER_NOTE.to_string());
+        }
+        config.service_tier = None;
+        return Ok(());
+    }
+
     let candidate_service_tiers = [
         config.service_tier.clone(),
         requested_service_tier.map(str::to_string),
@@ -429,19 +482,17 @@ pub(crate) async fn apply_spawn_agent_service_tier(
     if let Some(requested_service_tier) = requested_service_tier
         && !model_info.supports_service_tier(requested_service_tier)
     {
-        let supported_service_tiers = if model_info.service_tiers.is_empty() {
-            "none".to_string()
-        } else {
-            model_info
-                .service_tiers
-                .iter()
-                .map(|tier| tier.id.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        return Err(FunctionCallError::RespondToModel(format!(
-            "Service tier `{requested_service_tier}` is not supported for model `{model}`. Supported service tiers: {supported_service_tiers}"
-        )));
+        let supported = model_info
+            .service_tiers
+            .iter()
+            .map(|tier| tier.id.as_str())
+            .collect::<Vec<_>>();
+        // FORK: drop with a note rather than failing the whole spawn.
+        notes.push(unsupported_service_tier_note(
+            &model,
+            requested_service_tier,
+            &supported,
+        ));
     }
 
     config.service_tier =
@@ -454,10 +505,31 @@ pub(crate) async fn apply_spawn_agent_service_tier(
     Ok(())
 }
 
+/// FORK: the sentence handed back when a requested `service_tier` cannot be
+/// applied. Kept pure so the wording is covered by a test without standing up a
+/// `Session` and a models manager.
+fn unsupported_service_tier_note(model: &str, requested: &str, supported: &[&str]) -> String {
+    let supported = if supported.is_empty() {
+        "none".to_string()
+    } else {
+        supported.join(", ")
+    };
+    format!(
+        "Service tier `{requested}` is not supported for model `{model}` and was dropped. Supported service tiers: {supported}."
+    )
+}
+
+/// FORK: the note for a child served by the local Claude CLI, which has no
+/// backend service tiers of any kind.
+const CLAUDE_SERVICE_TIER_NOTE: &str =
+    "`service_tier` was dropped: a Claude agent runs on the local CLI, which has no service tiers.";
+
 pub(crate) async fn apply_spawn_agent_role(
     session: &Session,
     config: &mut Config,
     role_name: Option<&str>,
+    // FORK: notes accumulate the arguments we adjusted instead of rejecting.
+    notes: &mut Vec<String>,
 ) -> Result<(), FunctionCallError> {
     let previous_model = config.model.clone();
     let previous_reasoning_effort = config.model_reasoning_effort.clone();
@@ -483,15 +555,20 @@ pub(crate) async fn apply_spawn_agent_role(
         .models_manager
         .get_model_info(&model, &config.to_models_manager_config())
         .await;
+    // Fallback metadata does not describe the real model, so clamping against it
+    // would silently downgrade a role that is in fact supported.
     if model_info.used_fallback_model_metadata {
         return Ok(());
     }
 
-    validate_spawn_agent_reasoning_effort(
+    let (effort, note) = clamp_spawn_agent_reasoning_effort(
         &model,
         &model_info.supported_reasoning_levels,
         &reasoning_effort,
-    )
+    );
+    notes.extend(note);
+    config.model_reasoning_effort = effort.or(model_info.default_reasoning_level);
+    Ok(())
 }
 
 fn find_spawn_agent_model_name(
@@ -521,26 +598,81 @@ fn find_spawn_agent_model_name(
         })
 }
 
-fn validate_spawn_agent_reasoning_effort(
+/// Rank used to clamp an unsupported reasoning effort down to the closest
+/// supported level. `Custom` has no position on the scale, so it maps to the
+/// model default instead of to a neighbour.
+fn reasoning_effort_rank(effort: &ReasoningEffort) -> Option<u8> {
+    match effort {
+        ReasoningEffort::None => Some(0),
+        ReasoningEffort::Minimal => Some(1),
+        ReasoningEffort::Low => Some(2),
+        ReasoningEffort::Medium => Some(3),
+        ReasoningEffort::High => Some(4),
+        ReasoningEffort::XHigh => Some(5),
+        ReasoningEffort::Max => Some(6),
+        ReasoningEffort::Ultra => Some(7),
+        ReasoningEffort::Custom(_) => None,
+    }
+}
+
+/// FORK: an effort the child model does not have is a bad *spawn argument*, not
+/// a reason to refuse the whole spawn. Requesting `ultra` for a Claude child
+/// used to fail the call outright; now it lands on the highest level the child
+/// actually supports and the caller gets a note saying so.
+///
+/// Clamping is one-directional: never above what was asked for. An empty
+/// support list (or an unrankable `Custom`) leaves the model default alone.
+fn clamp_spawn_agent_reasoning_effort(
     model: &str,
     supported_reasoning_levels: &[ReasoningEffortPreset],
     requested_reasoning_effort: &ReasoningEffort,
-) -> Result<(), FunctionCallError> {
+) -> (Option<ReasoningEffort>, Option<String>) {
     if supported_reasoning_levels
         .iter()
         .any(|preset| &preset.effort == requested_reasoning_effort)
     {
-        return Ok(());
+        return (Some(requested_reasoning_effort.clone()), None);
     }
+    if supported_reasoning_levels.is_empty() {
+        return (
+            None,
+            Some(format!(
+                "Reasoning effort `{requested_reasoning_effort}` was dropped: model `{model}` declares no reasoning levels."
+            )),
+        );
+    }
+
+    let clamped = reasoning_effort_rank(requested_reasoning_effort).and_then(|requested_rank| {
+        supported_reasoning_levels
+            .iter()
+            .filter_map(|preset| {
+                reasoning_effort_rank(&preset.effort)
+                    .filter(|rank| *rank <= requested_rank)
+                    .map(|rank| (rank, preset.effort.clone()))
+            })
+            .max_by_key(|(rank, _)| *rank)
+            .map(|(_, effort)| effort)
+    });
 
     let supported = supported_reasoning_levels
         .iter()
         .map(|preset| preset.effort.to_string())
         .collect::<Vec<_>>()
         .join(", ");
-    Err(FunctionCallError::RespondToModel(format!(
-        "Reasoning effort `{requested_reasoning_effort}` is not supported for model `{model}`. Supported reasoning efforts: {supported}"
-    )))
+    match clamped {
+        Some(effort) => (
+            Some(effort.clone()),
+            Some(format!(
+                "Reasoning effort `{requested_reasoning_effort}` is not supported for model `{model}`; used `{effort}` instead. Supported: {supported}."
+            )),
+        ),
+        None => (
+            None,
+            Some(format!(
+                "Reasoning effort `{requested_reasoning_effort}` is not supported for model `{model}`; used the model default. Supported: {supported}."
+            )),
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -554,12 +686,50 @@ mod tests {
             task_fork_mode_for_wire_api(
                 WireApi::ClaudeCode,
                 Some(SpawnAgentForkMode::LastNTurns(10)),
-            ),
+                /*max_fork_turns*/ 0,
+            )
+            .0,
             None
         );
+        // A full-history fork is refused even when turns are allowed: it also
+        // inherits the parent agent type, which a Claude child cannot be.
         assert_eq!(
-            task_fork_mode_for_wire_api(WireApi::ClaudeCode, Some(SpawnAgentForkMode::FullHistory),),
+            task_fork_mode_for_wire_api(
+                WireApi::ClaudeCode,
+                Some(SpawnAgentForkMode::FullHistory),
+                /*max_fork_turns*/ 8,
+            )
+            .0,
             None
+        );
+    }
+
+    /// FORK: `[claude_code] max_fork_turns` is a ceiling, and a request above it
+    /// is clamped rather than refused.
+    #[test]
+    fn claude_fork_turns_are_capped_by_config() {
+        assert_eq!(
+            task_fork_mode_for_wire_api(
+                WireApi::ClaudeCode,
+                Some(SpawnAgentForkMode::LastNTurns(10)),
+                /*max_fork_turns*/ 3,
+            ),
+            (
+                Some(SpawnAgentForkMode::LastNTurns(3)),
+                Some(
+                    "`fork_turns` was reduced from 10 to 3 by `[claude_code] max_fork_turns`."
+                        .to_string()
+                )
+            )
+        );
+        // Under the cap nothing is adjusted, so nothing is said.
+        assert_eq!(
+            task_fork_mode_for_wire_api(
+                WireApi::ClaudeCode,
+                Some(SpawnAgentForkMode::LastNTurns(2)),
+                /*max_fork_turns*/ 3,
+            ),
+            (Some(SpawnAgentForkMode::LastNTurns(2)), None)
         );
     }
 
@@ -569,8 +739,107 @@ mod tests {
             task_fork_mode_for_wire_api(
                 WireApi::Responses,
                 Some(SpawnAgentForkMode::LastNTurns(10)),
+                /*max_fork_turns*/ 0,
             ),
-            Some(SpawnAgentForkMode::LastNTurns(10))
+            (Some(SpawnAgentForkMode::LastNTurns(10)), None)
+        );
+    }
+
+    /// FORK: a dropped `fork_turns` has to be said out loud, or the parent keeps
+    /// writing briefs that assume the child saw the conversation.
+    #[test]
+    fn spawning_a_claude_agent_with_fork_turns_returns_a_note() {
+        let (fork_mode, note) = task_fork_mode_for_wire_api(
+            WireApi::ClaudeCode,
+            Some(SpawnAgentForkMode::LastNTurns(3)),
+            /*max_fork_turns*/ 0,
+        );
+        assert_eq!(fork_mode, None);
+        let note = note.expect("dropping fork_turns must be reported");
+        assert!(note.contains("fork_turns"), "{note}");
+        assert!(note.contains("self-contained"), "{note}");
+
+        // Nothing was requested, so there is nothing to explain.
+        assert_eq!(
+            task_fork_mode_for_wire_api(WireApi::ClaudeCode, None, 0),
+            (None, None)
+        );
+    }
+
+    fn effort_presets(efforts: &[ReasoningEffort]) -> Vec<ReasoningEffortPreset> {
+        efforts
+            .iter()
+            .map(|effort| ReasoningEffortPreset {
+                effort: effort.clone(),
+                description: String::new(),
+            })
+            .collect()
+    }
+
+    /// FORK: `ultra` is this user's configured default; a child that cannot go
+    /// that high should run at its ceiling, not fail to spawn.
+    #[test]
+    fn an_unsupported_reasoning_effort_clamps_down_not_up() {
+        let supported = effort_presets(&[
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+        ]);
+
+        let (effort, note) = clamp_spawn_agent_reasoning_effort(
+            "claude-opus-5",
+            &supported,
+            &ReasoningEffort::Ultra,
+        );
+        assert_eq!(effort, Some(ReasoningEffort::High));
+        let note = note.expect("a clamped effort must be reported");
+        assert!(note.contains("`ultra`"), "{note}");
+        assert!(note.contains("`high`"), "{note}");
+
+        // Never upgrade: asking for less than the floor keeps the model default.
+        let (effort, note) = clamp_spawn_agent_reasoning_effort(
+            "claude-opus-5",
+            &supported,
+            &ReasoningEffort::Minimal,
+        );
+        assert_eq!(effort, None);
+        assert!(note.is_some());
+
+        // A supported level passes through untouched and says nothing.
+        assert_eq!(
+            clamp_spawn_agent_reasoning_effort(
+                "claude-opus-5",
+                &supported,
+                &ReasoningEffort::Medium
+            ),
+            (Some(ReasoningEffort::Medium), None)
+        );
+    }
+
+    /// FORK: `service_tier: "priority"` is inherited from the parent turn and
+    /// used to hard-fail every Claude spawn. It is now dropped with a note.
+    #[test]
+    fn an_unsupported_service_tier_is_dropped_with_a_note() {
+        let note = unsupported_service_tier_note("claude-opus-5", "priority", &[]);
+        assert!(note.contains("`priority`"), "{note}");
+        assert!(note.contains("was dropped"), "{note}");
+        assert!(note.contains("none"), "{note}");
+
+        let note = unsupported_service_tier_note("gpt-5.6-luna", "priority", &["flex", "default"]);
+        assert!(note.contains("flex, default"), "{note}");
+
+        assert!(CLAUDE_SERVICE_TIER_NOTE.contains("service_tier"));
+    }
+
+    /// A model that declares no levels at all cannot be clamped into one.
+    #[test]
+    fn an_effort_is_dropped_when_the_model_declares_no_levels() {
+        let (effort, note) =
+            clamp_spawn_agent_reasoning_effort("local-model", &[], &ReasoningEffort::High);
+        assert_eq!(effort, None);
+        assert!(
+            note.expect("dropping the effort must be reported")
+                .contains("no reasoning levels")
         );
     }
 

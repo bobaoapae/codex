@@ -258,6 +258,13 @@ impl AppliedPatchDelta {
         Self::new(Vec::new(), /*exact*/ true)
     }
 
+    /// FORK: builds a delta from changes that were committed by something other
+    /// than this crate's patch applier — a provider that edits files itself.
+    /// Exact by construction: the caller states the before and after contents.
+    pub fn from_changes(changes: Vec<AppliedPatchChange>) -> Self {
+        Self::new(changes, /*exact*/ true)
+    }
+
     pub fn changes(&self) -> &[AppliedPatchChange] {
         &self.changes
     }

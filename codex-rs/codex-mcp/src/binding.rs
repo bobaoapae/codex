@@ -245,6 +245,18 @@ impl PreparedMcpCall {
             .tool_approval_mode(&self.tool_info.tool.name)
     }
 
+    /// FORK: whether this tool is scoped to the root thread.
+    ///
+    /// The spec plan already hides it from a subagent's tool list; this is the
+    /// backstop for a call that reaches the runtime anyway (a replayed history
+    /// item, a hand-written call).
+    pub fn is_root_only(&self) -> bool {
+        self.server_metadata
+            .root_only_tools
+            .iter()
+            .any(|name| name == self.tool_info.tool.name.as_ref())
+    }
+
     pub fn plugin_id(&self) -> Option<&str> {
         self.plugin_id.as_deref()
     }

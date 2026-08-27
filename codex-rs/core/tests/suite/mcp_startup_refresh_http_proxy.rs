@@ -143,6 +143,8 @@ async fn local_mcp_startup_and_refresh_use_configured_http_client() -> Result<()
                     default_tools_approval_mode: None,
                     enabled_tools: None,
                     disabled_tools: None,
+                    root_only_tools: None,
+                    tool_approval_overrides: Default::default(),
                     scopes: None,
                     oauth: None,
                     oauth_resource: None,

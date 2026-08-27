@@ -877,19 +877,32 @@ impl AgentControl {
             forked_rollout_items =
                 truncate_rollout_to_last_n_fork_turns(forked_rollout_items, *last_n_turns);
         }
-        let multi_agent_v2_usage_hint_texts_to_filter: Vec<String> =
-            if multi_agent_version == MultiAgentVersion::V2 {
-                let parent_config = parent_thread.session.get_config().await;
-                let parent_usage_hints =
-                    resolve_usage_hints(&parent_config.multi_agent_v2, /*catalog*/ None);
-                [parent_usage_hints.root, parent_usage_hints.subagent]
-                    .into_iter()
-                    .flatten()
-                    .map(|instructions| instructions.render())
-                    .collect()
-            } else {
-                Vec::new()
-            };
+        let multi_agent_v2_usage_hint_texts_to_filter: Vec<String> = if multi_agent_version
+            == MultiAgentVersion::V2
+        {
+            let parent_config = parent_thread.session.get_config().await;
+            let parent_usage_hints =
+                resolve_usage_hints(&parent_config.multi_agent_v2, /*catalog*/ None);
+            // FORK: match both the full hint and the part before the
+            // fork-owned sections, so a hint recorded by a build with
+            // different sections is still recognized as the parent's.
+            [parent_usage_hints.root, parent_usage_hints.subagent]
+                .into_iter()
+                .flatten()
+                .flat_map(|instructions| {
+                    let rendered = instructions.render();
+                    let base = crate::session::multi_agents::without_fork_hint_sections(&rendered)
+                        .to_string();
+                    if base == rendered {
+                        vec![rendered]
+                    } else {
+                        vec![rendered, base]
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut preserve_reference_context_item =
             matches!(fork_mode, SpawnAgentForkMode::FullHistory);
         if preserve_reference_context_item {

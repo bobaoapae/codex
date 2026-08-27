@@ -424,6 +424,8 @@ fn mcp_dependency_to_server_config(
             default_tools_approval_mode: None,
             enabled_tools: None,
             disabled_tools: None,
+            root_only_tools: None,
+            tool_approval_overrides: HashMap::new(),
             scopes: None,
             oauth: dependency
                 .oauth_callback_port
@@ -462,6 +464,8 @@ fn mcp_dependency_to_server_config(
             default_tools_approval_mode: None,
             enabled_tools: None,
             disabled_tools: None,
+            root_only_tools: None,
+            tool_approval_overrides: HashMap::new(),
             scopes: None,
             oauth: None,
             oauth_resource: None,

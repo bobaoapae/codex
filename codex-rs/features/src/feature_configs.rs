@@ -260,6 +260,24 @@ pub struct MultiAgentV2ConfigToml {
     pub root_agent_usage_hint_text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subagent_usage_hint_text: Option<String>,
+    /// FORK: appended to the root hint, never replacing it.
+    ///
+    /// The `*_usage_hint_text` keys above *replace* the bundled text, so setting
+    /// one silently drops everything the harness needed to say. These append.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_agent_usage_hint_suffix: Option<String>,
+    /// FORK: appended to the subagent hint, never replacing it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subagent_usage_hint_suffix: Option<String>,
+    /// FORK: whether to append the delivery-discipline hint to the root agent.
+    /// Defaults to true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_discipline_hint: Option<bool>,
+    /// FORK: after this many Desktop threads created in one session, the result
+    /// of `create_thread`/`fork_thread` carries a warning. 0 disables the
+    /// warning entirely. Never blocks: the user may genuinely want them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_desktop_threads_per_session: Option<usize>,
     /// Overrides inherited developer instructions for subagents without role-specific instructions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subagent_developer_instructions: Option<String>,

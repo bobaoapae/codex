@@ -165,6 +165,33 @@ pub(crate) async fn handle_mcp_tool_call(
                 .unwrap_or_else(|| JsonValue::Object(serde_json::Map::new())),
         };
     };
+    // FORK: backstop for tools scoped to the root thread. `spec_plan` already
+    // hides them from a subagent's tool list, so reaching here means the call
+    // came from somewhere else — replayed history, or a model that guessed the
+    // name. Refusing by name is what keeps a subagent from posting into the
+    // user's own thread.
+    if turn_context.session_source.is_non_root_agent() && prepared_call.is_root_only() {
+        let item_metadata =
+            McpToolCallItemMetadata::from_tool_metadata(&server, /*metadata*/ None);
+        let result = notify_mcp_tool_call_skip(
+            sess.as_ref(),
+            turn_context.as_ref(),
+            &call_id,
+            invocation,
+            item_metadata,
+            format!(
+                "MCP tool `{server}/{tool_name}` is available only to the root thread. Report to your parent instead."
+            ),
+            /*already_started*/ false,
+        )
+        .await;
+        return HandledMcpToolCall {
+            result: CallToolResult::from_result(result),
+            tool_input: arguments_value
+                .unwrap_or_else(|| JsonValue::Object(serde_json::Map::new())),
+        };
+    }
+
     let metadata = mcp_tool_metadata(&prepared_call);
     let item_metadata = McpToolCallItemMetadata::from_tool_metadata(&server, Some(&metadata));
     let runtime_config = prepared_call.config();
@@ -549,10 +576,62 @@ async fn handle_approved_mcp_tool_call(
         Some(duration),
     );
 
+    // FORK: a warning, never a block. The user genuinely does create threads
+    // from their own session; what they do not want is an agent opening a dozen
+    // of them and scattering the conversation.
+    let result = note_desktop_thread_count(sess, turn_context, &server, &tool_name, result).await;
+
     HandledMcpToolCall {
         result: CallToolResult::from_result(result),
         tool_input,
     }
+}
+
+/// FORK: counts successful Desktop thread creations and prefixes a note once
+/// they pass `features.multi_agent_v2.max_desktop_threads_per_session`.
+///
+/// Advisory by design: the call still succeeds, and the note reaches the model
+/// that is doing the creating rather than the user who has to live with the
+/// result.
+async fn note_desktop_thread_count(
+    sess: &Arc<Session>,
+    turn_context: &TurnContext,
+    server: &str,
+    tool_name: &str,
+    result: Result<CallToolResult, String>,
+) -> Result<CallToolResult, String> {
+    const THREAD_TOOLS: &[&str] = &["create_thread", "fork_thread"];
+    let limit = turn_context
+        .config
+        .multi_agent_v2
+        .max_desktop_threads_per_session;
+    if limit == 0 || server != CODEX_APPS_MCP_SERVER_NAME || !THREAD_TOOLS.contains(&tool_name) {
+        return result;
+    }
+    let Ok(call_result) = &result else {
+        return result;
+    };
+    if call_result.is_error.unwrap_or(false) {
+        return result;
+    }
+
+    let created = sess.record_desktop_thread_created();
+    if created <= limit {
+        return result;
+    }
+    let Ok(mut call_result) = result else {
+        return result;
+    };
+    call_result.content.insert(
+        0,
+        serde_json::json!({
+            "type": "text",
+            "text": format!(
+                "Note: this session has now opened {created} Desktop threads (soft limit {limit}). Prefer `spawn_agent` for parallel work; extra threads scatter the conversation the user has to read."
+            ),
+        }),
+    );
+    Ok(call_result)
 }
 
 fn mcp_tool_call_span(

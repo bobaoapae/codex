@@ -101,6 +101,11 @@ pub enum Feature {
     SecretAuthStorage,
 
     // Experimental
+    /// FORK: speak the Claude Code CLI's stdio control protocol, enabling tool
+    /// approvals, the in-process MCP bridge and usage reporting for Claude
+    /// subagents. Falls back to the one-shot stdin path when the installed CLI
+    /// does not answer `initialize`.
+    ClaudeCodeControlProtocol,
     /// Send per-content-entry classifications in internal Responses metadata.
     ContentItemKinds,
     /// Record model-attempted tool calls in internal Responses metadata.
@@ -922,6 +927,14 @@ pub const FEATURES: &[FeatureSpec] = &[
         key: "js_repl",
         stage: Stage::Removed,
         default_enabled: false,
+    },
+    // FORK: on by default; the handshake itself decides whether the installed
+    // CLI can actually do it.
+    FeatureSpec {
+        id: Feature::ClaudeCodeControlProtocol,
+        key: "claude_code_control_protocol",
+        stage: Stage::Stable,
+        default_enabled: true,
     },
     FeatureSpec {
         id: Feature::ContentItemKinds,

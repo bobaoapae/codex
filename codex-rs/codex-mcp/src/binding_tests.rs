@@ -122,6 +122,8 @@ async fn test_step(
             supports_parallel_tool_calls: false,
             default_tools_approval_mode: Some(approval_mode),
             tool_approval_modes: HashMap::new(),
+            tool_approval_overrides: Default::default(),
+            root_only_tools: Vec::new(),
         },
         Some(format!("{label}-plugin")),
         label == "old",

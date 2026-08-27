@@ -879,6 +879,20 @@ pub struct PluginMcpServerConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disabled_tools: Option<Vec<String>>,
 
+    /// FORK: tools only the root thread may see. See
+    /// `McpServerConfig::root_only_tools`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_only_tools: Option<Vec<String>>,
+
+    /// FORK: per-tool approval decisions that outrank the plugin's own. See
+    /// `McpServerConfig::tool_approval_overrides`.
+    ///
+    /// This table is the user's policy for a plugin's server, not the plugin's
+    /// manifest, so writing it here is the user deciding — which is the whole
+    /// point of a field that is allowed to loosen.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub tool_approval_overrides: HashMap<String, AppToolApproval>,
+
     /// Per-tool approval settings keyed by tool name.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub tools: HashMap<String, McpServerToolConfig>,
@@ -891,6 +905,8 @@ impl Default for PluginMcpServerConfig {
             default_tools_approval_mode: None,
             enabled_tools: None,
             disabled_tools: None,
+            root_only_tools: None,
+            tool_approval_overrides: HashMap::new(),
             tools: HashMap::new(),
         }
     }

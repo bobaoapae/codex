@@ -1868,6 +1868,50 @@ pub(super) fn realtime_text_for_event(msg: &EventMsg) -> Option<(String, Option<
     }
 }
 
+/// FORK: one short line describing what an agent is doing right now.
+///
+/// Deliberately narrow: only events that mean real work is happening, so a
+/// parent reading "last ran `cargo test` 40s ago" learns something. Streaming
+/// deltas are excluded — they fire constantly and would make every agent look
+/// equally busy.
+pub(crate) fn fork_activity_label(event: &EventMsg) -> Option<String> {
+    fn short(text: &str) -> String {
+        let text = text.trim().replace(['\n', '\r'], " ");
+        if text.chars().count() <= 80 {
+            return text;
+        }
+        text.chars().take(79).collect::<String>() + "…"
+    }
+
+    match event {
+        EventMsg::ExecCommandBegin(exec) => {
+            Some(format!("ran `{}`", short(&exec.command.join(" "))))
+        }
+        EventMsg::PatchApplyBegin(patch) => Some(match patch.changes.len() {
+            1 => format!(
+                "edited {}",
+                patch
+                    .changes
+                    .keys()
+                    .next()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default()
+            ),
+            count => format!("edited {count} files"),
+        }),
+        EventMsg::McpToolCallBegin(call) => Some(format!(
+            "called {}/{}",
+            call.invocation.server, call.invocation.tool
+        )),
+        EventMsg::WebSearchBegin(_) => Some("searched the web".to_string()),
+        EventMsg::AgentMessage(_) => Some("wrote a message".to_string()),
+        EventMsg::AgentReasoning(_) => Some("was thinking".to_string()),
+        EventMsg::TurnComplete(_) => Some("finished its turn".to_string()),
+        EventMsg::TurnAborted(_) => Some("had its turn aborted".to_string()),
+        _ => None,
+    }
+}
+
 /// Split the stream into normal assistant text vs. proposed plan content.
 /// Normal text becomes AgentMessage deltas; plan content becomes PlanDelta +
 /// TurnItem::Plan.
@@ -2221,6 +2265,17 @@ async fn try_run_sampling_request(
         step_context.settings.model_info.slug.as_str(),
         turn_context.provider.info().name.as_str(),
     );
+    // FORK: give a Claude-backed child somewhere to send its permission
+    // questions. Without a host the CLI's "ask" decisions are terminal, which is
+    // what used to block its builds and tests outright.
+    if turn_context.provider.info().wire_api == codex_model_provider_info::WireApi::ClaudeCode {
+        client_session.set_claude_code_host(Arc::new(crate::claude_code::SessionClaudeHost::new(
+            Arc::clone(&sess),
+            Arc::clone(&step_context),
+            Arc::clone(&turn_diff_tracker),
+            cancellation_token.clone(),
+        )));
+    }
     let sampling_timing_guard = turn_context.turn_timing_state.begin_sampling();
     let uses_sequential_cutoff_reasoning_summaries = turn_context
         .config
@@ -2553,6 +2608,44 @@ async fn try_run_sampling_request(
                 sess.record_rate_limits_info(snapshot).await;
                 should_emit_token_count = true;
             }
+            // FORK: the provider already ran this tool. Record it, show it, and
+            // fold any file mutations into the turn diff — but never dispatch
+            // it: there is nothing left to execute, and `in_flight` /
+            // `needs_follow_up` would make the turn wait for work that is done.
+            ResponseEvent::ProviderExecutedTool(executed) => {
+                let codex_api::ProviderExecutedTool {
+                    phase,
+                    turn_items,
+                    history_items,
+                    file_changes,
+                    ..
+                } = *executed;
+                for item in &history_items {
+                    record_completed_response_item_with_finalized_facts(
+                        &sess,
+                        &turn_context,
+                        item,
+                        /*finalized_facts*/ None,
+                    )
+                    .await;
+                }
+                for item in turn_items {
+                    match phase {
+                        codex_api::ProviderExecutedToolPhase::Started => {
+                            sess.emit_turn_item_started(&turn_context, &item).await;
+                        }
+                        codex_api::ProviderExecutedToolPhase::Completed => {
+                            sess.emit_turn_item_completed(&turn_context, item).await;
+                        }
+                    }
+                }
+                if !file_changes.is_empty()
+                    && let Some(delta) = provider_executed_patch_delta(&file_changes)
+                {
+                    turn_diff_tracker.lock().await.track_delta("", &delta);
+                    should_emit_turn_diff = true;
+                }
+            }
             ResponseEvent::ModelsEtag(etag) => {
                 // Update internal state with latest models etag
                 sess.services
@@ -2797,6 +2890,50 @@ async fn try_run_sampling_request(
     }
 
     outcome
+}
+
+/// FORK: converts provider-reported file mutations into the delta the turn-diff
+/// tracker consumes.
+///
+/// Returns `None` when nothing could be converted, so an unconvertible report
+/// leaves the accumulated diff untouched rather than invalidating it.
+fn provider_executed_patch_delta(
+    file_changes: &[codex_api::ProviderExecutedFileChange],
+) -> Option<codex_apply_patch::AppliedPatchDelta> {
+    let changes: Vec<codex_apply_patch::AppliedPatchChange> = file_changes
+        .iter()
+        .filter_map(|change| {
+            let path = codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(
+                change.path.as_path(),
+            )
+            .ok()
+            .map(|path| codex_utils_path_uri::PathUri::from_abs_path(&path))?;
+            let change = match &change.kind {
+                codex_api::ProviderExecutedFileChangeKind::Add { content } => {
+                    codex_apply_patch::AppliedPatchFileChange::Add {
+                        content: content.clone(),
+                        overwritten_content: None,
+                    }
+                }
+                codex_api::ProviderExecutedFileChangeKind::Delete { content } => {
+                    codex_apply_patch::AppliedPatchFileChange::Delete {
+                        content: content.clone(),
+                    }
+                }
+                codex_api::ProviderExecutedFileChangeKind::Update {
+                    old_content,
+                    new_content,
+                } => codex_apply_patch::AppliedPatchFileChange::Update {
+                    move_path: None,
+                    old_content: old_content.clone(),
+                    overwritten_move_content: None,
+                    new_content: new_content.clone(),
+                },
+            };
+            Some(codex_apply_patch::AppliedPatchChange { path, change })
+        })
+        .collect();
+    (!changes.is_empty()).then(|| codex_apply_patch::AppliedPatchDelta::from_changes(changes))
 }
 
 pub(crate) fn get_last_assistant_message_from_turn<'a>(

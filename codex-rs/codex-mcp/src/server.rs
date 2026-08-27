@@ -389,13 +389,21 @@ pub(crate) struct McpServerMetadata {
     pub supports_parallel_tool_calls: bool,
     pub default_tools_approval_mode: Option<AppToolApproval>,
     pub tool_approval_modes: HashMap<String, AppToolApproval>,
+    /// FORK: user decisions that outrank everything the server declared.
+    pub tool_approval_overrides: HashMap<String, AppToolApproval>,
+    /// FORK: tools only the root thread may reach.
+    pub root_only_tools: Vec<String>,
 }
 
 impl McpServerMetadata {
     pub fn tool_approval_mode(&self, tool_name: &str) -> AppToolApproval {
-        self.tool_approval_modes
+        // FORK: the user's override comes first. Everything below it can only
+        // tighten, which is correct for a server describing its own tools but
+        // leaves the user no way to settle a question once.
+        self.tool_approval_overrides
             .get(tool_name)
             .copied()
+            .or_else(|| self.tool_approval_modes.get(tool_name).copied())
             .or(self.default_tools_approval_mode)
             .unwrap_or_default()
     }
@@ -410,6 +418,8 @@ impl From<&EffectiveMcpServer> for McpServerMetadata {
             origin: McpServerOrigin::from_transport(&config.transport),
             supports_parallel_tool_calls: config.supports_parallel_tool_calls,
             default_tools_approval_mode: config.default_tools_approval_mode,
+            tool_approval_overrides: config.tool_approval_overrides.clone(),
+            root_only_tools: config.root_only_tools.clone().unwrap_or_default(),
             tool_approval_modes: config
                 .tools
                 .iter()

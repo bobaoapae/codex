@@ -53,6 +53,8 @@ async fn refresh_keeps_superseded_mcp_server_alive_for_in_flight_calls() -> anyh
                     default_tools_approval_mode: None,
                     enabled_tools: None,
                     disabled_tools: None,
+                    root_only_tools: None,
+                    tool_approval_overrides: Default::default(),
                     scopes: None,
                     oauth: None,
                     oauth_resource: None,

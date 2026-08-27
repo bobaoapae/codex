@@ -969,6 +969,16 @@ fn apply_plugin_mcp_server_policy(config: &mut McpServerConfig, policy: &PluginM
     if let Some(disabled_tools) = &policy.disabled_tools {
         config.disabled_tools = Some(disabled_tools.clone());
     }
+    // FORK: scoping a tool to the root thread is a restriction, so it applies
+    // the same way a deny-list does.
+    if let Some(root_only_tools) = &policy.root_only_tools {
+        config.root_only_tools = Some(root_only_tools.clone());
+    }
+    if !policy.tool_approval_overrides.is_empty() {
+        config
+            .tool_approval_overrides
+            .extend(policy.tool_approval_overrides.clone());
+    }
     for (tool_name, tool_policy) in &policy.tools {
         let tool_config = config.tools.entry(tool_name.clone()).or_default();
         if let Some(approval_mode) = tool_policy.approval_mode {
@@ -1451,6 +1461,22 @@ pub fn apply_configured_plugin_mcp_server_policies(
                     }
                 }
             }
+            // FORK: additive like `disabled_tools`; user config may only tighten
+            // what the plugin declared.
+            if let Some(root_only_tools) = &policy.root_only_tools {
+                let declared_tools = server.root_only_tools.get_or_insert_default();
+                for tool in root_only_tools {
+                    if !declared_tools.contains(tool) {
+                        declared_tools.push(tool.clone());
+                    }
+                }
+            }
+            // FORK: the one field that may loosen. It is the user's own table,
+            // and it exists so a question can be settled once instead of being
+            // asked on every call.
+            server
+                .tool_approval_overrides
+                .extend(policy.tool_approval_overrides.clone());
             for (tool_name, tool_policy) in &policy.tools {
                 if tool_policy.approval_mode.is_some() {
                     server.tools.entry(tool_name.clone()).or_default();

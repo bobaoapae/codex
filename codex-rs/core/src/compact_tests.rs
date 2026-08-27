@@ -232,6 +232,7 @@ fn build_token_limited_compacted_history_truncates_overlong_user_messages() {
         std::slice::from_ref(&user_message),
         "SUMMARY",
         max_tokens,
+        /*carried_plan*/ None,
     );
     assert_eq!(history.len(), 2);
 
@@ -780,4 +781,88 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_compaction_last
         },
     ];
     assert_eq!(refreshed, expected);
+}
+
+/// FORK: `update_plan` stored nothing, so the checklist lived only in the
+/// transcript — which compaction rewrites. The observed failure was an agent
+/// four steps into a six-step plan coming out of a compaction and restarting it.
+#[test]
+fn a_plan_survives_compaction() {
+    use codex_protocol::plan_tool::PlanItemArg;
+    use codex_protocol::plan_tool::StepStatus;
+    use codex_protocol::plan_tool::UpdatePlanArgs;
+
+    let plan = UpdatePlanArgs {
+        explanation: Some("Working through the migration.".to_string()),
+        plan: vec![
+            PlanItemArg {
+                step: "Map the call sites".to_string(),
+                status: StepStatus::Completed,
+            },
+            PlanItemArg {
+                step: "Rewrite the adapter".to_string(),
+                status: StepStatus::InProgress,
+            },
+            PlanItemArg {
+                step: "Update the tests".to_string(),
+                status: StepStatus::Pending,
+            },
+        ],
+    };
+
+    let history = super::build_compacted_history_with_plan(Vec::new(), &[], "SUMMARY", Some(&plan));
+    let rendered = history
+        .iter()
+        .filter_map(|envelope| match &envelope.item {
+            ResponseItem::Message { content, .. } => Some(
+                content
+                    .iter()
+                    .filter_map(|item| match item {
+                        codex_protocol::models::ContentItem::InputText { text }
+                        | codex_protocol::models::ContentItem::OutputText { text } => {
+                            Some(text.as_str())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n---\n");
+
+    assert!(rendered.contains("carried across compaction"), "{rendered}");
+    // Every step, including the finished one: a list showing only what is left
+    // reads as a shorter plan and invites an early declaration of victory.
+    assert!(rendered.contains("[x] Map the call sites"), "{rendered}");
+    assert!(rendered.contains("[>] Rewrite the adapter"), "{rendered}");
+    assert!(rendered.contains("[ ] Update the tests"), "{rendered}");
+    assert!(
+        rendered.contains("Working through the migration."),
+        "{rendered}"
+    );
+
+    // Without a plan the history is exactly what it was before.
+    let without =
+        super::build_compacted_history_with_plan(Vec::new(), &[], "SUMMARY", /*plan*/ None);
+    assert_eq!(
+        without.len(),
+        super::build_compacted_history(Vec::new(), &[], "SUMMARY").len()
+    );
+}
+
+/// An empty checklist is nothing to carry.
+#[test]
+fn an_empty_plan_adds_nothing() {
+    use codex_protocol::plan_tool::UpdatePlanArgs;
+
+    let empty = UpdatePlanArgs {
+        explanation: None,
+        plan: Vec::new(),
+    };
+    assert_eq!(
+        super::build_compacted_history_with_plan(Vec::new(), &[], "SUMMARY", Some(&empty)).len(),
+        super::build_compacted_history(Vec::new(), &[], "SUMMARY").len()
+    );
 }

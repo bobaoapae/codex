@@ -70,6 +70,21 @@ pub(crate) struct Session {
     pub(super) git_enrichment_policy: GitEnrichmentPolicy,
     pub(super) fork_persistence: ForkPersistence,
     pub(super) next_internal_sub_id: AtomicU64,
+    /// FORK: the most recent `update_plan` checklist.
+    ///
+    /// `update_plan` used to emit an event and store nothing, so the plan lived
+    /// only in the transcript — and compaction rewrites the transcript. Keeping
+    /// it here is what lets the compacted history carry it forward.
+    pub(crate) last_plan: std::sync::Mutex<Option<codex_protocol::plan_tool::UpdatePlanArgs>>,
+    /// FORK: Desktop threads (`create_thread`/`fork_thread`) opened by this
+    /// session, for the soft limit that warns when they pile up.
+    pub(crate) desktop_threads_created: AtomicU64,
+    /// FORK: whether this thread is a spawned agent rather than the root.
+    ///
+    /// Cached at construction because it is read on every emitted event, and
+    /// taking the session state lock there would be both wasteful and a
+    /// deadlock hazard.
+    pub(crate) is_subagent: bool,
 }
 
 #[derive(Clone)]
@@ -717,6 +732,8 @@ impl Session {
             }
             InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_) => None,
         };
+        let session_source_is_non_root_agent =
+            session_configuration.session_source.is_non_root_agent();
         // Legacy subagent rollouts synthesize session_id from their own thread id.
         let resumed_session_id = resumed_session_id.filter(|session_id| {
             !session_configuration.session_source.is_non_root_agent()
@@ -1443,6 +1460,9 @@ impl Session {
                 git_enrichment_policy,
                 fork_persistence,
                 next_internal_sub_id: AtomicU64::new(0),
+                last_plan: std::sync::Mutex::new(None),
+                desktop_threads_created: AtomicU64::new(0),
+                is_subagent: session_source_is_non_root_agent,
             });
             if let Some(network_policy_decider_session) = network_policy_decider_session {
                 let mut guard = network_policy_decider_session.write().await;

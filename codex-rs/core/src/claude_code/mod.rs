@@ -17,8 +17,14 @@
 //! spends the user's Claude Code subscription rather than an API key.
 
 pub(crate) mod accounts;
+mod bridge;
+mod control;
 mod history;
+mod host;
+mod session_host;
 mod sessions;
+mod state_file;
+mod tools;
 
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
@@ -33,6 +39,7 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::TokenUsage;
 use serde_json::Value as JsonValue;
 use std::path::Path;
@@ -52,6 +59,8 @@ use tracing::debug;
 use tracing::warn;
 
 pub(crate) use history::ClaudeSessionContinuity;
+pub(crate) use host::ClaudeHost;
+pub(crate) use session_host::SessionClaudeHost;
 
 /// Environment override for the CLI location, mirroring how the OSS providers
 /// let the endpoint be pointed elsewhere.
@@ -61,6 +70,10 @@ const DEFAULT_CLAUDE_BIN: &str = "claude";
 /// Buffer for translated events. Claude emits one event per content block and
 /// per tool call, so a turn produces tens of events, not thousands.
 const EVENT_CHANNEL_SIZE: usize = 256;
+
+/// FORK: outstanding control frames waiting to be written to the CLI's stdin.
+/// Bounded: a runaway producer should apply back-pressure, not grow forever.
+const CONTROL_CHANNEL_SIZE: usize = 64;
 
 /// How much of a failed child's stderr is worth reporting back.
 const MAX_STDERR_CHARS: usize = 2_000;
@@ -76,6 +89,9 @@ const SPAWN_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(
 pub(crate) struct ClaudeCodeWorkspace {
     /// Directory the CLI runs in.
     pub(crate) cwd: PathBuf,
+    /// FORK: the same directory as a URI, for the exec cells of the commands
+    /// Claude runs — the CLI does not report a working directory per call.
+    pub(crate) cwd_uri: codex_utils_path_uri::PathUri,
     /// Every other root the Codex session can reach. Without these the agent is
     /// confined to `cwd` and cannot open sibling repositories the task depends
     /// on.
@@ -100,6 +116,29 @@ pub(crate) struct ClaudeCodeWorkspace {
     /// FORK: how long the CLI may produce nothing before the turn is abandoned.
     /// `None` disables the watchdog.
     pub(crate) idle_timeout: Option<std::time::Duration>,
+    /// FORK: the agent role's own instructions.
+    ///
+    /// These used to reach the child as part of the rendered transcript, where
+    /// they sat behind tens of thousands of characters of harness scaffolding
+    /// and were sometimes cut by it. They belong in the system prompt.
+    pub(crate) developer_instructions: Option<String>,
+    /// FORK: whether to attempt the CLI's stdio control protocol
+    /// (`Feature::ClaudeCodeControlProtocol`). Attempting it is still
+    /// conditional on the installed CLI answering `initialize`.
+    pub(crate) control_protocol: bool,
+    /// FORK: roots the Codex session considers writable, named in the system
+    /// prompt so the agent does not have to discover them by trial and error.
+    pub(crate) writable_roots: Vec<PathBuf>,
+    /// FORK: the Codex sandbox this turn runs under, which together with the
+    /// approval policy decides the CLI's permission mode.
+    pub(crate) sandbox: SandboxPolicy,
+    /// FORK: the session that can answer the CLI's permission requests.
+    ///
+    /// Attached per sampling request rather than per turn, because it needs the
+    /// live `Session` and step context, which only exist there.
+    pub(crate) host: Option<Arc<dyn host::ClaudeHost>>,
+    /// FORK: stream partial assistant text and thinking as it is produced.
+    pub(crate) stream_partial_messages: bool,
 }
 
 impl ClaudeCodeWorkspace {
@@ -111,13 +150,21 @@ impl ClaudeCodeWorkspace {
     pub(crate) fn from_config(config: &crate::config::Config) -> Self {
         Self {
             cwd: config.cwd.to_path_buf(),
+            cwd_uri: codex_utils_path_uri::PathUri::from_abs_path(&config.cwd),
             extra_roots: config
                 .permissions
                 .workspace_roots()
                 .iter()
                 .map(codex_utils_absolute_path::AbsolutePathBuf::to_path_buf)
                 .collect(),
-            permission_mode: permission_mode_for(config.permissions.approval_policy.value()),
+            permission_mode: permission_mode_for(
+                &config.legacy_sandbox_policy(),
+                config.permissions.approval_policy.value(),
+            ),
+            writable_roots: writable_roots(&config.legacy_sandbox_policy()),
+            sandbox: config.legacy_sandbox_policy(),
+            // Attached later, by the sampling request that has a session.
+            host: None,
             account_dirs: config.claude_code_account_dirs.clone(),
             accounts_state_path: Some(
                 config
@@ -137,8 +184,98 @@ impl ClaudeCodeWorkspace {
             idle_timeout: config
                 .claude_code_idle_timeout_ms
                 .map(std::time::Duration::from_millis),
+            developer_instructions: config.developer_instructions.clone(),
+            control_protocol: config
+                .features
+                .enabled(codex_features::Feature::ClaudeCodeControlProtocol),
+            // Shares the control-protocol flag: both are the same bet on the
+            // installed CLI's newer stdio surface.
+            stream_partial_messages: config
+                .features
+                .enabled(codex_features::Feature::ClaudeCodeControlProtocol),
         }
     }
+}
+
+/// FORK: the system prompt handed to the CLI for one turn.
+///
+/// Three parts, in the order the child needs them: who it is and how to report,
+/// what it is allowed to touch, and finally the role's own instructions. It is
+/// delivered through the control protocol's `initialize.appendSystemPrompt`
+/// rather than a command-line flag — Windows caps a command line at 32k, and
+/// role instructions alone can exceed that.
+pub(crate) fn claude_system_prompt(workspace: &ClaudeCodeWorkspace) -> String {
+    let mut sections: Vec<String> = Vec::new();
+
+    sections.push(
+        "You are a subagent running inside a Codex session, under the direction of a parent \
+agent. You do not share the parent's conversation: everything you need is in the task you \
+were given. If a premise is missing, ask the parent rather than inventing one.\n\n\
+Report your result in your final message of this turn. To say something before you are \
+done, call `mcp__codex__send_message` with `target: \"..\"`. Do not try to reach the user \
+directly and do not create or fork threads."
+            .to_string(),
+    );
+
+    let mut environment = format!(
+        "Working directory: {}\nPermission mode: {}",
+        workspace.cwd.display(),
+        workspace.permission_mode
+    );
+    let extra_roots: Vec<String> = workspace
+        .extra_roots
+        .iter()
+        .filter(|root| *root != &workspace.cwd)
+        .map(|root| root.display().to_string())
+        .collect();
+    if !extra_roots.is_empty() {
+        environment.push_str(&format!(
+            "
+Other readable roots: {}",
+            extra_roots.join(", ")
+        ));
+    }
+    // Saying which roots are writable up front saves the agent a round of
+    // trial-and-error edits the sandbox would refuse anyway.
+    let writable: Vec<String> = workspace
+        .writable_roots
+        .iter()
+        .map(|root| root.display().to_string())
+        .collect();
+    if !writable.is_empty() {
+        environment.push_str(&format!(
+            "
+Writable roots: {}",
+            writable.join(", ")
+        ));
+    } else if workspace.permission_mode == "plan" {
+        environment.push_str(
+            "
+This turn is read-only: inspect and report, do not modify files.",
+        );
+    }
+    // Saying so up front avoids a turn spent discovering it by failure.
+    if !workspace.sandbox.has_full_network_access() {
+        environment.push_str(
+            "\nNetwork access is restricted for this turn; prefer what is already vendored.",
+        );
+    }
+    environment.push_str(
+        "\nThe working tree is shared with other agents and is dirty on purpose. Never run \
+`git reset`, `checkout`, `clean`, `stash`, or `commit`.",
+    );
+    sections.push(environment);
+
+    if let Some(instructions) = workspace
+        .developer_instructions
+        .as_deref()
+        .map(str::trim)
+        .filter(|instructions| !instructions.is_empty())
+    {
+        sections.push(instructions.to_string());
+    }
+
+    sections.join("\n\n")
 }
 
 /// FORK: how a caller named a Claude account.
@@ -147,6 +284,22 @@ pub(crate) enum AccountAlias {
     Auto,
     /// A specific configured account directory.
     Dir(PathBuf),
+}
+
+/// FORK: which Claude account a thread is currently spending, for `list_agents`
+/// and `wait_agent`.
+///
+/// Reads the persisted session record rather than any live state: the parent
+/// asking is a different thread, and the account is exactly the thing that is
+/// not visible from there.
+pub(crate) fn thread_account_label(
+    codex_home: &std::path::Path,
+    thread_id: codex_protocol::ThreadId,
+) -> Option<String> {
+    let path = codex_home.join(sessions::SESSIONS_STATE_FILE_NAME);
+    let (continuity, pinned) = sessions::load(&path, &thread_id.to_string())?;
+    let account = continuity.account_dir.or(pinned)?;
+    Some(accounts::account_label(Some(&account)))
 }
 
 /// FORK: one line per configured account, for tool descriptions and errors.
@@ -208,15 +361,68 @@ pub(crate) fn resolve_account_alias(
     }
 }
 
-/// Maps the Codex approval policy onto a Claude Code permission mode.
+/// FORK: maps the Codex sandbox and approval policy onto a Claude Code
+/// permission mode.
 ///
-/// `acceptEdits` only auto-approves file edits; in headless mode every other
-/// permission request is refused outright, which silently blocks builds and
-/// tests. When Codex itself stopped asking, the child must not ask either.
-pub(crate) fn permission_mode_for(approval_policy: AskForApproval) -> &'static str {
-    match approval_policy {
-        AskForApproval::Never => "bypassPermissions",
-        _ => "auto",
+/// | sandbox | approval | mode |
+/// |---|---|---|
+/// | read-only | anything | `plan` (+ a read-only tool set) |
+/// | anything writable | never | `bypassPermissions` |
+/// | anything writable | anything else | `auto` (+ the prompt tool) |
+///
+/// Two rules, both learned the hard way.
+///
+/// `acceptEdits` looks like the right fit for `workspace-write`, and it is not:
+/// it auto-approves file edits but, headless, *refuses* every other request
+/// outright. Tried against the real CLI, the agent's `Write` succeeded and its
+/// `cat` came back "This command requires approval" — it silently loses its
+/// shell, and with it every build and test. The mode is not in this table at
+/// all. Nor does it buy the confinement its name suggests: what the child may
+/// touch is decided by `--add-dir`, not by the permission mode.
+///
+/// `bypassPermissions` makes the CLI suppress `can_use_tool` entirely, so it
+/// must never be paired with the permission prompt tool — there would be nothing
+/// to answer.
+pub(crate) fn permission_mode_for(
+    sandbox: &SandboxPolicy,
+    approval_policy: AskForApproval,
+) -> &'static str {
+    match sandbox {
+        // Nothing is writable, so the agent may look but not touch.
+        SandboxPolicy::ReadOnly { .. } => "plan",
+        SandboxPolicy::DangerFullAccess
+        | SandboxPolicy::ExternalSandbox { .. }
+        | SandboxPolicy::WorkspaceWrite { .. } => match approval_policy {
+            // Codex has stopped asking, so the child must not ask either.
+            AskForApproval::Never => "bypassPermissions",
+            _ => "auto",
+        },
+    }
+}
+
+/// Whether the CLI should ask this host before running a tool.
+///
+/// Only in `auto`: `bypassPermissions` suppresses `can_use_tool` on the CLI
+/// side, and `plan`/`acceptEdits` have already decided the answer.
+pub(crate) fn uses_permission_prompt(permission_mode: &str) -> bool {
+    permission_mode == "auto"
+}
+
+/// Tools a read-only child is allowed to load at all.
+///
+/// `plan` mode already refuses mutations, but advertising the write tools
+/// invites the agent to try and then report a failure it could not avoid.
+const READ_ONLY_TOOLS: &str = "Read,Glob,Grep,WebFetch,WebSearch,TodoWrite,Task";
+
+/// The roots this sandbox lets the child write to.
+fn writable_roots(sandbox: &SandboxPolicy) -> Vec<PathBuf> {
+    match sandbox {
+        SandboxPolicy::WorkspaceWrite { writable_roots, .. } => writable_roots
+            .iter()
+            .map(codex_utils_absolute_path::AbsolutePathBuf::to_path_buf)
+            .collect(),
+        SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. } => Vec::new(),
+        SandboxPolicy::ReadOnly { .. } => Vec::new(),
     }
 }
 
@@ -337,22 +543,35 @@ pub(crate) async fn stream(
 ) -> Result<ResponseStream> {
     let mut workspace = match workspace {
         Some(workspace) => workspace.clone(),
-        None => ClaudeCodeWorkspace {
-            cwd: std::env::current_dir().map_err(|err| {
+        None => {
+            let cwd = codex_utils_absolute_path::AbsolutePathBuf::current_dir().map_err(|err| {
                 CodexErr::UnsupportedOperation(format!(
                     "claude_code provider could not resolve a workspace: {err}"
                 ))
-            })?,
-            extra_roots: Vec::new(),
-            permission_mode: permission_mode_for(AskForApproval::OnRequest),
-            account_dirs: Vec::new(),
-            accounts_state_path: None,
-            sessions_state_path: None,
-            selection: ClaudeCodeAccountSelection::default(),
-            sticky_min_headroom_pct: 0.0,
-            pinned_account: None,
-            idle_timeout: None,
-        },
+            })?;
+            ClaudeCodeWorkspace {
+                cwd_uri: codex_utils_path_uri::PathUri::from_abs_path(&cwd),
+                cwd: cwd.to_path_buf(),
+                extra_roots: Vec::new(),
+                sandbox: SandboxPolicy::new_read_only_policy(),
+                writable_roots: Vec::new(),
+                host: None,
+                permission_mode: permission_mode_for(
+                    &SandboxPolicy::new_read_only_policy(),
+                    AskForApproval::OnRequest,
+                ),
+                account_dirs: Vec::new(),
+                accounts_state_path: None,
+                sessions_state_path: None,
+                selection: ClaudeCodeAccountSelection::default(),
+                sticky_min_headroom_pct: 0.0,
+                pinned_account: None,
+                idle_timeout: None,
+                developer_instructions: None,
+                control_protocol: false,
+                stream_partial_messages: false,
+            }
+        }
     };
 
     // FORK: recover the Claude session this thread was using, in case the agent
@@ -405,6 +624,10 @@ enum AttemptOutcome {
         /// though output was emitted; a mid-stream death may not, because a
         /// retry would duplicate a half-delivered answer.
         turn_reported: bool,
+        /// FORK: the `result` frame that reported it, when there was one. Its
+        /// `subtype` says what kind of failure this was far more reliably than
+        /// the rendered text does.
+        frame: Option<JsonValue>,
     },
 }
 
@@ -508,22 +731,75 @@ async fn run_turn(
                 .await;
             return;
         };
+        // FORK: stdin stays open for the length of the turn and is driven by a
+        // writer task. The old code wrote one line and closed the pipe, which
+        // made the CLI's control protocol unreachable: every "ask" decision it
+        // took was terminal because there was nobody left to ask.
+        //
+        // Writing is concurrent with reading stdout either way: a replayed
+        // transcript easily exceeds the pipe buffer, and the CLI starts emitting
+        // events immediately, so writing to completion first would deadlock both
+        // sides on a full pipe.
+        let (tx_stdin, mut rx_stdin) = mpsc::channel::<String>(CONTROL_CHANNEL_SIZE);
+        let writer = tokio::spawn(async move {
+            while let Some(line) = rx_stdin.recv().await {
+                if let Err(err) = stdin.write_all(format!("{line}\n").as_bytes()).await {
+                    warn!("claude_code: failed to write to the CLI: {err}");
+                    break;
+                }
+                if let Err(err) = stdin.flush().await {
+                    warn!("claude_code: failed to flush the CLI stdin: {err}");
+                    break;
+                }
+            }
+            // Closing stdin is what tells the CLI the turn is over; without it a
+            // CLI that has finished its work keeps the pipe (and the process)
+            // alive waiting for more input.
+            let _ = stdin.shutdown().await;
+        });
+        let control = control::ControlChannel::new(tx_stdin.clone());
+        let control_protocol_enabled = workspace.control_protocol;
+
+        // FORK: the bridge only exists when there is a session behind it.
+        let bridge = workspace
+            .host
+            .clone()
+            .map(|host| Arc::new(bridge::McpBridge::new(host)));
+        let sdk_mcp_servers: &[&str] = if bridge.is_some() {
+            &[bridge::BRIDGE_SERVER_NAME]
+        } else {
+            &[]
+        };
+        // The handshake carries the system prompt and the in-process MCP bridge.
+        //
+        // Sent, not awaited: its answer arrives on stdout, and the only task
+        // that reads stdout is the one we have not started yet. Waiting here
+        // would stall every turn until the request timed out. `translate_stream`
+        // watches for the answer instead, and drops the bridge if the CLI says
+        // it cannot do it.
+        let (control, initialize_request_id) = if control_protocol_enabled {
+            let request_id = control
+                .send_request(
+                    "initialize",
+                    control::initialize_payload(
+                        Some(&claude_system_prompt(&workspace)),
+                        sdk_mcp_servers,
+                    ),
+                )
+                .await;
+            (Some(control), request_id)
+        } else {
+            (None, None)
+        };
+
         let turn_line = serde_json::json!({
             "type": "user",
             "message": { "role": "user", "content": plan.turn_text },
         })
         .to_string();
-        // Written concurrently with reading stdout: a replayed transcript easily
-        // exceeds the pipe buffer, and the CLI starts emitting events immediately,
-        // so writing to completion first would deadlock both sides on a full pipe.
-        // Closing stdin afterwards makes the CLI exit once it finishes this turn;
-        // the session is resumed by id on the next request rather than held open.
-        tokio::spawn(async move {
-            if let Err(err) = stdin.write_all(format!("{turn_line}\n").as_bytes()).await {
-                warn!("claude_code: failed to write the turn to the CLI: {err}");
-            }
-            let _ = stdin.shutdown().await;
-        });
+        if tx_stdin.send(turn_line).await.is_err() {
+            warn!("claude_code: the CLI closed stdin before the turn was written");
+        }
 
         let outcome = translate_stream(
             &mut child,
@@ -535,9 +811,28 @@ async fn run_turn(
                 state: &state,
                 pinned_account: workspace.pinned_account.as_deref(),
                 idle_timeout: workspace.idle_timeout,
+                control: control.clone(),
+                cwd: workspace.cwd_uri.clone(),
+                host: workspace.host.clone(),
+                bridge: bridge.clone(),
+                accounts_state_path: workspace.accounts_state_path.clone(),
+                initialize_request_id: initialize_request_id.clone(),
             },
         )
         .await;
+
+        // Ending the turn: let the CLI shut its session down cleanly if it knows
+        // how, then close stdin, which is the backstop that makes it exit.
+        if let Some(control) = control.as_ref() {
+            // Also fire-and-forget: nothing is reading stdout any more, so there
+            // is no answer to wait for. Closing stdin below is what actually
+            // ends the CLI; this only lets it shut its session down cleanly.
+            let _ = control
+                .send_request("end_session", serde_json::json!({}))
+                .await;
+        }
+        drop(tx_stdin);
+        let _ = writer.await;
 
         // The consumer stopped polling (an interrupt, or an error upstream):
         // the CLI would otherwise keep running its tool loop unattended.
@@ -556,6 +851,7 @@ async fn run_turn(
                 detail,
                 emitted_output,
                 turn_reported,
+                frame,
             } => {
                 // Only a session that cannot be resumed is worth forgetting.
                 // `delivered_items` advances on success alone, so keeping the
@@ -565,7 +861,10 @@ async fn run_turn(
                 if session_lost(&detail) {
                     state.invalidate();
                 }
-                let class = accounts::classify_failure(&detail);
+                let class = match frame.as_ref() {
+                    Some(frame) => accounts::classify_result_failure(frame, &detail),
+                    None => accounts::classify_failure(&detail),
+                };
                 let label = accounts::account_label(account_dir.as_deref());
                 if let Some(dir) = account_dir.as_deref() {
                     turn_accounts.record_failure(dir, &class, &detail);
@@ -654,6 +953,25 @@ fn drain_stderr(stderr: tokio::process::ChildStderr) -> tokio::task::JoinHandle<
     })
 }
 
+/// FORK: the Claude usage windows for the account that just served a turn.
+///
+/// Reads the snapshot cached when the account was chosen, which the selection
+/// path refreshes on its own TTL. Asking the CLI directly (`get_usage`) would be
+/// fresher, but the answer arrives on stdout inside the very loop that would be
+/// waiting for it — and by `result` the CLI is already on its way out.
+///
+/// Never fabricates zeros: an unknown window is reported as unknown, because a
+/// full green bar for an account we cannot see reads as good news rather than as
+/// no news.
+fn claude_rate_limits(
+    accounts_state_path: Option<&Path>,
+    account_dir: Option<&Path>,
+) -> Option<codex_protocol::protocol::RateLimitSnapshot> {
+    let label = account_dir.map(|dir| accounts::account_label(Some(dir)));
+    let state_path = accounts_state_path?;
+    accounts::cached_usage(state_path, account_dir)?.to_rate_limit_snapshot(label)
+}
+
 /// FORK: whether a failure means the recorded Claude session is unusable.
 ///
 /// The CLI refuses an unknown id outright ("No conversation found with session
@@ -662,9 +980,17 @@ fn drain_stderr(stderr: tokio::process::ChildStderr) -> tokio::task::JoinHandle<
 /// session resumable.
 fn session_lost(detail: &str) -> bool {
     let lower = detail.to_lowercase();
-    lower.contains("no conversation found")
+    if lower.contains("no conversation found")
         || (lower.contains("session") && lower.contains("not found"))
-        || lower.contains("--resume")
+    {
+        return true;
+    }
+    // FORK: `--resume` alone used to be enough, which threw the session away
+    // every time the CLI printed its help text or named the flag in an
+    // unrelated complaint — and each false positive costs a full transcript
+    // replay and the prompt cache with it.
+    lower.contains("--resume")
+        && (lower.contains("invalid") || lower.contains("unknown") || lower.contains("failed"))
 }
 
 /// True when the recorded Claude session belongs to the account we are about to
@@ -716,6 +1042,30 @@ fn build_claude_command(
         // The agent's MCP surface is Codex's business, not the CLI's user config.
         .arg("--strict-mcp-config");
 
+    // FORK: give the CLI somewhere to send its permission questions. Without
+    // this every "ask" decision it reaches is terminal, which is what silently
+    // blocked builds and tests. Never in `bypassPermissions`: the CLI suppresses
+    // `can_use_tool` there, so the flag would only be misleading.
+    if workspace.host.is_some() && uses_permission_prompt(workspace.permission_mode) {
+        command.args(["--permission-prompt-tool", "stdio"]);
+    }
+    // A read-only turn should not even load the tools it is not allowed to use.
+    if workspace.permission_mode == "plan" {
+        command.args(["--tools", READ_ONLY_TOOLS]);
+    }
+    // The bridge's tools are already gated by Codex's own allow-list; asking the
+    // user again for each call would make the child feel permission-bound for no
+    // added safety.
+    if workspace.host.is_some() {
+        command.args(["--allowedTools", bridge::BRIDGE_ALLOWED_TOOLS]);
+    }
+    // FORK: without this the CLI emits nothing between one completed block and
+    // the next, so a child thinking through a hard problem looks identical to a
+    // wedged one for minutes at a time.
+    if workspace.stream_partial_messages {
+        command.arg("--include-partial-messages");
+    }
+
     // FORK: pin the CLI to one account instead of inheriting the environment.
     if let Some(config_dir) = config_dir {
         command.env("CLAUDE_CONFIG_DIR", config_dir);
@@ -730,8 +1080,8 @@ fn build_claude_command(
         }
     }
 
-    if let Some(effort) = effort {
-        command.args(["--effort", &effort.to_string()]);
+    if let Some(effort) = effort.and_then(claude_effort) {
+        command.args(["--effort", effort]);
     }
     match resume_session_id {
         Some(session_id) => {
@@ -756,6 +1106,24 @@ fn build_claude_command(
     command.process_group(0);
 
     command
+}
+
+/// FORK: the Codex effort scale is wider than the CLI's. Passing `ultra` (the
+/// user's default) straight through made the CLI reject the whole run, so the
+/// request is clamped down to the nearest level the CLI does accept, never up.
+fn claude_effort(effort: &ReasoningEffortConfig) -> Option<&'static str> {
+    match effort {
+        ReasoningEffortConfig::None | ReasoningEffortConfig::Minimal => Some("low"),
+        ReasoningEffortConfig::Low => Some("low"),
+        ReasoningEffortConfig::Medium => Some("medium"),
+        ReasoningEffortConfig::High => Some("high"),
+        ReasoningEffortConfig::XHigh
+        | ReasoningEffortConfig::Max
+        | ReasoningEffortConfig::Ultra => Some("max"),
+        // A value this build does not know: let the CLI pick its own default
+        // rather than forwarding a string it may reject.
+        ReasoningEffortConfig::Custom(_) => None,
+    }
 }
 
 fn spawn_claude(
@@ -791,6 +1159,22 @@ struct AttemptContext<'a> {
     pinned_account: Option<&'a Path>,
     /// How long the CLI may stay silent before the turn is abandoned.
     idle_timeout: Option<std::time::Duration>,
+    /// FORK: the control channel for this attempt, when the CLI speaks the
+    /// protocol. `None` reproduces the pre-control behavior exactly.
+    control: Option<control::ControlChannel>,
+    /// FORK: directory the CLI runs in, shown on the exec cells of the commands
+    /// it runs — the CLI does not report one per call.
+    cwd: codex_utils_path_uri::PathUri,
+    /// FORK: the session that answers the CLI's permission requests.
+    host: Option<Arc<dyn host::ClaudeHost>>,
+    /// FORK: the in-process MCP server the CLI calls back into.
+    bridge: Option<Arc<bridge::McpBridge>>,
+    /// FORK: where the cached per-account usage lives, for the rate-limit
+    /// snapshot reported at the end of the turn.
+    accounts_state_path: Option<PathBuf>,
+    /// FORK: the id of the `initialize` request, so its answer can be
+    /// recognized among the CLI's other control responses.
+    initialize_request_id: Option<String>,
 }
 
 async fn translate_stream(
@@ -805,6 +1189,12 @@ async fn translate_stream(
         state,
         pinned_account,
         idle_timeout,
+        control,
+        cwd,
+        host,
+        mut bridge,
+        accounts_state_path,
+        initialize_request_id,
     } = attempt;
     let mut emitted_output = false;
     let Some(stdout) = child.stdout.take() else {
@@ -812,6 +1202,7 @@ async fn translate_stream(
             detail: "claude_code provider could not open the CLI stdout".to_string(),
             emitted_output,
             turn_reported: false,
+            frame: None,
         };
     };
     // Drained continuously, not only when the turn fails: a chatty child that
@@ -823,6 +1214,8 @@ async fn translate_stream(
     let mut session_id: Option<String> = None;
     let account_label_dir = account_dir.clone();
     let mut assembler = StreamAssembler::new(tx_event);
+    // FORK: pairs each `tool_use` with the `tool_result` that closes it.
+    let mut pending_tool_uses = tools::PendingToolUses::new(cwd);
 
     loop {
         let next_line = async {
@@ -847,6 +1240,7 @@ async fn translate_stream(
                     detail: format!("claude_code provider read failed: {err}"),
                     emitted_output,
                     turn_reported: false,
+                    frame: None,
                 };
             }
             Err(()) => {
@@ -858,6 +1252,7 @@ async fn translate_stream(
                     ),
                     emitted_output,
                     turn_reported: false,
+                    frame: None,
                 };
             }
         };
@@ -871,6 +1266,75 @@ async fn translate_stream(
         };
 
         match event.get("type").and_then(JsonValue::as_str) {
+            // FORK: the CLI is asking us something mid-turn. Every recognized
+            // frame must be answered — one left hanging stalls the CLI's own
+            // turn until it times out, which reads to the parent as a wedged
+            // agent.
+            Some("control_request") => {
+                let Some(control) = control.as_ref() else {
+                    // We never opened the channel, so we cannot answer on it.
+                    debug!("claude_code: ignoring a control_request with no control channel");
+                    continue;
+                };
+                let Some((request_id, request)) = control::classify_request(&event) else {
+                    continue;
+                };
+                handle_control_request(
+                    control,
+                    host.as_ref(),
+                    bridge.as_ref(),
+                    &request_id,
+                    request,
+                )
+                .await;
+            }
+            Some("control_response") => {
+                let Some(outcome) = control
+                    .as_ref()
+                    .and_then(|control| control.resolve_response(&event))
+                else {
+                    continue;
+                };
+                // FORK: this is the handshake's answer. A CLI that refuses it
+                // does not host our MCP server either, so stop offering it —
+                // the turn itself carries on regardless.
+                if Some(&outcome.request_id) == initialize_request_id.as_ref()
+                    && let Err(error) = &outcome.result
+                {
+                    warn!(
+                        "claude_code: CLI refused `initialize` ({error}); running without the bridge"
+                    );
+                    bridge = None;
+                }
+            }
+            // FORK: incremental text and thinking, so a working child looks
+            // like one. The completed `assistant` frames still arrive and are
+            // what actually build the items; these only paint.
+            Some("stream_event") => {
+                let Some(delta) = event.get("event").and_then(|inner| inner.get("delta")) else {
+                    continue;
+                };
+                let alive = match delta.get("type").and_then(JsonValue::as_str) {
+                    Some("text_delta") => {
+                        let text = delta.get("text").and_then(JsonValue::as_str);
+                        match text.filter(|text| !text.is_empty()) {
+                            Some(text) => assembler.push_text_delta(text).await,
+                            None => true,
+                        }
+                    }
+                    Some("thinking_delta") => {
+                        let text = delta.get("thinking").and_then(JsonValue::as_str);
+                        match text.filter(|text| !text.is_empty()) {
+                            Some(text) => assembler.push_reasoning_delta(text).await,
+                            None => true,
+                        }
+                    }
+                    _ => true,
+                };
+                if !alive {
+                    return AttemptOutcome::ConsumerGone;
+                }
+            }
             Some("system") => {
                 if let Some(id) = event.get("session_id").and_then(JsonValue::as_str) {
                     session_id = Some(id.to_string());
@@ -907,13 +1371,20 @@ async fn translate_stream(
                                 (assembler.push_reasoning(text).await, true)
                             }
                             Some("tool_use") => {
-                                // Claude executes its own tools; surface the
-                                // activity as reasoning so the turn is not a
-                                // silent black box.
-                                (
-                                    assembler.push_reasoning(&describe_tool_use(&block)).await,
-                                    true,
-                                )
+                                // FORK: Claude executed this itself. Open a real
+                                // exec / file-change / MCP cell for it instead of
+                                // the one line of reasoning text this used to be.
+                                match pending_tool_uses.start(&block) {
+                                    Some(started) => {
+                                        // Close any prose run first, so the cell
+                                        // does not land inside a message.
+                                        if !assembler.close(MessagePhase::Commentary).await {
+                                            return AttemptOutcome::ConsumerGone;
+                                        }
+                                        (assembler.send_provider_tool(started).await, true)
+                                    }
+                                    None => (true, false),
+                                }
                             }
                             _ => (true, false),
                         };
@@ -925,7 +1396,32 @@ async fn translate_stream(
                     }
                 }
             }
+            // FORK: the CLI reports each tool's outcome in a `user` frame whose
+            // content holds `tool_result` blocks. These used to be discarded
+            // outright, which is why a Claude child showed no command output and
+            // no diff.
+            Some("user") => {
+                let blocks = event
+                    .get("message")
+                    .and_then(|message| message.get("content"))
+                    .and_then(JsonValue::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                for block in blocks {
+                    if block.get("type").and_then(JsonValue::as_str) != Some("tool_result") {
+                        continue;
+                    }
+                    let Some(completed) = pending_tool_uses.complete(&block) else {
+                        continue;
+                    };
+                    if !assembler.send_provider_tool(completed).await {
+                        return AttemptOutcome::ConsumerGone;
+                    }
+                    emitted_output = true;
+                }
+            }
             Some("result") => {
+                pending_tool_uses.clear();
                 if let Some(id) = event.get("session_id").and_then(JsonValue::as_str) {
                     session_id = Some(id.to_string());
                 }
@@ -957,6 +1453,7 @@ async fn translate_stream(
                         detail,
                         emitted_output,
                         turn_reported: true,
+                        frame: Some(event.clone()),
                     };
                 }
 
@@ -1011,6 +1508,20 @@ async fn translate_stream(
                         "claude_code turn completed without usage; context accounting will not advance"
                     ),
                 }
+                // FORK: the Claude window is what actually limits this thread,
+                // and the status line had no way to show it. Ask the CLI first
+                // — it knows exactly — and fall back to the usage we cached
+                // when choosing the account.
+                if let Some(snapshot) =
+                    claude_rate_limits(accounts_state_path.as_deref(), account_label_dir.as_deref())
+                    && tx_event
+                        .send(Ok(ResponseEvent::RateLimits(snapshot)))
+                        .await
+                        .is_err()
+                {
+                    return AttemptOutcome::ConsumerGone;
+                }
+
                 if tx_event
                     .send(Ok(ResponseEvent::Completed {
                         response_id,
@@ -1043,6 +1554,85 @@ async fn translate_stream(
         },
         emitted_output,
         turn_reported: false,
+        frame: None,
+    }
+}
+
+/// FORK: answers one inbound control request.
+///
+/// Phase 3 establishes the transport only: approvals (Phase 4) and the MCP
+/// bridge (Phase 6) replace the refusals below with real decisions. Refusing
+/// explicitly is still strictly better than not answering — the CLI learns
+/// immediately that the host cannot help and continues, instead of stalling.
+async fn handle_control_request(
+    control: &control::ControlChannel,
+    host: Option<&Arc<dyn host::ClaudeHost>>,
+    bridge: Option<&Arc<bridge::McpBridge>>,
+    request_id: &str,
+    request: control::InboundControl,
+) {
+    match request {
+        control::InboundControl::CanUseTool(can_use_tool) => {
+            let decision = match host {
+                Some(host) => host.approve_tool(&can_use_tool).await,
+                // Without a host the safe answer is "no, but keep going":
+                // denying is information the agent can work around, whereas
+                // interrupting loses the whole turn.
+                None => control::ToolPermissionDecision::Deny {
+                    message: format!(
+                        "`{}` was not approved: this Codex session cannot review tool permissions right now.",
+                        can_use_tool.tool_name
+                    ),
+                    interrupt: false,
+                },
+            };
+            control.respond_tool_permission(request_id, &decision).await;
+        }
+        control::InboundControl::McpMessage { server, message } => {
+            match bridge.filter(|_| server == bridge::BRIDGE_SERVER_NAME) {
+                Some(bridge) => match bridge.handle(&message).await {
+                    Some(response) => {
+                        control
+                            .respond_success(
+                                request_id,
+                                serde_json::json!({ "mcp_response": response }),
+                            )
+                            .await;
+                    }
+                    // A JSON-RPC notification has no reply, but the control
+                    // request still needs one or the CLI stalls.
+                    None => {
+                        control
+                            .respond_success(request_id, serde_json::json!({}))
+                            .await
+                    }
+                },
+                None => {
+                    control
+                        .respond_error(
+                            request_id,
+                            &format!(
+                                "no in-process MCP server named `{server}` is hosted by this session"
+                            ),
+                        )
+                        .await;
+                }
+            }
+        }
+        control::InboundControl::HookCallback { .. } => {
+            control
+                .respond_success(request_id, serde_json::json!({}))
+                .await;
+        }
+        control::InboundControl::Unknown { subtype } => {
+            debug!("claude_code: unsupported control request `{subtype}`");
+            control
+                .respond_error(
+                    request_id,
+                    &format!("unsupported control request `{subtype}`"),
+                )
+                .await;
+        }
     }
 }
 
@@ -1059,6 +1649,9 @@ struct StreamAssembler<'a> {
     /// FORK: fingerprints of every item this turn produced, so the next request
     /// can drop them from its tail instead of reading them back to Claude.
     authored: Vec<u64>,
+    /// FORK: whether the partial stream already painted the block that is being
+    /// completed, so the completed block records without repainting it.
+    painted_via_deltas: bool,
 }
 
 enum ActiveItem {
@@ -1073,6 +1666,7 @@ impl<'a> StreamAssembler<'a> {
             active: None,
             streamed_any_text: false,
             authored: Vec::new(),
+            painted_via_deltas: false,
         }
     }
 
@@ -1088,6 +1682,74 @@ impl<'a> StreamAssembler<'a> {
     async fn send_done(&mut self, item: ResponseItem) -> bool {
         self.authored.push(history::item_fingerprint(&item));
         self.send(ResponseEvent::OutputItemDone(item)).await
+    }
+
+    /// FORK: paints streamed assistant text as the CLI produces it.
+    ///
+    /// The completed `assistant` block still arrives afterwards and is what
+    /// records the item; these deltas only paint, so the text is never
+    /// accumulated here. Two things this must get right:
+    ///
+    /// - an item has to be open first. A delta with no active item is a harness
+    ///   invariant violation, and in a debug build it panics outright;
+    /// - the completed block must not repaint what the deltas already showed,
+    ///   which is what `painted_via_deltas` tracks.
+    async fn push_text_delta(&mut self, text: &str) -> bool {
+        if !matches!(self.active, Some(ActiveItem::Message(_))) {
+            if !self.close(MessagePhase::Commentary).await {
+                return false;
+            }
+            if !self
+                .send(ResponseEvent::OutputItemAdded(message_item(
+                    String::new(),
+                    &MessagePhase::Commentary,
+                )))
+                .await
+            {
+                return false;
+            }
+            self.active = Some(ActiveItem::Message(String::new()));
+        }
+        self.painted_via_deltas = true;
+        self.send(ResponseEvent::OutputTextDelta(text.to_string()))
+            .await
+    }
+
+    /// FORK: the same, for thinking.
+    async fn push_reasoning_delta(&mut self, text: &str) -> bool {
+        if !matches!(self.active, Some(ActiveItem::Reasoning(_))) {
+            if !self.close(MessagePhase::Commentary).await {
+                return false;
+            }
+            if !self
+                .send(ResponseEvent::OutputItemAdded(
+                    reasoning_item(String::new()),
+                ))
+                .await
+            {
+                return false;
+            }
+            self.active = Some(ActiveItem::Reasoning(String::new()));
+        }
+        self.painted_via_deltas = true;
+        self.send(ResponseEvent::ReasoningSummaryDelta {
+            delta: text.to_string(),
+            summary_index: 0,
+        })
+        .await
+    }
+
+    /// FORK: forwards a tool the provider already executed.
+    ///
+    /// Its history items are fingerprinted like anything else this turn
+    /// produced, so the next request's tail does not replay Claude's own trace
+    /// back at it.
+    async fn send_provider_tool(&mut self, executed: codex_api::ProviderExecutedTool) -> bool {
+        for item in &executed.history_items {
+            self.authored.push(history::item_fingerprint(item));
+        }
+        self.send(ResponseEvent::ProviderExecutedTool(Box::new(executed)))
+            .await
     }
 
     /// Sends one event; `false` means the consumer is gone and we should stop.
@@ -1115,6 +1777,11 @@ impl<'a> StreamAssembler<'a> {
             buffer.push_str(text);
         }
         self.streamed_any_text = true;
+        // FORK: the partial stream already showed this block character by
+        // character; repeating it here would print it twice.
+        if std::mem::take(&mut self.painted_via_deltas) {
+            return true;
+        }
         self.send(ResponseEvent::OutputTextDelta(text.to_string()))
             .await
     }
@@ -1136,6 +1803,10 @@ impl<'a> StreamAssembler<'a> {
         }
         if let Some(ActiveItem::Reasoning(buffer)) = self.active.as_mut() {
             buffer.push_str(text);
+        }
+        // FORK: as above — the partial stream already painted this block.
+        if std::mem::take(&mut self.painted_via_deltas) {
+            return true;
         }
         self.send(ResponseEvent::ReasoningSummaryDelta {
             delta: text.to_string(),
@@ -1191,38 +1862,6 @@ fn reasoning_item(text: String) -> ResponseItem {
     }
 }
 
-fn describe_tool_use(block: &JsonValue) -> String {
-    let name = block
-        .get("name")
-        .and_then(JsonValue::as_str)
-        .unwrap_or("tool");
-    let input = block.get("input");
-    let detail = match name {
-        "Bash" => input
-            .and_then(|input| input.get("command"))
-            .and_then(JsonValue::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        "Read" | "Write" | "Edit" | "NotebookEdit" => input
-            .and_then(|input| input.get("file_path"))
-            .and_then(JsonValue::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        "Grep" | "Glob" => input
-            .and_then(|input| input.get("pattern"))
-            .and_then(JsonValue::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        _ => String::new(),
-    };
-    let detail: String = detail.chars().take(200).collect();
-    if detail.is_empty() {
-        format!("[{name}]\n")
-    } else {
-        format!("[{name}] {detail}\n")
-    }
-}
-
 fn parse_token_usage(usage: Option<&JsonValue>) -> Option<TokenUsage> {
     let usage = usage?;
     let field = |key: &str| usage.get(key).and_then(JsonValue::as_i64).unwrap_or(0);
@@ -1247,17 +1886,152 @@ mod tests {
 
     #[test]
     fn headless_claude_uses_auto_for_interactive_codex_policies() {
-        assert_eq!(permission_mode_for(AskForApproval::OnRequest), "auto");
-        assert_eq!(permission_mode_for(AskForApproval::UnlessTrusted), "auto");
+        // FORK: the mode now depends on the sandbox too. Eight combinations,
+        // and the two rules that matter: `acceptEdits` refuses every non-edit
+        // request in headless mode, so it is only reachable once Codex itself
+        // stopped asking; and `bypassPermissions` suppresses `can_use_tool`, so
+        // it must never be paired with the prompt tool.
+        let workspace = SandboxPolicy::new_workspace_write_policy();
+        let full = SandboxPolicy::DangerFullAccess;
+        let external = SandboxPolicy::ExternalSandbox {
+            network_access: Default::default(),
+        };
+        let read_only = SandboxPolicy::new_read_only_policy();
+
         assert_eq!(
-            permission_mode_for(AskForApproval::Never),
+            permission_mode_for(&full, AskForApproval::Never),
             "bypassPermissions"
         );
+        assert_eq!(
+            permission_mode_for(&external, AskForApproval::Never),
+            "bypassPermissions"
+        );
+        // FORK: not `acceptEdits`. Against the real CLI that mode auto-approves
+        // edits and refuses everything else, so the agent keeps `Write` and
+        // loses `Bash` — observed as "This command requires approval" on a plain
+        // `cat`. And it confines nothing: `--add-dir` decides that.
+        assert_eq!(
+            permission_mode_for(&workspace, AskForApproval::Never),
+            "bypassPermissions"
+        );
+        assert_eq!(
+            permission_mode_for(&workspace, AskForApproval::OnRequest),
+            "auto"
+        );
+        assert_eq!(
+            permission_mode_for(&workspace, AskForApproval::UnlessTrusted),
+            "auto"
+        );
+        assert_eq!(
+            permission_mode_for(&read_only, AskForApproval::Never),
+            "plan"
+        );
+        assert_eq!(
+            permission_mode_for(&read_only, AskForApproval::OnRequest),
+            "plan"
+        );
+
+        // Only `auto` has a question left to ask.
+        assert!(uses_permission_prompt("auto"));
+        assert!(!uses_permission_prompt("bypassPermissions"));
+        assert!(!uses_permission_prompt("acceptEdits"));
+        assert!(!uses_permission_prompt("plan"));
+    }
+
+    /// FORK: a read-only child should not even load the tools it is forbidden
+    /// to use, and an approving child must be given a prompt surface.
+    #[test]
+    fn the_command_line_matches_the_permission_mode() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut workspace = test_workspace(&temp);
+
+        workspace.permission_mode = "plan";
+        let args = command_args(&workspace);
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--tools", READ_ONLY_TOOLS])
+        );
+        assert!(!args.iter().any(|arg| arg == "--permission-prompt-tool"));
+
+        workspace.permission_mode = "auto";
+        workspace.host = Some(Arc::new(NoHost));
+        let args = command_args(&workspace);
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--permission-prompt-tool", "stdio"])
+        );
+
+        // Never in bypass: the CLI suppresses `can_use_tool` there anyway.
+        workspace.permission_mode = "bypassPermissions";
+        let args = command_args(&workspace);
+        assert!(!args.iter().any(|arg| arg == "--permission-prompt-tool"));
+    }
+
+    fn command_args(workspace: &ClaudeCodeWorkspace) -> Vec<String> {
+        build_claude_command("claude-opus-5", None, None, workspace, None)
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// FORK: discarding the session costs a full transcript replay and the
+    /// prompt cache with it, so only a genuine "that session is gone" counts.
+    #[test]
+    fn help_text_mentioning_resume_does_not_discard_the_session() {
+        assert!(session_lost("No conversation found with session ID: abc"));
+        assert!(session_lost("Session not found"));
+        assert!(session_lost("invalid --resume argument"));
+        assert!(session_lost("--resume failed"));
+
+        // The CLI printing its usage, or naming the flag in passing, is not a
+        // lost session.
+        assert!(!session_lost(
+            "Usage: claude [options]\n  --resume <id>  Resume a conversation"
+        ));
+        assert!(!session_lost("try --resume to continue where you left off"));
+        assert!(!session_lost("connection reset by peer"));
+    }
+
+    /// A host that is present but answers nothing; enough to prove the flag is
+    /// driven by having one, not by what it decides.
+    #[derive(Debug)]
+    struct NoHost;
+
+    impl host::ClaudeHost for NoHost {
+        fn approve_tool<'a>(
+            &'a self,
+            _request: &'a control::CanUseTool,
+        ) -> futures::future::BoxFuture<'a, control::ToolPermissionDecision> {
+            Box::pin(async {
+                control::ToolPermissionDecision::Deny {
+                    message: String::new(),
+                    interrupt: false,
+                }
+            })
+        }
+
+        fn call_bridge_tool<'a>(
+            &'a self,
+            _name: &'a str,
+            _arguments: JsonValue,
+        ) -> futures::future::BoxFuture<'a, std::result::Result<JsonValue, String>> {
+            Box::pin(async { Err(String::new()) })
+        }
+
+        fn bridge_tool_specs(&self) -> futures::future::BoxFuture<'_, Vec<JsonValue>> {
+            Box::pin(async { Vec::new() })
+        }
     }
 
     fn test_workspace(temp: &tempfile::TempDir) -> ClaudeCodeWorkspace {
+        let cwd = codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(
+            temp.path().join("repo"),
+        )
+        .expect("an absolute temp path");
         ClaudeCodeWorkspace {
-            cwd: temp.path().join("repo"),
+            cwd_uri: codex_utils_path_uri::PathUri::from_abs_path(&cwd),
+            cwd: cwd.to_path_buf(),
             extra_roots: vec![temp.path().join("sibling"), temp.path().join("repo")],
             permission_mode: "bypassPermissions",
             account_dirs: Vec::new(),
@@ -1267,6 +2041,12 @@ mod tests {
             sticky_min_headroom_pct: 20.0,
             pinned_account: None,
             idle_timeout: None,
+            developer_instructions: None,
+            control_protocol: false,
+            stream_partial_messages: false,
+            sandbox: SandboxPolicy::new_workspace_write_policy(),
+            writable_roots: Vec::new(),
+            host: None,
         }
     }
 

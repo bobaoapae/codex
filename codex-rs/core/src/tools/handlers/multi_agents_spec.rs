@@ -17,8 +17,8 @@ pub const MULTI_AGENT_V1_NAMESPACE: &str = "multi_agent_v1";
 ///
 /// `message` is encrypted for the model backend, which an agent served by a
 /// local process cannot decrypt. Those agents need the task in the clear.
-const LOCAL_AGENT_PLAINTEXT_MESSAGE_DESCRIPTION: &str = "Use this instead of `message` when the target agent runs on a local backend \
-that cannot decrypt an encrypted payload (any Claude agent type). Exactly one of \
+const LOCAL_AGENT_PLAINTEXT_MESSAGE_DESCRIPTION: &str = "Required for every Claude agent type. Use this instead of `message` when the target \
+agent runs on a local backend that cannot decrypt an encrypted payload. Exactly one of \
 `message` or `plaintext_message` must be set.";
 const MULTI_AGENT_V1_NAMESPACE_DESCRIPTION: &str = "Tools for spawning and managing sub-agents.";
 
@@ -320,7 +320,7 @@ pub fn create_wait_agent_tool_v1(options: WaitAgentTimeoutOptions) -> ToolSpec {
 pub fn create_wait_agent_tool_v2(options: WaitAgentTimeoutOptions) -> ToolSpec {
     ToolSpec::Function(ResponsesApiTool {
         name: "wait_agent".to_string(),
-        description: "Wait for a mailbox update from any live agent, including queued messages and final-status notifications. The wait also ends early when new user input is steered into the active turn. Does not return the content; returns either a summary of which agents have updates (if any), an interruption summary for steered input, or a timeout summary if no activity arrives before the deadline."
+        description: "Wait for a mailbox update from a live agent, including queued messages and final-status notifications. Pass `targets` to wake only for specific agents; without it any agent's mail ends the wait. The wait also ends early when new user input is steered into the active turn. Does not return the content; returns a summary plus what each live agent was last observed doing. Prefer one long wait per round over repeated short ones, and read `agents` before deciding an agent is stuck."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -442,6 +442,14 @@ fn spawn_agent_output_schema_v1() -> Value {
 }
 
 fn spawn_agent_output_schema_v2(hide_agent_metadata: bool) -> Value {
+    // FORK: `notes` reports spawn arguments that were adjusted rather than
+    // rejected (an unsupported service tier, an effort clamped down, an ignored
+    // `fork_turns`), so the caller sees what the child actually got.
+    let notes_schema = json!({
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Spawn arguments that were adjusted instead of rejected. Empty when everything requested was applied."
+    });
     if hide_agent_metadata {
         return json!({
             "type": "object",
@@ -449,9 +457,10 @@ fn spawn_agent_output_schema_v2(hide_agent_metadata: bool) -> Value {
                 "task_name": {
                     "type": "string",
                     "description": "Canonical task name for the spawned agent."
-                }
+                },
+                "notes": notes_schema
             },
-            "required": ["task_name"],
+            "required": ["task_name", "notes"],
             "additionalProperties": false
         });
     }
@@ -466,9 +475,10 @@ fn spawn_agent_output_schema_v2(hide_agent_metadata: bool) -> Value {
             "nickname": {
                 "type": ["string", "null"],
                 "description": "User-facing nickname for the spawned agent when available."
-            }
+            },
+            "notes": notes_schema
         },
-        "required": ["task_name", "nickname"],
+        "required": ["task_name", "nickname", "notes"],
         "additionalProperties": false
     })
 }
@@ -503,6 +513,28 @@ fn list_agents_output_schema() -> Value {
                         "agent_status": {
                             "description": "Last known status of the agent.",
                             "allOf": [agent_status_output_schema()]
+                        },
+                        // FORK: enough to decide whether an agent needs help,
+                        // needs waiting on, or is genuinely stuck.
+                        "agent_role": {
+                            "type": ["string", "null"],
+                            "description": "Role the agent was spawned as, when it had one."
+                        },
+                        "model": {
+                            "type": ["string", "null"],
+                            "description": "Model actually serving the agent."
+                        },
+                        "account": {
+                            "type": ["string", "null"],
+                            "description": "For a Claude-backed agent, the account it is spending."
+                        },
+                        "last_activity": {
+                            "type": ["string", "null"],
+                            "description": "What the agent was last observed doing."
+                        },
+                        "idle_seconds": {
+                            "type": ["integer", "null"],
+                            "description": "Seconds since that observation. Small means the agent is working, not stuck."
                         }
                     },
                     "required": ["agent_name", "agent_status"],
@@ -557,9 +589,25 @@ fn wait_output_schema_v2() -> Value {
             "timed_out": {
                 "type": "boolean",
                 "description": "Whether the wait call returned because no mailbox update arrived before the timeout."
+            },
+            // FORK: on a timeout the parent used to learn nothing at all, so it
+            // could not tell a working child from a wedged one.
+            "agents": {
+                "type": "array",
+                "description": "Live agents and what each was last observed doing.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "agent_name": { "type": "string" },
+                        "last_activity": { "type": ["string", "null"] },
+                        "idle_seconds": { "type": ["integer", "null"] }
+                    },
+                    "required": ["agent_name"],
+                    "additionalProperties": false
+                }
             }
         },
-        "required": ["message", "timed_out"],
+        "required": ["message", "timed_out", "agents"],
         "additionalProperties": false
     })
 }
@@ -913,13 +961,27 @@ fn wait_agent_tool_parameters_v1(options: WaitAgentTimeoutOptions) -> JsonSchema
 }
 
 fn wait_agent_tool_parameters_v2(options: WaitAgentTimeoutOptions) -> JsonSchema {
-    let properties = BTreeMap::from([(
-        "timeout_ms".to_string(),
-        JsonSchema::number(Some(format!(
-            "Timeout in milliseconds. Defaults to {}, min {}, max {}.",
-            options.default_timeout_ms, options.min_timeout_ms, options.max_timeout_ms,
-        ))),
-    )]);
+    let properties = BTreeMap::from([
+        (
+            "timeout_ms".to_string(),
+            JsonSchema::number(Some(format!(
+                "Timeout in milliseconds. Defaults to {}, min {}, max {}. Prefer one long wait per round.",
+                options.default_timeout_ms, options.min_timeout_ms, options.max_timeout_ms,
+            ))),
+        ),
+        (
+            // FORK: waking on any agent's mail meant a parent waiting on one
+            // child was woken by an unrelated sibling and had to wait again.
+            "targets".to_string(),
+            JsonSchema::array(
+                JsonSchema::string(None),
+                Some(
+                    "Task names to wait for. Only mail from these agents ends the wait; omit to wake on any agent."
+                        .to_string(),
+                ),
+            ),
+        ),
+    ]);
 
     JsonSchema::object(properties, /*required*/ None, Some(false.into()))
 }

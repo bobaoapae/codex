@@ -459,6 +459,8 @@ async fn run_add(config_overrides: &CliConfigOverrides, add_args: AddArgs) -> Re
         default_tools_approval_mode: None,
         enabled_tools: None,
         disabled_tools: None,
+        root_only_tools: None,
+        tool_approval_overrides: Default::default(),
         scopes: None,
         oauth: oauth_client_id
             .clone()

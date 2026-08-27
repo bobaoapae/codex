@@ -1476,6 +1476,7 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
         Some("Child root guidance.".to_string());
     child_config.multi_agent_v2.subagent_usage_hint_text =
         Some("Child subagent guidance.".to_string());
+    let child_multi_agent_v2_config = child_config.multi_agent_v2.clone();
     let new_thread = harness
         .manager
         .start_thread(StartThreadOptions::new(parent_config.clone()))
@@ -1695,13 +1696,22 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
             .and_then(|metadata| metadata.create_time.clone())
             .expect("recorded developer message should have a creation timestamp"),
     );
+    let expected_child_subagent_hint = crate::session::multi_agents::resolve_usage_hints(
+        &child_multi_agent_v2_config,
+        /*catalog*/ None,
+    )
+    .subagent
+    .expect("child subagent hint should resolve")
+    .body();
     let expected_history = [
         expected_parent_seed,
         expected_developer_message,
         expected_final_answer,
         expected_standalone_output,
+        // FORK: the child's own hint carries the fork-owned reporting section,
+        // appended after the configured text rather than replacing it.
         ContextualUserFragment::into(MultiAgentRoleInstructions::unmarked(
-            "Child subagent guidance.",
+            expected_child_subagent_hint.as_str(),
         )),
     ];
     assert_eq!(

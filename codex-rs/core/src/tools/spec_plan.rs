@@ -172,12 +172,35 @@ pub(crate) fn build_tool_router(
     )
 }
 
+/// FORK: whether a tool is scoped to the root thread and must be hidden here.
+///
+/// Both names are checked because the config lists the server's own tool name
+/// while the model may see a renamed `callable_name`.
+fn tool_is_root_only(
+    root_only_tools: Option<&[String]>,
+    server_tool_name: &str,
+    callable_name: &str,
+    is_subagent: bool,
+) -> bool {
+    is_subagent
+        && root_only_tools
+            .unwrap_or_default()
+            .iter()
+            .any(|name| name == server_tool_name || name == callable_name)
+}
+
 fn apply_mcp_tool_exposure_policy(
     turn_context: &TurnContext,
     mcp: &codex_mcp::McpBinding,
     registered_mcp_tools: &HashSet<ToolName>,
     registry: &mut ToolRegistry,
 ) {
+    // FORK: tools scoped to the root thread are hidden from every spawned
+    // agent. The Desktop declares `send_message_to_thread` and friends for the
+    // whole session, and a subagent reaching for them is what produces "sent
+    // from another task" cards in the user's own thread.
+    let is_subagent = turn_context.session_source.is_non_root_agent();
+
     let mut omitted_exposures_by_tool = HashMap::new();
     for tool in mcp.tools() {
         let tool_name = tool.canonical_tool_name();
@@ -187,11 +210,21 @@ fn apply_mcp_tool_exposure_policy(
         let Some(server) = mcp.config().mcp_server_catalog.server(&tool.server_name) else {
             continue;
         };
+        let server_config = server.config();
+        let root_only = tool_is_root_only(
+            server_config.root_only_tools.as_deref(),
+            tool.tool.name.as_ref(),
+            &tool.callable_name,
+            is_subagent,
+        );
         omitted_exposures_by_tool
             .entry(tool_name)
             .or_insert_with(|| {
-                server
-                    .config()
+                if root_only {
+                    // Every surface omitted collapses to `Hidden` below.
+                    return ToolExposures::ALL;
+                }
+                server_config
                     .omit_tools_from
                     .as_deref()
                     .unwrap_or_default()

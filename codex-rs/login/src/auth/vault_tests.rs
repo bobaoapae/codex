@@ -141,7 +141,10 @@ fn resolve_matches_label_email_and_session_prefix() {
         )
         .expect("upsert second");
 
-    assert_eq!(vault.resolve("JOAO").expect("by label").session_id, entry.session_id);
+    assert_eq!(
+        vault.resolve("JOAO").expect("by label").session_id,
+        entry.session_id
+    );
     assert_eq!(
         vault
             .resolve("joao@example.com")

@@ -6,9 +6,10 @@
 //! configured, every spawn is pinned to one directory of that list, and
 //! account-level failures (usage limit, expired login) fail over to the next.
 //!
-//! Health state is shared with external tooling (the claude-agents MCP bridge)
-//! through a small JSON file in `CODEX_HOME`, which also mirrors the configured
-//! directory list and carries a user-selected preferred account.
+//! Health state is persisted in a small JSON file in `CODEX_HOME`, which also
+//! mirrors the configured directory list and carries a user-selected preferred
+//! account. (It was once shared with an external `claude_agents` MCP bridge;
+//! that path is retired.)
 
 use codex_config::config_toml::ClaudeCodeAccountSelection;
 use serde::Deserialize;
@@ -20,7 +21,7 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 use tracing::warn;
 
-/// File name under `CODEX_HOME` shared with the claude-agents MCP bridge.
+/// File name under `CODEX_HOME` holding per-account health and preference.
 pub(crate) const ACCOUNTS_STATE_FILE_NAME: &str = "claude_code_accounts.json";
 
 /// How long an account sits out after a usage-limit failure. Deliberately
@@ -52,22 +53,73 @@ pub(crate) enum FailureClass {
     UsageLimit { reset_hint: Option<String> },
     /// The account needs a fresh login (expired/revoked OAuth, logged out).
     Auth,
+    /// FORK: the CLI ended the turn for its own reasons — an interrupt, a
+    /// tool-use cap. Not an account problem, and explicitly *not* worth failing
+    /// over: another account would hit the same wall.
+    Transient,
     /// Anything else — not an account problem, so not worth failing over.
     Other,
 }
 
 impl FailureClass {
     pub(crate) fn is_account_level(&self) -> bool {
-        !matches!(self, FailureClass::Other)
+        matches!(self, FailureClass::UsageLimit { .. } | FailureClass::Auth)
     }
 
     fn reason(&self) -> &'static str {
         match self {
             FailureClass::UsageLimit { .. } => "usage_limit",
             FailureClass::Auth => "auth",
+            FailureClass::Transient => "transient",
             FailureClass::Other => "other",
         }
     }
+}
+
+/// FORK: classifies a CLI failure from the structured fields of its `result`
+/// frame, falling back to the error text.
+///
+/// The CLI states the shape of the failure in `subtype` (and sometimes a nested
+/// `error.type`); reading that first avoids the guesswork of substring matching,
+/// which cannot tell "the model mentioned a rate limit" from "this account hit
+/// one". The text fallback stays for CLI versions that say nothing structured.
+pub(crate) fn classify_result_failure(frame: &serde_json::Value, text: &str) -> FailureClass {
+    let structured = frame
+        .get("subtype")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            frame
+                .get("error")
+                .and_then(|error| error.get("type"))
+                .and_then(serde_json::Value::as_str)
+        });
+    if let Some(structured) = structured {
+        let structured = structured.to_lowercase();
+        if structured.contains("usage_limit") || structured.contains("rate_limit") {
+            return FailureClass::UsageLimit {
+                reset_hint: extract_reset_hint(text),
+            };
+        }
+        if structured.contains("auth") || structured.contains("login") {
+            return FailureClass::Auth;
+        }
+        // A turn the CLI ended for its own reasons — an interrupt, a tool-use
+        // cap — says nothing about the account, so failing over to another one
+        // would only waste a second attempt on the same wall.
+        if structured.contains("max_turns")
+            || structured.contains("interrupt")
+            || structured.contains("cancel")
+        {
+            return FailureClass::Transient;
+        }
+    }
+    let classified = classify_failure(text);
+    if matches!(classified, FailureClass::Other) && structured.is_some() {
+        warn!(
+            "claude_code: unrecognized failure subtype {structured:?}; treating as non-account-level"
+        );
+    }
+    classified
 }
 
 /// Classifies a CLI failure from its error text.
@@ -219,6 +271,61 @@ impl UsageSnapshot {
     fn remaining_pct(&self) -> Option<f64> {
         self.binding_pct.map(|pct| 100.0 - pct)
     }
+
+    /// FORK: this usage in the shape the Codex status line already renders.
+    ///
+    /// Returns `None` when nothing was ever fetched. Reporting zeros instead
+    /// would draw a full, healthy bar for an account we know nothing about —
+    /// worse than drawing nothing, because it reads as good news.
+    pub(crate) fn to_rate_limit_snapshot(
+        &self,
+        account_label: Option<String>,
+    ) -> Option<codex_protocol::protocol::RateLimitSnapshot> {
+        use codex_protocol::protocol::RateLimitWindow;
+        if self.five_hour_pct.is_none() && self.weekly_pct.is_none() {
+            return None;
+        }
+        Some(codex_protocol::protocol::RateLimitSnapshot {
+            // A limit id of its own: the display keys snapshots by it, so
+            // sharing the default would make the Claude window overwrite the
+            // OpenAI one (and vice versa) in a session that uses both.
+            limit_id: Some("claude_code".to_string()),
+            limit_name: account_label,
+            primary: self.five_hour_pct.map(|used_percent| RateLimitWindow {
+                used_percent,
+                window_minutes: Some(5 * 60),
+                resets_at: parse_reset_timestamp(self.five_hour_resets_at.as_deref()),
+            }),
+            secondary: self.weekly_pct.map(|used_percent| RateLimitWindow {
+                used_percent,
+                window_minutes: Some(7 * 24 * 60),
+                resets_at: parse_reset_timestamp(self.weekly_resets_at.as_deref()),
+            }),
+            credits: None,
+            individual_limit: None,
+            spend_control_reached: None,
+            plan_type: None,
+            rate_limit_reached_type: None,
+        })
+    }
+}
+
+/// FORK: the reset time as a Unix timestamp, when the CLI gave a parseable one.
+fn parse_reset_timestamp(resets_at: Option<&str>) -> Option<i64> {
+    let resets_at = resets_at?;
+    // The endpoint reports RFC 3339; anything else is a human hint we cannot
+    // place on a clock, and an unplaced reset is better left blank than guessed.
+    chrono::DateTime::parse_from_rfc3339(resets_at)
+        .ok()
+        .map(|parsed| parsed.timestamp())
+        .or_else(|| resets_at.parse::<i64>().ok())
+}
+
+/// FORK: the cached usage recorded for one account, without a network call.
+pub(crate) fn cached_usage(state_path: &Path, dir: Option<&Path>) -> Option<UsageSnapshot> {
+    let dir = dir?;
+    let state: AccountsFile = super::state_file::read(state_path);
+    state.usage.get(&dir_key(dir)).cloned()
 }
 
 fn oauth_access_token(dir: &Path) -> Option<String> {
@@ -339,37 +446,27 @@ pub(crate) struct AccountHealth {
 
 impl AccountsFile {
     fn load(path: &Path) -> Self {
-        match std::fs::read(path) {
-            Ok(raw) => serde_json::from_slice(&raw).unwrap_or_default(),
-            Err(_) => Self::default(),
-        }
+        super::state_file::read(path)
     }
 
-    fn save(&self, path: &Path) {
-        let Ok(raw) = serde_json::to_vec_pretty(self) else {
-            return;
-        };
-        // A shared temp name loses data as soon as two agents save at once: one
-        // writer's temp file is overwritten, renamed, or deleted under the
-        // other. Every writer gets its own.
-        let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
-        let write_result = std::fs::write(&tmp, raw).and_then(|()| {
-            // `rename` replaces the destination on both platforms, so it is
-            // the atomic path; it only fails when the target is locked, and
-            // only then is it worth the window where the file does not exist.
-            match std::fs::rename(&tmp, path) {
-                Ok(()) => Ok(()),
-                Err(_) if path.exists() => {
-                    std::fs::remove_file(path)?;
-                    std::fs::rename(&tmp, path)
-                }
-                Err(err) => Err(err),
+    /// Merges this in-memory copy into whatever is on disk right now.
+    ///
+    /// A blind overwrite loses the concurrent edits of the other agents sharing
+    /// this file — up to ten in one process. Each field is folded in instead:
+    /// the dirs mirror and preference are process-wide facts, while health and
+    /// usage are per account and merged key by key.
+    fn merge_into(self, path: &Path) {
+        super::state_file::update(path, |on_disk: &mut AccountsFile| {
+            on_disk.version = self.version.max(on_disk.version);
+            if !self.dirs.is_empty() {
+                on_disk.dirs = self.dirs;
             }
+            if self.preferred_dir.is_some() {
+                on_disk.preferred_dir = self.preferred_dir;
+            }
+            on_disk.accounts.extend(self.accounts);
+            on_disk.usage.extend(self.usage);
         });
-        if let Err(err) = write_result {
-            let _ = std::fs::remove_file(&tmp);
-            warn!("claude_code: failed to persist account state: {err}");
-        }
     }
 
     fn is_cooling(&self, dir: &Path, now: u64) -> bool {
@@ -596,7 +693,7 @@ impl TurnAccounts {
         if usable.is_empty() {
             warn!("claude_code: no configured account dir is usable; using ambient environment");
             if dirty && let Some(path) = state_path.as_deref() {
-                state.save(path);
+                state.clone().merge_into(path);
             }
             return Self {
                 candidates: vec![None],
@@ -611,7 +708,7 @@ impl TurnAccounts {
             dirty |= refresh_usage(&mut state, &usable, now).await;
         }
         if dirty && let Some(path) = state_path.as_deref() {
-            state.save(path);
+            state.clone().merge_into(path);
         }
 
         let pinned_key = policy.pinned.map(dir_key);
@@ -692,20 +789,22 @@ impl TurnAccounts {
         let cooldown = match class {
             FailureClass::UsageLimit { .. } => USAGE_LIMIT_COOLDOWN_MS,
             FailureClass::Auth => AUTH_COOLDOWN_MS,
-            FailureClass::Other => return,
+            FailureClass::Transient | FailureClass::Other => return,
         };
-        let mut state = AccountsFile::load(path);
-        let health = state.accounts.entry(dir_key(dir)).or_default();
-        health.cooldown_until_ms = now + cooldown;
-        health.reason = Some(class.reason().to_string());
-        health.reset_hint = match class {
-            FailureClass::UsageLimit { reset_hint } => reset_hint.clone(),
-            _ => None,
-        };
-        health.detail = Some(detail.chars().take(300).collect());
-        health.cred_mtime_ms = credentials_mtime_ms(dir);
-        health.last_failure_ms = now;
-        state.save(path);
+        // Read-modify-write under one lock: a sibling agent recording its own
+        // failure at the same moment must not erase this one.
+        super::state_file::update(path, |state: &mut AccountsFile| {
+            let health = state.accounts.entry(dir_key(dir)).or_default();
+            health.cooldown_until_ms = now + cooldown;
+            health.reason = Some(class.reason().to_string());
+            health.reset_hint = match class {
+                FailureClass::UsageLimit { reset_hint } => reset_hint.clone(),
+                _ => None,
+            };
+            health.detail = Some(detail.chars().take(300).collect());
+            health.cred_mtime_ms = credentials_mtime_ms(dir);
+            health.last_failure_ms = now;
+        });
     }
 
     /// Clears any recorded failure once the account served a turn again.
@@ -713,36 +812,35 @@ impl TurnAccounts {
         let (Some(path), Some(dir)) = (self.state_path.as_deref(), dir) else {
             return;
         };
-        let mut state = AccountsFile::load(path);
-        if state.accounts.remove(&dir_key(dir)).is_some() {
-            state.save(path);
-        }
+        super::state_file::update(path, |state: &mut AccountsFile| {
+            state.accounts.remove(&dir_key(dir));
+        });
     }
 }
 
 /// FORK: one configured account, as the `claude_accounts` tool reports it.
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct AccountStatus {
+pub struct AccountStatus {
     /// 1-based, matching what `spawn_agent(account = …)` accepts.
-    pub(crate) index: usize,
-    pub(crate) account: String,
-    pub(crate) config_dir: String,
+    pub index: usize,
+    pub account: String,
+    pub config_dir: String,
     /// False when the directory has no credentials: the account is configured
     /// but not logged in, and the provider skips it entirely.
-    pub(crate) logged_in: bool,
-    pub(crate) preferred: bool,
-    pub(crate) five_hour_used_pct: Option<f64>,
-    pub(crate) weekly_used_pct: Option<f64>,
+    pub logged_in: bool,
+    pub preferred: bool,
+    pub five_hour_used_pct: Option<f64>,
+    pub weekly_used_pct: Option<f64>,
     /// Headroom before the tightest window closes.
-    pub(crate) remaining_pct: Option<f64>,
-    pub(crate) five_hour_resets_at: Option<String>,
-    pub(crate) weekly_resets_at: Option<String>,
+    pub remaining_pct: Option<f64>,
+    pub five_hour_resets_at: Option<String>,
+    pub weekly_resets_at: Option<String>,
     /// Turns this process is running against the account right now.
-    pub(crate) running_turns: usize,
+    pub running_turns: usize,
     /// Seconds left on a failure cooldown, if any.
-    pub(crate) cooldown_seconds_left: Option<u64>,
-    pub(crate) cooldown_reason: Option<String>,
-    pub(crate) limit_reset_hint: Option<String>,
+    pub cooldown_seconds_left: Option<u64>,
+    pub cooldown_reason: Option<String>,
+    pub limit_reset_hint: Option<String>,
 }
 
 /// FORK: reports every configured account, optionally refreshing usage first.
@@ -768,7 +866,7 @@ pub(crate) async fn list_accounts(
         if refresh_usage(&mut state, &usable, now).await
             && let Some(path) = state_path
         {
-            state.save(path);
+            state.clone().merge_into(path);
         }
     }
     let preferred_key = state
@@ -816,10 +914,12 @@ pub(crate) async fn list_accounts(
 /// Running agents keep the account they already resumed against; this only
 /// changes what the next selection tries first.
 pub(crate) fn select_account(state_path: &Path, dir: Option<&Path>) {
-    let mut state = AccountsFile::load(state_path);
-    state.version = 1;
-    state.preferred_dir = dir.map(|dir| dir.to_string_lossy().into_owned());
-    state.save(state_path);
+    super::state_file::update(state_path, |state: &mut AccountsFile| {
+        state.version = 1;
+        // `None` here means "clear the preference", which `merge_into` cannot
+        // express, so this one writes through directly.
+        state.preferred_dir = dir.map(|dir| dir.to_string_lossy().into_owned());
+    });
 }
 
 #[cfg(test)]
@@ -914,7 +1014,7 @@ mod tests {
             preferred_dir: Some(dir_b.to_string_lossy().into_owned()),
             ..AccountsFile::default()
         };
-        state.save(&state_path);
+        state.clone().merge_into(&state_path);
         let plan = TurnAccounts::resolve(
             &dirs,
             Some(&state_path),
@@ -976,7 +1076,7 @@ mod tests {
             usage,
             ..AccountsFile::default()
         };
-        state.save(&state_path);
+        state.clone().merge_into(&state_path);
 
         let plan = TurnAccounts::resolve(
             &dirs,
@@ -1008,7 +1108,7 @@ mod tests {
             usage,
             ..AccountsFile::default()
         };
-        state.save(&state_path);
+        state.clone().merge_into(&state_path);
 
         let plan = TurnAccounts::resolve(
             &dirs,
@@ -1021,7 +1121,7 @@ mod tests {
         // A deliberate selection outranks the sticky account.
         let mut state = AccountsFile::load(&state_path);
         state.preferred_dir = Some(dirs[2].to_string_lossy().into_owned());
-        state.save(&state_path);
+        state.clone().merge_into(&state_path);
         let plan = TurnAccounts::resolve(
             &dirs,
             Some(&state_path),
@@ -1082,7 +1182,7 @@ mod tests {
             usage,
             ..AccountsFile::default()
         };
-        state.save(&state_path);
+        state.clone().merge_into(&state_path);
 
         let plan = TurnAccounts::resolve(
             &dirs,
@@ -1112,7 +1212,7 @@ mod tests {
             usage,
             ..AccountsFile::default()
         };
-        state.save(&state_path);
+        state.clone().merge_into(&state_path);
 
         let plan = TurnAccounts::resolve(
             &dirs,
@@ -1136,7 +1236,7 @@ mod tests {
             preferred_dir: Some(dirs[1].to_string_lossy().into_owned()),
             ..AccountsFile::default()
         };
-        state.save(&state_path);
+        state.clone().merge_into(&state_path);
 
         let plan = TurnAccounts::resolve(
             &dirs,
@@ -1173,7 +1273,7 @@ mod tests {
             usage,
             ..AccountsFile::default()
         };
-        state.save(&state_path);
+        state.clone().merge_into(&state_path);
 
         let busy = InFlightGuard::acquire(Some(&dirs[0]));
         let plan = TurnAccounts::resolve(

@@ -365,13 +365,25 @@ pub(crate) mod spawn_tool_spec {
                         }
                         (None, None) => String::new(),
                     };
-                    let service_tier_note = service_tier
-                        .map(|service_tier| {
-                            format!(
-                                "\n- This role's service tier is set to `{service_tier}`. If it is supported by the resolved model, it takes precedence over a valid spawn request service tier."
-                            )
-                        })
-                        .unwrap_or_default();
+                    // FORK: the old wording invited the caller to pass a
+                    // `service_tier` "if supported"; the caller cannot know what
+                    // the child model supports, and a locally served child
+                    // supports none at all. Say what to do instead.
+                    let is_claude_role = role_toml
+                        .get("model_provider")
+                        .and_then(TomlValue::as_str)
+                        .is_some_and(|provider| provider == CLAUDE_CODE_PROVIDER_ID);
+                    let service_tier_note = if is_claude_role {
+                        "\n- Do not pass `service_tier` for this role.".to_string()
+                    } else {
+                        service_tier
+                            .map(|service_tier| {
+                                format!(
+                                    "\n- This role's service tier is set to `{service_tier}`; do not pass `service_tier` for this role."
+                                )
+                            })
+                            .unwrap_or_default()
+                    };
                     format!("{model_and_reasoning_note}{service_tier_note}{claude_note}")
                 })
                 .unwrap_or_default();
@@ -421,7 +433,8 @@ Typical tasks:
 - Split large refactors into independent chunks
 Rules:
 - Explicitly assign **ownership** of the task (files / responsibility). When the subtask involves code changes, you should clearly specify which files or modules the worker is responsible for. This helps avoid merge conflicts and ensures accountability. For example, you can say "Worker 1 is responsible for updating the authentication module, while Worker 2 will handle the database layer." By defining clear ownership, you can delegate more effectively and reduce coordination overhead.
-- Always tell workers they are **not alone in the codebase**, and they should not revert the edits made by others, and they should adjust their implementation to accommodate the changes made by others. This is important because there may be multiple workers making changes in parallel, and they need to be aware of each other's work to avoid conflicts and ensure a cohesive final product."#.to_string()),
+- Always tell workers they are **not alone in the codebase**, and they should not revert the edits made by others, and they should adjust their implementation to accommodate the changes made by others. This is important because there may be multiple workers making changes in parallel, and they need to be aware of each other's work to avoid conflicts and ensure a cohesive final product.
+- The working tree is shared and dirty by design. Workers must never run `git reset`, `checkout`, `clean`, `stash`, or `commit`: those discard other agents' uncommitted work, and there is no way to get it back."#.to_string()),
                         config_file: None,
                         nickname_candidates: None,
                     }

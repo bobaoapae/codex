@@ -666,6 +666,11 @@ non_code_mode_only = true
             usage_hint_text: Some("Custom delegation guidance.".to_string()),
             root_agent_usage_hint_text: Some("Root guidance.".to_string()),
             subagent_usage_hint_text: Some("Subagent guidance.".to_string()),
+            // FORK: unset in this fixture; the toml under test does not name them.
+            root_agent_usage_hint_suffix: None,
+            subagent_usage_hint_suffix: None,
+            delivery_discipline_hint: None,
+            max_desktop_threads_per_session: None,
             subagent_developer_instructions: Some("Delegate carefully.".to_string()),
             multi_agent_mode_hint_text: Some("Custom mode guidance.".to_string()),
             tool_namespace: Some("agents".to_string()),

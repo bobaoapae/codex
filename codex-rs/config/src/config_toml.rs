@@ -174,6 +174,12 @@ pub struct ClaudeCodeToml {
     /// is abandoned and its process tree killed. Defaults to 10 minutes; set to
     /// 0 to wait forever.
     pub idle_timeout_ms: Option<u64>,
+
+    /// Upper bound on how many parent turns a Claude child may inherit through
+    /// `fork_turns`. Defaults to 0: the child starts from its brief alone, which
+    /// is what a different harness can actually use. A full-history fork is
+    /// never honored regardless of this value.
+    pub max_fork_turns: Option<usize>,
 }
 
 /// FORK: account-selection policy for the `claude_code` provider.
@@ -676,6 +682,13 @@ pub struct ExperimentalRequestUserInput {
 pub struct UpdatePlanToolConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
+
+    /// FORK: re-inject the current checklist after a compaction.
+    ///
+    /// Without it the plan lives only in the transcript, which compaction
+    /// rewrites, so the model comes back with no idea which step it was on.
+    #[serde(default = "default_true")]
+    pub survives_compaction: bool,
 }
 
 #[derive(Deserialize)]

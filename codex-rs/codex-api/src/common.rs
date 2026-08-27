@@ -141,6 +141,61 @@ pub enum ResponseEvent {
     },
     RateLimits(RateLimitSnapshot),
     ModelsEtag(String),
+    /// FORK: a tool the *provider* ran on its own behalf.
+    ///
+    /// The `claude_code` provider is an agent, not a completion endpoint: it
+    /// executes `Bash`, `Edit`, `Read` and the rest itself and reports what it
+    /// did. Those calls must be recorded and displayed like any other tool
+    /// activity, but they must never reach the `ToolRouter` — the work is
+    /// already done, and dispatching it would run it a second time.
+    /// `OutputItemDone(FunctionCall)` cannot express that, hence a variant of
+    /// its own.
+    ProviderExecutedTool(Box<ProviderExecutedTool>),
+}
+
+/// FORK: one lifecycle edge of a provider-executed tool call.
+#[derive(Debug, Clone)]
+pub struct ProviderExecutedTool {
+    /// Identifier the provider used for the call, so the completion can be
+    /// matched to the start.
+    pub call_id: String,
+    pub phase: ProviderExecutedToolPhase,
+    /// Items to show in the transcript.
+    pub turn_items: Vec<codex_protocol::items::TurnItem>,
+    /// Items to persist in the conversation history. Empty on `Started`: the
+    /// call and its output are recorded together when it completes.
+    pub history_items: Vec<ResponseItem>,
+    /// Textual file mutations the provider committed, for the turn diff.
+    pub file_changes: Vec<ProviderExecutedFileChange>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderExecutedToolPhase {
+    Started,
+    Completed,
+}
+
+/// FORK: a file mutation a provider made, in the form the turn-diff tracker
+/// needs. Deliberately plain types: the conversion to the `apply-patch` delta
+/// happens in core, so this crate keeps its dependency set unchanged.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderExecutedFileChange {
+    pub path: std::path::PathBuf,
+    pub kind: ProviderExecutedFileChangeKind,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProviderExecutedFileChangeKind {
+    Add {
+        content: String,
+    },
+    Update {
+        old_content: String,
+        new_content: String,
+    },
+    Delete {
+        content: String,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]

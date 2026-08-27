@@ -131,16 +131,21 @@ async fn handle_spawn_agent(
         requested_fork_mode.as_ref(),
         Some(SpawnAgentForkMode::FullHistory)
     );
+    // FORK: every argument we adjust rather than reject lands here and is
+    // reported back in the tool result, so the model learns what it actually
+    // got instead of retrying a spawn that would fail the same way.
+    let mut notes: Vec<String> = Vec::new();
     apply_requested_spawn_agent_model_overrides(
         &session,
         turn.as_ref(),
         &mut config,
         args.model.as_deref(),
         args.reasoning_effort.clone(),
+        &mut notes,
     )
     .await?;
     if !requested_full_history_fork || role_name.is_some() {
-        apply_spawn_agent_role(&session, &mut config, role_name).await?;
+        apply_spawn_agent_role(&session, &mut config, role_name, &mut notes).await?;
         if requested_full_history_fork && config.developer_instructions.is_none() {
             config
                 .developer_instructions
@@ -152,6 +157,7 @@ async fn handle_spawn_agent(
         &mut config,
         turn.config.service_tier.as_deref(),
         args.service_tier.as_deref(),
+        &mut notes,
     )
     .await?;
     apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
@@ -163,8 +169,12 @@ async fn handle_spawn_agent(
     // the inter-agent message. Inheriting parent turns makes the local Claude
     // session reprocess stale work and Codex-only instructions, so Claude must
     // always start from task-only context.
-    let fork_mode =
-        task_fork_mode_for_wire_api(config.model_provider.wire_api, requested_fork_mode);
+    let (fork_mode, fork_note) = task_fork_mode_for_wire_api(
+        config.model_provider.wire_api,
+        requested_fork_mode,
+        turn.config.claude_code_max_fork_turns,
+    );
+    notes.extend(fork_note);
     let is_full_history_fork = matches!(fork_mode, Some(SpawnAgentForkMode::FullHistory));
 
     // Remember an applied configured default so cold reload reapplies its restrictions.
@@ -280,11 +290,12 @@ async fn handle_spawn_agent(
 
     let hide_agent_metadata = turn.config.multi_agent_v2.hide_spawn_agent_metadata;
     let output = if hide_agent_metadata {
-        SpawnAgentResult::HiddenMetadata { task_name }
+        SpawnAgentResult::HiddenMetadata { task_name, notes }
     } else {
         SpawnAgentResult::WithNickname {
             task_name,
             nickname,
+            notes,
         }
     };
     Ok((output, new_thread_id, agent_status, agent_snapshot))
@@ -356,9 +367,13 @@ pub(crate) enum SpawnAgentResult {
     WithNickname {
         task_name: String,
         nickname: Option<String>,
+        /// FORK: spawn arguments that were adjusted instead of rejected.
+        notes: Vec<String>,
     },
     HiddenMetadata {
         task_name: String,
+        /// FORK: spawn arguments that were adjusted instead of rejected.
+        notes: Vec<String>,
     },
 }
 

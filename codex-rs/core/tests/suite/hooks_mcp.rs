@@ -298,6 +298,8 @@ fn insert_rmcp_test_server(
             default_tools_approval_mode: Some(approval_mode),
             enabled_tools: None,
             disabled_tools: None,
+            root_only_tools: None,
+            tool_approval_overrides: Default::default(),
             scopes: None,
             oauth: None,
             oauth_resource: None,

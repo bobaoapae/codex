@@ -1290,6 +1290,8 @@ impl SessionTelemetry {
             ResponseEvent::ServerReasoningIncluded(_) => "server_reasoning_included".into(),
             ResponseEvent::RateLimits(_) => "rate_limits".into(),
             ResponseEvent::ModelsEtag(_) => "models_etag".into(),
+            // FORK: a tool the provider ran itself (the `claude_code` path).
+            ResponseEvent::ProviderExecutedTool(_) => "provider_executed_tool".into(),
         }
     }
 

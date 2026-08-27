@@ -10,6 +10,7 @@
 //! request replays everything into a fresh Claude session.
 
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::ContentItemKind;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::models::plaintext_agent_message_content;
@@ -140,10 +141,30 @@ the last message.\n\n<codex_transcript>\n{}\n</codex_transcript>",
 
 fn render_item(item: &ResponseItem) -> String {
     match item {
-        ResponseItem::Message { role, content, .. } => {
+        ResponseItem::Message {
+            role,
+            content,
+            internal_chat_message_metadata_passthrough,
+            ..
+        } => {
+            // FORK: the harness annotates every injected fragment with its kind.
+            // Filtering by that annotation replaces the text-marker heuristic
+            // below, which could only cut whole message tails and regularly took
+            // the user's role instructions with it.
+            let kinds = internal_chat_message_metadata_passthrough
+                .as_ref()
+                .and_then(|metadata| metadata.content_item_kinds.as_deref());
+            let annotated = kinds.is_some_and(|kinds| kinds.len() == content.len());
             let text = content
                 .iter()
-                .map(|content_item| match content_item {
+                .enumerate()
+                .filter(|(index, _)| match kinds {
+                    Some(kinds) if annotated => keep_content_kind(&kinds[*index]),
+                    // Without a usable annotation nothing can be classified, so
+                    // keep the entry and let the fallback stripper handle it.
+                    _ => true,
+                })
+                .map(|(_, content_item)| match content_item {
                     ContentItem::InputText { text } | ContentItem::OutputText { text } => {
                         text.as_str()
                     }
@@ -152,7 +173,13 @@ fn render_item(item: &ResponseItem) -> String {
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            let text = strip_codex_harness_sections(&text);
+            // An annotated item was already classified precisely; running the
+            // marker stripper over it would only risk eating real content.
+            let text = if annotated {
+                text
+            } else {
+                strip_codex_harness_sections(&text)
+            };
             if text.trim().is_empty() {
                 String::new()
             } else {
@@ -183,6 +210,17 @@ fn render_item(item: &ResponseItem) -> String {
             // noise at best and misleading at worst.
             String::new()
         }
+        // FORK: Claude's own tool calls, recorded by the adapter. The live
+        // Claude session already holds them; replaying them would show the agent
+        // its own trace as if it were new transcript.
+        ResponseItem::FunctionCall {
+            namespace: Some(namespace),
+            ..
+        }
+        | ResponseItem::FunctionCallOutput {
+            namespace: Some(namespace),
+            ..
+        } if namespace == super::tools::CLAUDE_TOOL_NAMESPACE => String::new(),
         ResponseItem::FunctionCall {
             name, arguments, ..
         } => format!(
@@ -250,41 +288,100 @@ fn render_item(item: &ResponseItem) -> String {
     }
 }
 
-/// Instructions that describe the Codex harness rather than the task.
+/// FORK: content kinds that describe the Codex harness rather than the task.
 ///
-/// A Claude agent has none of the tools they talk about — the collaboration
-/// namespace, `functions.exec`, the Codex memory folder — so replaying them
-/// burns context and provokes attempts that can only fail. Observed in
-/// production: an agent spent a turn trying to read `.codex/memories` because
-/// this text told it to.
+/// A Claude agent has none of the tools these fragments talk about — the
+/// collaboration namespace, `functions.exec`, the Codex memory folder, the
+/// plugin catalog — so forwarding them burns context and provokes attempts that
+/// can only fail. Observed in production: an agent spent a turn trying to read
+/// `.codex/memories` because this text told it to; the median injected preamble
+/// was 37k characters and the largest was 1.39M.
 ///
-/// Each entry starts a harness section; everything from that line to the end of
-/// the message is dropped. The role instructions written by the user's agent
-/// role sit *before* these markers and survive.
-///
-/// Matching is line-anchored rather than substring-based: the harness emits CRLF,
-/// so a marker carrying its own newlines silently fails to match.
-const HARNESS_SECTION_MARKERS: &[&str] = &[
-    "## Memory",
-    "You are an agent in a team of agents",
-    "<multi_agent_mode>",
-    "<recommended_plugins>",
+/// An entry ending in `.` is a family prefix and drops every kind under it.
+/// Anything not listed here is kept, including `unknown`: a fragment we cannot
+/// classify may well be the task.
+const DROPPED_CONTENT_KIND_PREFIXES: &[&str] = &[
+    // The parent's own operating manual, none of which applies to a CLI agent.
+    "agents_md.instructions",
+    "model.base_instructions",
+    "generic.developer_instructions",
+    "generic.developer_policy",
+    "managed_config.developer_instructions",
+    "personality.spec_instructions",
+    // Catalogs of tools and surfaces the child cannot reach.
+    "plugins.",
+    "apps.instructions",
+    "environments.instructions",
+    "tools.deferred_namespaces",
+    "collaboration_mode.instructions",
+    "realtime_conversation.",
+    "unified_exec.",
+    "apply_patch.legacy_exec_command_warning",
+    "model_switch.",
+    // Multi-agent scaffolding written for the Codex harness. The inter-agent
+    // *messages* are the task itself and are kept below.
+    "multi_agent.mode_instructions",
+    "multi_agent.usage_hint",
+    "multi_agent.role_instructions",
+    // Budgets and reviewer bookkeeping the child neither sees nor controls.
+    "token_budget.",
+    "rollout_budget.",
+    "guardian.",
 ];
 
-/// Removes Codex-harness scaffolding from a message before it reaches Claude.
+/// Whether one annotated content entry survives into the Claude turn.
+fn keep_content_kind(kind: &ContentItemKind) -> bool {
+    let kind = kind.0.as_str();
+    !DROPPED_CONTENT_KIND_PREFIXES
+        .iter()
+        .any(|dropped| match dropped.strip_suffix('.') {
+            Some(_) => kind.starts_with(dropped),
+            None => kind == *dropped,
+        })
+}
+
+/// Legacy text markers for messages that carry no kind annotation.
+///
+/// Only rollouts recorded before the harness started annotating fragments reach
+/// this path. Matching is line-anchored rather than substring-based: the harness
+/// emits CRLF, so a marker carrying its own newlines silently fails to match.
+const HARNESS_SECTION_MARKERS: &[(&str, &str)] = &[
+    ("<multi_agent_mode>", "</multi_agent_mode>"),
+    ("<recommended_plugins>", "</recommended_plugins>"),
+];
+
+/// Removes Codex-harness scaffolding from an unannotated message.
+///
+/// FORK: this used to drop everything from a marker to the end of the message,
+/// which silently ate the role instructions that the user's own agent role had
+/// appended after them. It now cuts only up to the matching closing tag.
 fn strip_codex_harness_sections(text: &str) -> String {
-    let mut kept = Vec::new();
+    let mut kept: Vec<&str> = Vec::new();
+    let mut skip_until: Option<&str> = None;
     for line in text.split_inclusive('\n') {
         let trimmed = line.trim();
-        if HARNESS_SECTION_MARKERS
+        if let Some(closing) = skip_until {
+            if trimmed == closing {
+                skip_until = None;
+            }
+            continue;
+        }
+        if let Some((_, closing)) = HARNESS_SECTION_MARKERS
             .iter()
-            .any(|marker| trimmed == *marker || trimmed.starts_with(marker))
+            .find(|(opening, _)| trimmed == *opening)
         {
-            break;
+            skip_until = Some(closing);
+            continue;
         }
         kept.push(line);
     }
     kept.concat().trim_end().to_string()
+}
+
+/// FORK: the same elision used on replayed tool output, for the tool results
+/// this fork now records from Claude's own calls.
+pub(super) fn truncate_tool_output(text: &str) -> String {
+    truncate_middle(text, MAX_TOOL_OUTPUT_CHARS)
 }
 
 fn truncate_middle(text: &str, max_chars: usize) -> String {

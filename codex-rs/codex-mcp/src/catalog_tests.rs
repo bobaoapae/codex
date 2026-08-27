@@ -42,6 +42,8 @@ fn server(url: &str) -> McpServerConfig {
         default_tools_approval_mode: Some(AppToolApproval::Prompt),
         enabled_tools: Some(vec!["read".to_string()]),
         disabled_tools: Some(vec!["write".to_string()]),
+        root_only_tools: None,
+        tool_approval_overrides: Default::default(),
         scopes: None,
         oauth: None,
         oauth_resource: None,

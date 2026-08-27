@@ -21,6 +21,19 @@ impl MultiAgentRoleInstructions {
             marked: true,
         }
     }
+
+    /// FORK: the resolved text, so fork-owned sections can be appended to it.
+    pub(crate) fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// FORK: the same instructions with different text, keeping the marking.
+    pub(crate) fn with_text(self, text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            marked: self.marked,
+        }
+    }
 }
 
 impl ContextualUserFragment for MultiAgentRoleInstructions {

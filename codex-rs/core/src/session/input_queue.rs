@@ -138,6 +138,24 @@ impl InputQueue {
         !self.mailbox_pending_mails.lock().await.is_empty()
     }
 
+    /// FORK: the agents that currently have mail waiting.
+    ///
+    /// `wait_agent` wakes on mail from *any* agent, so a parent waiting on one
+    /// specific child is woken by an unrelated sibling and has to wait again.
+    /// This is what lets it filter.
+    pub(crate) async fn pending_mailbox_authors(&self) -> Vec<String> {
+        let mut authors: Vec<String> = self
+            .mailbox_pending_mails
+            .lock()
+            .await
+            .iter()
+            .map(|mail| mail.communication.author.to_string())
+            .collect();
+        authors.sort();
+        authors.dedup();
+        authors
+    }
+
     pub(crate) async fn has_trigger_turn_mailbox_items(&self) -> bool {
         self.mailbox_pending_mails
             .lock()

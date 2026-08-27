@@ -176,3 +176,53 @@ fn format_reset(resets_at: DateTime<Local>) -> String {
         resets_at.format("%d %b %H:%M").to_string()
     }
 }
+
+/// FORK: one line per configured Claude account.
+///
+/// The columns are the ones that decide what to do next: how much of each
+/// window is spent, whether the account is on a failure cooldown, and which one
+/// new work will pick.
+pub(crate) fn render_claude_table(
+    accounts: &[codex_core::claude_accounts_api::ClaudeAccountStatus],
+) -> String {
+    fn window(used_pct: Option<f64>) -> String {
+        match used_pct {
+            Some(used) => format!("{used:.0}% used"),
+            // Not "0%": an account whose usage was never fetched must not be
+            // drawn as a healthy one.
+            None => "unknown".to_string(),
+        }
+    }
+
+    let mut out = String::new();
+    for account in accounts {
+        let marker = if account.preferred { "*" } else { " " };
+        out.push_str(&format!(
+            "{marker} {}. {}\n",
+            account.index, account.account
+        ));
+        if !account.logged_in {
+            out.push_str("      not logged in (no credentials in its config dir)\n");
+            continue;
+        }
+        out.push_str(&format!(
+            "      5h: {}   7d: {}\n",
+            window(account.five_hour_used_pct),
+            window(account.weekly_used_pct)
+        ));
+        if account.running_turns > 0 {
+            out.push_str(&format!(
+                "      {} turn(s) running right now\n",
+                account.running_turns
+            ));
+        }
+        if let Some(seconds) = account.cooldown_seconds_left {
+            let reason = account.cooldown_reason.as_deref().unwrap_or("failure");
+            out.push_str(&format!("      cooling down for {seconds}s ({reason})\n"));
+        }
+        if let Some(hint) = account.limit_reset_hint.as_deref() {
+            out.push_str(&format!("      {hint}\n"));
+        }
+    }
+    out
+}

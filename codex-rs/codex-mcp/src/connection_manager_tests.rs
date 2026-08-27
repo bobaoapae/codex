@@ -133,6 +133,8 @@ impl McpConnectionSet {
                     supports_parallel_tool_calls: false,
                     default_tools_approval_mode: None,
                     tool_approval_modes: HashMap::new(),
+                    tool_approval_overrides: Default::default(),
+                    root_only_tools: Vec::new(),
                 },
                 tool_timeout: None,
                 catalog_item_limit: crate::pagination::MAX_MCP_CATALOG_ITEMS,
@@ -683,6 +685,8 @@ async fn create_test_manager_with_ready_apps_client(
             supports_parallel_tool_calls: false,
             default_tools_approval_mode: None,
             tool_approval_modes: HashMap::new(),
+            tool_approval_overrides: Default::default(),
+            root_only_tools: Vec::new(),
         },
     );
     Ok(Arc::new(manager))
@@ -1995,6 +1999,8 @@ async fn capture_binding_uses_the_ready_clients_own_tools() {
             supports_parallel_tool_calls: false,
             default_tools_approval_mode: None,
             tool_approval_modes: HashMap::new(),
+            tool_approval_overrides: Default::default(),
+            root_only_tools: Vec::new(),
         },
     );
     let manager = Arc::new(manager);
@@ -2391,6 +2397,8 @@ async fn capture_binding_exposes_cached_tools_before_startup() {
             supports_parallel_tool_calls: false,
             default_tools_approval_mode: None,
             tool_approval_modes: HashMap::new(),
+            tool_approval_overrides: Default::default(),
+            root_only_tools: Vec::new(),
         },
     );
     let manager = Arc::new(manager);
@@ -3257,6 +3265,8 @@ async fn list_all_tools_reconnects_failed_codex_apps_startup_and_reuses_client()
         supports_parallel_tool_calls: false,
         default_tools_approval_mode: None,
         tool_approval_modes: HashMap::new(),
+        tool_approval_overrides: Default::default(),
+        root_only_tools: Vec::new(),
     };
     let manager = Arc::new(manager);
 
@@ -3449,6 +3459,8 @@ async fn tool_lists_do_not_block_and_share_codex_apps_startup_reconnect() {
             supports_parallel_tool_calls: false,
             default_tools_approval_mode: None,
             tool_approval_modes: HashMap::new(),
+            tool_approval_overrides: Default::default(),
+            root_only_tools: Vec::new(),
         },
     );
     let manager = Arc::new(manager);
@@ -3535,6 +3547,8 @@ async fn list_all_tools_adds_server_metadata_to_tools() {
             supports_parallel_tool_calls: true,
             default_tools_approval_mode: None,
             tool_approval_modes: HashMap::new(),
+            tool_approval_overrides: Default::default(),
+            root_only_tools: Vec::new(),
         },
     );
 
@@ -3851,6 +3865,8 @@ async fn no_local_runtime_fails_local_stdio_but_keeps_local_http_server() {
                 default_tools_approval_mode: None,
                 enabled_tools: None,
                 disabled_tools: None,
+                root_only_tools: None,
+                tool_approval_overrides: Default::default(),
                 scopes: None,
                 oauth: None,
                 oauth_resource: None,
@@ -3879,6 +3895,8 @@ async fn no_local_runtime_fails_local_stdio_but_keeps_local_http_server() {
                 default_tools_approval_mode: None,
                 enabled_tools: None,
                 disabled_tools: None,
+                root_only_tools: None,
+                tool_approval_overrides: Default::default(),
                 scopes: None,
                 oauth: None,
                 oauth_resource: None,
@@ -3990,6 +4008,8 @@ fn mcp_init_error_display_prompts_for_github_pat() {
         default_tools_approval_mode: None,
         enabled_tools: None,
         disabled_tools: None,
+        root_only_tools: None,
+        tool_approval_overrides: Default::default(),
         scopes: None,
         oauth: None,
         oauth_resource: None,
@@ -4150,6 +4170,8 @@ fn mcp_init_error_display_reports_generic_errors() {
         default_tools_approval_mode: None,
         enabled_tools: None,
         disabled_tools: None,
+        root_only_tools: None,
+        tool_approval_overrides: Default::default(),
         scopes: None,
         oauth: None,
         oauth_resource: None,
@@ -4208,6 +4230,8 @@ fn reusable_server_config(url: &str) -> McpServerConfig {
         default_tools_approval_mode: None,
         enabled_tools: None,
         disabled_tools: None,
+        root_only_tools: None,
+        tool_approval_overrides: Default::default(),
         scopes: None,
         oauth: None,
         oauth_resource: None,

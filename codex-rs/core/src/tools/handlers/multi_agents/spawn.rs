@@ -94,31 +94,37 @@ async fn handle_spawn_agent(
     if args.fork_context {
         reject_full_fork_agent_type_override(role_name)?;
     }
+    // FORK: v1 has no place to surface adjustment notes in its result, so it
+    // collects them only to keep one signature shared with v2.
+    let mut notes: Vec<String> = Vec::new();
     apply_requested_spawn_agent_model_overrides(
         &session,
         turn.as_ref(),
         &mut config,
         args.model.as_deref(),
         args.reasoning_effort.clone(),
+        &mut notes,
     )
     .await?;
     if !args.fork_context {
-        apply_spawn_agent_role(&session, &mut config, role_name).await?;
+        apply_spawn_agent_role(&session, &mut config, role_name, &mut notes).await?;
     }
     apply_spawn_agent_service_tier(
         &session,
         &mut config,
         turn.config.service_tier.as_deref(),
         args.service_tier.as_deref(),
+        &mut notes,
     )
     .await?;
     apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
 
     // Claude children receive a complete plaintext brief and must not inherit
     // the parent's Codex conversation through the legacy fork flag.
-    let fork_mode = task_fork_mode_for_wire_api(
+    let (fork_mode, _fork_note) = task_fork_mode_for_wire_api(
         config.model_provider.wire_api,
         args.fork_context.then_some(SpawnAgentForkMode::FullHistory),
+        turn.config.claude_code_max_fork_turns,
     );
 
     let result = Box::pin(session.services.agent_control.spawn_agent_with_metadata(

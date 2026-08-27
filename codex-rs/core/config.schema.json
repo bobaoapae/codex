@@ -470,6 +470,12 @@
           "minimum": 0.0,
           "type": "integer"
         },
+        "max_fork_turns": {
+          "description": "Upper bound on how many parent turns a Claude child may inherit through `fork_turns`. Defaults to 0: the child starts from its brief alone, which is what a different harness can actually use. A full-history fork is never honored regardless of this value.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
         "selection": {
           "allOf": [
             {
@@ -673,6 +679,9 @@
               "type": "boolean"
             },
             "chronicle": {
+              "type": "boolean"
+            },
+            "claude_code_control_protocol": {
               "type": "boolean"
             },
             "code_mode": {
@@ -2269,6 +2278,10 @@
           "minimum": 0.0,
           "type": "integer"
         },
+        "delivery_discipline_hint": {
+          "description": "FORK: whether to append the delivery-discipline hint to the root agent. Defaults to true.",
+          "type": "boolean"
+        },
         "enabled": {
           "type": "boolean"
         },
@@ -2282,6 +2295,12 @@
         "max_concurrent_threads_per_session": {
           "format": "uint",
           "minimum": 1.0,
+          "type": "integer"
+        },
+        "max_desktop_threads_per_session": {
+          "description": "FORK: after this many Desktop threads created in one session, the result of `create_thread`/`fork_thread` carries a warning. 0 disables the warning entirely. Never blocks: the user may genuinely want them.",
+          "format": "uint",
+          "minimum": 0.0,
           "type": "integer"
         },
         "max_wait_timeout_ms": {
@@ -2302,11 +2321,19 @@
         "non_code_mode_only": {
           "type": "boolean"
         },
+        "root_agent_usage_hint_suffix": {
+          "description": "FORK: appended to the root hint, never replacing it.\n\nThe `*_usage_hint_text` keys above *replace* the bundled text, so setting one silently drops everything the harness needed to say. These append.",
+          "type": "string"
+        },
         "root_agent_usage_hint_text": {
           "type": "string"
         },
         "subagent_developer_instructions": {
           "description": "Overrides inherited developer instructions for subagents without role-specific instructions.",
+          "type": "string"
+        },
+        "subagent_usage_hint_suffix": {
+          "description": "FORK: appended to the subagent hint, never replacing it.",
           "type": "string"
         },
         "subagent_usage_hint_text": {
@@ -3012,6 +3039,20 @@
           },
           "type": "array"
         },
+        "root_only_tools": {
+          "description": "FORK: tools only the root thread may see. See `McpServerConfig::root_only_tools`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "tool_approval_overrides": {
+          "additionalProperties": {
+            "$ref": "#/definitions/AppToolApproval"
+          },
+          "description": "FORK: per-tool approval decisions that outrank the plugin's own. See `McpServerConfig::tool_approval_overrides`.\n\nThis table is the user's policy for a plugin's server, not the plugin's manifest, so writing it here is the user deciding — which is the whole point of a field that is allowed to loosen.",
+          "type": "object"
+        },
         "tools": {
           "additionalProperties": {
             "$ref": "#/definitions/McpServerToolConfig"
@@ -3168,6 +3209,14 @@
           "default": null,
           "type": "boolean"
         },
+        "root_only_tools": {
+          "default": null,
+          "description": "FORK: see `McpServerConfig::root_only_tools`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "scopes": {
           "default": null,
           "items": {
@@ -3189,6 +3238,14 @@
         "supports_parallel_tool_calls": {
           "default": null,
           "type": "boolean"
+        },
+        "tool_approval_overrides": {
+          "additionalProperties": {
+            "$ref": "#/definitions/AppToolApproval"
+          },
+          "default": null,
+          "description": "FORK: see `McpServerConfig::tool_approval_overrides`.",
+          "type": "object"
         },
         "tool_timeout_sec": {
           "default": null,
@@ -5359,6 +5416,11 @@
         "enabled": {
           "default": true,
           "type": "boolean"
+        },
+        "survives_compaction": {
+          "default": true,
+          "description": "FORK: re-inject the current checklist after a compaction.\n\nWithout it the plan lives only in the transcript, which compaction rewrites, so the model comes back with no idea which step it was on.",
+          "type": "boolean"
         }
       },
       "type": "object"
@@ -5711,6 +5773,9 @@
           "type": "boolean"
         },
         "chronicle": {
+          "type": "boolean"
+        },
+        "claude_code_control_protocol": {
           "type": "boolean"
         },
         "code_mode": {

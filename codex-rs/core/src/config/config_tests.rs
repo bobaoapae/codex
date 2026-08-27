@@ -149,6 +149,8 @@ fn stdio_mcp_with_args(command: &str, args: &[&str]) -> McpServerConfig {
         default_tools_approval_mode: None,
         enabled_tools: None,
         disabled_tools: None,
+        root_only_tools: None,
+        tool_approval_overrides: Default::default(),
         scopes: None,
         oauth: None,
         oauth_resource: None,
@@ -177,6 +179,8 @@ fn http_mcp(url: &str) -> McpServerConfig {
         default_tools_approval_mode: None,
         enabled_tools: None,
         disabled_tools: None,
+        root_only_tools: None,
+        tool_approval_overrides: Default::default(),
         scopes: None,
         oauth: None,
         oauth_resource: None,
@@ -6621,6 +6625,8 @@ async fn replace_mcp_servers_round_trips_entries() -> anyhow::Result<()> {
             default_tools_approval_mode: None,
             enabled_tools: None,
             disabled_tools: None,
+            root_only_tools: None,
+            tool_approval_overrides: Default::default(),
             scopes: None,
             oauth: None,
             oauth_resource: None,
@@ -7025,6 +7031,8 @@ async fn replace_mcp_servers_serializes_env_sorted() -> anyhow::Result<()> {
             default_tools_approval_mode: None,
             enabled_tools: None,
             disabled_tools: None,
+            root_only_tools: None,
+            tool_approval_overrides: Default::default(),
             scopes: None,
             oauth: None,
             oauth_resource: None,
@@ -7103,6 +7111,8 @@ async fn replace_mcp_servers_serializes_env_vars() -> anyhow::Result<()> {
             default_tools_approval_mode: None,
             enabled_tools: None,
             disabled_tools: None,
+            root_only_tools: None,
+            tool_approval_overrides: Default::default(),
             scopes: None,
             oauth: None,
             oauth_resource: None,
@@ -7166,6 +7176,8 @@ async fn replace_mcp_servers_serializes_sourced_env_vars() -> anyhow::Result<()>
             default_tools_approval_mode: None,
             enabled_tools: None,
             disabled_tools: None,
+            root_only_tools: None,
+            tool_approval_overrides: Default::default(),
             scopes: None,
             oauth: None,
             oauth_resource: None,
@@ -7220,6 +7232,8 @@ async fn replace_mcp_servers_serializes_cwd() -> anyhow::Result<()> {
             default_tools_approval_mode: None,
             enabled_tools: None,
             disabled_tools: None,
+            root_only_tools: None,
+            tool_approval_overrides: Default::default(),
             scopes: None,
             oauth: None,
             oauth_resource: None,
@@ -7277,6 +7291,8 @@ async fn replace_mcp_servers_streamable_http_serializes_bearer_token() -> anyhow
             default_tools_approval_mode: None,
             enabled_tools: None,
             disabled_tools: None,
+            root_only_tools: None,
+            tool_approval_overrides: Default::default(),
             scopes: None,
             oauth: None,
             oauth_resource: None,
@@ -7351,6 +7367,8 @@ async fn replace_mcp_servers_streamable_http_serializes_custom_headers() -> anyh
             default_tools_approval_mode: None,
             enabled_tools: None,
             disabled_tools: None,
+            root_only_tools: None,
+            tool_approval_overrides: Default::default(),
             scopes: None,
             oauth: None,
             oauth_resource: None,
@@ -7436,6 +7454,8 @@ async fn replace_mcp_servers_streamable_http_removes_optional_sections() -> anyh
             default_tools_approval_mode: None,
             enabled_tools: None,
             disabled_tools: None,
+            root_only_tools: None,
+            tool_approval_overrides: Default::default(),
             scopes: None,
             oauth: None,
             oauth_resource: None,
@@ -7474,6 +7494,8 @@ async fn replace_mcp_servers_streamable_http_removes_optional_sections() -> anyh
             default_tools_approval_mode: None,
             enabled_tools: None,
             disabled_tools: None,
+            root_only_tools: None,
+            tool_approval_overrides: Default::default(),
             scopes: None,
             oauth: None,
             oauth_resource: None,
@@ -7548,6 +7570,8 @@ async fn replace_mcp_servers_streamable_http_isolates_headers_between_servers() 
                 default_tools_approval_mode: None,
                 enabled_tools: None,
                 disabled_tools: None,
+                root_only_tools: None,
+                tool_approval_overrides: Default::default(),
                 scopes: None,
                 oauth: None,
                 oauth_resource: None,
@@ -7576,6 +7600,8 @@ async fn replace_mcp_servers_streamable_http_isolates_headers_between_servers() 
                 default_tools_approval_mode: None,
                 enabled_tools: None,
                 disabled_tools: None,
+                root_only_tools: None,
+                tool_approval_overrides: Default::default(),
                 scopes: None,
                 oauth: None,
                 oauth_resource: None,
@@ -7666,6 +7692,8 @@ async fn replace_mcp_servers_serializes_disabled_flag() -> anyhow::Result<()> {
             default_tools_approval_mode: None,
             enabled_tools: None,
             disabled_tools: None,
+            root_only_tools: None,
+            tool_approval_overrides: Default::default(),
             scopes: None,
             oauth: None,
             oauth_resource: None,
@@ -7718,6 +7746,8 @@ async fn replace_mcp_servers_serializes_required_flag() -> anyhow::Result<()> {
             default_tools_approval_mode: None,
             enabled_tools: None,
             disabled_tools: None,
+            root_only_tools: None,
+            tool_approval_overrides: Default::default(),
             scopes: None,
             oauth: None,
             oauth_resource: None,
@@ -7770,6 +7800,8 @@ async fn replace_mcp_servers_serializes_tool_filters() -> anyhow::Result<()> {
             default_tools_approval_mode: None,
             enabled_tools: Some(vec!["allowed".to_string()]),
             disabled_tools: Some(vec!["blocked".to_string()]),
+            root_only_tools: None,
+            tool_approval_overrides: Default::default(),
             scopes: None,
             oauth: None,
             oauth_resource: None,
@@ -7827,6 +7859,8 @@ async fn replace_mcp_servers_streamable_http_serializes_oauth_resource() -> anyh
             default_tools_approval_mode: None,
             enabled_tools: None,
             disabled_tools: None,
+            root_only_tools: None,
+            tool_approval_overrides: Default::default(),
             scopes: None,
             oauth: Some(McpServerOAuthConfig {
                 client_id: Some("eci-prd-pub-codex-123".to_string()),
@@ -11629,16 +11663,31 @@ expose_spawn_agent_model_overrides = true
             subagent: Some("Catalog subagent base.".to_string()),
         }),
     );
+    // FORK: a configured hint is kept verbatim and the fork's own sections are
+    // appended after it, rather than being lost because the user replaced the
+    // bundled text.
     assert_eq!(
         (
-            usage_hints.root.map(|hint| hint.body()),
-            usage_hints.subagent.map(|hint| hint.body()),
+            usage_hints
+                .root
+                .map(|hint| without_fork_sections(&hint.body()).to_string()),
+            usage_hints
+                .subagent
+                .map(|hint| without_fork_sections(&hint.body()).to_string()),
         ),
         (
             Some("Root guidance.".to_string()),
             Some("Subagent guidance.".to_string()),
         )
     );
+}
+
+/// FORK: the portion of a usage hint before the fork's appended sections.
+fn without_fork_sections(hint: &str) -> &str {
+    match hint.find("\n\n## Reporting") {
+        Some(index) => &hint[..index],
+        None => hint,
+    }
 }
 
 #[test]
@@ -11659,13 +11708,17 @@ fn multi_agent_v2_exposes_model_overrides_by_default() {
             usage_hints_without_model_overrides.subagent,
         ),
     ] {
+        // FORK: compare the parts before the appended fork sections, which are
+        // identical either way and would otherwise break the prefix strip.
         let hint = hint.expect("default usage hints should be present").body();
+        let hint = without_fork_sections(&hint);
         let hint_without_model_overrides = hint_without_model_overrides
             .expect("default usage hints should be present without model overrides")
             .body();
+        let hint_without_model_overrides = without_fork_sections(&hint_without_model_overrides);
 
         let model_override_guidance = hint
-            .strip_prefix(hint_without_model_overrides.as_str())
+            .strip_prefix(hint_without_model_overrides)
             .expect("model-override guidance should extend the base usage hint");
         for required_fragment in [
             "Full-history forks",

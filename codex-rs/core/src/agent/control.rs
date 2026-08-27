@@ -104,6 +104,44 @@ pub(crate) struct LiveAgent {
 pub(crate) struct ListedAgent {
     pub(crate) agent_name: String,
     pub(crate) agent_status: AgentStatus,
+    /// FORK: which role the agent was spawned as, when it had one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) agent_role: Option<String>,
+    /// FORK: the model actually serving it, which a role or an override may
+    /// have changed from what the caller asked for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) model: Option<String>,
+    /// FORK: for a Claude-backed agent, the account it is spending.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) account: Option<String>,
+    /// FORK: what it was last seen doing. The line that lets a parent tell
+    /// "compiling" from "wedged" before reaching for `interrupt_agent`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) last_activity: Option<String>,
+    /// FORK: seconds since that observation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) idle_seconds: Option<u64>,
+}
+
+/// FORK: seconds elapsed since a Unix-millisecond timestamp, saturating.
+fn seconds_since(at_ms: u64) -> u64 {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or_default();
+    now_ms.saturating_sub(at_ms) / 1_000
+}
+
+/// FORK: the Claude account backing a thread, when it has one.
+fn claude_account_label(
+    codex_home: &std::path::Path,
+    thread_id: ThreadId,
+    model_provider_id: &str,
+) -> Option<String> {
+    if model_provider_id != codex_model_provider_info::CLAUDE_CODE_PROVIDER_ID {
+        return None;
+    }
+    crate::claude_code::thread_account_label(codex_home, thread_id)
 }
 
 /// Control-plane handle for multi-agent operations.
@@ -531,6 +569,11 @@ impl AgentControl {
             agents.push(ListedAgent {
                 agent_name: root_path.to_string(),
                 agent_status: root_thread.agent_status().await,
+                agent_role: None,
+                model: None,
+                account: None,
+                last_activity: None,
+                idle_seconds: None,
             });
         }
 
@@ -553,13 +596,41 @@ impl AgentControl {
                 .as_ref()
                 .map(ToString::to_string)
                 .unwrap_or_else(|| thread_id.to_string());
+            let thread_config = thread.config().await;
+            let (last_activity, idle_seconds) = match self.agent_activity(thread_id) {
+                Some(activity) => (Some(activity.label), Some(seconds_since(activity.at_ms))),
+                None => (None, None),
+            };
             agents.push(ListedAgent {
                 agent_name,
                 agent_status: thread.agent_status().await,
+                agent_role: metadata.agent_role.clone(),
+                model: thread_config.model.clone(),
+                account: claude_account_label(
+                    thread_config.codex_home.as_path(),
+                    thread_id,
+                    &thread_config.model_provider_id,
+                ),
+                last_activity,
+                idle_seconds,
             });
         }
 
         Ok(agents)
+    }
+
+    /// FORK: records what an agent was last seen doing, for `list_agents` and
+    /// for the line `wait_agent` prints when it times out.
+    pub(crate) fn record_agent_activity(&self, thread_id: ThreadId, label: String) {
+        self.state.record_activity(thread_id, label);
+    }
+
+    /// FORK: what an agent was last seen doing.
+    pub(crate) fn agent_activity(
+        &self,
+        thread_id: ThreadId,
+    ) -> Option<crate::agent::registry::AgentActivity> {
+        self.state.activity(thread_id)
     }
 
     /// Starts a detached watcher for sub-agents spawned from another thread.

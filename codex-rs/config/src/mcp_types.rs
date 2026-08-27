@@ -238,6 +238,31 @@ pub struct McpServerConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disabled_tools: Option<Vec<String>>,
 
+    /// FORK: tools only the root thread may see.
+    ///
+    /// `disabled_tools` is all-or-nothing, which is the wrong shape for the
+    /// Desktop's `codex_app` server: the user genuinely wants `create_thread`
+    /// and `send_message_to_thread` from their own thread, and genuinely does
+    /// not want a subagent reaching for them — a subagent that does produces
+    /// "sent from another task" cards in the user's thread and a permission
+    /// dialog per call. Listed tools stay `Direct` for the root and become
+    /// `Hidden` for every spawned agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_only_tools: Option<Vec<String>>,
+
+    /// FORK: per-tool approval decisions that outrank whatever the server (or a
+    /// plugin manifest) declared.
+    ///
+    /// Every other approval knob can only *tighten*, which is the right default
+    /// for a server describing its own tools — but it leaves no way to say "I
+    /// have decided about this one". The Desktop's `codex_app` declares
+    /// `approval_mode = "prompt"` for `send_message_to_thread`, and `prompt` is
+    /// unconditionally blocking, so the user is asked on every single call.
+    /// Only the user's own `config.toml` may write this; plugin policy never
+    /// touches it.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub tool_approval_overrides: HashMap<String, AppToolApproval>,
+
     /// Optional OAuth scopes to request during MCP login.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scopes: Option<Vec<String>>,
@@ -353,6 +378,12 @@ pub struct RawMcpServerConfig {
     pub enabled_tools: Option<Vec<String>>,
     #[serde(default)]
     pub disabled_tools: Option<Vec<String>>,
+    /// FORK: see `McpServerConfig::root_only_tools`.
+    #[serde(default)]
+    pub root_only_tools: Option<Vec<String>>,
+    /// FORK: see `McpServerConfig::tool_approval_overrides`.
+    #[serde(default)]
+    pub tool_approval_overrides: Option<HashMap<String, AppToolApproval>>,
     #[serde(default)]
     pub scopes: Option<Vec<String>>,
     #[serde(default)]
@@ -394,6 +425,8 @@ impl TryFrom<RawMcpServerConfig> for McpServerConfig {
             default_tools_approval_mode,
             enabled_tools,
             disabled_tools,
+            root_only_tools,
+            tool_approval_overrides,
             scopes,
             oauth,
             oauth_resource,
@@ -490,6 +523,8 @@ impl TryFrom<RawMcpServerConfig> for McpServerConfig {
             default_tools_approval_mode,
             enabled_tools,
             disabled_tools,
+            root_only_tools,
+            tool_approval_overrides: tool_approval_overrides.unwrap_or_default(),
             scopes,
             oauth,
             oauth_resource,

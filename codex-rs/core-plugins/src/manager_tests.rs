@@ -979,6 +979,8 @@ async fn load_plugins_loads_default_skills_and_mcp_servers() {
                     default_tools_approval_mode: None,
                     enabled_tools: None,
                     disabled_tools: None,
+                    root_only_tools: None,
+                    tool_approval_overrides: Default::default(),
                     scopes: None,
                     oauth: Some(McpServerOAuthConfig {
                         client_id: Some("client-id".to_string()),
@@ -1080,6 +1082,8 @@ enabled = true
                 default_tools_approval_mode: None,
                 enabled_tools: None,
                 disabled_tools: None,
+                root_only_tools: None,
+                tool_approval_overrides: Default::default(),
                 scopes: None,
                 oauth: None,
                 oauth_resource: None,
@@ -1131,6 +1135,7 @@ enabled = false
 default_tools_approval_mode = "approve"
 enabled_tools = ["search"]
 disabled_tools = ["delete"]
+root_only_tools = ["publish"]
 
 [plugins."sample@test".mcp_servers.sample.tools.search]
 approval_mode = "approve"
@@ -1150,6 +1155,9 @@ approval_mode = "approve"
     );
     assert_eq!(server.enabled_tools, Some(vec!["search".to_string()]));
     assert_eq!(server.disabled_tools, Some(vec!["delete".to_string()]));
+    // FORK: scoping a tool to the root thread travels with the rest of the
+    // per-server policy.
+    assert_eq!(server.root_only_tools, Some(vec!["publish".to_string()]));
     assert_eq!(
         server.tools.get("search"),
         Some(&McpServerToolConfig {
@@ -2181,6 +2189,8 @@ async fn load_plugins_uses_manifest_configured_component_paths() {
                     default_tools_approval_mode: None,
                     enabled_tools: None,
                     disabled_tools: None,
+                    root_only_tools: None,
+                    tool_approval_overrides: Default::default(),
                     scopes: None,
                     oauth: None,
                     oauth_resource: None,
@@ -2519,6 +2529,8 @@ async fn load_plugins_ignores_manifest_component_paths_without_dot_slash() {
                 default_tools_approval_mode: None,
                 enabled_tools: None,
                 disabled_tools: None,
+                root_only_tools: None,
+                tool_approval_overrides: Default::default(),
                 scopes: None,
                 oauth: None,
                 oauth_resource: None,
@@ -2774,6 +2786,8 @@ fn capability_index_filters_inactive_and_zero_capability_plugins() {
         default_tools_approval_mode: None,
         enabled_tools: None,
         disabled_tools: None,
+        root_only_tools: None,
+        tool_approval_overrides: Default::default(),
         scopes: None,
         oauth: None,
         oauth_resource: None,

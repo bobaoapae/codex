@@ -3144,3 +3144,50 @@ async fn hosted_web_search_and_standalone_image_generation_follow_runtime_gates(
     bedrock_with_standalone_web_search.assert_visible_contains(&["web_search"]);
     bedrock_with_standalone_web_search.assert_visible_lacks(&["web"]);
 }
+
+/// FORK: the Desktop declares `send_message_to_thread` and friends for the whole
+/// session, and a subagent reaching for them posts into the user's own thread as
+/// a "sent from another task" card. Scoping them to the root keeps them usable
+/// where the user wants them and unreachable where they cause that.
+#[test]
+fn root_only_tools_are_hidden_from_subagents_only() {
+    let scoped = [
+        "send_message_to_thread".to_string(),
+        "create_thread".to_string(),
+    ];
+
+    assert!(crate::tools::spec_plan::tool_is_root_only(
+        Some(&scoped),
+        "send_message_to_thread",
+        "send_message_to_thread",
+        /*is_subagent*/ true,
+    ));
+    // The root keeps them.
+    assert!(!crate::tools::spec_plan::tool_is_root_only(
+        Some(&scoped),
+        "send_message_to_thread",
+        "send_message_to_thread",
+        /*is_subagent*/ false,
+    ));
+    // A tool that was not scoped is untouched.
+    assert!(!crate::tools::spec_plan::tool_is_root_only(
+        Some(&scoped),
+        "search",
+        "search",
+        /*is_subagent*/ true,
+    ));
+    // A renamed tool is matched by either name, so a rename cannot open a hole.
+    assert!(crate::tools::spec_plan::tool_is_root_only(
+        Some(&scoped),
+        "create_thread",
+        "codex_app__create_thread",
+        /*is_subagent*/ true,
+    ));
+    // Nothing configured: nothing scoped.
+    assert!(!crate::tools::spec_plan::tool_is_root_only(
+        None,
+        "send_message_to_thread",
+        "send_message_to_thread",
+        /*is_subagent*/ true,
+    ));
+}

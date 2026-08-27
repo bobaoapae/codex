@@ -226,9 +226,12 @@ impl Default for GhostSnapshotConfig {
 pub(crate) const AGENTS_MD_MAX_BYTES: usize = DEFAULT_PROJECT_DOC_MAX_BYTES; // 32 KiB
 pub(crate) const DEFAULT_AGENT_MAX_THREADS: Option<usize> = Some(6);
 pub(crate) const DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION: usize = 4;
-pub(crate) const DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS: i64 = 10_000;
+// FORK: raised from 10s/30s. In 30 days of sessions, 13,942 of 28,986 waits
+// timed out — the parent was calling `wait_agent` again and again while its
+// children were still working, burning its own context on nothing.
+pub(crate) const DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS: i64 = 15_000;
 pub(crate) const DEFAULT_MULTI_AGENT_V2_MAX_WAIT_TIMEOUT_MS: i64 = 3600 * 1000;
-pub(crate) const DEFAULT_MULTI_AGENT_V2_DEFAULT_WAIT_TIMEOUT_MS: i64 = 30_000;
+pub(crate) const DEFAULT_MULTI_AGENT_V2_DEFAULT_WAIT_TIMEOUT_MS: i64 = 120_000;
 const DEFAULT_MULTI_AGENT_V2_TOOL_NAMESPACE: &str = "collaboration";
 
 pub(crate) const HARD_MIN_MULTI_AGENT_V2_TIMEOUT_MS: i64 = 0;
@@ -909,6 +912,10 @@ pub struct Config {
     /// abandoned. `None` waits forever.
     pub claude_code_idle_timeout_ms: Option<u64>,
 
+    /// FORK: upper bound on parent turns a Claude child may inherit. 0 (the
+    /// default) keeps every Claude child on task-only context.
+    pub claude_code_max_fork_turns: usize,
+
     /// FORK: Claude account this agent was pinned to at spawn time, if any.
     /// Set from `spawn_agent(account = …)` and persisted with the child thread,
     /// so its follow-up turns keep resuming the same Claude session.
@@ -1040,6 +1047,9 @@ pub struct Config {
 
     /// Whether to register the update_plan tool.
     pub update_plan_enabled: bool,
+
+    /// FORK: carry the `update_plan` checklist across a compaction.
+    pub tools_update_plan_survives_compaction: bool,
 
     /// Policy for collecting and validating tool runtimes.
     pub tool_registry: ToolRegistryConfig,
@@ -1283,6 +1293,15 @@ pub struct MultiAgentV2Config {
     pub usage_hint_text: Option<String>,
     pub root_agent_usage_hint_text: Option<String>,
     pub subagent_usage_hint_text: Option<String>,
+    /// FORK: appended to the resolved root hint; never replaces it.
+    pub root_agent_usage_hint_suffix: Option<String>,
+    /// FORK: appended to the resolved subagent hint; never replaces it.
+    pub subagent_usage_hint_suffix: Option<String>,
+    /// FORK: append the delivery-discipline hint to the root agent.
+    pub delivery_discipline_hint: bool,
+    /// FORK: Desktop threads created in one session before the result starts
+    /// warning about it. 0 disables the warning.
+    pub max_desktop_threads_per_session: usize,
     pub subagent_developer_instructions: Option<String>,
     pub multi_agent_mode_hint_text: Option<String>,
     pub tool_namespace: Option<String>,
@@ -1302,6 +1321,10 @@ impl MultiAgentV2Config {
             usage_hint_text: None,
             root_agent_usage_hint_text: None,
             subagent_usage_hint_text: None,
+            root_agent_usage_hint_suffix: None,
+            subagent_usage_hint_suffix: None,
+            delivery_discipline_hint: true,
+            max_desktop_threads_per_session: 4,
             subagent_developer_instructions: None,
             multi_agent_mode_hint_text: None,
             tool_namespace: Some(DEFAULT_MULTI_AGENT_V2_TOOL_NAMESPACE.to_string()),
@@ -2638,6 +2661,15 @@ fn resolve_experimental_request_user_input_enabled(config_toml: &ConfigToml) -> 
         .is_none_or(|config| config.enabled)
 }
 
+/// FORK: whether the `update_plan` checklist is re-injected after a compaction.
+fn resolve_update_plan_survives_compaction(config_toml: &ConfigToml) -> bool {
+    config_toml
+        .tools
+        .as_ref()
+        .and_then(|tools| tools.update_plan.as_ref())
+        .is_none_or(|config| config.survives_compaction)
+}
+
 fn resolve_update_plan_enabled(config_toml: &ConfigToml) -> bool {
     config_toml
         .tools
@@ -2720,6 +2752,18 @@ fn resolve_multi_agent_v2_config(config_toml: &ConfigToml) -> MultiAgentV2Config
     let subagent_usage_hint_text = base
         .and_then(|config| config.subagent_usage_hint_text.as_ref())
         .cloned();
+    let root_agent_usage_hint_suffix = base
+        .and_then(|config| config.root_agent_usage_hint_suffix.as_ref())
+        .cloned();
+    let subagent_usage_hint_suffix = base
+        .and_then(|config| config.subagent_usage_hint_suffix.as_ref())
+        .cloned();
+    let delivery_discipline_hint = base
+        .and_then(|config| config.delivery_discipline_hint)
+        .unwrap_or(default.delivery_discipline_hint);
+    let max_desktop_threads_per_session = base
+        .and_then(|config| config.max_desktop_threads_per_session)
+        .unwrap_or(default.max_desktop_threads_per_session);
     let wait_agent_enabled = base
         .and_then(|config| config.wait_agent_enabled)
         .unwrap_or(default.wait_agent_enabled);
@@ -2746,6 +2790,10 @@ fn resolve_multi_agent_v2_config(config_toml: &ConfigToml) -> MultiAgentV2Config
         usage_hint_text,
         root_agent_usage_hint_text,
         subagent_usage_hint_text,
+        root_agent_usage_hint_suffix,
+        subagent_usage_hint_suffix,
+        delivery_discipline_hint,
+        max_desktop_threads_per_session,
         subagent_developer_instructions,
         multi_agent_mode_hint_text,
         tool_namespace,
@@ -3670,6 +3718,7 @@ impl Config {
         let experimental_request_user_input_enabled =
             resolve_experimental_request_user_input_enabled(&cfg);
         let update_plan_enabled = resolve_update_plan_enabled(&cfg);
+        let tools_update_plan_survives_compaction = resolve_update_plan_survives_compaction(&cfg);
         let tool_registry = ToolRegistryConfig {
             error_on_tool_collisions: cfg
                 .features
@@ -4168,6 +4217,11 @@ impl Config {
                     .unwrap_or(DEFAULT_CLAUDE_CODE_IDLE_TIMEOUT_MS),
             )
             .filter(|timeout| *timeout > 0),
+            claude_code_max_fork_turns: cfg
+                .claude_code
+                .as_ref()
+                .and_then(|claude_code| claude_code.max_fork_turns)
+                .unwrap_or(0),
             // Only a spawn request sets this; it never comes from config.toml.
             claude_code_account_override: None,
             notify: cfg.notify,
@@ -4302,6 +4356,7 @@ impl Config {
             web_search_config,
             experimental_request_user_input_enabled,
             update_plan_enabled,
+            tools_update_plan_survives_compaction,
             tool_registry,
             code_mode,
             background_terminal_max_timeout,

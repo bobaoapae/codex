@@ -89,8 +89,21 @@ impl Handler {
             .await;
 
         let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
-        let outcome = wait_for_activity(&mut activity_rx, pending_activity, deadline).await;
-        let result = WaitAgentResult::from_outcome(outcome, requested_timeout_ms, timeout_ms);
+        let targets = args.targets.unwrap_or_default();
+        let mut outcome = wait_for_activity(&mut activity_rx, pending_activity, deadline).await;
+        // FORK: mail from an agent the caller did not ask about is not the event
+        // it was waiting for. Keep waiting until the deadline instead of
+        // returning and making it call again.
+        while outcome == WaitOutcome::MailboxActivity
+            && !targets.is_empty()
+            && !mailbox_matches_targets(&session, &targets).await
+        {
+            outcome =
+                wait_for_activity(&mut activity_rx, /*pending_activity*/ None, deadline).await;
+        }
+        let agents = live_agent_snapshots(&session, &turn).await;
+        let result =
+            WaitAgentResult::from_outcome(outcome, requested_timeout_ms, timeout_ms, agents);
 
         session
             .emit_turn_item_completed(
@@ -120,16 +133,73 @@ impl CoreToolRuntime for Handler {
     }
 }
 
+/// FORK: whether any waiting mail is from one of the named agents.
+///
+/// Matching is by prefix so `targets: ["/root/explorer"]` also wakes for that
+/// agent's own children, which report through it.
+async fn mailbox_matches_targets(
+    session: &crate::session::session::Session,
+    targets: &[String],
+) -> bool {
+    let authors = session.input_queue.pending_mailbox_authors().await;
+    authors.iter().any(|author| {
+        targets
+            .iter()
+            .any(|target| author == target || author.starts_with(&format!("{target}/")))
+    })
+}
+
+/// FORK: what every live agent was last observed doing.
+async fn live_agent_snapshots(
+    session: &crate::session::session::Session,
+    turn: &crate::session::turn_context::TurnContext,
+) -> Vec<WaitAgentSnapshot> {
+    let Ok(agents) = session
+        .services
+        .agent_control
+        .list_agents(&turn.session_source, /*path_prefix*/ None)
+        .await
+    else {
+        return Vec::new();
+    };
+    agents
+        .into_iter()
+        .map(|agent| WaitAgentSnapshot {
+            agent_name: agent.agent_name,
+            last_activity: agent.last_activity,
+            idle_seconds: agent.idle_seconds,
+        })
+        .collect()
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WaitArgs {
     timeout_ms: Option<i64>,
+    /// FORK: only wake for these agents.
+    #[serde(default)]
+    targets: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct WaitAgentResult {
     pub(crate) message: String,
     pub(crate) timed_out: bool,
+    /// FORK: what each live agent was last observed doing.
+    ///
+    /// A bare "wait timed out" told the parent nothing, so it interrupted on a
+    /// hunch. This is the line that distinguishes a child running `cargo test`
+    /// from one that has genuinely stopped.
+    pub(crate) agents: Vec<WaitAgentSnapshot>,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct WaitAgentSnapshot {
+    pub(crate) agent_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) last_activity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) idle_seconds: Option<u64>,
 }
 
 impl WaitAgentResult {
@@ -137,6 +207,7 @@ impl WaitAgentResult {
         outcome: WaitOutcome,
         requested_timeout_ms: Option<i64>,
         timeout_ms: i64,
+        agents: Vec<WaitAgentSnapshot>,
     ) -> Self {
         let message = match outcome {
             WaitOutcome::MailboxActivity => "Wait completed.",
@@ -149,9 +220,27 @@ impl WaitAgentResult {
             ),
             Some(_) | None => message.to_string(),
         };
+        // On a timeout, say what the agents are actually doing rather than
+        // leaving the parent to guess.
+        let message = if outcome == WaitOutcome::TimedOut && !agents.is_empty() {
+            let lines: Vec<String> = agents
+                .iter()
+                .map(|agent| match (&agent.last_activity, agent.idle_seconds) {
+                    (Some(activity), Some(idle)) => {
+                        format!("- {} {activity} {idle}s ago", agent.agent_name)
+                    }
+                    (Some(activity), None) => format!("- {} {activity}", agent.agent_name),
+                    _ => format!("- {} has not reported activity yet", agent.agent_name),
+                })
+                .collect();
+            format!("{message}\n\nLive agents:\n{}", lines.join("\n"))
+        } else {
+            message
+        };
         Self {
             message,
             timed_out: outcome == WaitOutcome::TimedOut,
+            agents,
         }
     }
 }

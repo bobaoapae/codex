@@ -25,6 +25,22 @@ use std::sync::atomic::Ordering;
 pub(crate) struct AgentRegistry {
     active_agents: Mutex<ActiveAgents>,
     total_count: AtomicUsize,
+    /// FORK: what each agent was last seen doing, and when.
+    ///
+    /// The parent had no way to tell a child that was compiling from one that
+    /// was wedged, so it interrupted on a hunch: 593 `interrupt_agent` calls in
+    /// 30 days, 70% of them aimed at children that were still working. One line
+    /// of "last ran `cargo test` 40s ago" is what makes that decision possible.
+    last_activity: Mutex<HashMap<ThreadId, AgentActivity>>,
+}
+
+/// FORK: the most recent thing an agent was observed doing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AgentActivity {
+    /// Unix milliseconds when it was observed.
+    pub(crate) at_ms: u64,
+    /// Short human label, e.g. "ran `cargo test`" or "edited src/lib.rs".
+    pub(crate) label: String,
 }
 
 #[derive(Default)]
@@ -55,6 +71,29 @@ pub(crate) struct AgentMetadata {
     pub(crate) agent_path: Option<AgentPath>,
     pub(crate) agent_nickname: Option<String>,
     pub(crate) agent_role: Option<String>,
+}
+
+impl AgentRegistry {
+    /// FORK: records what an agent was last seen doing.
+    pub(crate) fn record_activity(&self, thread_id: ThreadId, label: String) {
+        let at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as u64)
+            .unwrap_or_default();
+        self.last_activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(thread_id, AgentActivity { at_ms, label });
+    }
+
+    /// FORK: what an agent was last seen doing, if anything.
+    pub(crate) fn activity(&self, thread_id: ThreadId) -> Option<AgentActivity> {
+        self.last_activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&thread_id)
+            .cloned()
+    }
 }
 
 fn format_agent_nickname(name: &str, nickname_reset_count: usize) -> String {
