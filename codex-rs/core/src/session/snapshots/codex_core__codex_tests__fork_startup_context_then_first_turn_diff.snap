@@ -12,3 +12,4 @@ Scenario: First request after fork when startup preserves the parent baseline, t
     [01] <PERMISSIONS_INSTRUCTIONS>
     [02] <collaboration_mode>Fork turn collaboration instructions.</collaboration_mode>
 04:message/user:after fork
+05:message/developer:<plan_mode_reminder>Plan mode is still active (full instructions earlier in this conversation): ...

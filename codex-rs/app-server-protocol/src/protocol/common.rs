@@ -806,6 +806,18 @@ client_request_definitions! {
         serialization: thread_id(params.thread_id),
         response: v2::ThreadInjectItemsResponse,
     },
+    /// Fork extension: list the plans persisted by Plan mode, newest first.
+    PlanList => "plan/list" {
+        params: v2::PlanListParams,
+        serialization: global_shared_read("plans"),
+        response: v2::PlanListResponse,
+    },
+    /// Fork extension: read one saved plan, including its Markdown body.
+    PlanRead => "plan/read" {
+        params: v2::PlanReadParams,
+        serialization: global_shared_read("plans"),
+        response: v2::PlanReadResponse,
+    },
     SkillsList => "skills/list" {
         params: v2::SkillsListParams,
         serialization: global_shared_read("config"),

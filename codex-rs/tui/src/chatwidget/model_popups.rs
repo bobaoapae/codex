@@ -322,7 +322,8 @@ impl ChatWidget {
                     "built-in Plan default ({})",
                     Self::reasoning_effort_sentence_label(plan_effort)
                 ),
-                None => "built-in Plan default (no reasoning)".to_string(),
+                // FORK: the built-in Plan preset no longer pins an effort; it inherits the thread's.
+                None => "the session's reasoning effort".to_string(),
             }
         } else {
             "built-in Plan default".to_string()

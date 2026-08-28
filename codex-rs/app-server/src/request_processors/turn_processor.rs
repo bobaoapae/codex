@@ -3,6 +3,8 @@ use super::*;
 use codex_agent_extension::AgentInvocation;
 use codex_agent_extension::AgentRun;
 use codex_agent_extension::AgentRunner;
+use codex_models_manager::collaboration_mode_presets::plan_mode_instructions;
+use codex_protocol::config_types::ModeKind;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
@@ -381,6 +383,17 @@ impl TurnRequestProcessor {
         &self,
         mut collaboration_mode: CollaborationMode,
     ) -> CollaborationMode {
+        // FORK: Plan mode honors the optional `$CODEX_HOME/plan_mode.md` override.
+        if collaboration_mode.settings.developer_instructions.is_none()
+            && collaboration_mode.mode == ModeKind::Plan
+        {
+            let instructions = plan_mode_instructions(Some(&self.config.codex_home));
+            if !instructions.is_empty() {
+                collaboration_mode.settings.developer_instructions = Some(instructions);
+                return collaboration_mode;
+            }
+        }
+
         if collaboration_mode.settings.developer_instructions.is_none()
             && let Some(instructions) = builtin_collaboration_mode_presets()
                 .into_iter()

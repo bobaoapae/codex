@@ -253,6 +253,7 @@ mod plan_mode;
 mod plugin_catalog;
 mod popups_and_settings;
 mod review_mode;
+mod saved_plans;
 mod side;
 mod slash_commands;
 mod status_and_layout;

@@ -2549,6 +2549,26 @@ impl App {
                     .chat_widget
                     .add_error_message(format!("Failed to start the background server: {error}")),
             },
+            // FORK: `/plans` — saved Plan-mode plans.
+            AppEvent::OpenPlansPicker => {
+                self.open_plans_picker(app_server);
+            }
+            AppEvent::PlansPickerLoaded { request_id, result } => {
+                self.apply_plans_picker_result(request_id, result);
+            }
+            AppEvent::OpenSavedPlanActions { id, title } => {
+                self.chat_widget.show_saved_plan_actions(id, title);
+            }
+            AppEvent::LoadSavedPlan { id, action } => {
+                self.load_saved_plan(app_server, id, action);
+            }
+            AppEvent::SavedPlanLoaded {
+                request_id,
+                action,
+                result,
+            } => {
+                self.apply_saved_plan_loaded(request_id, action, result);
+            }
             AppEvent::OpenAgentPicker => {
                 self.open_agent_picker(app_server).await;
             }
@@ -2680,6 +2700,10 @@ impl App {
             }
             AppEvent::OpenReviewCustomPrompt => {
                 self.chat_widget.show_review_custom_prompt();
+            }
+            // FORK: prefill the composer so the user can dictate the plan revision.
+            AppEvent::SetComposerText { text } => {
+                self.chat_widget.set_composer_text(text);
             }
             AppEvent::SubmitUserMessageWithMode {
                 text,

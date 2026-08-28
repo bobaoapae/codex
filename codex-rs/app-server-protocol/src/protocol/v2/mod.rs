@@ -21,6 +21,8 @@ mod mcp;
 mod model;
 mod notification;
 mod permissions;
+/// FORK extension: saved Plan-mode plans.
+mod plan;
 mod plugin;
 mod plugin_search;
 mod process;
@@ -55,6 +57,7 @@ pub use mcp::*;
 pub use model::*;
 pub use notification::*;
 pub use permissions::*;
+pub use plan::*;
 pub use plugin::*;
 pub use plugin_search::*;
 pub use process::*;

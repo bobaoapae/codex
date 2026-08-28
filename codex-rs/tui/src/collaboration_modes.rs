@@ -1,8 +1,33 @@
 use codex_models_manager::collaboration_mode_presets::builtin_collaboration_mode_presets;
+use codex_models_manager::collaboration_mode_presets::plan_mode_instructions;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::config_types::ModeKind;
+use std::path::Path;
 
 use crate::model_catalog::ModelCatalog;
+
+/// FORK: replace the built-in Plan-mode developer instructions with
+/// `$CODEX_HOME/plan_mode.md` when that override file exists.
+///
+/// Applied where the active mask is installed rather than where the presets are built, so the
+/// preset list itself stays a pure function of the built-ins.
+pub(crate) fn apply_plan_instructions_override(
+    mask: &mut CollaborationModeMask,
+    codex_home: &Path,
+) {
+    if mask.mode != Some(ModeKind::Plan) {
+        return;
+    }
+    // Only rewrite instructions the mask already carries: a sparse mask (`None`) means "leave the
+    // current instructions alone", and a cleared one (`Some(None)`) means "no instructions".
+    if !matches!(mask.developer_instructions, Some(Some(_))) {
+        return;
+    }
+    let instructions = plan_mode_instructions(Some(codex_home));
+    if !instructions.is_empty() {
+        mask.developer_instructions = Some(Some(instructions));
+    }
+}
 
 fn filtered_presets(_model_catalog: &ModelCatalog) -> Vec<CollaborationModeMask> {
     builtin_collaboration_mode_presets()

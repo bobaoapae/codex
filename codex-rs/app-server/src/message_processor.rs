@@ -36,6 +36,7 @@ use crate::request_processors::MarketplaceRequestProcessor;
 use crate::request_processors::McpEventStreamReady;
 use crate::request_processors::McpEventStreams;
 use crate::request_processors::McpRequestProcessor;
+use crate::request_processors::PlanRequestProcessor;
 use crate::request_processors::PluginRequestProcessor;
 use crate::request_processors::ProcessExecRequestProcessor;
 use crate::request_processors::ProjectRequestProcessor;
@@ -152,6 +153,7 @@ pub(crate) struct MessageProcessor {
     marketplace_processor: MarketplaceRequestProcessor,
     mcp_processor: McpRequestProcessor,
     plugin_processor: PluginRequestProcessor,
+    plan_processor: PlanRequestProcessor,
     project_processor: ProjectRequestProcessor,
     remote_control_processor: RemoteControlRequestProcessor,
     search_processor: SearchRequestProcessor,
@@ -480,6 +482,7 @@ impl MessageProcessor {
             outgoing.clone(),
             queue_service,
         );
+        let plan_processor = PlanRequestProcessor::new(Arc::clone(&config));
         let project_processor = ProjectRequestProcessor::new(
             Arc::clone(&thread_store),
             outgoing.clone(),
@@ -574,6 +577,7 @@ impl MessageProcessor {
             marketplace_processor,
             mcp_processor,
             plugin_processor,
+            plan_processor,
             project_processor,
             remote_control_processor,
             search_processor,
@@ -1350,6 +1354,9 @@ impl MessageProcessor {
             ClientRequest::GetConversationSummary { params, .. } => {
                 self.thread_processor.conversation_summary(params).await
             }
+            // FORK extension: saved Plan-mode plans.
+            ClientRequest::PlanList { params, .. } => self.plan_processor.plan_list(params).await,
+            ClientRequest::PlanRead { params, .. } => self.plan_processor.plan_read(params).await,
             ClientRequest::SkillsList { params, .. } => {
                 self.catalog_processor.skills_list(params).await
             }

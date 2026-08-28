@@ -3951,6 +3951,9 @@ async fn status_line_reasoning_updates_on_mode_switch_without_manual_refresh() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.2")).await;
     chat.set_feature_enabled(Feature::CollaborationModes, /*enabled*/ true);
     chat.config.tui_status_line = Some(vec!["reasoning".to_string()]);
+    // The Plan preset inherits the thread effort; a Plan-only override is what makes the
+    // footer differ across modes.
+    chat.set_plan_mode_reasoning_effort(Some(ReasoningEffortConfig::Medium));
     chat.set_reasoning_effort(Some(ReasoningEffortConfig::High));
 
     assert_eq!(status_line_text(&chat), Some("high".to_string()));
@@ -3967,6 +3970,7 @@ async fn status_line_model_with_reasoning_updates_on_mode_switch_without_manual_
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.2")).await;
     chat.set_feature_enabled(Feature::CollaborationModes, /*enabled*/ true);
     chat.config.tui_status_line = Some(vec!["model-with-reasoning".to_string()]);
+    chat.set_plan_mode_reasoning_effort(Some(ReasoningEffortConfig::Medium));
     chat.set_reasoning_effort(Some(ReasoningEffortConfig::High));
 
     assert_eq!(status_line_text(&chat), Some("gpt-5.2 high".to_string()));
@@ -3993,6 +3997,7 @@ async fn status_line_model_with_reasoning_plan_mode_footer_snapshot() {
     chat.show_welcome_banner = false;
     chat.set_feature_enabled(Feature::CollaborationModes, /*enabled*/ true);
     chat.config.tui_status_line = Some(vec!["model-with-reasoning".to_string()]);
+    chat.set_plan_mode_reasoning_effort(Some(ReasoningEffortConfig::Medium));
     chat.set_reasoning_effort(Some(ReasoningEffortConfig::High));
 
     let plan_mask = collaboration_modes::plan_mask(chat.model_catalog.as_ref())

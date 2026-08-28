@@ -311,6 +311,8 @@ pub(crate) async fn run_turn(
     // 2. After auto-compact, when model/tool continuation needs to resume before any steer.
 
     let mut next_step_context = Some(first_step_context);
+    // FORK: the Plan-mode reminder is recorded once per turn, not once per model step.
+    let mut plan_mode_reminder_recorded = false;
     loop {
         // Note that pending_input would be something like a message the user
         // submitted through the UI while the model was running. Though the UI
@@ -374,6 +376,15 @@ pub(crate) async fn run_turn(
                 &window_id,
             )
             .await?;
+
+            // FORK: remind the model that Plan mode is still active.
+            super::plan_reminder::maybe_record_plan_mode_reminder(
+                sess.as_ref(),
+                turn_context.as_ref(),
+                step_context.as_ref(),
+                &mut plan_mode_reminder_recorded,
+            )
+            .await;
 
             world_state = sess
                 .record_step_world_state_if_changed(&world_state, step_context.as_ref())
@@ -2073,6 +2084,22 @@ async fn maybe_complete_plan_item_from_message(
         }
         if let Some(plan_text) = extract_proposed_plan_text(&text) {
             let (plan_text, _citations) = strip_citations(&plan_text);
+            if state.plan_item_state.completed {
+                return;
+            }
+            // FORK: persist the plan so it survives the session (see `codex-plans`).
+            if let Err(err) = codex_plans::save_plan(codex_plans::SavePlanRequest {
+                codex_home: turn_context.config.codex_home.clone(),
+                thread_id: sess.thread_id,
+                turn_id: turn_context.sub_id.clone(),
+                cwd: Some(turn_context.config.cwd.clone()),
+                model: Some(turn_context.model_info().slug.clone()),
+                markdown: plan_text.clone(),
+            })
+            .await
+            {
+                warn!("failed to persist proposed plan: {err}");
+            }
             if !state.plan_item_state.started {
                 state.plan_item_state.start(sess, turn_context).await;
             }

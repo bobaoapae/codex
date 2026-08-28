@@ -75,7 +75,7 @@ fn request_user_input_tool_includes_questions_schema() {
                                             Some(false.into()),
                                         ),
                                         Some(
-                                            "Provide 2-3 mutually exclusive choices. Put the recommended option first and suffix its label with \"(Recommended)\". Do not include an \"Other\" option in this list; the client will add a free-form \"Other\" option automatically."
+                                            "Provide 2-4 mutually exclusive choices. Put the recommended option first and suffix its label with \"(Recommended)\". Do not include an \"Other\" option in this list; the client will add a free-form \"Other\" option automatically."
                                                 .to_string(),
                                         ),
                                     ),
@@ -96,7 +96,7 @@ fn request_user_input_tool_includes_questions_schema() {
                             Some(false.into()),
                         ),
                         Some(
-                            "Questions to show the user. Prefer 1 and do not exceed 3".to_string(),
+                            "Questions to show the user. Batch related decisions of the same design choice in one call; 1 to 4 questions per call.".to_string(),
                         ),
                     ),
                 ),
@@ -177,14 +177,14 @@ fn request_user_input_unavailable_messages_respect_default_mode_feature_flag() {
 fn request_user_input_tool_description_mentions_available_modes() {
     assert_eq!(
         request_user_input_tool_description(&default_available_modes()),
-        "Request user input for one to three short questions and wait for the response. This tool is only available in Plan mode.".to_string()
+        "Request user input for one to four short questions and wait for the response. This tool is only available in Plan mode.".to_string()
     );
     assert_eq!(
         request_user_input_tool_description(&default_mode_enabled_available_modes()),
-        "Request user input for one to three short questions and wait for the response. This tool is only available in Default or Plan mode.".to_string()
+        "Request user input for one to four short questions and wait for the response. This tool is only available in Default or Plan mode.".to_string()
     );
     assert_eq!(
         request_user_input_tool_description(&[ModeKind::Default]),
-        "Request user input for one to three short questions and wait for the response. This tool is only available in Default mode.".to_string()
+        "Request user input for one to four short questions and wait for the response. This tool is only available in Default mode.".to_string()
     );
 }

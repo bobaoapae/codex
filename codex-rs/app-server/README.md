@@ -251,8 +251,19 @@ Example with notification opt-out:
 - `environment/info` — experimental; connect to a configured environment by `environmentId` and return its detected `shell` plus its default `cwd` as a canonical environment-native `file:` URI. Connection failures are returned as request errors.
 - `environment/status` — experimental; read the current status for one configured `environmentId`. Ready remote environments are probed over their existing exec-server connection without starting or reconnecting environments; the response reports `ready`, `pending`, `disconnected`, or `unknown`.
 - `thread/environment/connected` and `thread/environment/disconnected` — experimental; report exec-server connection transitions observed after thread startup for selected environments. Current connection state is not replayed.
-- `collaborationMode/list` — list available collaboration mode presets (experimental, no pagination). Built-in presets do not select a model; the Plan preset selects medium reasoning effort. This response omits built-in developer instructions; clients should either pass `settings.developer_instructions: null` when setting a mode to use Codex's built-in instructions, or provide their own instructions explicitly.
+- `collaborationMode/list` — list available collaboration mode presets (experimental, no pagination). Built-in presets do not select a model; the Plan preset inherits the thread's reasoning effort unless a client overrides it. This response omits built-in developer instructions; clients should either pass `settings.developer_instructions: null` when setting a mode to use Codex's built-in instructions, or provide their own instructions explicitly.
 - `skills/list` — list skills for one or more `cwd` values (optional `forceReload`).
+- `plan/list` — fork extension; list the plans Plan mode persisted under `$CODEX_HOME/plans/`, newest first, with cursor pagination (`cursor` is the last `id` returned; `limit` defaults to 50 and is clamped to 200). Filtering by project is client-side using each entry's `cwd`.
+- `plan/read` — fork extension; read one saved plan by `id`, returning its `plan` summary plus the Markdown `markdown` body. Unknown or unsafe ids (path separators, `.`, `..`) return `-32602`. To hand a saved plan to a new thread, send it as the first `turn/start` input, using the same `## My request for Codex:` delimiter the IDE context uses:
+
+  ```
+  # Saved plan: {title} ({path})
+
+  {markdown}
+
+  ## My request for Codex:
+  Implement this plan.
+  ```
 - `skills/extraRoots/set` — replace the app-server process runtime extra standalone skill roots. The roots are not persisted; missing directories are accepted and simply load no skills.
 - `hooks/list` — list discovered hooks for one or more `cwd` values.
 - `marketplace/add` — add a remote plugin marketplace from an HTTP(S) Git URL, SSH Git URL, or GitHub `owner/repo` shorthand, then persist it into the user marketplace config. Returns the installed root path plus whether the marketplace was already present.

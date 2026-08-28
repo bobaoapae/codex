@@ -125,7 +125,13 @@ impl ChatWidget {
                     from_replay,
                 );
             }
-            ThreadItem::Plan { text, .. } => self.on_plan_item_completed(text),
+            ThreadItem::Plan { text, .. } => {
+                self.on_plan_item_completed(text);
+                // FORK: only for live turns — replay/resume must not repeat the hint.
+                if !from_replay {
+                    self.on_plan_item_saved();
+                }
+            }
             ThreadItem::Reasoning {
                 summary, content, ..
             } => {

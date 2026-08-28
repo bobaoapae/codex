@@ -1,0 +1,1 @@
+Antes de eu aprovar: lista todas as decisões de design que tomaste por assunção (sem me perguntar). Para cada uma diz: (a) a alternativa que descartaste, (b) se na tua opinião devia ter sido uma pergunta para mim. Depois apresenta o plano final atualizado.

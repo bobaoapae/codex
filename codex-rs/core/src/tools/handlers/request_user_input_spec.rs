@@ -32,7 +32,7 @@ pub fn create_request_user_input_tool(description: String) -> ToolSpec {
             Some(vec!["label".to_string(), "description".to_string()]),
             Some(false.into()),
         ), Some(
-            "Provide 2-3 mutually exclusive choices. Put the recommended option first and suffix its label with \"(Recommended)\". Do not include an \"Other\" option in this list; the client will add a free-form \"Other\" option automatically."
+            "Provide 2-4 mutually exclusive choices. Put the recommended option first and suffix its label with \"(Recommended)\". Do not include an \"Other\" option in this list; the client will add a free-form \"Other\" option automatically."
                 .to_string(),
         ));
 
@@ -69,7 +69,10 @@ pub fn create_request_user_input_tool(description: String) -> ToolSpec {
             ]),
             Some(false.into()),
         ),
-        Some("Questions to show the user. Prefer 1 and do not exceed 3".to_string()),
+        Some(
+            "Questions to show the user. Batch related decisions of the same design choice in one call; 1 to 4 questions per call."
+                .to_string(),
+        ),
     );
 
     let properties = BTreeMap::from([("questions".to_string(), questions_schema)]);
@@ -123,7 +126,7 @@ pub(crate) fn normalize_request_user_input_tool_args(
 pub fn request_user_input_tool_description(available_modes: &[ModeKind]) -> String {
     let allowed_modes = format_allowed_modes(available_modes);
     format!(
-        "Request user input for one to three short questions and wait for the response. This tool is only available in {allowed_modes}."
+        "Request user input for one to four short questions and wait for the response. This tool is only available in {allowed_modes}."
     )
 }
 

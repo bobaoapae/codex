@@ -6,10 +6,7 @@ fn preset_names_use_mode_display_names() {
     assert_eq!(plan_preset().name, ModeKind::Plan.display_name());
     assert_eq!(default_preset().name, ModeKind::Default.display_name());
     assert_eq!(plan_preset().model, None);
-    assert_eq!(
-        plan_preset().reasoning_effort,
-        Some(Some(ReasoningEffort::Medium))
-    );
+    assert_eq!(plan_preset().reasoning_effort, None);
     assert_eq!(default_preset().model, None);
     assert_eq!(default_preset().reasoning_effort, None);
 }
@@ -32,5 +29,35 @@ fn default_mode_instructions_replace_mode_names_placeholder() {
     ));
     assert!(
         default_instructions.contains("ask the user directly with a concise plain-text question")
+    );
+}
+
+#[test]
+fn plan_mode_instructions_falls_back_to_builtin_without_override() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    assert_eq!(
+        plan_mode_instructions(Some(dir.path())),
+        COLLABORATION_MODE_PLAN
+    );
+    assert_eq!(plan_mode_instructions(None), COLLABORATION_MODE_PLAN);
+}
+
+#[test]
+fn plan_mode_instructions_uses_override_file_when_present() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let contents = "# Custom plan mode\n\nAsk everything.\n";
+    std::fs::write(dir.path().join(PLAN_MODE_INSTRUCTIONS_FILE), contents).expect("write override");
+
+    assert_eq!(plan_mode_instructions(Some(dir.path())), contents);
+}
+
+#[test]
+fn plan_mode_instructions_ignores_blank_override_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join(PLAN_MODE_INSTRUCTIONS_FILE), "   \n\t\n").expect("write blank");
+
+    assert_eq!(
+        plan_mode_instructions(Some(dir.path())),
+        COLLABORATION_MODE_PLAN
     );
 }

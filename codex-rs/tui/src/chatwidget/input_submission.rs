@@ -325,6 +325,8 @@ impl ChatWidget {
             return (false, None);
         }
 
+        // FORK: a plan loaded via `/plans` goes in front of the IDE context.
+        self.maybe_apply_pending_plan_context(&mut items);
         self.maybe_apply_ide_context(&mut items);
         crate::task_mentions::apply_task_references(&mut items, &mention_bindings, self.thread_id);
 

@@ -224,6 +224,7 @@ mod loaded_threads;
 mod pending_interactive_replay;
 mod permission_shortcuts;
 mod pets;
+mod plans_picker;
 mod platform_actions;
 mod plugin_mentions;
 mod recap;

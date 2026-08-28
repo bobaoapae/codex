@@ -1,0 +1,14 @@
+---
+source: tui/src/chatwidget/tests/saved_plans.rs
+expression: popup
+---
+  Load plan «Newer plan»?
+
+› 1. Implement this plan        Switch to Default mode and start coding from
+                                it.
+  2. Attach to my next message  Include the plan as hidden context with
+                                whatever you type next.
+  3. Revise in Plan mode        Ask the model to critique and re-emit the
+                                plan.
+
+  Press enter to confirm or esc to go back

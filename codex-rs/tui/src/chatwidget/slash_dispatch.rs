@@ -305,6 +305,14 @@ impl ChatWidget {
             SlashCommand::Plan => {
                 self.apply_plan_slash_command();
             }
+            // FORK: browse the plans persisted by Plan mode.
+            SlashCommand::Plans => {
+                if self.blocks_direct_input {
+                    self.add_error_message(PARENT_OWNED_INPUT_MESSAGE.to_string());
+                    return;
+                }
+                self.app_event_tx.send(AppEvent::OpenPlansPicker);
+            }
             SlashCommand::Goal => {
                 if !self.config.features.enabled(Feature::Goals) {
                     return;
@@ -1169,6 +1177,7 @@ impl ChatWidget {
             | SlashCommand::Model
             | SlashCommand::Personality
             | SlashCommand::Plan
+            | SlashCommand::Plans
             | SlashCommand::Goal
             | SlashCommand::Side
             | SlashCommand::Btw

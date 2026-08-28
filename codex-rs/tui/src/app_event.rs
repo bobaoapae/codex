@@ -24,6 +24,8 @@ use codex_app_server_protocol::MarketplaceRemoveResponse;
 use codex_app_server_protocol::MarketplaceUpgradeResponse;
 use codex_app_server_protocol::McpServerStatus;
 use codex_app_server_protocol::McpServerStatusDetail;
+use codex_app_server_protocol::PlanReadResponse;
+use codex_app_server_protocol::PlanSummary;
 use codex_app_server_protocol::PluginInstallResponse;
 use codex_app_server_protocol::PluginListResponse;
 use codex_app_server_protocol::PluginMarketplaceEntry;
@@ -209,6 +211,17 @@ pub(crate) enum ThreadTitleDestination {
 pub(crate) enum RecapTrigger {
     Automatic,
     Manual,
+}
+
+/// FORK: what to do with a plan loaded from `~/.codex/plans`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SavedPlanAction {
+    /// Switch to Default mode and implement it.
+    Implement,
+    /// Keep it around and prepend it to the next user message.
+    AttachToNextMessage,
+    /// Stay in Plan mode and ask the model to revise it.
+    Revise,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -413,6 +426,34 @@ pub(crate) enum AppEvent {
 
     /// Open the resume picker inside the running TUI session.
     OpenResumePicker,
+
+    /// FORK: open the saved-plans picker (`/plans`).
+    OpenPlansPicker,
+
+    /// FORK: saved plans fetched for the picker.
+    PlansPickerLoaded {
+        request_id: Uuid,
+        result: Result<Vec<PlanSummary>, String>,
+    },
+
+    /// FORK: show what to do with the saved plan the user selected.
+    OpenSavedPlanActions {
+        id: String,
+        title: String,
+    },
+
+    /// FORK: fetch one saved plan and apply `action` when it arrives.
+    LoadSavedPlan {
+        id: String,
+        action: SavedPlanAction,
+    },
+
+    /// FORK: the saved plan requested by [`AppEvent::LoadSavedPlan`].
+    SavedPlanLoaded {
+        request_id: Uuid,
+        action: SavedPlanAction,
+        result: Result<PlanReadResponse, String>,
+    },
 
     /// Open the Claude Code migration picker inside the running TUI session.
     OpenExternalAgentConfigMigration,
@@ -1214,6 +1255,11 @@ pub(crate) enum AppEvent {
 
     /// Open the custom prompt option from the review popup.
     OpenReviewCustomPrompt,
+
+    /// FORK: replace the composer text (used by the plan-revision affordance).
+    SetComposerText {
+        text: String,
+    },
 
     /// Submit a user message with an explicit collaboration mask.
     SubmitUserMessageWithMode {

@@ -2045,6 +2045,7 @@ dependencies = [
  "codex-model-provider-info",
  "codex-models-manager",
  "codex-otel",
+ "codex-plans",
  "codex-plugin",
  "codex-protocol",
  "codex-queue-extension",
@@ -2800,6 +2801,7 @@ dependencies = [
  "codex-models-manager",
  "codex-network-proxy",
  "codex-otel",
+ "codex-plans",
  "codex-plugin",
  "codex-prompts",
  "codex-protocol",
@@ -3928,6 +3930,22 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "codex-plans"
+version = "0.0.0"
+dependencies = [
+ "chrono",
+ "codex-protocol",
+ "codex-utils-absolute-path",
+ "codex-utils-path",
+ "pretty_assertions",
+ "serde",
+ "serde_yaml",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

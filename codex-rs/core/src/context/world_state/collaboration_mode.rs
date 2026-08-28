@@ -29,13 +29,25 @@ impl CollaborationModeState {
                 ModeKind::Plan => messages.plan.as_ref(),
             });
 
-        let instructions = catalog_instructions.cloned().or_else(|| {
-            collaboration_mode
-                .settings
-                .developer_instructions
-                .clone()
-                .filter(|instructions| !instructions.is_empty())
-        });
+        let settings_instructions = collaboration_mode
+            .settings
+            .developer_instructions
+            .clone()
+            .filter(|instructions| !instructions.is_empty());
+        // FORK: the remote model catalog still wins over client-supplied instructions, which
+        // silently disables the `$CODEX_HOME/plan_mode.md` override. Surface it instead of
+        // failing quietly.
+        if let Some(catalog_instructions) = catalog_instructions.as_ref()
+            && settings_instructions
+                .as_ref()
+                .is_some_and(|settings| settings != *catalog_instructions)
+        {
+            tracing::warn!(
+                mode = ?collaboration_mode.mode,
+                "remote model catalog collaboration-mode instructions override the client-supplied ones"
+            );
+        }
+        let instructions = catalog_instructions.cloned().or(settings_instructions);
         // Keep an empty-state snapshot so removing instructions clears retained history only once.
         let fragment = CollaborationModeInstructions {
             instructions: instructions.clone().unwrap_or_default(),

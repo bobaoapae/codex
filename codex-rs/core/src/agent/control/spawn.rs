@@ -9,6 +9,7 @@ use crate::context::DeveloperInstructions;
 use crate::context::ManagedDeveloperInstructions;
 use crate::context::MultiAgentModeInstructions;
 use crate::context::MultiAgentRoleInstructions;
+use crate::context::PlanModeReminder;
 use crate::context::world_state::PersistentModeState;
 use crate::session::multi_agents::resolve_usage_hints;
 use crate::tools::handlers::multi_agents_common::build_agent_resume_config;
@@ -116,6 +117,8 @@ fn retain_forked_developer_message(item: &mut ResponseItem, usage_hint_texts: &[
         !(MultiAgentRoleInstructions::matches_text(text)
             || MultiAgentModeInstructions::matches_text(text)
             || CurrentTimeReminder::matches_text(text)
+            // FORK: drop the per-turn Plan-mode reminder so subagents do not inherit N copies.
+            || PlanModeReminder::matches_text(text)
             || usage_hint_texts
                 .iter()
                 .any(|usage_hint_text| usage_hint_text == text))

@@ -253,12 +253,20 @@ impl ChatWidget {
     pub(super) fn open_plan_implementation_prompt(&mut self) {
         let default_mask = collaboration_modes::default_mode_mask(self.model_catalog.as_ref());
         let context_usage_label = self.plan_implementation_context_usage_label();
+        // FORK: prefer the active mask so the revision path keeps any ephemeral Plan effort,
+        // and fall back to the preset when the popup is opened outside Plan mode.
+        let plan_mask = self
+            .active_collaboration_mask
+            .clone()
+            .filter(|mask| mask.mode == Some(ModeKind::Plan))
+            .or_else(|| collaboration_modes::plan_mask(self.model_catalog.as_ref()));
 
         self.bottom_pane
             .show_selection_view(plan_implementation::selection_view_params(
                 default_mask,
                 self.transcript.latest_proposed_plan_markdown.as_deref(),
                 context_usage_label.as_deref(),
+                plan_mask,
             ));
         self.notify(Notification::PlanModePrompt {
             title: PLAN_IMPLEMENTATION_TITLE.to_string(),

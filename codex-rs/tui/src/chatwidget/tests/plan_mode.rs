@@ -181,6 +181,7 @@ async fn plan_implementation_clear_context_requires_default_mode_and_plan() {
         /*default_mask*/ None,
         Some("- Step\n"),
         /*clear_context_usage_label*/ None,
+        /*plan_mask*/ None,
     );
     assert_eq!(
         params.items[1].disabled_reason.as_deref(),
@@ -191,6 +192,7 @@ async fn plan_implementation_clear_context_requires_default_mode_and_plan() {
         Some(default_mask.clone()),
         /*plan_markdown*/ None,
         /*clear_context_usage_label*/ None,
+        /*plan_mask*/ None,
     );
     assert_eq!(
         params.items[1].disabled_reason.as_deref(),
@@ -201,6 +203,7 @@ async fn plan_implementation_clear_context_requires_default_mode_and_plan() {
         Some(default_mask.clone()),
         Some("  \n"),
         /*clear_context_usage_label*/ None,
+        /*plan_mask*/ None,
     );
     assert_eq!(
         params.items[1].disabled_reason.as_deref(),
@@ -211,6 +214,7 @@ async fn plan_implementation_clear_context_requires_default_mode_and_plan() {
         Some(default_mask.clone()),
         Some("- Step\n"),
         /*clear_context_usage_label*/ None,
+        /*plan_mask*/ None,
     );
     assert_eq!(params.items[1].disabled_reason, None);
     assert!(!params.items[1].actions.is_empty());
@@ -224,6 +228,7 @@ async fn plan_implementation_clear_context_requires_default_mode_and_plan() {
         Some(default_mask),
         Some("- Step\n"),
         Some("89% used"),
+        /*plan_mask*/ None,
     );
     assert_eq!(
         params.items[1].description.as_deref(),
@@ -329,9 +334,10 @@ async fn reasoning_selection_in_plan_mode_matching_plan_effort_but_different_glo
     let _ = drain_insert_history(&mut rx);
     set_chatgpt_auth(&mut chat);
 
-    // Reproduce: Plan effective reasoning remains the preset (medium), but the
-    // global default differs (high). Pressing Enter on the current Plan choice
+    // Reproduce: Plan effective reasoning is pinned by the Plan-only override (medium),
+    // but the global default differs (high). Pressing Enter on the current Plan choice
     // should open the scope prompt rather than silently rewriting the global default.
+    chat.set_plan_mode_reasoning_effort(Some(ReasoningEffortConfig::Medium));
     chat.set_reasoning_effort(Some(ReasoningEffortConfig::High));
 
     let preset = get_available_model(&chat, "gpt-5.4");
@@ -357,7 +363,7 @@ async fn reasoning_shortcut_in_plan_mode_updates_plan_override_without_prompt_or
         .expect("expected plan collaboration mode");
     chat.set_collaboration_mask(plan_mask);
     let _ = drain_insert_history(&mut rx);
-    chat.set_reasoning_effort(Some(ReasoningEffortConfig::High));
+    chat.set_reasoning_effort(Some(ReasoningEffortConfig::Medium));
 
     chat.handle_key_event(KeyEvent::new(KeyCode::Char('.'), KeyModifiers::ALT));
 
@@ -678,7 +684,7 @@ async fn plan_reasoning_scope_popup_mentions_built_in_plan_default_when_no_overr
     );
 
     let popup = render_bottom_popup(&chat, /*width*/ 100);
-    assert!(popup.contains("built-in Plan default (medium)"));
+    assert!(popup.contains("the session's reasoning effort"));
 }
 
 #[tokio::test]
@@ -1372,7 +1378,7 @@ async fn mode_switch_surfaces_model_change_notification_when_effective_model_cha
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        plan_messages.contains("Model changed to gpt-5.4-mini medium for Plan mode."),
+        plan_messages.contains("Model changed to gpt-5.4-mini default for Plan mode."),
         "expected Plan-mode model switch notice, got: {plan_messages:?}"
     );
 
@@ -1397,6 +1403,9 @@ async fn mode_switch_surfaces_model_change_notification_when_effective_model_cha
 async fn mode_switch_surfaces_reasoning_change_notification_when_model_stays_same() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.2")).await;
     chat.set_feature_enabled(Feature::CollaborationModes, /*enabled*/ true);
+    // The Plan preset inherits the thread effort, so only a Plan-only override makes the
+    // effective reasoning differ between modes.
+    chat.set_plan_mode_reasoning_effort(Some(ReasoningEffortConfig::Medium));
     chat.set_reasoning_effort(Some(ReasoningEffortConfig::High));
 
     let plan_mask = collaboration_modes::plan_mask(chat.model_catalog.as_ref())
@@ -1669,11 +1678,12 @@ async fn set_reasoning_effort_updates_active_collaboration_mask() {
         .expect("expected plan collaboration mask");
     chat.set_collaboration_mask(plan_mask);
 
-    chat.set_reasoning_effort(/*effort*/ None);
+    chat.set_reasoning_effort(Some(ReasoningEffortConfig::High));
 
+    // Without a Plan-only override the Plan mask follows the session effort.
     assert_eq!(
         chat.current_reasoning_effort(),
-        Some(ReasoningEffortConfig::Medium)
+        Some(ReasoningEffortConfig::High)
     );
     assert_eq!(chat.active_collaboration_mode_kind(), ModeKind::Plan);
 }
@@ -1799,4 +1809,165 @@ async fn plan_update_renders_history_cell() {
     assert!(blob.contains("Explore codebase"));
     assert!(blob.contains("Implement feature"));
     assert!(blob.contains("Write tests"));
+}
+
+#[tokio::test]
+async fn plan_mask_uses_codex_home_instructions_override() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.2")).await;
+    chat.set_feature_enabled(Feature::CollaborationModes, /*enabled*/ true);
+    let temp = tempdir().expect("tempdir");
+    chat.config.codex_home =
+        codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(temp.path())
+            .expect("temp dir is absolute");
+    let override_text = "# Custom plan mode\n\nAsk about everything.\n";
+    std::fs::write(temp.path().join("plan_mode.md"), override_text).expect("write override");
+
+    let plan_mask = collaboration_modes::mask_for_kind(chat.model_catalog.as_ref(), ModeKind::Plan)
+        .expect("expected plan collaboration mask");
+    chat.set_collaboration_mask(plan_mask);
+
+    assert_eq!(
+        chat.effective_collaboration_mode()
+            .settings
+            .developer_instructions
+            .as_deref(),
+        Some(override_text)
+    );
+}
+
+#[tokio::test]
+async fn plan_mask_falls_back_to_builtin_instructions_without_override() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.2")).await;
+    chat.set_feature_enabled(Feature::CollaborationModes, /*enabled*/ true);
+    let temp = tempdir().expect("tempdir");
+    chat.config.codex_home =
+        codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(temp.path())
+            .expect("temp dir is absolute");
+
+    let plan_mask = collaboration_modes::mask_for_kind(chat.model_catalog.as_ref(), ModeKind::Plan)
+        .expect("expected plan collaboration mask");
+    chat.set_collaboration_mask(plan_mask);
+
+    let instructions = chat
+        .effective_collaboration_mode()
+        .settings
+        .developer_instructions
+        .expect("plan mode should carry developer instructions");
+    assert!(instructions.contains("# Plan Mode (Conversational)"));
+    assert!(instructions.contains("Decision checkpoint (mandatory before the first plan)"));
+}
+
+/// FORK: the popup keeps a revision path instead of only yes/no.
+#[tokio::test]
+async fn plan_implementation_popup_decision_audit_emits_plan_mode_submit() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    chat.set_feature_enabled(Feature::CollaborationModes, /*enabled*/ true);
+    let plan_mask = collaboration_modes::plan_mask(chat.model_catalog.as_ref())
+        .expect("expected plan collaboration mode");
+    chat.set_collaboration_mask(plan_mask);
+    chat.on_plan_item_completed(
+        "- Step 1
+"
+        .to_string(),
+    );
+    let _ = drain_insert_history(&mut rx);
+    chat.open_plan_implementation_prompt();
+
+    for _ in 0..3 {
+        chat.handle_key_event(KeyEvent::from(KeyCode::Down));
+    }
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+    let submit = events
+        .iter()
+        .find_map(|event| match event {
+            AppEvent::SubmitUserMessageWithMode {
+                text,
+                collaboration_mode,
+            } => Some((text.clone(), collaboration_mode.clone())),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("expected SubmitUserMessageWithMode; events: {events:?}"));
+    assert_eq!(submit.0, plan_implementation::PLAN_DECISION_AUDIT_MESSAGE);
+    assert_eq!(submit.1.mode, Some(ModeKind::Plan));
+}
+
+#[tokio::test]
+async fn plan_implementation_popup_revise_prefills_composer() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    chat.set_feature_enabled(Feature::CollaborationModes, /*enabled*/ true);
+    let plan_mask = collaboration_modes::plan_mask(chat.model_catalog.as_ref())
+        .expect("expected plan collaboration mode");
+    chat.set_collaboration_mask(plan_mask);
+    chat.on_plan_item_completed(
+        "- Step 1
+"
+        .to_string(),
+    );
+    let _ = drain_insert_history(&mut rx);
+    chat.open_plan_implementation_prompt();
+
+    for _ in 0..4 {
+        chat.handle_key_event(KeyEvent::from(KeyCode::Down));
+    }
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+    let text = events
+        .iter()
+        .find_map(|event| match event {
+            AppEvent::SetComposerText { text } => Some(text.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("expected SetComposerText; events: {events:?}"));
+    assert_eq!(text, plan_implementation::PLAN_REVISE_COMPOSER_PREFIX);
+
+    chat.set_composer_text(text);
+    assert_eq!(
+        chat.bottom_pane.composer_text(),
+        plan_implementation::PLAN_REVISE_COMPOSER_PREFIX
+    );
+}
+
+#[tokio::test]
+async fn plan_implementation_revision_items_require_plan_mask() {
+    let (chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    let default_mask = collaboration_modes::default_mode_mask(chat.model_catalog.as_ref())
+        .expect("expected default collaboration mode");
+    let plan_mask = collaboration_modes::plan_mask(chat.model_catalog.as_ref())
+        .expect("expected plan collaboration mode");
+
+    let params = plan_implementation::selection_view_params(
+        Some(default_mask.clone()),
+        Some(
+            "- Step
+",
+        ),
+        /*clear_context_usage_label*/ None,
+        /*plan_mask*/ None,
+    );
+    for index in [3, 4] {
+        assert_eq!(
+            params.items[index].disabled_reason.as_deref(),
+            Some(plan_implementation::PLAN_IMPLEMENTATION_PLAN_UNAVAILABLE)
+        );
+        assert!(params.items[index].actions.is_empty());
+    }
+
+    let params = plan_implementation::selection_view_params(
+        Some(default_mask),
+        Some(
+            "- Step
+",
+        ),
+        /*clear_context_usage_label*/ None,
+        Some(plan_mask),
+    );
+    for index in [3, 4] {
+        assert_eq!(params.items[index].disabled_reason, None);
+        assert!(!params.items[index].actions.is_empty());
+    }
+    // The first three rows keep their indices so existing keyboard flows are unchanged.
+    assert_eq!(params.items.len(), 5);
 }

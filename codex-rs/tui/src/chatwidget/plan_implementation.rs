@@ -19,6 +19,16 @@ pub(super) const PLAN_IMPLEMENTATION_CLEAR_CONTEXT_PREFIX: &str = concat!(
 );
 pub(super) const PLAN_IMPLEMENTATION_DEFAULT_UNAVAILABLE: &str = "Default mode unavailable";
 pub(super) const PLAN_IMPLEMENTATION_NO_APPROVED_PLAN: &str = "No approved plan available";
+/// FORK: revision path out of the approval popup.
+const PLAN_IMPLEMENTATION_DECISION_AUDIT: &str = "Ask me the open decisions first";
+const PLAN_IMPLEMENTATION_REVISE: &str = "Revise the plan…";
+pub(super) const PLAN_IMPLEMENTATION_PLAN_UNAVAILABLE: &str = "Plan mode unavailable";
+pub(super) const PLAN_REVISE_COMPOSER_PREFIX: &str = "Revise the plan: ";
+pub(super) const PLAN_DECISION_AUDIT_MESSAGE: &str = concat!(
+    "Before I approve: list every design decision you resolved by assumption; for each, the ",
+    "alternative you rejected and whether it should have been a question. Ask me the ones that ",
+    "are mine to make via request_user_input, then re-emit the complete <proposed_plan>."
+);
 
 /// Builds the confirmation prompt shown after a plan is approved in Plan mode.
 ///
@@ -29,6 +39,7 @@ pub(super) fn selection_view_params(
     default_mask: Option<CollaborationModeMask>,
     plan_markdown: Option<&str>,
     clear_context_usage_label: Option<&str>,
+    plan_mask: Option<CollaborationModeMask>,
 ) -> SelectionViewParams {
     let (implement_actions, implement_disabled_reason) = match default_mask.clone() {
         Some(mask) => {
@@ -69,6 +80,32 @@ pub(super) fn selection_view_params(
         ),
     };
 
+    // FORK: staying in Plan mode with a concrete next step, instead of only yes/no.
+    let (decision_audit_actions, plan_disabled_reason) = match plan_mask {
+        Some(mask) => {
+            let actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
+                tx.send(AppEvent::SubmitUserMessageWithMode {
+                    text: PLAN_DECISION_AUDIT_MESSAGE.to_string(),
+                    collaboration_mode: mask.clone(),
+                });
+            })];
+            (actions, None)
+        }
+        None => (
+            Vec::new(),
+            Some(PLAN_IMPLEMENTATION_PLAN_UNAVAILABLE.to_string()),
+        ),
+    };
+    let revise_actions: Vec<SelectionAction> = if plan_disabled_reason.is_none() {
+        vec![Box::new(|tx| {
+            tx.send(AppEvent::SetComposerText {
+                text: PLAN_REVISE_COMPOSER_PREFIX.to_string(),
+            });
+        })]
+    } else {
+        Vec::new()
+    };
+
     let clear_context_description = clear_context_usage_label.map_or_else(
         || "Fresh thread with this plan.".to_string(),
         |label| format!("Fresh thread. Context: {label}."),
@@ -105,6 +142,29 @@ pub(super) fn selection_view_params(
                 selected_description: None,
                 is_current: false,
                 actions: Vec::new(),
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: PLAN_IMPLEMENTATION_DECISION_AUDIT.to_string(),
+                description: Some(
+                    "The model lists what it assumed and asks you the product decisions before you approve."
+                        .to_string(),
+                ),
+                selected_description: None,
+                is_current: false,
+                actions: decision_audit_actions,
+                disabled_reason: plan_disabled_reason.clone(),
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: PLAN_IMPLEMENTATION_REVISE.to_string(),
+                description: Some("Stay in Plan mode and tell the model what to change.".to_string()),
+                selected_description: None,
+                is_current: false,
+                actions: revise_actions,
+                disabled_reason: plan_disabled_reason,
                 dismiss_on_select: true,
                 ..Default::default()
             },

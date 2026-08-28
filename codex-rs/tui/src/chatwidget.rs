@@ -383,6 +383,8 @@ use self::plugins::PluginInstallAuthFlowState;
 use self::plugins::PluginListFetchState;
 use self::plugins::PluginsCacheState;
 mod plan_implementation;
+/// FORK: `/plans` — plans persisted by Plan mode.
+pub(crate) mod saved_plans;
 use self::plan_implementation::PLAN_IMPLEMENTATION_TITLE;
 mod model_popups;
 mod notifications;
@@ -634,6 +636,8 @@ pub(crate) struct ChatWidget {
     mcp_startup_pending_next_round_saw_starting: bool,
     connectors: ConnectorsState,
     ide_context: IdeContextState,
+    /// FORK: state for `/plans`.
+    saved_plans: saved_plans::SavedPlansState,
     plugins_cache: PluginsCacheState,
     plugins_fetch_state: PluginListFetchState,
     plugin_remote_sections_loading: bool,
@@ -1733,6 +1737,12 @@ impl ChatWidget {
 
     pub(crate) fn insert_str(&mut self, text: &str) {
         self.bottom_pane.insert_str(text);
+    }
+
+    /// FORK: replace the composer contents (plan-revision affordance).
+    pub(crate) fn set_composer_text(&mut self, text: String) {
+        self.bottom_pane
+            .set_composer_text(text, Vec::new(), Vec::new());
     }
 
     pub(crate) fn set_remote_image_urls(&mut self, remote_image_urls: Vec<String>) {

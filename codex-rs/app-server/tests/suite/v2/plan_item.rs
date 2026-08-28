@@ -9,6 +9,10 @@ use codex_app_server_protocol::ItemCompletedNotification;
 use codex_app_server_protocol::ItemStartedNotification;
 use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::PlanDeltaNotification;
+use codex_app_server_protocol::PlanListParams;
+use codex_app_server_protocol::PlanListResponse;
+use codex_app_server_protocol::PlanReadParams;
+use codex_app_server_protocol::PlanReadResponse;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::TurnCompletedNotification;
@@ -55,7 +59,7 @@ async fn plan_mode_uses_proposed_plan_block_for_plan_item() -> Result<()> {
         .build_initialized()
         .await?;
 
-    let turn = start_plan_mode_turn(&mut mcp).await?;
+    let (turn, thread_id) = start_plan_mode_turn(&mut mcp).await?;
     let (_, completed_items, plan_deltas, turn_completed) =
         collect_turn_notifications(&mut mcp).await?;
     wait_for_responses_request_count(&server, /*expected_count*/ 1).await?;
@@ -93,6 +97,37 @@ async fn plan_mode_uses_proposed_plan_block_for_plan_item() -> Result<()> {
         "agent message items should still be emitted alongside the plan item"
     );
 
+    // FORK: the plan is also persisted under $CODEX_HOME/plans and readable via plan/list + plan/read.
+    let listed: PlanListResponse = mcp
+        .request(|request_id| ClientRequest::PlanList {
+            request_id,
+            params: PlanListParams::default(),
+        })
+        .await?;
+    assert_eq!(listed.data.len(), 1, "expected one saved plan: {listed:?}");
+    let summary = &listed.data[0];
+    assert_eq!(summary.title, "Final plan");
+    assert_eq!(summary.thread_id.as_deref(), Some(thread_id.as_str()));
+    assert_eq!(summary.revision, 1);
+    assert_eq!(listed.next_cursor, None);
+
+    let read: PlanReadResponse = mcp
+        .request(|request_id| ClientRequest::PlanRead {
+            request_id,
+            params: PlanReadParams {
+                id: summary.id.clone(),
+            },
+        })
+        .await?;
+    assert_eq!(
+        read.markdown,
+        "# Final plan
+- first
+- second
+"
+    );
+    assert_eq!(read.plan.id, summary.id);
+
     Ok(())
 }
 
@@ -117,7 +152,7 @@ async fn plan_mode_without_proposed_plan_does_not_emit_plan_item() -> Result<()>
         .build_initialized()
         .await?;
 
-    let _turn = start_plan_mode_turn(&mut mcp).await?;
+    let (_turn, _thread_id) = start_plan_mode_turn(&mut mcp).await?;
     let (_, completed_items, plan_deltas, _) = collect_turn_notifications(&mut mcp).await?;
     wait_for_responses_request_count(&server, /*expected_count*/ 1).await?;
 
@@ -130,7 +165,9 @@ async fn plan_mode_without_proposed_plan_does_not_emit_plan_item() -> Result<()>
     Ok(())
 }
 
-async fn start_plan_mode_turn(mcp: &mut TestAppServer) -> Result<codex_app_server_protocol::Turn> {
+async fn start_plan_mode_turn(
+    mcp: &mut TestAppServer,
+) -> Result<(codex_app_server_protocol::Turn, String)> {
     let thread = mcp
         .start_thread(ThreadStartParams {
             model: Some("mock-model".to_string()),
@@ -147,6 +184,7 @@ async fn start_plan_mode_turn(mcp: &mut TestAppServer) -> Result<codex_app_serve
             developer_instructions: None,
         },
     };
+    let thread_id = thread.id.clone();
     let response: TurnStartResponse = mcp
         .request(|request_id| ClientRequest::TurnStart {
             request_id,
@@ -162,7 +200,7 @@ async fn start_plan_mode_turn(mcp: &mut TestAppServer) -> Result<codex_app_serve
             },
         })
         .await?;
-    Ok(response.turn)
+    Ok((response.turn, thread_id))
 }
 
 async fn collect_turn_notifications(

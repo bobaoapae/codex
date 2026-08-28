@@ -40,6 +40,8 @@ pub enum SlashCommand {
     Compact,
     Recap,
     Plan,
+    /// FORK: browse plans saved by Plan mode.
+    Plans,
     Goal,
     Agents,
     Side,
@@ -128,6 +130,7 @@ impl SlashCommand {
             }
             SlashCommand::Personality => "choose a communication style for Codex",
             SlashCommand::Plan => "switch to Plan mode",
+            SlashCommand::Plans => "browse saved plans and load one into this session",
             SlashCommand::Goal => "set or view the goal for a long-running task",
             SlashCommand::Agents => "view and switch between all active agent sessions",
             SlashCommand::MultiAgents => "switch between this session's subagents",
@@ -223,6 +226,7 @@ impl SlashCommand {
             | SlashCommand::Import
             | SlashCommand::Review
             | SlashCommand::Plan
+            | SlashCommand::Plans
             | SlashCommand::Cd
             | SlashCommand::Clear
             | SlashCommand::Logout

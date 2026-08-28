@@ -1,0 +1,11 @@
+---
+source: tui/src/chatwidget/tests/saved_plans.rs
+expression: popup
+---
+  Saved plans
+
+
+› Newer plan  <updated_at> · project · rev 2
+  Older plan  <updated_at> · other · rev 2
+
+  Press enter to confirm or esc to go back

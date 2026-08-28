@@ -13,7 +13,7 @@ const MAX_OPEN_TABS_CHARS: usize = 20_000;
 // raw prompt before this marker, then transcript rendering strips back to the request after the last
 // marker. Keeping the same marker and stripping semantics lets threads created with IDE context in
 // one surface replay cleanly in the others.
-const PROMPT_REQUEST_BEGIN: &str = "## My request for Codex:";
+pub(crate) const PROMPT_REQUEST_BEGIN: &str = "## My request for Codex:";
 
 pub(crate) fn apply_ide_context_to_user_input(
     context: &IdeContext,
@@ -73,7 +73,11 @@ pub(crate) fn extract_prompt_request_with_offset(message: &str) -> (&str, usize)
     (trimmed_request, request_start + leading_trimmed_len)
 }
 
-fn prefixed_text_input(prefix: String, text: String, text_elements: Vec<TextElement>) -> UserInput {
+pub(crate) fn prefixed_text_input(
+    prefix: String,
+    text: String,
+    text_elements: Vec<TextElement>,
+) -> UserInput {
     let prefix_len = prefix.len();
     UserInput::Text {
         text: format!("{prefix}{text}"),

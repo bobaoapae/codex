@@ -68,3 +68,42 @@ Every key is optional. Durations are milliseconds. The driver also honors
 | `turn_ttl_ms` | `3600000` | Lifetime of a turn token in the daemon. |
 | `connector_mention_strategy` | `"auto"` | How the connector is attached to the composer: `auto` (mention in the background, activate the tab only if the menu never mounts), `background_only`, or `activate`. |
 | `manual_mcp_url` | unset | Public MCP URL of the daemon when `tunnel = "manual"`. |
+
+## Plan mode (fork)
+
+Fork-only additions to Plan mode.
+
+### `$CODEX_HOME/plan_mode.md` — override the Plan-mode instructions
+
+When this file exists and is not blank, its contents replace the built-in
+Plan-mode developer instructions for every Plan-mode turn (TUI and app-server
+clients alike). Delete the file to go back to the built-in template. The file is
+read when the Plan mask is applied, so editing it takes effect on the next turn
+— no rebuild and no restart.
+
+Caveat: if the remote model catalog ever ships its own
+`model_messages.collaboration_modes.plan`, that still takes precedence over both
+the override and the built-in template. Codex logs a warning when that happens.
+
+### Plan-mode reasoning effort
+
+The built-in Plan preset no longer pins medium reasoning effort; Plan mode
+inherits the thread's effort. Set `plan_mode_reasoning_effort` in `config.toml`
+(or `/model` → "Apply to Plan mode override") only when you want Plan mode
+pinned to a specific effort regardless of the session's.
+
+### Saved plans and `/plans`
+
+Every plan Codex emits in a `<proposed_plan>` block is written to
+`$CODEX_HOME/plans/<timestamp>-<slug>.md` with YAML front matter (`title`,
+`thread_id`, `turn_id`, `cwd`, `model`, `created_at`, `updated_at`, `revision`).
+One file per thread: revising a plan in the same thread rewrites that file and
+bumps `revision`, and an unchanged plan body is not rewritten at all.
+
+`/plans` in the TUI lists the saved plans and offers three actions for the one
+you pick: implement it in Default mode, attach it as hidden context to your next
+message, or revise it in Plan mode. App-server clients read the same data
+through the `plan/list` and `plan/read` methods.
+
+Plans are kept indefinitely; delete files from `$CODEX_HOME/plans/` to remove
+them.

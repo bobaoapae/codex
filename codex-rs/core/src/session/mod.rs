@@ -225,6 +225,8 @@ mod mcp_prewarm;
 mod mcp_refresh;
 mod mcp_runtime;
 pub(crate) mod multi_agents;
+/// FORK: per-turn Plan-mode reminder.
+mod plan_reminder;
 mod review;
 mod rollout_budget;
 mod rollout_reconstruction;

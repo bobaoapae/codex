@@ -156,22 +156,25 @@ impl ChatWidget {
         self.refresh_model_dependent_surfaces();
     }
 
-    /// Set the reasoning effort for the non-Plan collaboration mode.
+    /// Set the reasoning effort for the session.
     ///
-    /// Does not touch the active Plan mask — Plan reasoning is controlled
-    /// exclusively by the Plan preset and `set_plan_mode_reasoning_effort`.
+    /// Touches the active Plan mask as well, unless a Plan-only override
+    /// (`plan_mode_reasoning_effort`) is configured — that override is owned by
+    /// `set_plan_mode_reasoning_effort`.
     pub(crate) fn set_reasoning_effort(&mut self, effort: Option<ReasoningEffortConfig>) {
         self.current_collaboration_mode = self.current_collaboration_mode.with_updates(
             /*model*/ None,
             Some(effort.clone()),
             /*developer_instructions*/ None,
         );
+        // FORK: without a Plan-only override the Plan preset inherits the session effort, so
+        // global updates must reach the active Plan mask too. With an override in place the
+        // Plan mask stays owned by `set_plan_mode_reasoning_effort`.
+        let plan_override_active = self.config.plan_mode_reasoning_effort.is_some();
         if self.collaboration_modes_enabled()
             && let Some(mask) = self.active_collaboration_mask.as_mut()
-            && mask.mode != Some(ModeKind::Plan)
+            && !(plan_override_active && mask.mode == Some(ModeKind::Plan))
         {
-            // Generic "global default" updates should not mutate the active Plan mask.
-            // Plan reasoning is controlled by the Plan preset and Plan-only override updates.
             mask.reasoning_effort = Some(effort);
         }
         self.refresh_model_dependent_surfaces();
@@ -659,6 +662,8 @@ impl ChatWidget {
         {
             mask.reasoning_effort = Some(Some(effort));
         }
+        // FORK: honor the optional `$CODEX_HOME/plan_mode.md` instructions override.
+        collaboration_modes::apply_plan_instructions_override(&mut mask, &self.config.codex_home);
         self.active_collaboration_mask = Some(mask);
         self.update_collaboration_mode_indicator();
         self.refresh_model_dependent_surfaces();

@@ -86,3 +86,73 @@ async fn plan_mode_uses_contributed_turn_item_for_last_agent_message() {
         Some("plan contributed assistant text")
     );
 }
+
+/// FORK: the Plan-mode reminder is recorded once per turn and only in Plan mode.
+#[tokio::test]
+async fn plan_mode_reminder_is_recorded_once_per_plan_turn() {
+    use crate::session::plan_reminder::maybe_record_plan_mode_reminder;
+    use crate::session::step_context::StepContext;
+    use crate::session::tests::update_selected_settings_for_test;
+    use codex_protocol::config_types::ModeKind;
+
+    let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+    let mut turn_context = turn_context;
+    crate::session::tests::update_turn_settings_for_test(&mut turn_context, |settings| {
+        update_selected_settings_for_test(settings, |selected| {
+            selected.collaboration_mode.mode = ModeKind::Plan;
+        });
+    });
+    let turn_context = Arc::new(turn_context);
+    let step_context = StepContext::for_test(Arc::clone(&turn_context));
+
+    let mut recorded = false;
+    maybe_record_plan_mode_reminder(&session, &turn_context, &step_context, &mut recorded).await;
+    assert!(recorded);
+    // A second model step within the same turn must not add another reminder.
+    maybe_record_plan_mode_reminder(&session, &turn_context, &step_context, &mut recorded).await;
+
+    assert_eq!(count_plan_mode_reminders(&session).await, 1);
+}
+
+#[tokio::test]
+async fn plan_mode_reminder_is_not_recorded_outside_plan_mode() {
+    use crate::session::plan_reminder::maybe_record_plan_mode_reminder;
+    use crate::session::step_context::StepContext;
+    use codex_protocol::config_types::ModeKind;
+
+    let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+    let turn_context = Arc::new(turn_context);
+    assert_eq!(
+        turn_context
+            .initial_settings
+            .selected()
+            .collaboration_mode
+            .mode,
+        ModeKind::Default
+    );
+    let step_context = StepContext::for_test(Arc::clone(&turn_context));
+
+    let mut recorded = false;
+    maybe_record_plan_mode_reminder(&session, &turn_context, &step_context, &mut recorded).await;
+
+    assert!(!recorded);
+    assert_eq!(count_plan_mode_reminders(&session).await, 0);
+}
+
+async fn count_plan_mode_reminders(session: &Session) -> usize {
+    use crate::context::ContextualUserFragment;
+    use crate::context::PlanModeReminder;
+
+    session
+        .clone_history()
+        .await
+        .into_raw_items()
+        .iter()
+        .filter(|item| match item {
+            ResponseItem::Message { content, .. } => content.iter().any(|content_item| {
+                matches!(content_item, ContentItem::InputText { text } if PlanModeReminder::matches_text(text))
+            }),
+            _ => false,
+        })
+        .count()
+}

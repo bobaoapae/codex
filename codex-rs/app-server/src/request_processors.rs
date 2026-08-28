@@ -552,6 +552,8 @@ mod marketplace_processor;
 mod mcp_event_stream;
 mod mcp_processor;
 mod persisted_resume_settings;
+/// FORK extension: `plan/list` + `plan/read`.
+mod plan_processor;
 mod plugins;
 mod process_exec_processor;
 mod projects;
@@ -582,6 +584,7 @@ pub(crate) use marketplace_processor::MarketplaceRequestProcessor;
 pub(crate) use mcp_event_stream::McpEventStreamReady;
 pub(crate) use mcp_event_stream::McpEventStreams;
 pub(crate) use mcp_processor::McpRequestProcessor;
+pub(crate) use plan_processor::PlanRequestProcessor;
 pub(crate) use plugins::PluginRequestProcessor;
 pub(crate) use process_exec_processor::ProcessExecRequestProcessor;
 pub(crate) use projects::ProjectRequestProcessor;

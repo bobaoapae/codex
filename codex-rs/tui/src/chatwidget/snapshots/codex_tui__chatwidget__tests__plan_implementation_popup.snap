@@ -7,5 +7,10 @@ expression: popup
 › 1. Yes, implement this plan          Switch to Default and start coding.
   2. Yes, clear context and implement  Fresh thread with this plan.
   3. No, stay in Plan mode             Continue planning with the model.
+  4. Ask me the open decisions first   The model lists what it assumed and
+                                       asks you the product decisions before
+                                       you approve.
+  5. Revise the plan…                  Stay in Plan mode and tell the model
+                                       what to change.
 
   Press enter to confirm or esc to go back
