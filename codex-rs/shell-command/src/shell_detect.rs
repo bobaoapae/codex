@@ -132,6 +132,43 @@ fn file_exists(path: &std::path::Path) -> Option<PathBuf> {
     }
 }
 
+/// FORK (verified live on Windows): whether `path` is inside an MSIX package,
+/// which the Windows sandbox cannot launch.
+///
+/// `C:\Program Files\WindowsApps` denies directory traverse to everyone but
+/// TrustedInstaller and the package's own identity; an interactive user only
+/// gets through it because `SeChangeNotifyPrivilege` bypasses traverse checks.
+/// The sandbox runs commands as a dedicated user whose token does not have it,
+/// so `CreateProcessAsUserW` on
+/// `...\WindowsApps\Microsoft.PowerShell_*\pwsh.exe` fails with
+/// `ERROR_ACCESS_DENIED` (5) and every sandboxed command dies before it starts.
+/// The per-user `AppData\Local\Microsoft\WindowsApps` aliases are reparse-point
+/// stubs into the same packages. The plain Win32 install at
+/// `C:\Program Files\PowerShell\7` runs fine, and both are commonly on PATH
+/// with the packaged one first.
+fn is_packaged_app_path(path: &std::path::Path) -> bool {
+    path.components()
+        .any(|component| component.as_os_str().eq_ignore_ascii_case("WindowsApps"))
+}
+
+/// Splits PATH candidates into the first launchable one and the first packaged
+/// one, which is only worth using when the machine has nothing else. See
+/// [`is_packaged_app_path`].
+fn split_packaged_candidates<I>(candidates: I) -> (Option<PathBuf>, Option<PathBuf>)
+where
+    I: IntoIterator<Item = PathBuf>,
+{
+    let mut packaged = None;
+    for candidate in candidates {
+        if is_packaged_app_path(&candidate) {
+            packaged.get_or_insert(candidate);
+        } else {
+            return (Some(candidate), packaged);
+        }
+    }
+    (None, packaged)
+}
+
 fn get_shell_path(
     shell_type: ShellType,
     binary_name: &str,
@@ -145,7 +182,11 @@ fn get_shell_path(
         return Some(default_shell_path);
     }
 
-    if let Ok(path) = which::which(binary_name) {
+    let (unpackaged, packaged) = match which::which_all(binary_name) {
+        Ok(candidates) => split_packaged_candidates(candidates),
+        Err(_) => (None, None),
+    };
+    if let Some(path) = unpackaged {
         return Some(path);
     }
 
@@ -155,7 +196,9 @@ fn get_shell_path(
         }
     }
 
-    None
+    // Nothing else on this machine: a packaged shell still beats no shell at
+    // all, and it launches fine outside the sandbox.
+    packaged
 }
 
 const ZSH_FALLBACK_PATHS: &[&str] = &["/bin/zsh"];
@@ -293,6 +336,42 @@ pub fn default_user_shell_from_path(user_shell_path: Option<PathBuf>) -> Detecte
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    const PACKAGED_PWSH: &str =
+        r"C:\Program Files\WindowsApps\Microsoft.PowerShell_7.6.5.0_x64__8wekyb3d8bbwe\pwsh.exe";
+    const ALIAS_PWSH: &str = r"C:\Users\dev\AppData\Local\Microsoft\WindowsApps\pwsh.exe";
+    const WIN32_PWSH: &str = r"C:\Program Files\PowerShell\7\pwsh.exe";
+
+    /// FORK: the sandbox cannot launch an MSIX-packaged shell (see
+    /// [`is_packaged_app_path`]), so PATH order must not decide this.
+    #[test]
+    fn packaged_shells_are_recognized_wherever_they_sit_on_path() {
+        assert!(is_packaged_app_path(std::path::Path::new(PACKAGED_PWSH)));
+        assert!(is_packaged_app_path(std::path::Path::new(ALIAS_PWSH)));
+        assert!(!is_packaged_app_path(std::path::Path::new(WIN32_PWSH)));
+        assert!(!is_packaged_app_path(std::path::Path::new("/usr/bin/pwsh")));
+    }
+
+    #[test]
+    fn a_win32_install_wins_over_a_packaged_one_earlier_on_path() {
+        let (unpackaged, packaged) = split_packaged_candidates(vec![
+            PathBuf::from(PACKAGED_PWSH),
+            PathBuf::from(WIN32_PWSH),
+            PathBuf::from(ALIAS_PWSH),
+        ]);
+        assert_eq!(unpackaged, Some(PathBuf::from(WIN32_PWSH)));
+        assert_eq!(packaged, Some(PathBuf::from(PACKAGED_PWSH)));
+    }
+
+    #[test]
+    fn a_packaged_shell_is_kept_as_the_last_resort() {
+        let (unpackaged, packaged) = split_packaged_candidates(vec![
+            PathBuf::from(PACKAGED_PWSH),
+            PathBuf::from(ALIAS_PWSH),
+        ]);
+        assert_eq!(unpackaged, None);
+        assert_eq!(packaged, Some(PathBuf::from(PACKAGED_PWSH)));
+    }
 
     #[test]
     fn test_detect_shell_type() {
