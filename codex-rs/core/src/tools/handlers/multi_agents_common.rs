@@ -16,6 +16,7 @@ use codex_model_provider_info::WireApi;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
+use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::models::BaseInstructions;
@@ -475,29 +476,22 @@ pub(crate) async fn apply_requested_spawn_agent_model_overrides(
 pub(crate) async fn apply_spawn_agent_service_tier(
     session: &Session,
     config: &mut Config,
-    parent_service_tier: Option<&str>,
-    requested_service_tier: Option<&str>,
-    // FORK: notes accumulate the arguments we adjusted instead of rejecting.
-    notes: &mut Vec<String>,
 ) -> Result<(), FunctionCallError> {
-    // FORK: a locally served child has no backend service tiers at all. The
-    // parent's `priority` is inherited by default, so refusing here failed
-    // spawns over an argument the caller never wrote.
+    // FORK: a locally served child has no backend service tiers at all, and the
+    // root tier is now inherited unconditionally (including the `default`
+    // early-return below, which skips the model capability check), so strip it
+    // before any of that can push a tier onto a local provider request.
     if is_locally_served(config) {
-        if requested_service_tier.is_some() {
-            notes.push(LOCAL_SERVICE_TIER_NOTE.to_string());
-        }
         config.service_tier = None;
         return Ok(());
     }
 
-    let candidate_service_tiers = [
-        config.service_tier.clone(),
-        requested_service_tier.map(str::to_string),
-        parent_service_tier.map(str::to_string),
-    ];
-    if candidate_service_tiers.iter().all(Option::is_none) {
+    let Some(service_tier) = session.services.agent_control.root_service_tier() else {
         config.service_tier = None;
+        return Ok(());
+    };
+    if service_tier == SERVICE_TIER_DEFAULT_REQUEST_VALUE {
+        config.service_tier = Some(service_tier);
         return Ok(());
     }
 
@@ -512,49 +506,11 @@ pub(crate) async fn apply_spawn_agent_service_tier(
         .get_model_info(model.as_str(), &config.to_models_manager_config())
         .await;
 
-    if let Some(requested_service_tier) = requested_service_tier
-        && !model_info.supports_service_tier(requested_service_tier)
-    {
-        let supported = model_info
-            .service_tiers
-            .iter()
-            .map(|tier| tier.id.as_str())
-            .collect::<Vec<_>>();
-        // FORK: drop with a note rather than failing the whole spawn.
-        notes.push(unsupported_service_tier_note(
-            &model,
-            requested_service_tier,
-            &supported,
-        ));
-    }
-
-    config.service_tier =
-        candidate_service_tiers
-            .into_iter()
-            .flatten()
-            .find(|candidate_service_tier| {
-                model_info.supports_service_tier(candidate_service_tier.as_str())
-            });
+    config.service_tier = model_info
+        .supports_service_tier(service_tier.as_str())
+        .then_some(service_tier);
     Ok(())
 }
-
-/// FORK: the sentence handed back when a requested `service_tier` cannot be
-/// applied. Kept pure so the wording is covered by a test without standing up a
-/// `Session` and a models manager.
-fn unsupported_service_tier_note(model: &str, requested: &str, supported: &[&str]) -> String {
-    let supported = if supported.is_empty() {
-        "none".to_string()
-    } else {
-        supported.join(", ")
-    };
-    format!(
-        "Service tier `{requested}` is not supported for model `{model}` and was dropped. Supported service tiers: {supported}."
-    )
-}
-
-/// FORK: the note for a child served by the local Claude CLI, which has no
-/// backend service tiers of any kind.
-const LOCAL_SERVICE_TIER_NOTE: &str = "`service_tier` was dropped: a locally served agent (Claude Code CLI, ChatGPT Web) has no service tiers.";
 
 pub(crate) async fn apply_spawn_agent_role(
     session: &Session,
@@ -848,21 +804,6 @@ mod tests {
             ),
             (Some(ReasoningEffort::Medium), None)
         );
-    }
-
-    /// FORK: `service_tier: "priority"` is inherited from the parent turn and
-    /// used to hard-fail every Claude spawn. It is now dropped with a note.
-    #[test]
-    fn an_unsupported_service_tier_is_dropped_with_a_note() {
-        let note = unsupported_service_tier_note("claude-opus-5", "priority", &[]);
-        assert!(note.contains("`priority`"), "{note}");
-        assert!(note.contains("was dropped"), "{note}");
-        assert!(note.contains("none"), "{note}");
-
-        let note = unsupported_service_tier_note("gpt-5.6-luna", "priority", &["flex", "default"]);
-        assert!(note.contains("flex, default"), "{note}");
-
-        assert!(LOCAL_SERVICE_TIER_NOTE.contains("service_tier"));
     }
 
     /// A model that declares no levels at all cannot be clamped into one.

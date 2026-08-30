@@ -1507,7 +1507,7 @@ impl App {
                         config.permissions.active_permission_profile().as_ref(),
                         self.runtime_permission_profile_override
                             .as_ref()
-                            .map(|profile| &profile.permission_profile),
+                            .and_then(RuntimePermissionProfileOverride::turn_permission_profile),
                     );
                     if turn_permissions_overrides(permissions_override, config.cwd.as_path())
                         .is_ok()
@@ -1516,6 +1516,18 @@ impl App {
                             .set_queue_autosend_suppressed(/*suppressed*/ false);
                         self.chat_widget.maybe_send_next_queued_input();
                     }
+                }
+            }
+            AppEvent::FetchModels { request_id } => {
+                if self.chat_widget.model_popup_request_is_current(request_id) {
+                    app_server.fetch_models(request_id, self.app_event_tx.clone());
+                }
+            }
+            AppEvent::ModelsLoaded { request_id, result } => {
+                if self.chat_widget.on_models_loaded(request_id, result) {
+                    self.model_catalog = self.chat_widget.model_catalog();
+                    app_server.set_available_models(self.model_catalog.try_list_models()?);
+                    self.sync_active_thread_service_tier_to_cached_session().await;
                 }
             }
             AppEvent::OpenReasoningPopup { model } => {
@@ -1571,8 +1583,8 @@ impl App {
                 self.chat_widget
                     .open_plan_reasoning_scope_prompt(model, effort);
             }
-            AppEvent::OpenAllModelsPopup { models } => {
-                self.chat_widget.open_all_models_popup(models);
+            AppEvent::OpenAllModelsPopup => {
+                self.chat_widget.open_all_models_popup();
             }
             AppEvent::OpenFullAccessConfirmation {
                 preset,

@@ -53,6 +53,7 @@ fn server(url: &str) -> McpServerConfig {
             "read".to_string(),
             McpServerToolConfig {
                 approval_mode: Some(AppToolApproval::Approve),
+                ..Default::default()
             },
         )]),
     }

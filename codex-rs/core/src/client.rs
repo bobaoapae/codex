@@ -30,6 +30,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
+use async_channel::Sender;
 use codex_api::AgentIdentityTelemetry;
 use codex_api::ApiError;
 use codex_api::AuthProvider;
@@ -83,6 +84,9 @@ use codex_protocol::config_types::Verbosity as VerbosityConfig;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
+use codex_protocol::protocol::AuthRecoveryEvent;
+use codex_protocol::protocol::Event as ProtocolEvent;
+use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::W3cTraceContext;
@@ -185,9 +189,36 @@ pub(crate) struct CompactConversationRequestSettings {
     pub(crate) service_tier: Option<String>,
 }
 
-fn reasoning_effort_for_request(effort: ReasoningEffortConfig) -> ReasoningEffortConfig {
+fn reasoning_effort_for_request(
+    model_info: &ModelInfo,
+    effort: ReasoningEffortConfig,
+) -> ReasoningEffortConfig {
     match effort {
-        ReasoningEffortConfig::Ultra => ReasoningEffortConfig::Max,
+        ReasoningEffortConfig::Ultra => model_info
+            .multi_agent_reasoning_effort
+            .as_ref()
+            .filter(|effort| {
+                *effort != &ReasoningEffortConfig::Ultra
+                    && model_info
+                        .supported_reasoning_levels
+                        .iter()
+                        .any(|preset| &preset.effort == *effort)
+            })
+            .cloned()
+            .or_else(|| {
+                let supported_reasoning_levels = &model_info.supported_reasoning_levels;
+                supported_reasoning_levels
+                    .iter()
+                    .find(|preset| preset.effort == ReasoningEffortConfig::Max)
+                    .or_else(|| {
+                        supported_reasoning_levels
+                            .iter()
+                            .rev()
+                            .find(|preset| preset.effort != ReasoningEffortConfig::Ultra)
+                    })
+                    .map(|preset| preset.effort.clone())
+            })
+            .unwrap_or(ReasoningEffortConfig::Medium),
         // Keep "persistent" in local settings; the Responses API calls it "disabled".
         ReasoningEffortConfig::Persistent => ReasoningEffortConfig::Custom("disabled".to_string()),
         effort => effort,
@@ -281,6 +312,7 @@ pub struct ModelClient {
     /// FORK: workspace for the `chatgpt_web` provider; likewise unused elsewhere.
     chatgpt_web_workspace: Option<ChatGptWebWorkspace>,
     free_guardian_enabled: bool,
+    event_sender: Option<Sender<ProtocolEvent>>,
     http_client_factory: HttpClientFactory,
 }
 
@@ -512,6 +544,7 @@ impl ModelClient {
             claude_code_workspace: None,
             chatgpt_web_workspace: None,
             free_guardian_enabled: false,
+            event_sender: None,
             http_client_factory,
         }
     }
@@ -521,11 +554,13 @@ impl ModelClient {
         self
     }
 
-    pub(crate) fn with_prompt_cache_key_override(
+    pub(crate) fn with_session_context(
         mut self,
         prompt_cache_key_override: Option<String>,
+        event_sender: Sender<ProtocolEvent>,
     ) -> Self {
         self.prompt_cache_key_override = prompt_cache_key_override;
+        self.event_sender = Some(event_sender);
         self
     }
 
@@ -815,7 +850,7 @@ impl ModelClient {
             model: model_info.slug.clone(),
             raw_memories,
             reasoning: effort
-                .map(reasoning_effort_for_request)
+                .map(|effort| reasoning_effort_for_request(model_info, effort))
                 .map(|effort| Reasoning {
                     effort: Some(effort),
                     summary: None,
@@ -913,6 +948,7 @@ impl ModelClient {
     }
 
     fn build_reasoning(
+        &self,
         model_info: &ModelInfo,
         effort: Option<ReasoningEffortConfig>,
         summary: ReasoningSummaryConfig,
@@ -920,7 +956,7 @@ impl ModelClient {
         Reasoning {
             effort: effort
                 .or_else(|| model_info.default_reasoning_level.clone())
-                .map(reasoning_effort_for_request),
+                .map(|effort| reasoning_effort_for_request(model_info, effort)),
             summary: (model_info.supports_reasoning_summary_parameter
                 && summary != ReasoningSummaryConfig::None)
                 .then_some(summary),
@@ -993,7 +1029,7 @@ impl ModelClient {
                 }
             }
         }
-        let reasoning = Self::build_reasoning(model_info, effort, summary);
+        let reasoning = self.build_reasoning(model_info, effort, summary);
         let stream_options = (self.state.concurrent_reasoning_summaries_enabled
             && is_openai
             && reasoning.summary.is_some())
@@ -1688,6 +1724,8 @@ impl ModelClientSession {
                             &mut provider_auth_recovery_attempted,
                             session_telemetry,
                             &self.client.state.provider,
+                            self.client.event_sender.as_ref(),
+                            responses_metadata.turn_id.as_deref(),
                         )
                         .await?,
                     );
@@ -1821,6 +1859,8 @@ impl ModelClientSession {
                             &mut provider_auth_recovery_attempted,
                             session_telemetry,
                             &provider,
+                            self.client.event_sender.as_ref(),
+                            responses_metadata.turn_id.as_deref(),
                         )
                         .await?,
                     );
@@ -2448,18 +2488,57 @@ struct WebsocketConnectParams<'a> {
     endpoint: ResponsesEndpoint,
 }
 
+fn emit_auth_recovery_event(
+    event_sender: Option<&Sender<ProtocolEvent>>,
+    turn_id: Option<&str>,
+    provider: &SharedModelProvider,
+    message: &str,
+    event: fn(AuthRecoveryEvent) -> EventMsg,
+) {
+    if let (Some(sender), Some(turn_id)) = (event_sender, turn_id) {
+        let _ = sender.try_send(ProtocolEvent {
+            id: turn_id.to_string(),
+            msg: event(AuthRecoveryEvent {
+                provider: provider.info().name.clone(),
+                message: message.to_string(),
+            }),
+        });
+    }
+}
+
 async fn handle_unauthorized(
     transport: TransportError,
     auth_recovery: &mut Option<UnauthorizedRecovery>,
     provider_auth_recovery_attempted: &mut bool,
     session_telemetry: &SessionTelemetry,
     provider: &SharedModelProvider,
+    event_sender: Option<&Sender<ProtocolEvent>>,
+    turn_id: Option<&str>,
 ) -> Result<UnauthorizedRecoveryExecution> {
     let debug = extract_response_debug_context(&transport);
     if !*provider_auth_recovery_attempted {
         *provider_auth_recovery_attempted = true;
+        let messages = provider.auth_recovery_messages();
+        if let Some(messages) = messages {
+            emit_auth_recovery_event(
+                event_sender,
+                turn_id,
+                provider,
+                messages.started,
+                EventMsg::AuthRecoveryStarted,
+            );
+        }
         match provider.recover_from_unauthorized().await {
             Ok(ProviderUnauthorizedRecovery::Recovered) => {
+                if let Some(messages) = messages {
+                    emit_auth_recovery_event(
+                        event_sender,
+                        turn_id,
+                        provider,
+                        messages.succeeded,
+                        EventMsg::AuthRecoveryCompleted,
+                    );
+                }
                 return Ok(UnauthorizedRecoveryExecution {
                     mode: "provider",
                     phase: "provider_refresh",

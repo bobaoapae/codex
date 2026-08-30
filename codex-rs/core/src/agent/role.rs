@@ -337,9 +337,6 @@ pub(crate) mod spawn_tool_spec {
                     let reasoning_effort = role_toml
                         .get("model_reasoning_effort")
                         .and_then(TomlValue::as_str);
-                    let service_tier = role_toml
-                        .get("service_tier")
-                        .and_then(TomlValue::as_str);
                     // FORK: a locally served role behaves differently enough
                     // that the orchestrator has to know before it writes the
                     // task.
@@ -370,23 +367,7 @@ pub(crate) mod spawn_tool_spec {
                         }
                         (None, None) => String::new(),
                     };
-                    // FORK: the old wording invited the caller to pass a
-                    // `service_tier` "if supported"; the caller cannot know what
-                    // the child model supports, and a locally served child
-                    // supports none at all. Say what to do instead.
-                    let is_local_role = role_provider.is_some_and(is_locally_served_provider);
-                    let service_tier_note = if is_local_role {
-                        "\n- Do not pass `service_tier` for this role.".to_string()
-                    } else {
-                        service_tier
-                            .map(|service_tier| {
-                                format!(
-                                    "\n- This role's service tier is set to `{service_tier}`; do not pass `service_tier` for this role."
-                                )
-                            })
-                            .unwrap_or_default()
-                    };
-                    format!("{model_and_reasoning_note}{service_tier_note}{local_note}")
+                    format!("{model_and_reasoning_note}{local_note}")
                 })
                 .unwrap_or_default();
             format!("{name}: {{\n{description}{locked_settings_note}\n}}")
@@ -466,8 +447,8 @@ Rules:
 
     /// Resolves a built-in role `config_file` path to embedded content.
     pub(super) fn config_file_contents(path: &Path) -> Option<&'static str> {
-        const EXPLORER: &str = include_str!("builtins/explorer.toml");
-        const AWAITER: &str = include_str!("builtins/awaiter.toml");
+        const EXPLORER: &str = include_str!("../../assets/agent/builtins/explorer.toml");
+        const AWAITER: &str = include_str!("../../assets/agent/builtins/awaiter.toml");
         match path.to_str()? {
             "explorer.toml" => Some(EXPLORER),
             "awaiter.toml" => Some(AWAITER),

@@ -20,7 +20,7 @@ use codex_protocol::intersect_effective_permission_profiles;
 use codex_protocol::protocol::EnvironmentConfigState;
 use codex_utils_path_uri::PathUri;
 
-const AGENT_NAMES: &str = include_str!("../agent_names.txt");
+const AGENT_NAMES: &str = include_str!("../../../assets/agent/agent_names.txt");
 
 struct SpawnAgentThreadInheritance {
     environments: Option<TurnEnvironmentSnapshot>,
@@ -418,6 +418,7 @@ impl AgentControl {
                     CodexErr::InvalidRequest(format!("permission_profile is invalid: {err}"))
                 })?;
         }
+        config.service_tier = self.root_service_tier();
         if let Some(model) = stored_model {
             config.model = Some(model);
         }

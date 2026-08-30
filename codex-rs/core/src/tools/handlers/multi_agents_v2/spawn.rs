@@ -127,9 +127,6 @@ async fn handle_spawn_agent(
     let child_depth = next_thread_spawn_depth(&session_source);
     let mut config =
         build_agent_spawn_config(&session.get_base_instructions().await, turn.as_ref())?;
-    if let Some(service_tier) = args.service_tier.as_ref() {
-        config.service_tier = Some(service_tier.clone());
-    }
     let requested_full_history_fork = matches!(
         requested_fork_mode.as_ref(),
         Some(SpawnAgentForkMode::FullHistory)
@@ -155,14 +152,7 @@ async fn handle_spawn_agent(
                 .clone_from(&turn.developer_instructions);
         }
     }
-    apply_spawn_agent_service_tier(
-        &session,
-        &mut config,
-        turn.config.service_tier.as_deref(),
-        args.service_tier.as_deref(),
-        &mut notes,
-    )
-    .await?;
+    apply_spawn_agent_service_tier(&session, &mut config).await?;
     apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
     // After the provider is final: the account only means something once we
     // know the child really is Claude-backed.
@@ -320,7 +310,6 @@ struct SpawnAgentArgs {
     agent_type: Option<String>,
     model: Option<String>,
     reasoning_effort: Option<ReasoningEffort>,
-    service_tier: Option<String>,
     fork_turns: Option<String>,
     fork_context: Option<bool>,
     /// FORK: Claude account for a Claude-backed agent.

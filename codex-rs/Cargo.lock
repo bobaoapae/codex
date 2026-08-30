@@ -3216,9 +3216,13 @@ name = "codex-feedback"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "codex-http-client",
  "codex-login",
  "codex-protocol",
+ "flate2",
+ "http 1.4.0",
+ "httpdate",
  "log",
  "mime_guess",
  "pretty_assertions",
@@ -3332,6 +3336,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-guardian-context"
+version = "0.0.0"
+dependencies = [
+ "codex-protocol",
+ "pretty_assertions",
+ "serde_json",
+]
+
+[[package]]
 name = "codex-guardian-v2"
 version = "0.0.0"
 dependencies = [
@@ -3356,6 +3369,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -3385,6 +3399,7 @@ dependencies = [
  "codex-protocol",
  "codex-tools",
  "codex-utils-output-truncation",
+ "core_test_support",
  "http 1.4.0",
  "pretty_assertions",
  "serde_json",
@@ -3958,6 +3973,7 @@ dependencies = [
  "codex-utils-path-uri",
  "codex-utils-plugins",
  "pretty_assertions",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 

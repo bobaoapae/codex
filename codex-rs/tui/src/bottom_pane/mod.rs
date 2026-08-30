@@ -758,7 +758,7 @@ impl BottomPane {
                 self.request_redraw();
             }
             event
-        } else if self.composer.cancel_history_search() {
+        } else if self.composer.cancel_vim_search() || self.composer.cancel_history_search() {
             self.request_redraw();
             CancellationEvent::Handled
         } else if self.composer_is_empty() {
@@ -1198,6 +1198,7 @@ impl BottomPane {
     }
 
     /// Replace the newest matching selection view without disturbing views stacked above it.
+    /// Preserve pending parent cleanup when an already-open child is accepted.
     pub(crate) fn replace_selection_view_if_present(
         &mut self,
         view_id: &'static str,
@@ -1213,11 +1214,13 @@ impl BottomPane {
 
         let replaces_active_view = index + 1 == self.view_stack.len();
         self.apply_standard_popup_hint(&mut params);
-        self.view_stack[index] = Box::new(list_selection_view::ListSelectionView::new(
+        let mut view = list_selection_view::ListSelectionView::new(
             params,
             self.app_event_tx.clone(),
             self.keymap.list.clone(),
-        ));
+        );
+        view.dismiss_after_child_accept = self.view_stack[index].dismiss_after_child_accept();
+        self.view_stack[index] = Box::new(view);
         if replaces_active_view {
             self.schedule_active_view_frame();
         }
@@ -2138,6 +2141,11 @@ mod tests {
         assert_eq!(pane.composer_text(), "draft");
         assert!(!pane.composer.popup_active());
         assert!(!pane.quit_shortcut_hint_visible());
+        pane.composer.set_vim_enabled(/*enabled*/ true);
+        pane.handle_key_event(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert_eq!(CancellationEvent::Handled, pane.on_ctrl_c());
+        assert_eq!(pane.composer_text(), "draft");
+        assert!(!pane.composer.popup_active());
     }
 
     // live ring removed; related tests deleted.

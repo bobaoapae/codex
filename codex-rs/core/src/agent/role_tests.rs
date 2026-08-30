@@ -712,7 +712,7 @@ fn spawn_tool_spec_marks_role_locked_reasoning_effort_only() {
 }
 
 #[test]
-fn spawn_tool_spec_marks_role_locked_service_tier() {
+fn spawn_tool_spec_omits_role_service_tier() {
     let tempdir = TempDir::new().expect("create temp dir");
     let role_path = tempdir.path().join("tiered.toml");
     fs::write(
@@ -731,9 +731,7 @@ fn spawn_tool_spec_marks_role_locked_service_tier() {
 
     let spec = spawn_tool_spec::build(&user_defined_roles);
 
-    assert!(spec.contains(
-        "Stay fast.\n- This role's service tier is set to `priority`; do not pass `service_tier` for this role."
-    ));
+    assert!(spec.contains("tiered: {\nStay fast.\n}"));
 }
 
 #[test]
@@ -895,5 +893,4 @@ model_provider = "chatgpt_web"
         "{spec}"
     );
     assert!(spec.contains("`plaintext_message`"), "{spec}");
-    assert!(spec.contains("Do not pass `service_tier`"), "{spec}");
 }

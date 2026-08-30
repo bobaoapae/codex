@@ -984,6 +984,7 @@ fn apply_plugin_mcp_server_policy(config: &mut McpServerConfig, policy: &PluginM
         if let Some(approval_mode) = tool_policy.approval_mode {
             tool_config.approval_mode = Some(approval_mode);
         }
+        tool_config.restrict_output_token_limit(tool_policy.output_token_limit);
     }
 }
 
@@ -1077,7 +1078,7 @@ pub(crate) async fn load_plugin_skill_inventory(
     }
 }
 
-fn plugin_skill_roots(
+pub(crate) fn plugin_skill_roots(
     plugin_root: &AbsolutePathBuf,
     manifest_paths: &PluginManifestPaths,
     manifest_format: PluginManifestFormat,
@@ -1475,7 +1476,7 @@ pub fn apply_configured_plugin_mcp_server_policies(
                 .tool_approval_overrides
                 .extend(policy.tool_approval_overrides.clone());
             for (tool_name, tool_policy) in &policy.tools {
-                if tool_policy.approval_mode.is_some() {
+                if tool_policy.approval_mode.is_some() || tool_policy.output_token_limit.is_some() {
                     server.tools.entry(tool_name.clone()).or_default();
                 }
             }
@@ -1493,6 +1494,12 @@ pub fn apply_configured_plugin_mcp_server_policies(
                             .restrict_to(approval_mode),
                     );
                 }
+                tool_config.restrict_output_token_limit(
+                    policy
+                        .tools
+                        .get(tool_name)
+                        .and_then(|tool_policy| tool_policy.output_token_limit),
+                );
             }
         }
     }

@@ -116,6 +116,7 @@ async fn remote_models_get_model_info_uses_longest_matching_prefix() -> Result<(
         display_name: "GPT 5.3 Codex".to_string(),
         model_messages: Some(ModelMessages {
             persistent_instructions: None,
+            tools: None,
             instructions_template: Some("use specific prefix".to_string()),
             instructions_variables: None,
             approvals: None,
@@ -133,6 +134,7 @@ async fn remote_models_get_model_info_uses_longest_matching_prefix() -> Result<(
         display_name: "GPT 5.3".to_string(),
         model_messages: Some(ModelMessages {
             persistent_instructions: None,
+            tools: None,
             instructions_template: Some("use generic prefix".to_string()),
             instructions_variables: None,
             approvals: None,
@@ -408,6 +410,7 @@ async fn remote_models_long_model_slug_is_sent_with_supported_reasoning(
     remote_model.default_reasoning_summary = ReasoningSummary::Detailed;
     remote_model.model_messages = Some(ModelMessages {
         persistent_instructions: catalog_instructions.map(str::to_string),
+        tools: None,
         instructions_template: Some(base_instructions.to_string()),
         instructions_variables: None,
         approvals: None,
@@ -574,6 +577,7 @@ async fn remote_models_remote_model_uses_unified_exec() -> Result<()> {
         model_specialty: None,
         tool_mode: None,
         multi_agent_version: None,
+        multi_agent_reasoning_effort: None,
         priority: 1,
         additional_speed_tiers: Vec::new(),
         service_tiers: Vec::new(),
@@ -842,6 +846,7 @@ async fn remote_models_apply_legacy_instructions() -> Result<()> {
         model_specialty: None,
         tool_mode: None,
         multi_agent_version: None,
+        multi_agent_reasoning_effort: None,
         priority: 1,
         additional_speed_tiers: Vec::new(),
         service_tiers: Vec::new(),
@@ -849,6 +854,7 @@ async fn remote_models_apply_legacy_instructions() -> Result<()> {
         upgrade: None,
         model_messages: Some(ModelMessages {
             persistent_instructions: None,
+            tools: None,
             instructions_template: Some(remote_instructions.to_string()),
             instructions_variables: None,
             approvals: None,
@@ -1426,6 +1432,7 @@ fn test_remote_model_with_policy(
         model_specialty: None,
         tool_mode: None,
         multi_agent_version: None,
+        multi_agent_reasoning_effort: None,
         priority,
         additional_speed_tiers: Vec::new(),
         service_tiers: Vec::new(),

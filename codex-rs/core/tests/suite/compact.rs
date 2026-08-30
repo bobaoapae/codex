@@ -2137,6 +2137,7 @@ async fn pre_sampling_compact_runs_on_switch_to_smaller_context_model() {
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_model(previous_model)
         .with_config(move |config| {
+            config.update_plan_enabled = true;
             config.model_provider = model_provider;
             set_test_compact_prompt(config);
         });
@@ -2666,9 +2667,11 @@ async fn pre_sampling_compact_falls_back_after_previous_model_invalid_request_on
     let mut previous_model_info =
         model_info_with_context_window("gpt-5.4", /*context_window*/ 273_000);
     previous_model_info.slug = previous_model_family.to_string();
+    previous_model_info.use_responses_lite = true;
     let mut next_model_info =
         model_info_with_context_window("gpt-5.4", /*context_window*/ 125_000);
     next_model_info.slug = next_model.to_string();
+    next_model_info.use_responses_lite = false;
 
     let models_mock = mount_models_once(
         &server,
@@ -2710,6 +2713,7 @@ async fn pre_sampling_compact_falls_back_after_previous_model_invalid_request_on
         .with_model(retired_model)
         .with_config(move |config| {
             config.model_provider = model_provider;
+            config.tool_registry.turn_metadata_includes_tool_info = true;
             set_test_compact_prompt(config);
             let _ = config.features.enable(Feature::RemoteCompactionV2);
         });
@@ -2755,6 +2759,25 @@ async fn pre_sampling_compact_falls_back_after_previous_model_invalid_request_on
     );
     assert_eq!(requests[2].body_json()["model"].as_str(), Some(next_model));
     assert_eq!(requests[3].body_json()["model"].as_str(), Some(next_model));
+
+    // Preparing the non-Lite fallback must not clear the previous model's inventory
+    // before its compaction attempt is sent.
+    let [first_metadata, compact_metadata] = [&requests[0], &requests[1]].map(|request| {
+        serde_json::from_str::<Value>(
+            request.body_json()["client_metadata"]["x-codex-turn-metadata"]
+                .as_str()
+                .expect("request should include turn metadata"),
+        )
+        .expect("turn metadata should be valid JSON")
+    });
+    let inventory = first_metadata["tool_namespaces_info"]
+        .as_object()
+        .expect("Responses Lite request should include tool inventory");
+    assert!(!inventory.is_empty());
+    assert_eq!(
+        compact_metadata["tool_namespaces_info"],
+        first_metadata["tool_namespaces_info"],
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3624,6 +3647,7 @@ async fn auto_compact_persists_rollout_entries() {
         .unwrap();
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
+    let expected_settings = codex.thread_settings_snapshot().await;
     codex.submit(Op::Shutdown).await.unwrap();
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::ShutdownComplete)).await;
 
@@ -3631,6 +3655,8 @@ async fn auto_compact_persists_rollout_entries() {
     let text = std::fs::read_to_string(&rollout_path).expect("failed to read rollout file");
 
     let mut turn_context_count = 0usize;
+    let mut saw_compaction = false;
+    let mut checkpoint = None;
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -3643,7 +3669,12 @@ async fn auto_compact_persists_rollout_entries() {
             RolloutItem::TurnContext(_) => {
                 turn_context_count += 1;
             }
-            RolloutItem::Compacted(_) => {}
+            RolloutItem::Compacted(_) => saw_compaction = true,
+            RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(applied))
+                if saw_compaction && checkpoint.is_none() =>
+            {
+                checkpoint = Some((applied.thread_id, applied.thread_settings));
+            }
             _ => {}
         }
     }
@@ -3651,6 +3682,10 @@ async fn auto_compact_persists_rollout_entries() {
     assert_eq!(
         turn_context_count, 3,
         "rollout should contain one TurnContext entry per real user turn"
+    );
+    assert_eq!(
+        checkpoint,
+        Some((Some(session_configured.thread_id), expected_settings))
     );
 }
 
@@ -3875,6 +3910,7 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
     let model_provider = non_openai_model_provider(&server);
 
     let mut builder = test_codex().with_config(move |config| {
+        config.update_plan_enabled = true;
         config.model_provider = model_provider;
         set_test_compact_prompt(config);
     });
@@ -4198,6 +4234,7 @@ async fn snapshot_request_shape_mid_turn_continuation_compaction() {
     let model_provider = non_openai_model_provider(&server);
 
     let mut builder = test_codex().with_config(move |config| {
+        config.update_plan_enabled = true;
         config.model_provider = model_provider;
         set_test_compact_prompt(config);
         config.model_context_window = Some(context_window);
@@ -4797,6 +4834,7 @@ async fn snapshot_request_shape_pre_turn_compaction_including_incoming_user_mess
     let model_provider = non_openai_model_provider(&server);
     let codex = test_codex()
         .with_config(move |config| {
+            config.update_plan_enabled = true;
             config.model_provider = model_provider;
             set_test_compact_prompt(config);
             config.model_auto_compact_token_limit = Some(200);
@@ -4912,6 +4950,7 @@ async fn snapshot_request_shape_pre_turn_compaction_strips_incoming_model_switch
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_model(previous_model)
         .with_config(move |config| {
+            config.update_plan_enabled = true;
             config.model_provider = model_provider;
             set_test_compact_prompt(config);
             let _ = config.features.enable(Feature::RemoteModels);
@@ -5009,6 +5048,7 @@ async fn snapshot_request_shape_pre_turn_compaction_context_window_exceeded() {
     model_provider.stream_max_retries = Some(0);
     let codex = test_codex()
         .with_config(move |config| {
+            config.update_plan_enabled = true;
             config.model_provider = model_provider;
             set_test_compact_prompt(config);
             config.model_auto_compact_token_limit = Some(200);
@@ -5083,6 +5123,7 @@ async fn snapshot_request_shape_manual_compact_without_previous_user_messages() 
     let model_provider = non_openai_model_provider(&server);
     let codex = test_codex()
         .with_config(move |config| {
+            config.update_plan_enabled = true;
             config.model_provider = model_provider;
             set_test_compact_prompt(config);
         })
