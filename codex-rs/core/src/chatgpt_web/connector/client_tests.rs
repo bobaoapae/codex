@@ -190,3 +190,90 @@ async fn a_connector_turn_delivers_a_tool_call_and_posts_its_result() {
     drop(broker);
     daemon.shutdown().await;
 }
+
+fn probe_turn(ready_timeout: Duration) -> BeginTurn<'static> {
+    BeginTurn {
+        thread_id: codex_protocol::ThreadId::new(),
+        turn_id: "turn-probe",
+        tools: Vec::new(),
+        exec_tool: ExecTool::ExecCommand,
+        apply_patch: false,
+        ttl_ms: 60_000,
+        ready_timeout,
+    }
+}
+
+/// FORK (verified live): `browser_unavailable` means the chrome-mcp extension's
+/// service worker is asleep, and the daemon's next reconcile brings it back —
+/// 67s, once observed. Failing the turn on the first sighting killed an agent
+/// 19s into a 90s budget, so the status is now retried like any other
+/// not-yet-verified one.
+#[tokio::test]
+async fn a_transient_browser_unavailable_is_waited_out() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let daemon = start_daemon(&temp).await;
+    daemon
+        .control
+        .set_registry_status(RegistryStatus::BrowserUnavailable);
+
+    let broker = DaemonSessionBroker::connect(
+        daemon.endpoint.control_url.clone(),
+        daemon.endpoint.token.clone(),
+        "Codex Native".into(),
+    )
+    .await
+    .expect("broker connects");
+
+    let control = daemon.control.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        control.set_registry_status(RegistryStatus::Verified {
+            connector_id: "asdk_app_test".into(),
+            link_id: "link_test".into(),
+            mcp_url: "https://example.trycloudflare.com/mcp/x".into(),
+        });
+    });
+
+    let turn = broker
+        .begin_turn(probe_turn(Duration::from_secs(20)))
+        .await
+        .expect("the extension came back within the budget");
+
+    broker.end_turn(&turn.turn_token, "done").await;
+    drop(broker);
+    daemon.shutdown().await;
+}
+
+/// An extension that never comes back still fails, with the message that names
+/// what to fix — only now at the deadline instead of on the first poll.
+#[tokio::test]
+async fn a_browser_that_never_comes_back_fails_at_the_deadline() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let daemon = start_daemon(&temp).await;
+    daemon
+        .control
+        .set_registry_status(RegistryStatus::BrowserUnavailable);
+
+    let broker = DaemonSessionBroker::connect(
+        daemon.endpoint.control_url.clone(),
+        daemon.endpoint.token.clone(),
+        "Codex Native".into(),
+    )
+    .await
+    .expect("broker connects");
+
+    let started = std::time::Instant::now();
+    let error = match broker.begin_turn(probe_turn(Duration::from_secs(2))).await {
+        Ok(_) => panic!("the turn must not start while the extension is away"),
+        Err(error) => error,
+    };
+    assert!(error.contains("chrome-mcp"), "{error}");
+    assert!(
+        started.elapsed() >= Duration::from_secs(2),
+        "gave up after {:?}",
+        started.elapsed()
+    );
+
+    drop(broker);
+    daemon.shutdown().await;
+}

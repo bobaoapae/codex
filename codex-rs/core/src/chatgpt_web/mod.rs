@@ -390,6 +390,58 @@ struct SharedDriver {
     tabs: Arc<TabPool>,
 }
 
+/// How long to wait between `/healthz` probes in [`wait_extension_connected`].
+const HEALTH_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+
+/// FORK (verified live): waits for the chrome-mcp bridge to have its Chrome
+/// extension connected, up to `timeout`.
+///
+/// The extension's service worker sleeps and the bridge reconnects on its own —
+/// 67s, once observed — so failing a turn on the first sighting of a
+/// disconnected extension killed a consultant agent 19s in while the budget
+/// was barely touched. `Ok(false)` = the daemon answered but the extension
+/// never came back; `Err` = the daemon itself stayed unreachable.
+async fn wait_extension_connected(
+    driver: &SharedDriver,
+    timeout: Duration,
+) -> driver::DriverResult<bool> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let last_error = match driver.daemon.health().await {
+            Ok(health) if health.ok && health.extension_connected => return Ok(true),
+            Ok(_) => None,
+            Err(err) => {
+                warn!("chatgpt_web: chrome-mcp health check failed: {err}");
+                Some(err)
+            }
+        };
+        if tokio::time::Instant::now() >= deadline {
+            return match last_error {
+                Some(err) => Err(err),
+                None => Ok(false),
+            };
+        }
+        tokio::time::sleep(HEALTH_RETRY_INTERVAL).await;
+    }
+}
+
+/// FORK: the verdict after [`wait_extension_connected`] gave up.
+///
+/// It already spent the whole `connector_ready_timeout` on this, so the answer
+/// is final and the error must not be retryable: a `Stream` error sends the
+/// turn loop through five more reconnects, each waiting the budget again — nine
+/// minutes of nothing for a browser that is simply closed. One wait, one
+/// verdict; `connector_ready_timeout` is the knob for how long that wait is.
+fn chrome_mcp_unready(waited: Duration, error: Option<&driver::DriverError>) -> CodexErr {
+    let seconds = waited.as_secs();
+    CodexErr::UnsupportedOperation(match error {
+        Some(error) => format!("the chrome-mcp daemon stayed unreachable for {seconds}s: {error}"),
+        None => format!(
+            "chrome-mcp is up but its Chrome extension did not connect within {seconds}s; open Chrome with the 'Chrome MCP Bridge' extension loaded"
+        ),
+    })
+}
+
 fn shared_driver(settings: &ChatGptWebSettings, codex_home: &Path) -> Arc<SharedDriver> {
     static DRIVERS: OnceLock<StdMutex<HashMap<String, Arc<SharedDriver>>>> = OnceLock::new();
     let key = format!("{}|{}", settings.daemon_url, settings.base_url);
@@ -594,17 +646,18 @@ async fn run_turn(
     }
 
     let driver = shared_driver(&settings, &workspace.codex_home);
-    match driver.daemon.health().await {
-        Ok(health) if health.ok && health.extension_connected => {}
-        Ok(_) => {
-            fail(CodexErr::Stream(
-                "chrome-mcp daemon is up but its Chrome extension is not connected".to_string(),
-            ))
-            .await;
+    match wait_extension_connected(&driver, settings.connector_ready_timeout).await {
+        Ok(true) => {}
+        Ok(false) => {
+            fail(chrome_mcp_unready(settings.connector_ready_timeout, None)).await;
             return;
         }
         Err(err) => {
-            fail(map_driver_error(&err)).await;
+            fail(chrome_mcp_unready(
+                settings.connector_ready_timeout,
+                Some(&err),
+            ))
+            .await;
             return;
         }
     }
@@ -1027,21 +1080,22 @@ async fn run_connector_turn(
         images: Some(&image_store),
     });
 
-    match driver.daemon.health().await {
-        Ok(health) if health.ok && health.extension_connected => {}
-        Ok(_) => {
+    match wait_extension_connected(&driver, settings.connector_ready_timeout).await {
+        Ok(true) => {}
+        Ok(false) => {
             broker
                 .end_turn(&turn_token, "chrome-mcp extension not connected")
                 .await;
-            fail(CodexErr::Stream(
-                "chrome-mcp daemon is up but its Chrome extension is not connected".to_string(),
-            ))
-            .await;
+            fail(chrome_mcp_unready(settings.connector_ready_timeout, None)).await;
             return;
         }
         Err(err) => {
             broker.end_turn(&turn_token, "chrome-mcp unreachable").await;
-            fail(map_driver_error(&err)).await;
+            fail(chrome_mcp_unready(
+                settings.connector_ready_timeout,
+                Some(&err),
+            ))
+            .await;
             return;
         }
     }
@@ -1296,7 +1350,12 @@ async fn connector_loop(
                         return;
                     }
                 };
-                let deltas = live.tracker.observe(&conv, stream::TrackMode::Connector);
+                let deltas = live.tracker.observe_at(
+                    &conv,
+                    stream::TrackMode::Connector,
+                    step.hint,
+                    tokio::time::Instant::now(),
+                );
                 for delta in deltas {
                     match stream::apply_delta(&mut assembler, delta, &mut last_progress).await {
                         stream::DeltaStep::Continue => {}
@@ -1531,6 +1590,23 @@ mod tests {
         assert_eq!(usage.input_tokens, 3 + HIDDEN_TOKEN_RESERVE);
         assert_eq!(usage.output_tokens, 2);
         assert_eq!(usage.total_tokens, usage.input_tokens + usage.output_tokens);
+    }
+
+    /// FORK: `wait_extension_connected` already burned the whole budget, so
+    /// this verdict must be terminal — a retryable one made the turn loop
+    /// reconnect five more times, waiting 90s each, for a closed browser.
+    #[test]
+    fn a_browser_that_never_showed_up_fails_the_turn_once() {
+        let waited = Duration::from_secs(90);
+        let closed = chrome_mcp_unready(waited, None);
+        assert!(!closed.is_retryable(), "{closed}");
+        assert!(closed.to_string().contains("90s"), "{closed}");
+        let unreachable = chrome_mcp_unready(
+            waited,
+            Some(&DriverError::new(DriverErrorKind::DaemonDown, "refused")),
+        );
+        assert!(!unreachable.is_retryable(), "{unreachable}");
+        assert!(unreachable.to_string().contains("refused"), "{unreachable}");
     }
 
     #[test]

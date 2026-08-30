@@ -1,0 +1,123 @@
+{
+  "title": "Orientação para consultor Codex",
+  "create_time": 1788059686.94,
+  "update_time": 1788059702.8,
+  "mapping": {
+    "client-created-root": {
+      "id": "client-created-root",
+      "message": null,
+      "parent": null,
+      "children": ["33333333-0000-4000-8000-000000000001"]
+    },
+    "33333333-0000-4000-8000-000000000001": {
+      "id": "33333333-0000-4000-8000-000000000001",
+      "message": {
+        "id": "33333333-0000-4000-8000-000000000001",
+        "author": { "role": "system", "name": null, "metadata": {} },
+        "create_time": null,
+        "update_time": null,
+        "content": { "content_type": "text", "parts": [""] },
+        "status": "finished_successfully",
+        "end_turn": true,
+        "weight": 0.0,
+        "metadata": { "is_visually_hidden_from_conversation": true },
+        "recipient": "all",
+        "channel": null
+      },
+      "parent": "client-created-root",
+      "children": ["33333333-0000-4000-8000-000000000002"]
+    },
+    "33333333-0000-4000-8000-000000000002": {
+      "id": "33333333-0000-4000-8000-000000000002",
+      "message": {
+        "id": "33333333-0000-4000-8000-000000000002",
+        "author": { "role": "user", "name": null, "metadata": {} },
+        "create_time": 1788059686.94,
+        "update_time": null,
+        "content": {
+          "content_type": "text",
+          "parts": [
+            "Use current official primary documentation only. Research and summarize the Play Integrity and App Attest requirements for the release team."
+          ]
+        },
+        "status": "finished_successfully",
+        "end_turn": null,
+        "weight": 1.0,
+        "metadata": { "request_id": "9a8b7c6d5e4f3a2b-GRU", "timestamp_": "absolute" },
+        "recipient": "all",
+        "channel": null
+      },
+      "parent": "33333333-0000-4000-8000-000000000001",
+      "children": [
+        "33333333-0000-4000-8000-000000000003",
+        "33333333-0000-4000-8000-000000000004"
+      ]
+    },
+    "33333333-0000-4000-8000-000000000003": {
+      "id": "33333333-0000-4000-8000-000000000003",
+      "message": {
+        "id": "33333333-0000-4000-8000-000000000003",
+        "author": { "role": "tool", "name": null, "metadata": {} },
+        "create_time": 1788059688.49,
+        "update_time": null,
+        "content": { "content_type": "text", "parts": [""] },
+        "status": "in_progress",
+        "end_turn": null,
+        "weight": 0.0,
+        "metadata": { "message_type": "next", "model_slug": "gpt-5-6-pro" },
+        "recipient": "all",
+        "channel": null
+      },
+      "parent": "33333333-0000-4000-8000-000000000002",
+      "children": []
+    },
+    "33333333-0000-4000-8000-000000000004": {
+      "id": "33333333-0000-4000-8000-000000000004",
+      "message": {
+        "id": "33333333-0000-4000-8000-000000000004",
+        "author": { "role": "assistant", "name": null, "metadata": {} },
+        "create_time": 1788059702.79,
+        "update_time": null,
+        "content": {
+          "content_type": "text",
+          "parts": [
+            "Vou cruzar a documentação oficial atual da Google e Apple com a configuração real do repositório, sem alterações, distinguindo empacotamento de aplicativo e segredos de servidor."
+          ]
+        },
+        "status": "finished_successfully",
+        "end_turn": true,
+        "weight": 1.0,
+        "metadata": {
+          "finish_details": { "type": "stop", "stop_tokens": [200002] },
+          "is_complete": true,
+          "model_slug": "gpt-5-6-pro",
+          "default_model_slug": "gpt-5-6-pro",
+          "parent_id": "33333333-0000-4000-8000-000000000002",
+          "request_id": "9a8b7c6d5e4f3a2b-GRU"
+        },
+        "recipient": "all",
+        "channel": "final"
+      },
+      "parent": "33333333-0000-4000-8000-000000000002",
+      "children": []
+    }
+  },
+  "moderation_results": [],
+  "current_node": "33333333-0000-4000-8000-000000000004",
+  "plugin_ids": null,
+  "conversation_id": "33333333-aaaa-4bbb-8ccc-000000000003",
+  "conversation_template_id": null,
+  "gizmo_id": null,
+  "gizmo_type": null,
+  "is_archived": false,
+  "is_starred": null,
+  "safe_urls": [],
+  "blocked_urls": [],
+  "default_model_slug": "gpt-5-6-pro",
+  "conversation_origin": null,
+  "voice": null,
+  "async_status": 3,
+  "disabled_tool_ids": [],
+  "is_do_not_remember": false,
+  "memory_scope": "global_enabled"
+}

@@ -10,6 +10,7 @@ fn fixture(name: &str) -> Conversation {
         "thoughts" => serde_json::from_str(include_str!("fixtures/conv_thoughts.json")),
         "image_assets" => serde_json::from_str(include_str!("fixtures/conv_image_assets.json")),
         "api_tool" => serde_json::from_str(include_str!("fixtures/conv_api_tool.json")),
+        "pro_interim" => serde_json::from_str(include_str!("fixtures/conv_pro_interim.json")),
         "stopped_old" => {
             serde_json::from_str(include_str!("fixtures/conv_stopped_old_in_progress.json"))
         }
@@ -461,7 +462,8 @@ fn the_scheduler_reads_the_api_only_when_the_page_finishes_or_an_interval_elapse
         step,
         DomStep {
             changed: true,
-            read_api: false
+            read_api: false,
+            hint: DomHint::Generating
         }
     );
     let step = scheduler.on_dom(
@@ -473,7 +475,8 @@ fn the_scheduler_reads_the_api_only_when_the_page_finishes_or_an_interval_elapse
         step,
         DomStep {
             changed: true,
-            read_api: false
+            read_api: false,
+            hint: DomHint::Generating
         }
     );
     // Unchanged page: no progress, still no read.
@@ -486,7 +489,8 @@ fn the_scheduler_reads_the_api_only_when_the_page_finishes_or_an_interval_elapse
         step,
         DomStep {
             changed: false,
-            read_api: false
+            read_api: false,
+            hint: DomHint::Generating
         }
     );
     // Growth past the stream interval: one read to refresh the text.
@@ -499,7 +503,8 @@ fn the_scheduler_reads_the_api_only_when_the_page_finishes_or_an_interval_elapse
         step,
         DomStep {
             changed: true,
-            read_api: true
+            read_api: true,
+            hint: DomHint::Generating
         }
     );
     scheduler.on_api_read(t0 + Duration::from_secs(31));
@@ -513,7 +518,8 @@ fn the_scheduler_reads_the_api_only_when_the_page_finishes_or_an_interval_elapse
         step,
         DomStep {
             changed: true,
-            read_api: true
+            read_api: true,
+            hint: DomHint::Quiet
         }
     );
     scheduler.on_api_read(t0 + Duration::from_secs(33));
@@ -528,7 +534,8 @@ fn the_scheduler_reads_the_api_only_when_the_page_finishes_or_an_interval_elapse
         step,
         DomStep {
             changed: false,
-            read_api: false
+            read_api: false,
+            hint: DomHint::Quiet
         }
     );
     let step = scheduler.on_dom(
@@ -540,7 +547,8 @@ fn the_scheduler_reads_the_api_only_when_the_page_finishes_or_an_interval_elapse
         step,
         DomStep {
             changed: false,
-            read_api: true
+            read_api: true,
+            hint: DomHint::Quiet
         }
     );
 }
@@ -572,7 +580,8 @@ fn the_scheduler_falls_back_to_slow_api_polls_without_a_page() {
         scheduler.on_dom(Some(foreign), &anchor, t0 + Duration::from_secs(40)),
         DomStep {
             changed: false,
-            read_api: false
+            read_api: false,
+            hint: DomHint::Unknown
         }
     );
     // A quiet, unfinished page is re-checked on the safety cadence.
@@ -664,14 +673,226 @@ async fn with_a_page_the_loop_reads_the_api_once_when_the_reply_finishes() {
 }
 
 /// FORK (verified live on Pro): `async_status: 4` lingers after the final
-/// message; `end_turn: true` on the newest text still completes the turn.
+/// message; `end_turn: true` on the newest text still completes the turn —
+/// once the page is quiet and the conversation has stood still for
+/// [`ASYNC_ACTIVE_SETTLE`] (see the interim-message tests below for why that
+/// wait is not optional).
 #[test]
 fn a_finished_pro_reply_completes_despite_a_lingering_async_status() {
     let mut finished = fixture("finished");
     finished.async_status = Some(4);
     finished.is_generating = false;
     let mut tracker = ReplyTracker::new(&last_user_text(&finished));
-    let deltas = tracker.observe(&finished, TrackMode::None);
+    let t0 = Instant::now();
+    let early = tracker.observe_at(&finished, TrackMode::None, DomHint::Quiet, t0);
+    assert!(!kinds(&early).contains(&"done"), "{early:?}");
+    let deltas = tracker.observe_at(
+        &finished,
+        TrackMode::None,
+        DomHint::Quiet,
+        t0 + ASYNC_ACTIVE_SETTLE,
+    );
+    assert!(
+        matches!(
+            deltas.last(),
+            Some(Delta::Done {
+                reason: DoneReason::EndTurn
+            })
+        ),
+        "{deltas:?}"
+    );
+}
+
+/// FORK (verified live on Pro, thread `01a04a6e` / conversation `6a93a027`):
+/// GPT-5.x Pro answers first with a preamble carrying `end_turn: true` and
+/// `finished_successfully` while its async run keeps working — 10+ minutes of
+/// `web.run` calls followed. Taking that message as the answer delivered a
+/// 178-character "vou pesquisar" as a consultant's report.
+///
+/// Note what the snapshot does *not* offer: the tool node that marks the live
+/// run hangs off the user message rather than the current chain, so
+/// `is_generating` is false. Only `async_status` and the page know.
+#[test]
+fn a_pro_interim_end_turn_is_not_the_answer_while_the_page_shows_a_run() {
+    let conv = fixture("pro_interim");
+    assert_eq!(conv.async_status, Some(3));
+    assert!(
+        !conv.is_generating,
+        "the in-progress node is off the current chain, as observed live"
+    );
+    let mut tracker = ReplyTracker::new(&last_user_text(&conv));
+    let t0 = Instant::now();
+    let first = tracker.observe_at(&conv, TrackMode::None, DomHint::Generating, t0);
+    assert!(kinds(&first).contains(&"text"), "{first:?}");
+    assert!(!kinds(&first).contains(&"done"), "{first:?}");
+    // Waiting does not help while the stop button is still up (up to the
+    // stale-signal cap, which the next test covers).
+    let later = tracker.observe_at(
+        &conv,
+        TrackMode::None,
+        DomHint::Generating,
+        t0 + ASYNC_ACTIVE_SETTLE * 3,
+    );
+    assert!(!kinds(&later).contains(&"done"), "{later:?}");
+}
+
+/// FORK (verified live): both signals can be stale at once — the run ended at
+/// 03:46, yet an hour later the throttled tab still rendered the stop button
+/// and the API still reported `async_status: 3`. Holding out for either would
+/// hang until the stall watchdog and lose the answer, so total stillness for
+/// [`ASYNC_ACTIVE_STILL_CAP`] wins over both.
+#[test]
+fn a_conversation_that_stops_moving_completes_even_with_both_signals_stuck() {
+    let conv = fixture("pro_interim");
+    let mut tracker = ReplyTracker::new(&last_user_text(&conv));
+    let t0 = Instant::now();
+    let _ = tracker.observe_at(&conv, TrackMode::None, DomHint::Generating, t0);
+    let before = tracker.observe_at(
+        &conv,
+        TrackMode::None,
+        DomHint::Generating,
+        t0 + ASYNC_ACTIVE_STILL_CAP - Duration::from_secs(1),
+    );
+    assert!(!kinds(&before).contains(&"done"), "{before:?}");
+    let deltas = tracker.observe_at(
+        &conv,
+        TrackMode::None,
+        DomHint::Generating,
+        t0 + ASYNC_ACTIVE_STILL_CAP,
+    );
+    assert!(
+        matches!(
+            deltas.last(),
+            Some(Delta::Done {
+                reason: DoneReason::EndTurn
+            })
+        ),
+        "{deltas:?}"
+    );
+}
+
+/// The cap measures stillness, not the turn's age: a run that keeps producing
+/// messages never reaches it.
+#[test]
+fn a_run_that_keeps_moving_never_reaches_the_stale_signal_cap() {
+    let conv = fixture("pro_interim");
+    let mut grown = conv.clone();
+    let last = grown.turns.len() - 1;
+    let mut tracker = ReplyTracker::new(&last_user_text(&conv));
+    let t0 = Instant::now();
+    let _ = tracker.observe_at(&conv, TrackMode::None, DomHint::Generating, t0);
+    // A node lands every 90s for well past the cap, as a live Pro run does.
+    for step in 1..=12 {
+        grown.turns[last].text.push_str(" mais.");
+        let at = t0 + Duration::from_secs(90 * step);
+        let deltas = tracker.observe_at(&grown, TrackMode::None, DomHint::Generating, at);
+        assert!(!kinds(&deltas).contains(&"done"), "at {step}: {deltas:?}");
+    }
+}
+
+/// With no tab watching (or a quiet one) the settle window is what stands in
+/// for the page: the reply is accepted only after nothing moves for
+/// [`ASYNC_ACTIVE_SETTLE`].
+#[test]
+fn a_pro_interim_end_turn_is_accepted_once_the_page_is_quiet_and_nothing_moves() {
+    let conv = fixture("pro_interim");
+    let mut tracker = ReplyTracker::new(&last_user_text(&conv));
+    let t0 = Instant::now();
+    let first = tracker.observe_at(&conv, TrackMode::None, DomHint::Unknown, t0);
+    assert!(!kinds(&first).contains(&"done"), "{first:?}");
+    let almost = tracker.observe_at(
+        &conv,
+        TrackMode::None,
+        DomHint::Unknown,
+        t0 + ASYNC_ACTIVE_SETTLE - Duration::from_secs(1),
+    );
+    assert!(!kinds(&almost).contains(&"done"), "{almost:?}");
+    let deltas = tracker.observe_at(
+        &conv,
+        TrackMode::None,
+        DomHint::Quiet,
+        t0 + ASYNC_ACTIVE_SETTLE,
+    );
+    assert!(
+        matches!(
+            deltas.last(),
+            Some(Delta::Done {
+                reason: DoneReason::EndTurn
+            })
+        ),
+        "{deltas:?}"
+    );
+}
+
+/// The window measures silence, not elapsed time: anything moving in the
+/// conversation — or the page showing the run again — restarts it.
+#[test]
+fn the_settle_window_restarts_when_the_run_moves_again() {
+    let conv = fixture("pro_interim");
+    let mut grown = conv.clone();
+    let last = grown.turns.len() - 1;
+    grown.turns[last]
+        .text
+        .push_str(" Começo pela Play Integrity.");
+
+    let mut tracker = ReplyTracker::new(&last_user_text(&conv));
+    let t0 = Instant::now();
+    let _ = tracker.observe_at(&conv, TrackMode::None, DomHint::Quiet, t0);
+    // The interim message grows 100s in: the clock starts over from there.
+    let moved = tracker.observe_at(
+        &grown,
+        TrackMode::None,
+        DomHint::Quiet,
+        t0 + Duration::from_secs(100),
+    );
+    assert!(!kinds(&moved).contains(&"done"), "{moved:?}");
+    let old_window = tracker.observe_at(
+        &grown,
+        TrackMode::None,
+        DomHint::Quiet,
+        t0 + ASYNC_ACTIVE_SETTLE,
+    );
+    assert!(!kinds(&old_window).contains(&"done"), "{old_window:?}");
+    let deltas = tracker.observe_at(
+        &grown,
+        TrackMode::None,
+        DomHint::Quiet,
+        t0 + Duration::from_secs(100) + ASYNC_ACTIVE_SETTLE,
+    );
+    assert!(kinds(&deltas).contains(&"done"), "{deltas:?}");
+}
+
+/// A page that says "generating" mid-window clears it, even if the
+/// conversation itself did not change.
+#[test]
+fn the_page_showing_a_run_clears_a_window_already_counting() {
+    let conv = fixture("pro_interim");
+    let mut tracker = ReplyTracker::new(&last_user_text(&conv));
+    let t0 = Instant::now();
+    let _ = tracker.observe_at(&conv, TrackMode::None, DomHint::Quiet, t0);
+    let _ = tracker.observe_at(
+        &conv,
+        TrackMode::None,
+        DomHint::Generating,
+        t0 + Duration::from_secs(60),
+    );
+    let deltas = tracker.observe_at(
+        &conv,
+        TrackMode::None,
+        DomHint::Quiet,
+        t0 + ASYNC_ACTIVE_SETTLE,
+    );
+    assert!(!kinds(&deltas).contains(&"done"), "{deltas:?}");
+}
+
+/// The guard is scoped to an active async run: an ordinary reply still
+/// completes on the poll that first sees `end_turn: true`.
+#[test]
+fn a_reply_without_an_active_async_run_still_completes_immediately() {
+    let conv = fixture("finished");
+    assert!(matches!(conv.async_status, None | Some(0)));
+    let mut tracker = ReplyTracker::new(&last_user_text(&conv));
+    let deltas = tracker.observe_at(&conv, TrackMode::None, DomHint::Unknown, Instant::now());
     assert!(
         matches!(
             deltas.last(),

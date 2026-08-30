@@ -85,6 +85,48 @@ pub(crate) enum Delta {
 /// stop button blinks between phases.
 pub(crate) const STABLE_POLLS_WITHOUT_ASSETS: u32 = 8;
 
+/// FORK (verified live on Pro): how long an `end_turn: true` message must
+/// stand unchanged before it is accepted as the answer while the conversation
+/// still reports an active server-side run (`async_status != 0`).
+///
+/// GPT-5.x Pro posts interim messages — a preamble, a note between phases —
+/// with `end_turn: true` and `finished_successfully` while its async run keeps
+/// working, so `end_turn` alone once delivered a 178-character preamble as the
+/// whole answer. The page is the reliable discriminator (the stop button stays
+/// up for the entire Pro run), which is what [`DomHint`] carries; this window
+/// only covers the case where no tab is watching the conversation. The longest
+/// silent gap observed inside a live Pro run was ~95 s.
+pub(crate) const ASYNC_ACTIVE_SETTLE: Duration = Duration::from_secs(120);
+
+/// FORK (verified live on Pro): an upper bound on that wait, for the case
+/// where both signals are stale at once.
+///
+/// A hidden, throttled tab keeps rendering the stop button long after the run
+/// ended, and `async_status` was seen still reading `3` more than an hour after
+/// the final message landed — a turn holding out for either of them would hang
+/// until the stall watchdog failed it and threw the answer away. Nothing at all
+/// moving in the conversation for this long, with a finished message standing,
+/// is the run being over: inside a live Pro run something lands at least every
+/// ~95 s.
+pub(crate) const ASYNC_ACTIVE_STILL_CAP: Duration = Duration::from_secs(600);
+
+/// FORK: what the page says about the reply, as far as completion goes.
+///
+/// Derived from the stop-button/streaming signals only: `assistant_turns` and
+/// `last_assistant_done` depend on how much of the (possibly hidden and
+/// virtualized) page actually rendered, and a live Pro run was observed
+/// rendering neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum DomHint {
+    /// No tab shows this conversation, or it has not caught up with our send.
+    #[default]
+    Unknown,
+    /// The page shows a run in flight.
+    Generating,
+    /// The page shows nothing running.
+    Quiet,
+}
+
 #[derive(Debug, Clone)]
 struct Emitted {
     kind: ItemKind,
@@ -103,6 +145,13 @@ pub(crate) struct ReplyTracker {
     notes: HashSet<String>,
     last_fingerprint: Option<u64>,
     stable_polls: u32,
+    /// FORK: when the conversation first looked settled while a server-side
+    /// run was still flagged active (see [`ASYNC_ACTIVE_SETTLE`]). Cleared
+    /// whenever anything moves or the page says a run is in flight.
+    async_quiet_since: Option<Instant>,
+    /// FORK: when the conversation itself last changed, whatever the page says
+    /// (see [`ASYNC_ACTIVE_STILL_CAP`]).
+    changed_at: Option<Instant>,
     /// Characters of answer text emitted so far (for the usage estimate).
     text_chars: usize,
     done: bool,
@@ -117,6 +166,8 @@ impl ReplyTracker {
             notes: HashSet::new(),
             last_fingerprint: None,
             stable_polls: 0,
+            async_quiet_since: None,
+            changed_at: None,
             text_chars: 0,
             done: false,
         }
@@ -149,8 +200,25 @@ impl ReplyTracker {
         anchor_matches(&conv.turns[index].text, &self.anchor)
     }
 
-    /// Diffs one snapshot against what was already emitted.
+    /// Diffs one snapshot against what was already emitted, with nothing known
+    /// about the page: the shorthand the pure tests use. Both poll loops know
+    /// what the DOM last said and call [`Self::observe_at`].
+    #[cfg(test)]
     pub(crate) fn observe(&mut self, conv: &Conversation, mode: TrackMode) -> Vec<Delta> {
+        self.observe_at(conv, mode, DomHint::Unknown, Instant::now())
+    }
+
+    /// Diffs one snapshot against what was already emitted. `dom` is what the
+    /// page last said about this reply and `now` the time of this poll; both
+    /// only matter while a server-side run is still flagged active (see
+    /// [`ASYNC_ACTIVE_SETTLE`]).
+    pub(crate) fn observe_at(
+        &mut self,
+        conv: &Conversation,
+        mode: TrackMode,
+        dom: DomHint,
+        now: Instant,
+    ) -> Vec<Delta> {
         if self.done || !self.anchored(conv) {
             return Vec::new();
         }
@@ -187,8 +255,11 @@ impl ReplyTracker {
         let changed = self.last_fingerprint != Some(fingerprint);
         if changed {
             self.stable_polls = 0;
+            self.async_quiet_since = None;
+            self.changed_at = Some(now);
         } else {
             self.stable_polls = self.stable_polls.saturating_add(1);
+            self.changed_at.get_or_insert(now);
         }
         self.last_fingerprint = Some(fingerprint);
         if changed || !deltas.is_empty() {
@@ -203,12 +274,15 @@ impl ReplyTracker {
         // `async_status: 4` after its final message landed with
         // `end_turn: true`; waiting for the status to clear held the turn
         // until the watchdog. A newest text that says the turn ended is the
-        // turn ending, whatever the async flag says.
+        // turn ending, whatever the async flag says — but while the flag is
+        // still up that claim has to survive `async_settled` below.
         let ended = newest_text.is_some_and(|turn| {
             turn.end_turn == Some(true) && turn.status == "finished_successfully"
         });
-        let idle = !conv.is_generating && (matches!(conv.async_status, None | Some(0)) || ended);
+        let async_running = !matches!(conv.async_status, None | Some(0));
+        let idle = !conv.is_generating && (!async_running || ended);
         if !idle {
+            self.async_quiet_since = None;
             return deltas;
         }
         if let Some(turn) = newest_text
@@ -230,9 +304,27 @@ impl ReplyTracker {
         {
             return deltas;
         }
-        let done_end_turn = newest_text.is_some_and(|turn| {
-            turn.end_turn == Some(true) && turn.status == "finished_successfully"
-        });
+        // FORK (verified live on Pro): with a server-side run still active,
+        // `end_turn: true` can be an interim message that the run keeps going
+        // past. Trust it only once the page stops showing a run in flight and
+        // nothing has moved for `ASYNC_ACTIVE_SETTLE`.
+        let async_settled = !async_running || {
+            let still_for = self
+                .changed_at
+                .map_or(Duration::ZERO, |at| now.saturating_duration_since(at));
+            if still_for >= ASYNC_ACTIVE_STILL_CAP {
+                true
+            } else if dom == DomHint::Generating {
+                self.async_quiet_since = None;
+                false
+            } else {
+                let since = *self.async_quiet_since.get_or_insert(now);
+                now.saturating_duration_since(since) >= ASYNC_ACTIVE_SETTLE
+            }
+        };
+        if !async_settled {
+            return deltas;
+        }
         let has_assets = reply
             .iter()
             .any(|turn| turn.role != "user" && !turn.assets.is_empty());
@@ -240,7 +332,7 @@ impl ReplyTracker {
         let done_fallback = !has_assets
             && newest_text.is_some()
             && self.stable_polls >= STABLE_POLLS_WITHOUT_ASSETS;
-        if done_end_turn {
+        if ended {
             self.done = true;
             deltas.push(Delta::Done {
                 reason: DoneReason::EndTurn,
@@ -480,6 +572,8 @@ pub(crate) struct DomStep {
     pub(crate) changed: bool,
     /// The backend must be read now.
     pub(crate) read_api: bool,
+    /// FORK: what the page says about the reply, for [`ReplyTracker`].
+    pub(crate) hint: DomHint,
 }
 
 impl PollScheduler {
@@ -538,6 +632,7 @@ impl PollScheduler {
             return DomStep {
                 changed: false,
                 read_api,
+                hint: DomHint::Unknown,
             };
         };
         if !Self::anchored(&progress, anchor) {
@@ -547,8 +642,16 @@ impl PollScheduler {
             return DomStep {
                 changed: false,
                 read_api: self.since_api(now) >= self.stream_interval,
+                hint: DomHint::Unknown,
             };
         }
+        // FORK: the raw in-flight signals only — a hidden or virtualized page
+        // can render no assistant turn at all while the run is very much alive.
+        let hint = if progress.generating || progress.streaming > 0 {
+            DomHint::Generating
+        } else {
+            DomHint::Quiet
+        };
         let changed = self.last_dom.as_ref() != Some(&progress);
         let grew = self.last_dom.as_ref().is_none_or(|previous| {
             progress.assistant_chars > previous.assistant_chars
@@ -569,7 +672,11 @@ impl PollScheduler {
         } else {
             since_api >= self.safety_interval
         };
-        DomStep { changed, read_api }
+        DomStep {
+            changed,
+            read_api,
+            hint,
+        }
     }
 
     /// The API was just read.
@@ -605,6 +712,7 @@ impl PollLoop<'_> {
         let mut last_rate_limit: Option<Instant> = None;
         let mut scheduler = PollScheduler::new(self.sent_at);
         let anchor = anchor_of(&self.anchor);
+        let mut dom_hint = DomHint::Unknown;
         loop {
             let idle_deadline = self
                 .idle_timeout
@@ -631,6 +739,7 @@ impl PollLoop<'_> {
                     }
                 };
                 let step = scheduler.on_dom(progress, &anchor, Instant::now());
+                dom_hint = step.hint;
                 if step.changed {
                     last_progress = Instant::now();
                 }
@@ -681,7 +790,9 @@ impl PollLoop<'_> {
                 }
             };
 
-            let deltas = self.tracker.observe(&conv, self.mode);
+            let deltas = self
+                .tracker
+                .observe_at(&conv, self.mode, dom_hint, Instant::now());
             for delta in deltas {
                 match apply_delta(assembler, delta, &mut last_progress).await {
                     DeltaStep::Continue => {}

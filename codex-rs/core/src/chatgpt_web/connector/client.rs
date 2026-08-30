@@ -403,6 +403,13 @@ impl DaemonSessionBroker {
 
     async fn wait_verified(&self, ready_timeout: Duration) -> Result<(), String> {
         let deadline = tokio::time::Instant::now() + ready_timeout;
+        // FORK (verified live): `browser_unavailable` is transient — the
+        // chrome-mcp extension's service worker sleeps and the daemon's next
+        // reconcile brings the connector back (67s, once). Failing the turn on
+        // the first sighting killed a consultant agent 19s in while the
+        // 90s budget was barely touched, so it is retried like any other
+        // not-yet-verified state and only reported if the deadline runs out.
+        let mut browser_unavailable = false;
         loop {
             match self.session.daemon.health().await {
                 Ok(health) if health.registry_status == "verified" => return Ok(()),
@@ -412,16 +419,18 @@ impl DaemonSessionBroker {
                             .to_string(),
                     );
                 }
-                Ok(health) if health.registry_status == "browser_unavailable" => {
+                Ok(health) => {
+                    browser_unavailable = health.registry_status == "browser_unavailable";
+                }
+                Err(err) => warn!("chatgpt_web connector: health check failed: {err}"),
+            }
+            if tokio::time::Instant::now() >= deadline {
+                if browser_unavailable {
                     return Err(
                         "the daemon could not reach chatgpt.com through chrome-mcp to register the connector; make sure Chrome and the chrome-mcp extension are running."
                             .to_string(),
                     );
                 }
-                Ok(_) => {}
-                Err(err) => warn!("chatgpt_web connector: health check failed: {err}"),
-            }
-            if tokio::time::Instant::now() >= deadline {
                 return Err(format!(
                     "the ChatGPT connector was not ready within {}s; run `codex chatgpt-web registry show` to see why",
                     ready_timeout.as_secs()
