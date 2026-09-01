@@ -1,5 +1,7 @@
 use super::*;
 use crate::exec_output::StreamOutput;
+use crate::protocol::CodexErrorInfo;
+use crate::protocol::ErrorEvent;
 use crate::protocol::RateLimitWindow;
 use chrono::DateTime;
 use chrono::Duration as ChronoDuration;
@@ -74,6 +76,46 @@ fn retryability_preserves_error_details_distinctions() {
             "unexpected retryability for {err:?}"
         );
     }
+}
+
+#[test]
+fn history_recovery_error_is_structured_and_non_retryable() {
+    let err = CodexErr::history_recovery_required(
+        HistoryRecoveryReason::UndecryptableEncryptedFunctionOutput,
+    );
+
+    assert_eq!(
+        err.history_recovery_reason(),
+        Some(HistoryRecoveryReason::UndecryptableEncryptedFunctionOutput)
+    );
+    assert!(!err.is_retryable());
+    assert_eq!(err.to_string(), HISTORY_RECOVERY_REQUIRED_ERROR_MESSAGE);
+    assert_eq!(
+        err.to_error_event(None),
+        ErrorEvent {
+            message: HISTORY_RECOVERY_REQUIRED_ERROR_MESSAGE.to_string(),
+            codex_error_info: Some(CodexErrorInfo::Other),
+            misalignment: None,
+        }
+    );
+}
+
+#[test]
+fn only_the_persisted_history_recovery_message_is_recognized() {
+    assert_eq!(
+        history_recovery_reason_from_error_message(HISTORY_RECOVERY_REQUIRED_ERROR_MESSAGE),
+        Some(HistoryRecoveryReason::UndecryptableEncryptedFunctionOutput)
+    );
+    assert_eq!(
+        history_recovery_reason_from_error_message(ENCRYPTED_FUNCTION_OUTPUT_CONTENT_ERROR_MESSAGE),
+        None
+    );
+    assert_eq!(
+        history_recovery_reason_from_error_message(
+            "stream disconnected before completion: Encrypted function output content could not be decrypted or decoded. "
+        ),
+        None
+    );
 }
 
 fn rate_limit_snapshot() -> RateLimitSnapshot {

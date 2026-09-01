@@ -4,6 +4,8 @@ use crate::config_requirements::ConfigRequirementsToml;
 use crate::format_config_layer_source;
 
 use super::fingerprint::record_origins;
+use super::fingerprint::revision_for_layers;
+use super::fingerprint::runtime_feature_revision;
 use super::fingerprint::version_for_toml;
 use super::key_aliases::normalized_with_key_aliases;
 use super::merge::merge_toml_values;
@@ -304,6 +306,30 @@ impl ConfigLayerStack {
 
     pub fn startup_warnings(&self) -> Option<&[String]> {
         self.startup_warnings.as_deref()
+    }
+
+    /// Returns a stable revision of the enabled configuration layers.
+    ///
+    /// The revision includes only layer identity and the redacted layer
+    /// version. It does not serialize or hash raw configuration values. A
+    /// disabled layer is excluded because it cannot affect the effective
+    /// runtime configuration.
+    pub fn revision(&self) -> String {
+        revision_for_layers(self.layers_low_to_high().map(|layer| {
+            (
+                format_config_layer_source(&layer.name, CONFIG_TOML_FILE),
+                layer.version.clone(),
+            )
+        }))
+    }
+
+    /// Returns a revision of the effective runtime feature enablements.
+    ///
+    /// This is separate from [`Self::revision`] because feature defaults,
+    /// aliases, and dependency normalization have runtime meaning distinct
+    /// from the rest of the config layer contents.
+    pub fn runtime_feature_revision(&self) -> String {
+        runtime_feature_revision(&self.effective_config())
     }
 
     /// Returns the active raw user config layer, if any.

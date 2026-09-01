@@ -3,8 +3,13 @@
 //! The plan list and the plan body both come from the app-server (`plan/list`, `plan/read`), so
 //! the TUI never touches the plans directory itself.
 
+use std::collections::HashSet;
+
 use super::*;
 use crate::app_event::SavedPlanAction;
+use codex_app_server_protocol::PlanApproveParams;
+use codex_app_server_protocol::PlanApproveResponse;
+use codex_app_server_protocol::PlanLifecycle;
 use codex_app_server_protocol::PlanListParams;
 use codex_app_server_protocol::PlanListResponse;
 use codex_app_server_protocol::PlanReadParams;
@@ -26,7 +31,11 @@ impl App {
             let result = async {
                 let mut plans: Vec<PlanSummary> = Vec::new();
                 let mut cursor: Option<String> = None;
+                let mut seen_cursors = HashSet::new();
                 loop {
+                    if !seen_cursors.insert(cursor.clone()) {
+                        return Err("plan/list returned a repeated pagination cursor".to_string());
+                    }
                     let page = request_handle
                         .request_typed::<PlanListResponse>(ClientRequest::PlanList {
                             request_id: RequestId::String(format!("plan-list-{}", Uuid::new_v4())),
@@ -81,6 +90,8 @@ impl App {
         &mut self,
         app_server: &AppServerSession,
         id: String,
+        revision: u32,
+        lifecycle: PlanLifecycle,
         action: SavedPlanAction,
     ) {
         let request_id = self.chat_widget.begin_saved_plan_load();
@@ -90,12 +101,19 @@ impl App {
             let result = request_handle
                 .request_typed::<PlanReadResponse>(ClientRequest::PlanRead {
                     request_id: RequestId::String(format!("plan-read-{}", Uuid::new_v4())),
-                    params: PlanReadParams { id },
+                    params: PlanReadParams {
+                        id,
+                        revision: match lifecycle {
+                            PlanLifecycle::Draft => None,
+                            PlanLifecycle::Approved | PlanLifecycle::Superseded => Some(revision),
+                        },
+                    },
                 })
                 .await
                 .map_err(|err| err.to_string());
             app_event_tx.send(AppEvent::SavedPlanLoaded {
                 request_id,
+                expected_revision: revision,
                 action,
                 result,
             });
@@ -105,6 +123,7 @@ impl App {
     pub(super) fn apply_saved_plan_loaded(
         &mut self,
         request_id: Uuid,
+        expected_revision: u32,
         action: SavedPlanAction,
         result: Result<PlanReadResponse, String>,
     ) {
@@ -112,10 +131,59 @@ impl App {
             return;
         }
         match result {
-            Ok(plan) => self.chat_widget.apply_loaded_plan(plan, action),
+            Ok(plan) => self
+                .chat_widget
+                .apply_loaded_plan(plan, expected_revision, action),
             Err(err) => self
                 .chat_widget
                 .add_error_message(format!("Failed to load saved plan: {err}")),
+        }
+    }
+
+    pub(super) fn approve_saved_plan(
+        &mut self,
+        app_server: &AppServerSession,
+        id: String,
+        expected_revision: u32,
+        action: SavedPlanAction,
+    ) {
+        let request_id = self.chat_widget.begin_saved_plan_approval();
+        let request_handle = app_server.request_handle();
+        let app_event_tx = self.app_event_tx.clone();
+        tokio::spawn(async move {
+            let result = request_handle
+                .request_typed::<PlanApproveResponse>(ClientRequest::PlanApprove {
+                    request_id: RequestId::String(format!("plan-approve-{}", Uuid::new_v4())),
+                    params: PlanApproveParams {
+                        id,
+                        expected_revision,
+                    },
+                })
+                .await
+                .map_err(|err| err.to_string());
+            app_event_tx.send(AppEvent::PlanApprovalLoaded {
+                request_id,
+                action,
+                result,
+            });
+        });
+    }
+
+    pub(super) fn apply_plan_approval_result(
+        &mut self,
+        request_id: Uuid,
+        action: SavedPlanAction,
+        result: Result<PlanApproveResponse, String>,
+    ) {
+        if !self.chat_widget.finish_saved_plan_approval(request_id) {
+            return;
+        }
+        match result {
+            Ok(response) if response.plan.lifecycle == PlanLifecycle::Approved => self
+                .chat_widget
+                .apply_approved_plan(response.plan, response.approved_plan, action),
+            Ok(_) => self.chat_widget.show_saved_plan_stale(),
+            Err(error) => self.chat_widget.show_saved_plan_approval_conflict(error),
         }
     }
 }

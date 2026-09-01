@@ -978,6 +978,16 @@ impl From<CoreTurnItem> for ThreadItem {
             CoreTurnItem::Extension(extension) => match extension {
                 ExtensionItem::ImageGeneration(item) => ThreadItem::ImageGeneration(item),
                 ExtensionItem::Sleep(item) => ThreadItem::Sleep(item),
+                // Receipts are canonical host-side evidence, not model-facing
+                // transcript content. Preserve their id for lifecycle
+                // bookkeeping while using the existing hidden tool-output
+                // projection instead of exposing receipt metadata to clients.
+                ExtensionItem::ReceiptAttached(item) => ThreadItem::FunctionCallOutput {
+                    id: item.receipt_id,
+                    name: "receipt.attached".to_string(),
+                    namespace: None,
+                    output: FunctionCallOutputBody::default(),
+                },
                 ExtensionItem::WebSearch(item) => ThreadItem::WebSearch(item),
             },
             CoreTurnItem::ImageGeneration(image) => {

@@ -75,6 +75,16 @@ async fn resolve(
     thread_id: ThreadId,
     scope: LookupScope,
 ) -> ThreadStoreResult<Option<ResolvedThreadRollout>> {
+    if let Some(state_db) = store.state_db().await
+        && state_db
+            .is_thread_tombstoned(thread_id)
+            .await
+            .map_err(|error| ThreadStoreError::Internal {
+                message: format!("failed to read tombstone state for {thread_id}: {error}"),
+            })?
+    {
+        return Ok(None);
+    }
     if let Ok(path) = live_writer::rollout_path(store, thread_id).await
         && codex_rollout::existing_rollout_path(path.as_path())
             .await

@@ -32,6 +32,9 @@ pub(super) async fn read_thread(
     params: ReadThreadParams,
 ) -> ThreadStoreResult<StoredThread> {
     let thread_id = params.thread_id;
+    if is_tombstoned(store, thread_id).await? {
+        return Err(ThreadStoreError::ThreadNotFound { thread_id });
+    }
     if let Some(metadata) = read_sqlite_metadata(store, thread_id).await
         && (params.include_archived
             || (metadata.archived_at.is_none()
@@ -124,6 +127,11 @@ pub(super) async fn read_thread_by_rollout_path(
 ) -> ThreadStoreResult<StoredThread> {
     let path = resolve_requested_rollout_path(store, rollout_path).await?;
     let mut thread = read_thread_from_rollout_path(store, path.clone()).await?;
+    if is_tombstoned(store, thread.thread_id).await? {
+        return Err(ThreadStoreError::ThreadNotFound {
+            thread_id: thread.thread_id,
+        });
+    }
     if !include_archived && thread.archived_at.is_some() {
         return Err(ThreadStoreError::InvalidRequest {
             message: format!("thread {} is archived", thread.thread_id),
@@ -294,6 +302,21 @@ async fn read_sqlite_metadata(
 ) -> Option<ThreadMetadata> {
     let runtime = store.state_db().await?;
     runtime.get_thread(thread_id).await.ok().flatten()
+}
+
+async fn is_tombstoned(
+    store: &LocalThreadStore,
+    thread_id: codex_protocol::ThreadId,
+) -> ThreadStoreResult<bool> {
+    let Some(runtime) = store.state_db().await else {
+        return Ok(false);
+    };
+    runtime
+        .is_thread_tombstoned(thread_id)
+        .await
+        .map_err(|error| ThreadStoreError::Internal {
+            message: format!("failed to read tombstone state for {thread_id}: {error}"),
+        })
 }
 
 pub(super) async fn stored_thread_from_sqlite_metadata(

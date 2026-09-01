@@ -21,6 +21,7 @@ use codex_protocol::protocol::ThreadHistoryMode;
 use codex_rollout::StateDbHandle;
 use codex_state::RolloutMigrationCursor;
 use codex_state::RolloutMigrationSkippedRollout;
+use codex_state::WorkflowBackfillStatus;
 
 use super::LocalThreadStore;
 use super::RolloutMigrationMode;
@@ -43,6 +44,8 @@ const MALFORMED_SESSION_META_SKIP_REASON: &str = "malformed_session_meta";
 const BUSY_SKIP_REASON: &str = "busy";
 const CURSOR_LOOKBACK_SECONDS: i64 = 48 * 60 * 60;
 const MAINTENANCE_RETRY_DELAY: Duration = Duration::from_secs(1);
+const MAINTENANCE_CONFLICT_MESSAGE: &str =
+    "rollout compression or another migration is already running";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct RolloutFingerprint {
@@ -189,6 +192,7 @@ async fn retry_busy_rollouts(
     if paths.is_empty() {
         return Ok(());
     }
+    let paths = retry_paths_for_backfill(store, paths, discovered_paths).await?;
     let report = run_startup_migration(store, paths).await?;
     for moved_skip_path in moved_skip_paths {
         remove_skip(store, moved_skip_path).await?;
@@ -197,6 +201,54 @@ async fn retry_busy_rollouts(
         update_skip_after_outcome(store, outcome).await?;
     }
     Ok(())
+}
+
+/// Resume a recoverable startup backfill with the complete source set that produced its
+/// watermark. Retrying only the busy source would give the frozen apply a narrower watermark and
+/// be rejected as stale, even though the original source set is still available.
+async fn retry_paths_for_backfill(
+    store: &LocalThreadStore,
+    mut busy_paths: Vec<PathBuf>,
+    discovered_paths: &[PathBuf],
+) -> ThreadStoreResult<Vec<PathBuf>> {
+    let Some(state_db) = store.state_db.as_ref() else {
+        return Ok(busy_paths);
+    };
+    let workflow = state_db.workflow();
+    let state = workflow
+        .get_backfill_coordinator_state()
+        .await
+        .map_err(migration_error)?;
+    if state.watermark.is_none() || state.status == WorkflowBackfillStatus::Complete {
+        return Ok(busy_paths);
+    }
+    let journals = workflow
+        .list_backfill_journal()
+        .await
+        .map_err(migration_error)?;
+    for journal in journals {
+        let stored_path = PathBuf::from(&journal.source_path);
+        let path = if tokio::fs::try_exists(&stored_path)
+            .await
+            .map_err(migration_error)?
+        {
+            Some(stored_path)
+        } else {
+            discovered_paths
+                .iter()
+                .find(|path| {
+                    codex_rollout::rollout_id_from_path(path)
+                        .is_some_and(|rollout_id| rollout_id.to_string() == journal.rollout_id)
+                })
+                .cloned()
+        };
+        if let Some(path) = path
+            && !busy_paths.contains(&path)
+        {
+            busy_paths.push(path);
+        }
+    }
+    Ok(busy_paths)
 }
 
 async fn run_startup_migration(
@@ -227,7 +279,11 @@ async fn run_startup_migration(
             )
             .await
         {
-            Err(ThreadStoreError::Conflict { .. }) => continue,
+            Err(ThreadStoreError::Conflict { message })
+                if message == MAINTENANCE_CONFLICT_MESSAGE =>
+            {
+                continue;
+            }
             result => return result,
         }
     }

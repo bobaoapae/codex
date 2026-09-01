@@ -1,11 +1,67 @@
 use super::*;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::TurnItemContributor;
+use codex_history::RolloutItem;
 use codex_protocol::ResponseItemId;
+use codex_protocol::error::HISTORY_RECOVERY_REQUIRED_ERROR_MESSAGE;
 use codex_protocol::items::AgentMessageContent;
+use codex_protocol::protocol::CodexErrorInfo;
+use codex_protocol::protocol::ErrorEvent;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::TurnCompleteEvent;
 use pretty_assertions::assert_eq;
 use std::sync::Arc;
 use tracing_subscriber::prelude::*;
+
+#[test]
+fn history_recovery_marker_is_recovered_from_terminal_turn_event() {
+    let marker = RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+        turn_id: "turn-1".to_string(),
+        last_agent_message: None,
+        error: Some(ErrorEvent {
+            message: HISTORY_RECOVERY_REQUIRED_ERROR_MESSAGE.to_string(),
+            codex_error_info: Some(CodexErrorInfo::Other),
+            misalignment: None,
+        }),
+        started_at: None,
+        completed_at: None,
+        duration_ms: None,
+        time_to_first_token_ms: None,
+    }));
+    let unrelated = RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+        turn_id: "turn-2".to_string(),
+        last_agent_message: Some("done".to_string()),
+        error: None,
+        started_at: None,
+        completed_at: None,
+        duration_ms: None,
+        time_to_first_token_ms: None,
+    }));
+
+    assert_eq!(
+        history_recovery_reason_from_rollout(&[unrelated, marker]),
+        Some(codex_protocol::error::HistoryRecoveryReason::UndecryptableEncryptedFunctionOutput)
+    );
+}
+
+#[test]
+fn history_recovery_marker_ignores_unrelated_terminal_errors() {
+    let unrelated = RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+        turn_id: "turn-1".to_string(),
+        last_agent_message: None,
+        error: Some(ErrorEvent {
+            message: "stream disconnected before completion: network reset".to_string(),
+            codex_error_info: Some(CodexErrorInfo::Other),
+            misalignment: None,
+        }),
+        started_at: None,
+        completed_at: None,
+        duration_ms: None,
+        time_to_first_token_ms: None,
+    }));
+
+    assert_eq!(history_recovery_reason_from_rollout(&[unrelated]), None);
+}
 
 struct RewriteAgentMessageContributor;
 
@@ -59,7 +115,7 @@ fn post_sampling_token_estimate_is_disabled_by_always_on_sinks() {
 }
 
 #[tokio::test]
-async fn plan_mode_uses_contributed_turn_item_for_last_agent_message() {
+async fn fork_invariant_plan_mode_uses_contributed_turn_item_for_last_agent_message() {
     let (mut session, turn_context) = crate::session::tests::make_session_and_context().await;
     let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
     builder.turn_item_contributor(Arc::new(RewriteAgentMessageContributor));
@@ -89,7 +145,7 @@ async fn plan_mode_uses_contributed_turn_item_for_last_agent_message() {
 
 /// FORK: the Plan-mode reminder is recorded once per turn and only in Plan mode.
 #[tokio::test]
-async fn plan_mode_reminder_is_recorded_once_per_plan_turn() {
+async fn fork_invariant_plan_mode_reminder_is_recorded_once_per_turn() {
     use crate::session::plan_reminder::maybe_record_plan_mode_reminder;
     use crate::session::step_context::StepContext;
     use crate::session::tests::update_selected_settings_for_test;
@@ -115,7 +171,7 @@ async fn plan_mode_reminder_is_recorded_once_per_plan_turn() {
 }
 
 #[tokio::test]
-async fn plan_mode_reminder_is_not_recorded_outside_plan_mode() {
+async fn fork_invariant_plan_mode_reminder_is_not_recorded_outside_plan_mode() {
     use crate::session::plan_reminder::maybe_record_plan_mode_reminder;
     use crate::session::step_context::StepContext;
     use codex_protocol::config_types::ModeKind;

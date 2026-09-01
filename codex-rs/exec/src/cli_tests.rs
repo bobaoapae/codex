@@ -127,3 +127,23 @@ fn approve_for_me_flag_conflicts_with_other_sandbox_modes() {
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 }
+
+#[test]
+fn transient_parses_as_a_durable_new_session_mode() {
+    let cli = Cli::try_parse_from(["codex-exec", "--transient", "run this job"])
+        .expect("transient should parse");
+
+    assert!(cli.transient);
+    assert!(!cli.ephemeral);
+}
+
+#[test]
+fn fork_invariant_transient_conflicts_with_ephemeral() {
+    for args in [
+        ["codex-exec", "--transient", "--ephemeral", "prompt"],
+        ["codex-exec", "--ephemeral", "--transient", "prompt"],
+    ] {
+        let error = Cli::try_parse_from(args).expect_err("persistence modes should conflict");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+}

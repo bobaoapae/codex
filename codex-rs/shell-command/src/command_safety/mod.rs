@@ -1,5 +1,6 @@
 // Keep the PowerShell subprocess parser available as a test oracle, but do not
 // compile it into production command classification.
+pub(crate) mod mutation_intent;
 #[cfg(test)]
 #[allow(dead_code)]
 mod powershell_parser;

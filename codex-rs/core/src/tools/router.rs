@@ -15,6 +15,7 @@ use crate::tools::registry::ToolArgumentDiffConsumer;
 use crate::tools::registry::ToolRegistry;
 #[cfg(test)]
 use crate::tools::spec_plan::finalize_tool_router;
+use codex_protocol::is_sensitive_multi_agent_tool;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::models::SearchToolCallParams;
 #[cfg(test)]
@@ -41,17 +42,29 @@ pub struct ToolCall {
     pub encrypted_function_args: Option<Vec<String>>,
 }
 
+/// How the provider encoded function arguments in a response item.
+///
+/// `Some([])` is an explicit marker used by local provider bridges to say that
+/// the function arguments are plaintext. `None` means that no encoding marker
+/// was supplied and must not be treated as plaintext.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToolCallArgumentEncoding {
+    Unspecified,
+    Encrypted,
+    Plaintext,
+}
+
+const REDACTED_TOOL_ARGUMENTS: &str = "[redacted]";
+
 impl ToolCall {
     pub(crate) fn direct_source(&self) -> ToolCallSource {
-        if self.tool_name.namespace.as_deref() == Some("collaboration")
-            && matches!(
-                self.tool_name.name.as_str(),
-                "spawn_agent" | "send_message" | "followup_task"
-            )
-            && self
-                .encrypted_function_args
-                .as_ref()
-                .is_some_and(Vec::is_empty)
+        let argument_encoding = match self.encrypted_function_args.as_deref() {
+            Some([]) => ToolCallArgumentEncoding::Plaintext,
+            Some(_) => ToolCallArgumentEncoding::Encrypted,
+            None => ToolCallArgumentEncoding::Unspecified,
+        };
+        if matches!(argument_encoding, ToolCallArgumentEncoding::Plaintext)
+            && is_sensitive_multi_agent_tool(&self.tool_name.name)
         {
             ToolCallSource::DirectPlaintextMessage
         } else {
@@ -61,11 +74,14 @@ impl ToolCall {
 }
 
 pub(crate) fn tool_log_payload<'a>(
+    tool_name: &ToolName,
     payload: &'a ToolPayload,
     source: &ToolCallSource,
 ) -> Cow<'a, str> {
-    if matches!(source, ToolCallSource::DirectPlaintextMessage) {
-        return Cow::Borrowed("[plaintext arguments]");
+    if matches!(source, ToolCallSource::DirectPlaintextMessage)
+        || is_sensitive_multi_agent_tool(&tool_name.name)
+    {
+        return Cow::Borrowed(REDACTED_TOOL_ARGUMENTS);
     }
     payload.log_payload()
 }

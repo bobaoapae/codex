@@ -358,3 +358,125 @@ fn with_user_config_updates_matching_user_layer_without_replacing_active_profile
         Some("on-request")
     );
 }
+
+#[test]
+fn version_for_toml_is_canonical_and_includes_sensitive_values() {
+    let first: TomlValue = toml::from_str(
+        r#"
+model = "gpt-5"
+api_key = "first-secret"
+[mcp_servers.example.env]
+TOKEN = "first-secret"
+"#,
+    )
+    .expect("first config");
+    let second: TomlValue = toml::from_str(
+        r#"
+model = "gpt-5"
+api_key = "second-secret"
+[mcp_servers.example.env]
+TOKEN = "second-secret"
+"#,
+    )
+    .expect("second config");
+
+    let equivalent: TomlValue = toml::from_str(
+        r#"
+api_key = "first-secret"
+model = "gpt-5"
+[mcp_servers.example.env]
+TOKEN = "first-secret"
+"#,
+    )
+    .expect("equivalent config");
+
+    let first_hash = version_for_toml(&first);
+    assert_eq!(first_hash, version_for_toml(&equivalent));
+    assert_ne!(first_hash, version_for_toml(&second));
+    assert!(first_hash.starts_with("sha256:"));
+    assert!(!first_hash.contains("first-secret"));
+}
+
+#[test]
+fn revision_uses_only_enabled_layers() {
+    let temp_dir = TempDir::new().expect("tempdir");
+    let source = ConfigLayerSource::User {
+        file: test_user_config_path(&temp_dir, "config.toml"),
+        profile: None,
+    };
+    let enabled = ConfigLayerEntry::new(
+        source,
+        toml::from_str("model = 'gpt-5'").expect("enabled config"),
+    );
+    let disabled = ConfigLayerEntry::new_disabled(
+        ConfigLayerSource::Project {
+            dot_codex_folder: test_user_config_path(&temp_dir, ".codex"),
+        },
+        toml::from_str("model = 'different'").expect("disabled config"),
+        "untrusted",
+    );
+    let first = ConfigLayerStack::new(
+        vec![enabled.clone()],
+        ConfigRequirements::default(),
+        ConfigRequirementsToml::default(),
+    )
+    .expect("first stack");
+    let second = ConfigLayerStack::new(
+        vec![enabled, disabled],
+        ConfigRequirements::default(),
+        ConfigRequirementsToml::default(),
+    )
+    .expect("second stack");
+
+    assert_eq!(first.revision(), second.revision());
+    assert_eq!(first.revision(), first.revision());
+}
+
+#[test]
+fn runtime_feature_revision_tracks_effective_enablement_only() {
+    let enabled: TomlValue = toml::from_str(
+        r#"
+[features.multi_agent_v2]
+enabled = false
+subagent_usage_hint_text = "first"
+"#,
+    )
+    .expect("enabled feature config");
+    let disabled: TomlValue = toml::from_str(
+        r#"
+[features.multi_agent_v2]
+enabled = true
+subagent_usage_hint_text = "different"
+"#,
+    )
+    .expect("disabled feature config");
+    let custom: TomlValue = toml::from_str(
+        r#"
+[features.multi_agent_v2]
+enabled = false
+subagent_usage_hint_text = "second"
+"#,
+    )
+    .expect("custom feature config");
+
+    let make_stack = |config| {
+        ConfigLayerStack::new(
+            vec![ConfigLayerEntry::new(
+                ConfigLayerSource::SessionFlags,
+                config,
+            )],
+            ConfigRequirements::default(),
+            ConfigRequirementsToml::default(),
+        )
+        .expect("feature stack")
+    };
+
+    assert_ne!(
+        make_stack(enabled.clone()).runtime_feature_revision(),
+        make_stack(disabled).runtime_feature_revision()
+    );
+    assert_eq!(
+        make_stack(enabled).runtime_feature_revision(),
+        make_stack(custom).runtime_feature_revision()
+    );
+}

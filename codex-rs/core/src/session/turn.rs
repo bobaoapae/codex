@@ -76,6 +76,7 @@ use codex_extension_api::TurnInputEnvironment;
 use codex_features::Feature;
 use codex_file_system::FindUpErrorPolicy;
 use codex_file_system::find_nearest_ancestor_with_markers;
+use codex_history::RolloutItem;
 use codex_login::CodexAuth;
 use codex_model_provider::RemoteCompactionSupport;
 use codex_protocol::ResponseItemId;
@@ -84,7 +85,9 @@ use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::CodexErrorDetails;
+use codex_protocol::error::HistoryRecoveryReason;
 use codex_protocol::error::Result as CodexResult;
+use codex_protocol::error::history_recovery_reason_from_error_message;
 use codex_protocol::items::PlanItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::items::build_hook_prompt_message;
@@ -139,6 +142,24 @@ use tracing::warn;
 
 const POST_SAMPLING_TOKEN_ESTIMATE_TARGET: &str = "codex_core::post_sampling_token_estimate";
 
+/// Finds a terminal history-recovery marker in persisted rollout events.
+///
+/// This helper deliberately recognizes only the stable `TurnComplete.error`
+/// message produced by [`CodexErr::history_recovery_required`]. Callers use it
+/// while hydrating a resumed session so a poisoned history cannot issue another
+/// provider request before explicit recovery.
+pub(crate) fn history_recovery_reason_from_rollout(
+    rollout_items: &[RolloutItem],
+) -> Option<HistoryRecoveryReason> {
+    rollout_items.iter().find_map(|item| match item {
+        RolloutItem::EventMsg(EventMsg::TurnComplete(event)) => event
+            .error
+            .as_ref()
+            .and_then(|error| history_recovery_reason_from_error_message(&error.message)),
+        _ => None,
+    })
+}
+
 /// Takes initial turn input and runs a loop where, at each sampling request,
 /// the model replies with either:
 ///
@@ -160,6 +181,13 @@ pub(crate) async fn run_turn(
     prewarmed_client_session: Option<ModelClientSession>,
     cancellation_token: CancellationToken,
 ) -> CodexResult<Option<String>> {
+    // Pending mailbox work can start a task without passing through turn-input admission. Keep
+    // this final guard immediately before any pre-sampling work so a cold-resumed poisoned
+    // history cannot issue another provider request through an automatic wake-up.
+    if let Some(reason) = sess.history_recovery_reason().await {
+        return Err(CodexErr::history_recovery_required(reason));
+    }
+
     // Record results from hooks that finished after the previous turn before this turn's user prompt.
     drain_async_hook_results(&sess, &turn_context, /*before_user_prompt*/ true).await;
 
@@ -608,6 +636,9 @@ pub(crate) async fn run_turn(
             }
             Err(e) => {
                 info!("Turn error: {e:#}");
+                if let Some(reason) = e.history_recovery_reason() {
+                    sess.mark_history_recovery_required(reason).await;
+                }
                 let error = e.to_codex_protocol_error();
                 sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
                     .await;
@@ -1900,10 +1931,8 @@ pub(super) fn realtime_text_for_event(msg: &EventMsg) -> Option<(String, Option<
 
 /// FORK: one short line describing what an agent is doing right now.
 ///
-/// Deliberately narrow: only events that mean real work is happening, so a
-/// parent reading "last ran `cargo test` 40s ago" learns something. Streaming
-/// deltas are excluded — they fire constantly and would make every agent look
-/// equally busy.
+/// Deliberately bounded: command/output labels contain no raw terminal bytes,
+/// while output and input edges still keep a coordinator's idle view current.
 pub(crate) fn fork_activity_label(event: &EventMsg) -> Option<String> {
     fn short(text: &str) -> String {
         let text = text.trim().replace(['\n', '\r'], " ");
@@ -1915,8 +1944,17 @@ pub(crate) fn fork_activity_label(event: &EventMsg) -> Option<String> {
 
     match event {
         EventMsg::ExecCommandBegin(exec) => {
-            Some(format!("ran `{}`", short(&exec.command.join(" "))))
+            let command = crate::unified_exec::redact_and_truncate(&exec.command.join(" "), 80);
+            Some(format!("ran `{}`", short(&command)))
         }
+        EventMsg::ExecCommandOutputDelta(output) => Some(format!(
+            "received {} bytes of terminal output",
+            output.chunk.len()
+        )),
+        EventMsg::TerminalInteraction(interaction) => Some(format!(
+            "sent terminal input to {}",
+            short(&interaction.process_id)
+        )),
         EventMsg::PatchApplyBegin(patch) => Some(match patch.changes.len() {
             1 => format!(
                 "edited {}",
@@ -2095,14 +2133,27 @@ async fn maybe_complete_plan_item_from_message(
                 return;
             }
             // FORK: persist the plan so it survives the session (see `codex-plans`).
-            if let Err(err) = codex_plans::save_plan(codex_plans::SavePlanRequest {
-                codex_home: turn_context.config.codex_home.clone(),
-                thread_id: sess.thread_id,
-                turn_id: turn_context.sub_id.clone(),
-                cwd: Some(turn_context.config.cwd.clone()),
-                model: Some(turn_context.model_info().slug.clone()),
-                markdown: plan_text.clone(),
-            })
+            // Keep provenance bounded to values that are available at this point in the
+            // response pipeline. The rollout identity is not carried by this callback, so it is
+            // intentionally left unset rather than inferred from a path.
+            let build_info = codex_protocol::protocol::RuntimeBuildInfo::current();
+            if let Err(err) = codex_plans::save_plan_with_metadata(
+                codex_plans::SavePlanRequest {
+                    codex_home: turn_context.config.codex_home.clone(),
+                    thread_id: sess.thread_id,
+                    turn_id: turn_context.sub_id.clone(),
+                    cwd: Some(turn_context.config.cwd.clone()),
+                    model: Some(turn_context.model_info().slug.clone()),
+                    markdown: plan_text.clone(),
+                },
+                codex_plans::PlanOrigin {
+                    turn_id: Some(turn_context.sub_id.clone()),
+                    item_id: item.id().map(ToString::to_string),
+                    build_revision: Some(build_info.build_commit),
+                    config_revision: Some(turn_context.config.config_layer_stack.revision()),
+                    ..Default::default()
+                },
+            )
             .await
             {
                 warn!("failed to persist proposed plan: {err}");
@@ -2314,12 +2365,16 @@ async fn try_run_sampling_request(
     // questions. Without a host the CLI's "ask" decisions are terminal, which is
     // what used to block its builds and tests outright.
     if turn_context.provider.info().wire_api == codex_model_provider_info::WireApi::ClaudeCode {
-        client_session.set_claude_code_host(Arc::new(crate::claude_code::SessionClaudeHost::new(
+        let (workspace, host) = crate::claude_code::SessionClaudeHost::prepare(
             Arc::clone(&sess),
             Arc::clone(&step_context),
             Arc::clone(&turn_diff_tracker),
             cancellation_token.clone(),
-        )));
+        )
+        .await
+        .map_err(CodexErr::UnsupportedOperation)?;
+        client_session.set_claude_code_workspace(workspace);
+        client_session.set_claude_code_host(host);
     }
     let sampling_timing_guard = turn_context.turn_timing_state.begin_sampling();
     let uses_sequential_cutoff_reasoning_summaries = turn_context

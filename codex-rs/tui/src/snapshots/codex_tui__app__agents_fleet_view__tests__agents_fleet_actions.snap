@@ -1,0 +1,14 @@
+---
+source: tui/src/app/agents_fleet_view_tests.rs
+expression: actions
+---
+  Manage agent fleet
+  Root 00000000-0000-0000-0000-000000000801 · generation 42
+
+› 1. Refresh status           Read the current fleet generation and member states.
+  2. Suspend fleet            Seal admissions and suspend leaves before the root.
+     Resume fleet (disabled)  Recover the root and then its still-open descendants. (disabled: Fleet
+                              is not suspended.)
+  3. Close fleet              Close only when every member is idle or final. Confirmation required.
+
+  Press enter to confirm or esc to go back

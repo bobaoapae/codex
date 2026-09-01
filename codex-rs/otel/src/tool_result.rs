@@ -5,6 +5,7 @@ use crate::events::shared::tool_namespace;
 use crate::events::shared::trace_event;
 use codex_protocol::ToolName;
 use codex_protocol::config_types::ToolResultLogConfig;
+use codex_protocol::is_sensitive_multi_agent_tool;
 use codex_utils_string::take_bytes_at_char_boundary;
 use std::borrow::Cow;
 use std::sync::atomic::AtomicU64;
@@ -12,6 +13,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 const TRUNCATION_NOTICE: &str = "[... telemetry preview truncated ...]";
+const REDACTED_TOOL_ARGUMENTS: &str = "[redacted]";
 
 /// Result-recording order across all sessions in this process, not tool-start order.
 /// Independent of the optional rollout-trace writer and reset on process restart.
@@ -48,6 +50,7 @@ pub(crate) fn emit_tool_result(
         output,
     } = event;
     let tool_namespace = tool_namespace(tool_name);
+    let arguments = redact_tool_arguments(tool_name, arguments);
     let preview = telemetry_preview(output, limits);
     let tool_result_seq = next_tool_result_seq();
 
@@ -78,6 +81,16 @@ pub(crate) fn emit_tool_result(
             mcp_tool = !mcp_server.is_empty(),
         },
     );
+}
+
+/// Collaboration messages can be either provider-encrypted or plaintext,
+/// depending on the sender. Neither representation belongs in telemetry.
+fn redact_tool_arguments<'a>(tool_name: &ToolName, arguments: &'a str) -> &'a str {
+    if is_sensitive_multi_agent_tool(&tool_name.name) {
+        REDACTED_TOOL_ARGUMENTS
+    } else {
+        arguments
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]

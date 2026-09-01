@@ -17,6 +17,8 @@ chrono = { workspace = true, features = ["serde"] }
 codex-protocol = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
 codex-utils-path = { workspace = true }
+codex-utils-string = { workspace = true }
+fd-lock = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_yaml = { workspace = true }
 tokio = { workspace = true, features = ["fs", "rt"] }

@@ -325,8 +325,8 @@ impl ChatWidget {
             return (false, None);
         }
 
-        // FORK: a plan loaded via `/plans` goes in front of the IDE context.
-        self.maybe_apply_pending_plan_context(&mut items);
+        // FORK: carry the exact approved plan revision through the typed turn request.
+        let approved_plan = self.take_pending_approved_plan();
         self.maybe_apply_ide_context(&mut items);
         crate::task_mentions::apply_task_references(&mut items, &mention_bindings, self.thread_id);
 
@@ -367,6 +367,7 @@ impl ChatWidget {
             /*final_output_json_schema*/ None,
             collaboration_mode,
             personality,
+            approved_plan,
         );
         let submitted_message = UserMessage {
             text,

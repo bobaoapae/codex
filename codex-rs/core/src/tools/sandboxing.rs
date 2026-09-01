@@ -12,6 +12,7 @@ use crate::session::turn_context::TurnEnvironment;
 use crate::state::SessionServices;
 use crate::tools::hook_names::HookToolName;
 use crate::tools::network_approval::NetworkApprovalSpec;
+use crate::unified_exec::BuildAdmissionBusy;
 use codex_file_system::FileSystemSandboxContext;
 use codex_network_proxy::NetworkProxy;
 use codex_protocol::approvals::ExecPolicyAmendment;
@@ -358,6 +359,7 @@ pub(crate) struct ToolCtx {
 pub(crate) enum ToolError {
     Rejected(String),
     Codex(CodexErr),
+    BuildAdmissionBusy(BuildAdmissionBusy),
 }
 
 pub(crate) trait ToolRuntime<Req, Out>: Approvable<Req> + Sandboxable {

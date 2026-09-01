@@ -751,6 +751,9 @@ fn latest_session_lookup_params(
             LatestSessionLookupMode::ScanAndRepair => false,
         },
         search_term: None,
+        thread_classes: None,
+        root_thread_id: None,
+        terminal_outcomes: None,
     }
 }
 

@@ -97,6 +97,9 @@ async fn thread_section_move_pins_before_first_turn() -> Result<()> {
         search_term: None,
         parent_thread_id: None,
         ancestor_thread_id: None,
+        thread_classes: None,
+        root_thread_id: None,
+        terminal_outcomes: None,
     };
     for sort_key in [ThreadSortKey::SectionPosition, ThreadSortKey::RecencyAt] {
         let list_id = mcp
@@ -273,6 +276,9 @@ async fn thread_section_move_pins_and_unpins_with_filtered_recency_pagination() 
         search_term: None,
         parent_thread_id: None,
         ancestor_thread_id: None,
+        thread_classes: None,
+        root_thread_id: None,
+        terminal_outcomes: None,
     };
     let request_id = mcp.send_thread_list_request(list_params.clone()).await?;
     let response = timeout(
@@ -464,6 +470,9 @@ async fn thread_sections_preserve_server_owned_manual_order_across_moves_and_res
         search_term: None,
         parent_thread_id: None,
         ancestor_thread_id: None,
+        thread_classes: None,
+        root_thread_id: None,
+        terminal_outcomes: None,
     };
     let request_id = mcp.send_thread_list_request(list_params.clone()).await?;
     let response = timeout(

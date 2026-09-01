@@ -38,6 +38,30 @@ pub enum TurnInput {
     InterAgentCommunication(InterAgentCommunication),
 }
 
+/// Internal, already-approved plan context carried with a new turn request.
+///
+/// This is deliberately not serializable: app-server validates and resolves the immutable
+/// snapshot before constructing the Core request. Keeping the body here avoids threading plan
+/// state through the public `Op` enum while still letting Core admit the fragment atomically with
+/// the user input.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ApprovedPlanContext {
+    pub id: String,
+    pub revision: u32,
+    pub body: String,
+}
+
+impl std::fmt::Debug for ApprovedPlanContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ApprovedPlanContext")
+            .field("id", &self.id)
+            .field("revision", &self.revision)
+            .field("body", &"<redacted>")
+            .finish()
+    }
+}
+
 /// One turn input and the context that follows it through submission.
 ///
 /// Callers choose start-or-steer, idle-start, or steer-only behavior through
@@ -45,6 +69,8 @@ pub enum TurnInput {
 #[derive(Clone, Debug)]
 pub struct TurnInputRequest {
     pub input: TurnInput,
+    /// Internal approved-plan snapshot to load immediately before a new user input.
+    pub approved_plan: Option<ApprovedPlanContext>,
     pub thread_settings: ThreadSettingsOverrides,
     pub start: TurnStartOptions,
     pub additional_context: BTreeMap<String, AdditionalContextEntry>,
@@ -70,6 +96,7 @@ impl TurnInputRequest {
     pub fn new(input: TurnInput) -> Self {
         Self {
             input,
+            approved_plan: None,
             thread_settings: ThreadSettingsOverrides::default(),
             start: TurnStartOptions::default(),
             additional_context: BTreeMap::new(),
@@ -84,6 +111,21 @@ impl TurnInputRequest {
             content,
             client_id: None,
         })
+    }
+
+    /// Associates an immutable approved-plan snapshot with this new-turn request.
+    pub fn with_approved_plan(
+        mut self,
+        id: impl Into<String>,
+        revision: u32,
+        body: impl Into<String>,
+    ) -> Self {
+        self.approved_plan = Some(ApprovedPlanContext {
+            id: id.into(),
+            revision,
+            body: body.into(),
+        });
+        self
     }
 
     /// Persistent thread settings applied when Core accepts this input.
@@ -127,6 +169,10 @@ impl TurnInputRequest {
         self
     }
 }
+
+#[cfg(test)]
+#[path = "turn_input_tests.rs"]
+mod tests;
 
 /// How Core should route submitted turn input.
 #[derive(Clone, Debug, Eq, PartialEq)]

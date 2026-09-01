@@ -13,16 +13,28 @@ use codex_thread_store::LocalThreadStore;
 use codex_thread_store::LocalThreadStoreConfig;
 use codex_thread_store::RolloutMigrationMode;
 use codex_thread_store::RolloutMigrationOptions;
+use codex_thread_store::RolloutMigrationPreviewOptions;
 use codex_thread_store::RolloutMigrationProgress;
-use codex_thread_store::RolloutMigrationReport;
 use codex_thread_store::RolloutMigrationStatus;
 use codex_utils_cli::CliConfigOverrides;
+
+#[path = "migrate_rollouts_receipt.rs"]
+mod receipt;
+#[path = "migrate_rollouts_report.rs"]
+mod report;
+
+use receipt::persist_apply_receipt;
+use report::CliMigrationReport;
 
 #[derive(Debug, Parser)]
 pub(crate) struct MigrateRolloutsCommand {
     /// Publish the migration. Without this flag the command only reports eligible sessions.
-    #[arg(long)]
+    #[arg(long, requires = "preview_report")]
     apply: bool,
+
+    /// Read the exact JSON preview report to apply, or save a preview report at this path.
+    #[arg(long, value_name = "PATH")]
+    preview_report: Option<std::path::PathBuf>,
 
     /// Restrict inspection or migration to one or more thread IDs.
     #[arg(long, value_name = "THREAD_ID", value_parser = ThreadId::from_string)]
@@ -49,6 +61,14 @@ pub(crate) async fn run(
     command: MigrateRolloutsCommand,
     config_overrides: CliConfigOverrides,
 ) -> anyhow::Result<()> {
+    let frozen_preview = if command.apply {
+        let path = command.preview_report.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("--apply requires --preview-report <path> from a prior JSON preview")
+        })?;
+        Some(report::load_frozen_preview(path).await?)
+    } else {
+        None
+    };
     let overrides = config_overrides
         .parse_overrides()
         .map_err(anyhow::Error::msg)?;
@@ -56,6 +76,42 @@ pub(crate) async fn run(
         .cli_overrides(overrides)
         .build()
         .await?;
+    let json = command.json;
+    let verbose = command.verbose;
+    let operation_started_at = Instant::now();
+    if !command.apply {
+        let preview_options = RolloutMigrationPreviewOptions {
+            thread_ids: command.thread.clone(),
+            max_mib_per_second: command.max_mib_per_second,
+        };
+        // Preview intentionally uses a store without a state DB. StateRuntime::init performs
+        // legacy metadata backfill, which would violate the default command's read-only contract.
+        let preview_store = LocalThreadStore::new(
+            LocalThreadStoreConfig::from_config(&config),
+            /*state_db*/ None,
+        );
+        let preview = preview_store
+            .preview_rollout_migration(preview_options)
+            .await
+            .context("failed to preview local rollouts")?;
+        let report = CliMigrationReport::for_preview(
+            preview,
+            command.max_mib_per_second,
+            operation_started_at.elapsed(),
+        );
+        if let Some(path) = command.preview_report.as_deref() {
+            report::save_json_report(&report, path).await?;
+        }
+        report::write_report(&report, json, verbose, /*thread_storage*/ None)?;
+        return Ok(());
+    }
+
+    let Some(preview) = frozen_preview else {
+        return Err(anyhow::anyhow!(
+            "--apply requires --preview-report <path> from a prior JSON preview"
+        ));
+    };
+
     let otel = codex_core::otel_init::build_provider(
         &config,
         env!("CARGO_PKG_VERSION"),
@@ -67,15 +123,8 @@ pub(crate) async fn run(
         None
     });
     codex_core::otel_init::record_process_start(otel.as_ref(), "codex_migrate_rollouts");
-    let mode = if command.apply {
-        RolloutMigrationMode::Apply
-    } else {
-        RolloutMigrationMode::DryRun
-    };
-    let json = command.json;
-    let verbose = command.verbose;
     let thread_history_db_path = config.sqlite.thread_history_db_path();
-    let thread_storage_before = if mode == RolloutMigrationMode::Apply && !json {
+    let thread_storage_before = if !json {
         thread_storage_bytes(
             config.codex_home.as_path(),
             thread_history_db_path.as_path(),
@@ -85,22 +134,19 @@ pub(crate) async fn run(
     } else {
         None
     };
-    let state_db = if mode == RolloutMigrationMode::Apply {
-        Some(
-            codex_rollout::state_db::try_init(&config)
-                .await
-                .context("failed to initialize local thread metadata")?,
-        )
-    } else {
-        None
-    };
+    let state_db = Some(
+        codex_rollout::state_db::try_init(&config)
+            .await
+            .context("failed to initialize local thread metadata")?,
+    );
     let store = LocalThreadStore::new(LocalThreadStoreConfig::from_config(&config), state_db);
-    let mut progress = MigrationProgress::new(mode, json);
+    let mut progress = MigrationProgress::new(RolloutMigrationMode::Apply, json);
     progress.begin();
     let result = store
-        .migrate_rollouts_with_progress(
+        .migrate_rollouts_from_preview_with_progress(
+            preview.clone(),
             RolloutMigrationOptions {
-                mode,
+                mode: RolloutMigrationMode::Apply,
                 thread_ids: command.thread,
                 max_mib_per_second: command.max_mib_per_second,
             },
@@ -120,15 +166,26 @@ pub(crate) async fn run(
         None => None,
     };
 
-    if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    } else {
-        print_human_report(&report, mode, verbose, progress.elapsed(), thread_storage);
+    if let Some(apply_receipt) = report.apply_receipt.as_ref() {
+        let receipt = report::effective_apply_receipt(&preview, apply_receipt);
+        persist_apply_receipt(&config, &receipt)
+            .await
+            .context("failed to persist rollout migration receipt")?;
     }
 
-    if report
+    let cli_report = CliMigrationReport::for_apply(
+        preview,
+        report,
+        command.max_mib_per_second,
+        operation_started_at.elapsed(),
+    );
+    report::write_report(&cli_report, json, verbose, thread_storage)?;
+
+    if cli_report
         .outcomes
-        .iter()
+        .as_ref()
+        .into_iter()
+        .flatten()
         .any(|outcome| outcome.status == RolloutMigrationStatus::Failed)
     {
         anyhow::bail!("one or more rollout migrations failed");
@@ -138,7 +195,6 @@ pub(crate) async fn run(
 
 const TTY_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 const NON_TTY_PROGRESS_INTERVAL: usize = 1_000;
-const MAX_EXCEPTION_DETAILS: usize = 20;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProgressOutput {
@@ -289,102 +345,6 @@ impl MigrationCounts {
     }
 }
 
-fn print_human_report(
-    report: &RolloutMigrationReport,
-    mode: RolloutMigrationMode,
-    verbose: bool,
-    elapsed: Duration,
-    thread_storage: Option<(u64, u64)>,
-) {
-    let mut counts = MigrationCounts::default();
-    for outcome in &report.outcomes {
-        counts.observe(outcome.status);
-    }
-    let completion = match mode {
-        RolloutMigrationMode::DryRun => "Scan complete",
-        RolloutMigrationMode::Apply => "Migration complete",
-    };
-    println!("{completion} in {}.", format_elapsed(elapsed));
-    match mode {
-        RolloutMigrationMode::DryRun => println!(
-            "Scanned {} rollout(s): {} eligible, {} already paginated, {} skipped ({} empty, {} busy), {} failed.",
-            report.outcomes.len(),
-            counts.eligible,
-            counts.already_paginated,
-            counts.skipped(),
-            counts.skipped_empty,
-            counts.skipped_busy,
-            counts.failed,
-        ),
-        RolloutMigrationMode::Apply => println!(
-            "Scanned {} rollout(s): {} migrated, {} already paginated, {} skipped ({} empty, {} busy), {} failed.",
-            report.outcomes.len(),
-            counts.migrated,
-            counts.already_paginated,
-            counts.skipped(),
-            counts.skipped_empty,
-            counts.skipped_busy,
-            counts.failed,
-        ),
-    }
-    if let Some((before, after)) = thread_storage {
-        println!(
-            "Disk used for thread storage: {} -> {}",
-            format_bytes(before),
-            format_bytes(after)
-        );
-    }
-    if mode == RolloutMigrationMode::DryRun && counts.eligible > 0 {
-        println!("Run `codex migrate-rollouts --apply` to migrate eligible sessions.");
-    }
-
-    if verbose {
-        for outcome in &report.outcomes {
-            print_outcome(outcome);
-        }
-        return;
-    }
-
-    let exceptions = report.outcomes.iter().filter(|outcome| {
-        matches!(
-            outcome.status,
-            RolloutMigrationStatus::SkippedBusy | RolloutMigrationStatus::Failed
-        )
-    });
-    let exception_count = exceptions.clone().count();
-    if exception_count == 0 {
-        return;
-    }
-    println!();
-    for outcome in exceptions.take(MAX_EXCEPTION_DETAILS) {
-        print_outcome(outcome);
-    }
-    if exception_count > MAX_EXCEPTION_DETAILS {
-        println!(
-            "... and {} more; rerun with --json for the complete report.",
-            exception_count - MAX_EXCEPTION_DETAILS
-        );
-    }
-}
-
-fn print_outcome(outcome: &codex_thread_store::RolloutMigrationOutcome) {
-    let status = match outcome.status {
-        RolloutMigrationStatus::Eligible => "eligible",
-        RolloutMigrationStatus::Migrated => "migrated",
-        RolloutMigrationStatus::AlreadyPaginated => "already paginated",
-        RolloutMigrationStatus::SkippedEmpty => "skipped empty",
-        RolloutMigrationStatus::SkippedBusy => "skipped busy",
-        RolloutMigrationStatus::Failed => "failed",
-    };
-    let thread_id = outcome
-        .thread_id
-        .map_or_else(|| "unknown".to_string(), |thread_id| thread_id.to_string());
-    match &outcome.message {
-        Some(message) => println!("{status}\t{thread_id}\t{message}"),
-        None => println!("{status}\t{thread_id}"),
-    }
-}
-
 fn format_elapsed(elapsed: Duration) -> String {
     let seconds = elapsed.as_secs();
     let minutes = seconds / 60;
@@ -448,3 +408,7 @@ fn format_bytes(bytes: u64) -> String {
         format!("{} B", bytes as u64)
     }
 }
+
+#[cfg(test)]
+#[path = "migrate_rollouts_tests.rs"]
+mod tests;

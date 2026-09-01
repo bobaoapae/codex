@@ -9,6 +9,7 @@ use serde::Serialize;
 use ts_rs::TS;
 
 pub mod image_generation;
+pub mod receipt;
 pub mod sleep;
 pub mod web_search;
 
@@ -39,6 +40,9 @@ pub enum ExtensionItem {
     #[serde(rename = "clock.sleep")]
     #[ts(rename = "clock.sleep")]
     Sleep(sleep::SleepItem),
+    #[serde(rename = "receipt.attached")]
+    #[ts(rename = "receipt.attached")]
+    ReceiptAttached(receipt::ReceiptAttachedItem),
     #[serde(rename = "web.search")]
     #[ts(rename = "web.search")]
     WebSearch(web_search::WebSearchItem),
@@ -51,6 +55,7 @@ impl ExtensionItem {
         match self {
             Self::ImageGeneration(item) => &item.id,
             Self::Sleep(item) => &item.id,
+            Self::ReceiptAttached(item) => &item.receipt_id,
             Self::WebSearch(item) => &item.id,
         }
     }

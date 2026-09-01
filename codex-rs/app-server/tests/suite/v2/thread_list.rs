@@ -115,6 +115,9 @@ async fn list_threads_with_sort(
             search_term: None,
             parent_thread_id: None,
             ancestor_thread_id: None,
+            thread_classes: None,
+            root_thread_id: None,
+            terminal_outcomes: None,
         },
     })
     .await
@@ -154,6 +157,9 @@ async fn list_threads_for_relation(
             search_term: None,
             parent_thread_id,
             ancestor_thread_id,
+            thread_classes: None,
+            root_thread_id: None,
+            terminal_outcomes: None,
         },
     })
     .await
@@ -562,6 +568,9 @@ async fn thread_list_respects_cwd_filters() -> Result<()> {
             search_term: None,
             parent_thread_id: None,
             ancestor_thread_id: None,
+            thread_classes: None,
+            root_thread_id: None,
+            terminal_outcomes: None,
         })
         .await?;
     let ThreadListResponse {
@@ -672,6 +681,9 @@ sqlite = true
             search_term: Some("needle".to_string()),
             parent_thread_id: None,
             ancestor_thread_id: None,
+            thread_classes: None,
+            root_thread_id: None,
+            terminal_outcomes: None,
         })
         .await?;
     let ThreadListResponse {
@@ -730,6 +742,13 @@ async fn thread_search_returns_content_matches() -> Result<()> {
             limit: Some(10),
             sort_key: None,
             sort_direction: None,
+            model_providers: None,
+            cwd: None,
+            project_id: None,
+            root_thread_id: None,
+            ancestor_thread_id: None,
+            thread_classes: None,
+            terminal_outcomes: None,
             source_kinds: None,
             archived: None,
             search_term: "needle".to_string(),
@@ -785,6 +804,13 @@ async fn thread_search_returns_content_matches() -> Result<()> {
             limit: Some(10),
             sort_key: None,
             sort_direction: None,
+            model_providers: None,
+            cwd: None,
+            project_id: None,
+            root_thread_id: None,
+            ancestor_thread_id: None,
+            thread_classes: None,
+            terminal_outcomes: None,
             source_kinds: None,
             archived: None,
             search_term: "needle".to_string(),
@@ -847,6 +873,13 @@ async fn thread_search_matches_json_escaped_content() -> Result<()> {
             limit: Some(10),
             sort_key: None,
             sort_direction: None,
+            model_providers: None,
+            cwd: None,
+            project_id: None,
+            root_thread_id: None,
+            ancestor_thread_id: None,
+            thread_classes: None,
+            terminal_outcomes: None,
             source_kinds: None,
             archived: None,
             search_term: search_term.to_string(),
@@ -892,6 +925,13 @@ async fn thread_search_filters_by_source_kind() -> Result<()> {
             limit: Some(10),
             sort_key: None,
             sort_direction: None,
+            model_providers: None,
+            cwd: None,
+            project_id: None,
+            root_thread_id: None,
+            ancestor_thread_id: None,
+            thread_classes: None,
+            terminal_outcomes: None,
             source_kinds: Some(vec![ThreadSourceKind::Exec]),
             archived: None,
             search_term: "needle".to_string(),
@@ -959,6 +999,9 @@ sqlite = true
             search_term: None,
             parent_thread_id: None,
             ancestor_thread_id: None,
+            thread_classes: None,
+            root_thread_id: None,
+            terminal_outcomes: None,
         })
         .await?;
     let repaired_response: ThreadListResponse =
@@ -997,6 +1040,9 @@ sqlite = true
             search_term: None,
             parent_thread_id: None,
             ancestor_thread_id: None,
+            thread_classes: None,
+            root_thread_id: None,
+            terminal_outcomes: None,
         })
         .await?;
     let state_db_only_response: ThreadListResponse =
@@ -1026,6 +1072,9 @@ sqlite = true
             search_term: None,
             parent_thread_id: None,
             ancestor_thread_id: None,
+            thread_classes: None,
+            root_thread_id: None,
+            terminal_outcomes: None,
         })
         .await?;
     let scanned_response: ThreadListResponse =
@@ -1209,6 +1258,9 @@ async fn thread_list_relation_filters_reject_invalid_requests() -> Result<()> {
             search_term: None,
             parent_thread_id: Some("not-a-thread-id".to_string()),
             ancestor_thread_id: None,
+            thread_classes: None,
+            root_thread_id: None,
+            terminal_outcomes: None,
         })
         .await?;
     let error = timeout(
@@ -1235,6 +1287,9 @@ async fn thread_list_relation_filters_reject_invalid_requests() -> Result<()> {
             search_term: None,
             parent_thread_id: Some(thread_id.clone()),
             ancestor_thread_id: Some(thread_id),
+            thread_classes: None,
+            root_thread_id: None,
+            terminal_outcomes: None,
         })
         .await?;
     let error = timeout(
@@ -1439,6 +1494,13 @@ async fn thread_list_reports_loaded_subagent_direct_input_capability() -> Result
             limit: Some(10),
             sort_key: None,
             sort_direction: None,
+            model_providers: None,
+            cwd: None,
+            project_id: None,
+            root_thread_id: None,
+            ancestor_thread_id: None,
+            thread_classes: None,
+            terminal_outcomes: None,
             source_kinds: Some(vec![ThreadSourceKind::SubAgentThreadSpawn]),
             archived: None,
             search_term: "Subagent".to_string(),
@@ -1502,6 +1564,9 @@ async fn thread_list_reports_loaded_subagent_direct_input_capability() -> Result
                 search_term: None,
                 parent_thread_id: None,
                 ancestor_thread_id: Some(parent_thread_id.to_string()),
+                thread_classes: None,
+                root_thread_id: None,
+                terminal_outcomes: None,
             },
         })
         .await?;
@@ -2323,6 +2388,9 @@ async fn thread_list_backwards_cursor_can_seed_forward_delta_sync() -> Result<()
                 search_term: None,
                 parent_thread_id: None,
                 ancestor_thread_id: None,
+                thread_classes: None,
+                root_thread_id: None,
+                terminal_outcomes: None,
             })
             .await?;
         timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??
@@ -2364,6 +2432,9 @@ async fn thread_list_backwards_cursor_can_seed_forward_delta_sync() -> Result<()
                 search_term: None,
                 parent_thread_id: None,
                 ancestor_thread_id: None,
+                thread_classes: None,
+                root_thread_id: None,
+                terminal_outcomes: None,
             })
             .await?;
         timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??
@@ -2601,6 +2672,9 @@ async fn thread_list_invalid_cursor_returns_error() -> Result<()> {
             search_term: None,
             parent_thread_id: None,
             ancestor_thread_id: None,
+            thread_classes: None,
+            root_thread_id: None,
+            terminal_outcomes: None,
         })
         .await?;
     let error: JSONRPCError = timeout(

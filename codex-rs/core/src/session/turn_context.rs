@@ -884,13 +884,13 @@ impl Session {
         session_configuration: SessionConfiguration,
         options: NewTurnContextOptions,
     ) -> Arc<TurnContext> {
-        self.new_turn_context_from_configuration(
+        Box::pin(self.new_turn_context_from_configuration(
             sub_id,
             session_configuration,
             options,
             TurnMultiAgentRuntime::ResolveAndStore,
             self.git_enrichment_policy,
-        )
+        ))
         .await
     }
 
@@ -1077,10 +1077,10 @@ impl Session {
     }
 
     pub(crate) async fn new_default_turn(&self) -> Arc<TurnContext> {
-        self.new_turn_with_default_settings(
+        Box::pin(self.new_turn_with_default_settings(
             self.next_internal_sub_id(),
             NewTurnContextOptions::default(),
-        )
+        ))
         .await
     }
 
@@ -1090,8 +1090,7 @@ impl Session {
         options: NewTurnContextOptions,
     ) -> Arc<TurnContext> {
         let session_configuration = self.default_turn_configuration().await;
-        self.new_turn_from_configuration(sub_id, session_configuration, options)
-            .await
+        Box::pin(self.new_turn_from_configuration(sub_id, session_configuration, options)).await
     }
 
     pub(crate) async fn new_startup_prewarm_turn_with_sub_id(

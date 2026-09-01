@@ -1,6 +1,7 @@
 use crate::TurnInputRequest;
 use crate::TurnInputSubmission;
 use crate::TurnStartOptions;
+use crate::agent::AgentLifecycleStatus;
 use crate::agent::AgentStatus;
 use crate::agent::registry::AgentMetadata;
 use crate::agent::registry::AgentRegistry;
@@ -14,6 +15,14 @@ use crate::config::Config;
 use crate::config::RolloutBudgetConfig;
 use crate::context::SubagentNotification;
 use crate::environment_selection::TurnEnvironmentSnapshot;
+use crate::ownership::AuthorizedWorkspaceRoots;
+use crate::ownership::MutationAuthorizationRequest;
+use crate::ownership::MutationGuard;
+use crate::ownership::OwnershipActor;
+use crate::ownership::OwnershipError;
+use crate::ownership::OwnershipGrantRequest;
+use crate::ownership::OwnershipReleaseRequest;
+use crate::ownership::WorkspaceOwnershipService;
 use crate::rollout_budget::RolloutBudget;
 use crate::session::emit_subagent_session_started;
 use crate::session::multi_agents::ResolvedMultiAgentV2UsageHints;
@@ -25,6 +34,7 @@ use crate::thread_manager::ThreadManagerState;
 use crate::thread_manager::default_thread_id_generator;
 use crate::thread_rollout_truncation::truncate_rollout_to_last_n_fork_turns;
 use crate::turn_timing::now_unix_timestamp_ms;
+use crate::unified_exec::TerminalProcessSnapshot;
 use arc_swap::ArcSwapOption;
 use codex_history::InitialHistory;
 use codex_history::ResumedHistory;
@@ -55,6 +65,7 @@ use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::turn_input::CyberAccessProgram;
 use codex_protocol::user_input::UserInput;
+use codex_state::WorkflowStore;
 use codex_thread_store::LoadThreadHistoryParams;
 use codex_thread_store::ReadThreadParams;
 use serde::Serialize;
@@ -68,9 +79,15 @@ use uuid::Uuid;
 
 pub(crate) use self::execution::AgentExecutionGuard;
 use self::execution::AgentExecutionLimiter;
+use self::fork_metrics::ForkMetricsTracker;
 use self::residency::V2Residency;
 
+mod agent_lifecycle;
 mod execution;
+mod fleet;
+pub(crate) mod fleet_types;
+mod fork_metrics;
+mod fork_metrics_api;
 mod legacy;
 mod residency;
 mod service_tier;
@@ -106,6 +123,10 @@ pub(crate) struct LiveAgent {
 pub(crate) struct ListedAgent {
     pub(crate) agent_name: String,
     pub(crate) agent_status: AgentStatus,
+    /// Stable lifecycle projection shared with `wait_agent` target snapshots.
+    pub(crate) status: AgentLifecycleStatus,
+    /// Logical follow-up generation for this identity.
+    pub(crate) generation: u64,
     /// FORK: which role the agent was spawned as, when it had one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) agent_role: Option<String>,
@@ -170,6 +191,14 @@ pub(crate) struct AgentControl {
     rollout_budget: Arc<RolloutBudget>,
     /// The user-selected root routing tier, shared by the entire agent tree.
     root_service_tier: Arc<ArcSwapOption<String>>,
+    /// Workflow mailbox store shared by all sessions in this agent tree once
+    /// the first durable session has initialized its local state database.
+    workflow_store: Arc<std::sync::OnceLock<WorkflowStore>>,
+    /// Lazily constructed ownership service for this agent tree. Roots are
+    /// supplied by the current session and retained only in memory.
+    ownership_service: Arc<std::sync::OnceLock<Arc<WorkspaceOwnershipService>>>,
+    /// Causal fork timing/cache projection shared by every child control clone.
+    fork_metrics: Arc<ForkMetricsTracker>,
 }
 
 impl Default for AgentControl {
@@ -198,6 +227,9 @@ impl AgentControl {
             agent_execution_limiter: Arc::default(),
             rollout_budget: Arc::default(),
             root_service_tier: Arc::new(ArcSwapOption::from(None)),
+            workflow_store: Arc::new(std::sync::OnceLock::new()),
+            ownership_service: Arc::new(std::sync::OnceLock::new()),
+            fork_metrics: ForkMetricsTracker::new(),
         };
         if let Some(rollout_budget) = rollout_budget {
             control.rollout_budget.configure(rollout_budget);
@@ -223,6 +255,104 @@ impl AgentControl {
         self.rollout_budget.as_ref()
     }
 
+    pub(crate) fn install_workflow_store(&self, state_db: Option<&crate::StateDbHandle>) {
+        if let Some(state_db) = state_db {
+            let _ = self.workflow_store.set(state_db.workflow_store().clone());
+        }
+    }
+
+    fn workflow_store(&self) -> Option<WorkflowStore> {
+        self.workflow_store.get().cloned()
+    }
+
+    pub(crate) fn root_thread_id(&self) -> ThreadId {
+        self.state
+            .agent_id_for_path(&AgentPath::root())
+            .unwrap_or_else(|| ThreadId::from(self.session_id))
+    }
+
+    pub(crate) fn ownership_actor(&self, thread_id: ThreadId) -> CodexResult<OwnershipActor> {
+        if thread_id == self.root_thread_id() {
+            return Ok(OwnershipActor::root(thread_id));
+        }
+        let metadata = self
+            .state
+            .agent_metadata_for_thread(thread_id)
+            .ok_or(CodexErr::ThreadNotFound(thread_id))?;
+        Ok(OwnershipActor::subagent(
+            thread_id,
+            metadata.role_capabilities(),
+        ))
+    }
+
+    pub(crate) fn ownership_service(
+        &self,
+        authorized_roots: AuthorizedWorkspaceRoots,
+    ) -> Result<Arc<WorkspaceOwnershipService>, OwnershipError> {
+        if let Some(service) = self.ownership_service.get() {
+            return Ok(Arc::clone(service));
+        }
+        let workflow = self.workflow_store().ok_or(OwnershipError::Unavailable)?;
+        let service = Arc::new(WorkspaceOwnershipService::new(
+            workflow,
+            self.root_thread_id(),
+            authorized_roots,
+        ));
+        let _ = self.ownership_service.set(Arc::clone(&service));
+        Ok(self.ownership_service.get().cloned().unwrap_or(service))
+    }
+
+    pub(crate) async fn grant_agent_ownership(
+        &self,
+        authorized_roots: AuthorizedWorkspaceRoots,
+        request: OwnershipGrantRequest,
+    ) -> Result<Vec<codex_state::WorkflowPathLease>, OwnershipError> {
+        self.ownership_service(authorized_roots)?
+            .grant_agent_ownership(request)
+            .await
+    }
+
+    pub(crate) async fn release_agent_ownership(
+        &self,
+        authorized_roots: AuthorizedWorkspaceRoots,
+        request: OwnershipReleaseRequest,
+    ) -> Result<codex_state::WorkflowPathLease, OwnershipError> {
+        self.ownership_service(authorized_roots)?
+            .release_agent_ownership(request)
+            .await
+    }
+
+    pub(crate) async fn list_agent_ownership(
+        &self,
+        authorized_roots: AuthorizedWorkspaceRoots,
+        requester: crate::ownership::OwnershipActor,
+    ) -> Result<Vec<codex_state::WorkflowPathLease>, OwnershipError> {
+        self.ownership_service(authorized_roots)?
+            .list_agent_ownership(requester)
+            .await
+    }
+
+    pub(crate) async fn read_agent_ownership(
+        &self,
+        authorized_roots: AuthorizedWorkspaceRoots,
+        requester: crate::ownership::OwnershipActor,
+        lease_id: &str,
+    ) -> Result<Option<codex_state::WorkflowPathLease>, OwnershipError> {
+        self.ownership_service(authorized_roots)?
+            .read_agent_ownership(requester, lease_id)
+            .await
+    }
+
+    pub(crate) async fn authorize_mutation(
+        &self,
+        authorized_roots: AuthorizedWorkspaceRoots,
+        request: MutationAuthorizationRequest,
+    ) -> Result<MutationGuard, OwnershipError> {
+        self.ownership_service(authorized_roots)?
+            .authorize_mutation(request)
+            .await
+    }
+
     /// Send rich user input items to an existing agent thread.
     pub(crate) async fn send_input(
         &self,
@@ -232,6 +362,17 @@ impl AgentControl {
     ) -> CodexResult<String> {
         let state = self.upgrade()?;
         let thread = state.get_thread(agent_id).await?;
+        let config = thread.session.get_config().await;
+        let multi_agent_version = thread
+            .multi_agent_version()
+            .unwrap_or_else(|| config.multi_agent_version_from_features());
+        let was_active = self.state.is_agent_active(agent_id);
+        if self.state.agent_metadata_for_thread(agent_id).is_some() {
+            self.state.ensure_active_slot(
+                agent_id,
+                config.effective_agent_max_threads(multi_agent_version),
+            )?;
+        }
         let result = match thread
             .start_or_steer_turn(TurnInputRequest::user_input(input).on_start(start_options))
             .await
@@ -249,6 +390,9 @@ impl AgentControl {
             )),
             Err(err) => Err(err),
         };
+        if result.is_err() && !was_active {
+            self.state.release_active_slot(agent_id);
+        }
         self.handle_thread_request_result(agent_id, &state, result)
             .await
     }
@@ -261,19 +405,36 @@ impl AgentControl {
         start_options: TurnStartOptions,
     ) -> CodexResult<String> {
         let state = self.upgrade()?;
-        if communication.trigger_turn {
+        let was_active = self.state.is_agent_active(agent_id);
+        let trigger_turn = communication.trigger_turn;
+        if trigger_turn {
             let thread = state.get_thread(agent_id).await?;
+            let config = thread.session.get_config().await;
+            let multi_agent_version = thread
+                .multi_agent_version()
+                .unwrap_or_else(|| config.multi_agent_version_from_features());
+            if self.state.agent_metadata_for_thread(agent_id).is_some() {
+                self.state.ensure_active_slot(
+                    agent_id,
+                    config.effective_agent_max_threads(multi_agent_version),
+                )?;
+            }
             self.ensure_execution_capacity_for_turn_start(&thread)
                 .await?;
         }
-        self.send_inter_agent_communication_after_capacity_check(
-            agent_id,
-            &state,
-            communication,
-            agent_communication_context,
-            start_options,
-        )
-        .await
+        let result = self
+            .send_inter_agent_communication_after_capacity_check(
+                agent_id,
+                &state,
+                communication,
+                agent_communication_context,
+                start_options,
+            )
+            .await;
+        if result.is_err() && trigger_turn && !was_active {
+            self.state.release_active_slot(agent_id);
+        }
+        result
     }
 
     pub(crate) async fn emit_sub_agent_activity(
@@ -347,12 +508,39 @@ impl AgentControl {
         &self,
         agent_id: ThreadId,
         state: &Arc<ThreadManagerState>,
-        communication: InterAgentCommunication,
+        mut communication: InterAgentCommunication,
         context: AgentCommunicationContext,
         start_options: TurnStartOptions,
     ) -> CodexResult<String> {
-        let communication_for_log =
-            crate::agent_communication::logging_enabled().then(|| communication.clone());
+        let mut durable_message_id = None;
+        if let Some(workflow) = self.workflow_store() {
+            let message_id = crate::agent::mailbox::ensure_message_id(&mut communication);
+            durable_message_id = Some(message_id.clone());
+            let root_run_id = self
+                .state
+                .agent_id_for_path(&AgentPath::root())
+                .unwrap_or_else(|| ThreadId::from(self.session_id));
+            let sender_run_id = self
+                .state
+                .agent_id_for_path(&communication.author)
+                .unwrap_or(root_run_id);
+            self.ensure_fleet_data_admission(root_run_id).await?;
+            crate::agent::mailbox::enqueue(
+                &workflow,
+                root_run_id.to_string(),
+                sender_run_id.to_string(),
+                agent_id.to_string(),
+                &communication,
+                &start_options,
+            )
+            .await
+            .map_err(|error| {
+                CodexErr::InvalidRequest(format!(
+                    "inter-agent message {message_id} could not be queued: {error}"
+                ))
+            })?;
+        }
+        let communication_logging_enabled = crate::agent_communication::logging_enabled();
         let (parent_turn_id, root_turn_id) = if communication.trigger_turn {
             (
                 start_options.parent_turn_id.clone(),
@@ -378,13 +566,10 @@ impl AgentControl {
                     .await,
             )
             .await;
-        if let (Some(communication), Ok(communication_id)) =
-            (communication_for_log, result.as_ref())
-        {
+        if communication_logging_enabled && let Ok(communication_id) = result.as_ref() {
             crate::agent_communication::emit_agent_communication_send(
-                communication_id,
+                durable_message_id.as_deref().unwrap_or(communication_id),
                 &context,
-                &communication,
                 agent_id,
             );
         }
@@ -421,7 +606,7 @@ impl AgentControl {
         {
             let _ = state.remove_thread(&agent_id).await;
             self.forget_v2_residency(agent_id);
-            self.state.release_spawned_thread(agent_id);
+            self.state.release_active_slot(agent_id);
         }
         result
     }
@@ -452,6 +637,55 @@ impl AgentControl {
         self.state.agent_metadata_for_thread(agent_id)
     }
 
+    pub(crate) fn agent_entries_for_prefix(
+        &self,
+        prefix: Option<&AgentPath>,
+    ) -> Vec<(ThreadId, AgentPath)> {
+        self.state.agent_entries_for_prefix(prefix)
+    }
+
+    pub(crate) fn current_revision(&self) -> u64 {
+        self.state.revision()
+    }
+
+    pub(crate) fn subscribe_revision(&self) -> watch::Receiver<u64> {
+        self.state.subscribe_revision()
+    }
+
+    pub(crate) fn last_agent_change(
+        &self,
+        agent_id: ThreadId,
+    ) -> Option<crate::agent::registry::AgentChange> {
+        self.state.last_change(agent_id)
+    }
+
+    pub(crate) fn record_agent_message(&self, author: &AgentPath) -> Option<u64> {
+        self.state
+            .agent_id_for_path(author)
+            .map(|thread_id| self.state.record_message(thread_id))
+    }
+
+    pub(crate) fn record_agent_status_change(
+        &self,
+        agent_id: ThreadId,
+        status: AgentStatus,
+    ) -> Option<u64> {
+        self.state.record_status_change(agent_id, status)
+    }
+
+    /// Publish a terminal needs-attention edge without changing the agent's
+    /// protocol status or lifecycle slot.
+    pub(crate) fn record_agent_needs_attention(&self, agent_id: ThreadId) -> Option<u64> {
+        self.state.record_needs_attention(agent_id)
+    }
+
+    /// Publish a non-terminal status edge without mutating the agent status.
+    pub(crate) fn record_agent_status_edge(&self, agent_id: ThreadId) -> Option<u64> {
+        self.state
+            .agent_metadata_for_thread(agent_id)
+            .map(|_| self.state.record_status_edge(agent_id))
+    }
+
     pub(crate) fn ensure_agent_known(&self, agent_id: ThreadId) -> CodexResult<AgentMetadata> {
         self.state
             .agent_metadata_for_thread(agent_id)
@@ -480,18 +714,38 @@ impl AgentControl {
         Some(thread.config_snapshot().await)
     }
 
+    /// Return bounded runtime terminal snapshots for a loaded agent.
+    pub(crate) async fn terminal_observability_snapshots(
+        &self,
+        agent_id: ThreadId,
+    ) -> Vec<TerminalProcessSnapshot> {
+        let Ok(state) = self.upgrade() else {
+            return Vec::new();
+        };
+        let Ok(thread) = state.get_thread(agent_id).await else {
+            return Vec::new();
+        };
+        thread.session.terminal_observability_snapshots()
+    }
+
+    /// Returns the effective configuration of a loaded agent.
+    ///
+    /// Callers that need provider capabilities must use this rather than
+    /// inferring them from a provider id in [`ThreadConfigSnapshot`].
+    pub(crate) async fn get_agent_config(&self, agent_id: ThreadId) -> Option<Arc<Config>> {
+        let state = self.upgrade().ok()?;
+        let thread = state.get_thread(agent_id).await.ok()?;
+        Some(thread.config().await)
+    }
+
     pub(crate) async fn resolve_agent_reference(
         &self,
-        _current_thread_id: ThreadId,
+        current_thread_id: ThreadId,
         current_session_source: &SessionSource,
         agent_reference: &str,
     ) -> CodexResult<ThreadId> {
-        let current_agent_path = current_session_source
-            .get_agent_path()
-            .unwrap_or_else(AgentPath::root);
-        let agent_path = current_agent_path
-            .resolve(agent_reference)
-            .map_err(CodexErr::UnsupportedOperation)?;
+        let agent_path =
+            self.resolve_agent_path(current_thread_id, current_session_source, agent_reference)?;
         if let Some(thread_id) = self.state.agent_id_for_path(&agent_path) {
             return Ok(thread_id);
         }
@@ -499,6 +753,23 @@ impl AgentControl {
             "live agent path `{}` not found",
             agent_path.as_str()
         )))
+    }
+
+    pub(crate) fn resolve_agent_path(
+        &self,
+        current_thread_id: ThreadId,
+        current_session_source: &SessionSource,
+        agent_reference: &str,
+    ) -> CodexResult<AgentPath> {
+        let current_agent_path = self
+            .state
+            .agent_metadata_for_thread(current_thread_id)
+            .and_then(|metadata| metadata.agent_path)
+            .or_else(|| current_session_source.get_agent_path())
+            .unwrap_or_else(AgentPath::root);
+        current_agent_path
+            .resolve(agent_reference)
+            .map_err(CodexErr::UnsupportedOperation)
     }
 
     /// Subscribe to status updates for `agent_id`, yielding the latest value and changes.
@@ -569,11 +840,21 @@ impl AgentControl {
             .as_ref()
             .is_none_or(|prefix| agent_matches_prefix(Some(&root_path), prefix))
             && let Some(root_thread_id) = self.state.agent_id_for_path(&root_path)
-            && let Ok(root_thread) = state.get_thread(root_thread_id).await
         {
+            let root_thread = state.get_thread(root_thread_id).await.ok();
+            let observed_status = match root_thread.as_ref() {
+                Some(thread) => thread.agent_status().await,
+                None => AgentStatus::NotFound,
+            };
+            let agent_status = self
+                .state
+                .status_for_thread(root_thread_id, observed_status.clone());
+            let lifecycle = self.state.lifecycle(root_thread_id, observed_status, None);
             agents.push(ListedAgent {
                 agent_name: root_path.to_string(),
-                agent_status: root_thread.agent_status().await,
+                agent_status,
+                status: lifecycle.status,
+                generation: lifecycle.generation,
                 agent_role: None,
                 model: None,
                 account: None,
@@ -593,29 +874,50 @@ impl AgentControl {
                 continue;
             }
 
-            let Ok(thread) = state.get_thread(thread_id).await else {
-                continue;
-            };
             let agent_name = metadata
                 .agent_path
                 .as_ref()
                 .map(ToString::to_string)
                 .unwrap_or_else(|| thread_id.to_string());
-            let thread_config = thread.config().await;
-            let (last_activity, idle_seconds) = match self.agent_activity(thread_id) {
+            let thread = state.get_thread(thread_id).await.ok();
+            let observed_status = match thread.as_ref() {
+                Some(thread) => thread.agent_status().await,
+                None => AgentStatus::NotFound,
+            };
+            let activity = self.agent_activity(thread_id);
+            let agent_status = self
+                .state
+                .status_for_thread(thread_id, observed_status.clone());
+            let lifecycle = self.state.lifecycle(
+                thread_id,
+                observed_status,
+                activity.as_ref().map(|activity| activity.label.as_str()),
+            );
+            let (last_activity, idle_seconds) = match activity {
                 Some(activity) => (Some(activity.label), Some(seconds_since(activity.at_ms))),
                 None => (None, None),
             };
+            let (model, account) = if let Some(thread) = thread {
+                let thread_config = thread.config().await;
+                (
+                    thread_config.model.clone(),
+                    claude_account_label(
+                        thread_config.codex_home.as_path(),
+                        thread_id,
+                        &thread_config.model_provider_id,
+                    ),
+                )
+            } else {
+                (None, None)
+            };
             agents.push(ListedAgent {
                 agent_name,
-                agent_status: thread.agent_status().await,
+                agent_status,
+                status: lifecycle.status,
+                generation: lifecycle.generation,
                 agent_role: metadata.agent_role.clone(),
-                model: thread_config.model.clone(),
-                account: claude_account_label(
-                    thread_config.codex_home.as_path(),
-                    thread_id,
-                    &thread_config.model_provider_id,
-                ),
+                model,
+                account,
                 last_activity,
                 idle_seconds,
             });

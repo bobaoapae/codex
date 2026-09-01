@@ -450,11 +450,17 @@ fn fork_turn_positions_use_canonical_agent_messages_and_delivery_metadata() {
     let mut rollout = vec![
         response_item(user_msg("user task")),
         RolloutItem::InterAgentCommunicationMetadata {
+            message_id: None,
             trigger_turn: false,
+            wake_applied: false,
         },
         response_item(queued.to_model_input_item()),
         response_item(assistant_msg("first answer")),
-        RolloutItem::InterAgentCommunicationMetadata { trigger_turn: true },
+        RolloutItem::InterAgentCommunicationMetadata {
+            message_id: None,
+            trigger_turn: true,
+            wake_applied: false,
+        },
         response_item(triggered.to_model_input_item()),
         response_item(assistant_msg("second answer")),
         response_item(user_msg("next user task")),

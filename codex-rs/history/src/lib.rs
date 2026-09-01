@@ -103,7 +103,18 @@ pub enum RolloutItem {
     ResponseItem(ResponseItemEnvelope),
     InterAgentCommunication(InterAgentCommunication),
     InterAgentCommunicationMetadata {
+        /// The durable mailbox identity this metadata describes.
+        ///
+        /// This remains optional so rollouts written before mailbox delivery
+        /// metadata was keyed by UUID continue to decode unchanged.
+        message_id: Option<String>,
         trigger_turn: bool,
+        /// Whether the trigger's wake effect has been applied durably.
+        ///
+        /// A false value is the initial delivery intent. A later metadata
+        /// record with this set to true fences a redelivery from starting the
+        /// same wake a second time.
+        wake_applied: bool,
     },
     Compacted(CompactedItem),
     TurnContext(TurnContextItem),

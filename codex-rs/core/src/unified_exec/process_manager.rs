@@ -16,6 +16,7 @@ use super::oneshot::Completion;
 
 use crate::codex_thread::BackgroundTerminalInfo;
 use crate::exec_env::CODEX_PERMISSION_PROFILE_ENV_VAR;
+use crate::exec_env::CODEX_SESSION_ID_ENV_VAR;
 use crate::exec_env::CODEX_THREAD_ID_ENV_VAR;
 use crate::exec_env::create_env;
 use crate::exec_env::inject_apply_patch_env;
@@ -42,13 +43,17 @@ use crate::tools::runtimes::unified_exec::UnifiedExecRuntime;
 use crate::tools::sandboxing::SandboxAttempt;
 use crate::tools::sandboxing::ToolCtx;
 use crate::tools::sandboxing::ToolError;
+use crate::unified_exec::BuildAdmissionError;
 use crate::unified_exec::ExecCommandRequest;
+use crate::unified_exec::ExecMutationAuthorization;
 use crate::unified_exec::MAX_UNIFIED_EXEC_PROCESSES;
 use crate::unified_exec::MAX_YIELD_TIME_MS;
 use crate::unified_exec::MIN_EMPTY_YIELD_TIME_MS;
 use crate::unified_exec::MIN_YIELD_TIME_MS;
 use crate::unified_exec::ProcessEntry;
 use crate::unified_exec::ProcessStore;
+use crate::unified_exec::TerminalProcessSnapshot;
+use crate::unified_exec::TerminalProcessState;
 use crate::unified_exec::UnifiedExecContext;
 use crate::unified_exec::UnifiedExecError;
 use crate::unified_exec::UnifiedExecProcessManager;
@@ -76,11 +81,15 @@ use codex_protocol::config_types::ShellEnvironmentPolicy;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::SandboxErr;
+use codex_protocol::items::CommandExecutionStatus;
+use codex_protocol::items::TurnItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecCommandSource;
 use codex_protocol::protocol::TerminalInteractionEvent;
 use codex_protocol::shell_environment::is_non_inheritable_env_var;
 use codex_sandboxing::SandboxCommand;
+use codex_state::WorkflowTerminalObservation;
+use codex_state::WorkflowTerminalProcessState;
 use codex_tools::ToolName;
 use codex_utils_output_truncation::approx_tokens_from_byte_count;
 use codex_utils_path_uri::PathUri;
@@ -256,6 +265,7 @@ struct PreparedProcessHandles {
     hook_command: String,
     process_id: i32,
     tty: bool,
+    mutation_authorization: Option<ExecMutationAuthorization>,
 }
 
 struct InitialExecCommandGuard {
@@ -323,6 +333,7 @@ fn network_approval_error_message(err: ToolError) -> String {
     match err {
         ToolError::Rejected(message) => message,
         ToolError::Codex(err) => err.to_string(),
+        ToolError::BuildAdmissionBusy(busy) => busy.to_string(),
     }
 }
 
@@ -432,6 +443,181 @@ fn terminate_process_on_network_denial(
 }
 
 impl UnifiedExecProcessManager {
+    pub(crate) fn subscribe_observability_revision(&self) -> watch::Receiver<u64> {
+        self.observability.subscribe_revision()
+    }
+
+    pub(crate) fn observability_revision(&self) -> u64 {
+        self.observability.current_revision()
+    }
+
+    pub(crate) fn observe_event(&self, event: &EventMsg) {
+        match event {
+            EventMsg::ExecCommandOutputDelta(output) => {
+                self.observe_output_delta(&output.call_id, &output.chunk);
+            }
+            EventMsg::TerminalInteraction(interaction) => {
+                let process_id = interaction
+                    .process_id
+                    .parse::<i32>()
+                    .ok()
+                    .or_else(|| self.observability.pid_for_call_id(&interaction.call_id));
+                if let Some(process_id) = process_id {
+                    self.observe_write_stdin(process_id, &interaction.stdin);
+                }
+            }
+            EventMsg::ItemCompleted(completed) => {
+                let TurnItem::CommandExecution(command) = &completed.item else {
+                    return;
+                };
+                let process_id = command
+                    .process_id
+                    .as_deref()
+                    .and_then(|process_id| process_id.parse::<i32>().ok())
+                    .or_else(|| self.observability.pid_for_call_id(&command.id));
+                let Some(process_id) = process_id else {
+                    return;
+                };
+                let terminal_state = match command.status {
+                    CommandExecutionStatus::Completed => command
+                        .exit_code
+                        .filter(|exit_code| *exit_code != 0)
+                        .map_or(TerminalProcessState::Exited, |_| {
+                            TerminalProcessState::Failed
+                        }),
+                    CommandExecutionStatus::Failed => TerminalProcessState::Failed,
+                    CommandExecutionStatus::Declined => TerminalProcessState::Cancelled,
+                    CommandExecutionStatus::InProgress => return,
+                };
+                self.observability
+                    .mark_state(process_id, terminal_state, None);
+                self.observability.mark_final_receipt(process_id);
+                self.persist_observation(process_id);
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn terminal_snapshots(&self) -> Vec<TerminalProcessSnapshot> {
+        self.observability.snapshots(None)
+    }
+
+    pub(crate) fn terminal_snapshot(&self, process_id: i32) -> Option<TerminalProcessSnapshot> {
+        self.observability.snapshot(process_id, None)
+    }
+
+    /// Advance every live terminal observation once.  The production heartbeat
+    /// task calls the same store operations periodically; this explicit entry
+    /// point keeps deterministic tests and shutdown coordinators independent of
+    /// wall-clock sleeps.
+    pub(crate) async fn heartbeat_terminal_observability(&self) {
+        let processes = {
+            let store = self.process_store.lock().await;
+            store
+                .processes
+                .values()
+                .map(|entry| (entry.process_id, Arc::clone(&entry.process)))
+                .collect::<Vec<_>>()
+        };
+        for (process_id, process) in processes {
+            if !process.has_exited() && process.failure_message().is_none() {
+                let change = self.observability.heartbeat(process_id, true, None);
+                if change.is_some_and(|change| change.entered_needs_attention)
+                    && let Some(session) = self.observability.session_for_pid(process_id)
+                {
+                    let detail = self
+                        .observability
+                        .snapshot(process_id, None)
+                        .map(|snapshot| {
+                            format!(
+                                "terminal {} needs attention ({})",
+                                snapshot.pid, snapshot.command
+                            )
+                        })
+                        .unwrap_or_else(|| format!("terminal {process_id} needs attention"));
+                    session
+                        .services
+                        .agent_control
+                        .record_agent_activity(session.thread_id, detail);
+                    let _ = session
+                        .services
+                        .agent_control
+                        .record_agent_needs_attention(session.thread_id);
+                    spawn_persist_terminal_observation(&self.observability, process_id, session);
+                }
+            } else {
+                if process.failure_message().is_some() {
+                    self.observability
+                        .mark_state(process_id, TerminalProcessState::Failed, None);
+                }
+                self.observability.heartbeat(process_id, false, None);
+            }
+        }
+        self.reap_exited_processes().await;
+    }
+
+    pub(crate) fn observe_write_stdin(&self, process_id: i32, input: &str) {
+        let Some(change) = self.observability.mark_write(process_id, input, None) else {
+            return;
+        };
+        self.record_agent_terminal_activity(process_id, "terminal input observed");
+        if change.cleared_needs_attention {
+            self.notify_agent_terminal_activity(process_id, "terminal activity resumed");
+        }
+        if change.state_changed {
+            self.persist_observation(process_id);
+        }
+    }
+
+    fn observe_output_delta(&self, call_id: &str, bytes: &[u8]) {
+        let Some(process_id) = self.observability.pid_for_call_id(call_id) else {
+            return;
+        };
+        let Some(change) = self.observability.mark_output(process_id, bytes, None) else {
+            return;
+        };
+        self.record_agent_terminal_activity(process_id, "terminal output observed");
+        if change.cleared_needs_attention {
+            self.notify_agent_terminal_activity(process_id, "terminal output resumed");
+            self.persist_observation(process_id);
+        }
+    }
+
+    fn persist_observation(&self, process_id: i32) {
+        let Some(session) = self.observability.session_for_pid(process_id) else {
+            return;
+        };
+        spawn_persist_terminal_observation(&self.observability, process_id, session);
+    }
+
+    fn notify_agent_terminal_activity(&self, process_id: i32, detail: &str) {
+        let session = self.observability.session_for_pid(process_id);
+        let Some(session) = session else {
+            return;
+        };
+        session.services.agent_control.record_agent_activity(
+            session.thread_id,
+            format!("{detail} for terminal {process_id}"),
+        );
+        // AgentStatus has no separate terminal-resume variant. Publish one
+        // non-terminal status edge while leaving Session's public status at
+        // Running; this advances E1's causal revision for waiters.
+        let _ = session
+            .services
+            .agent_control
+            .record_agent_status_edge(session.thread_id);
+    }
+
+    fn record_agent_terminal_activity(&self, process_id: i32, detail: &str) {
+        let Some(session) = self.observability.session_for_pid(process_id) else {
+            return;
+        };
+        session.services.agent_control.record_agent_activity(
+            session.thread_id,
+            format!("{detail} for terminal {process_id}"),
+        );
+    }
+
     pub(crate) async fn allocate_process_id(&self) -> i32 {
         loop {
             let mut store = self.process_store.lock().await;
@@ -465,6 +651,21 @@ impl UnifiedExecProcessManager {
             store.remove(process_id)
         };
         if let Some(entry) = removed {
+            let state = if entry.process.timed_out() {
+                TerminalProcessState::Cancelled
+            } else if entry.process.failure_message().is_some() {
+                TerminalProcessState::Failed
+            } else if entry.process.has_exited() {
+                TerminalProcessState::Exited
+            } else {
+                // Releasing a live process is only used by an explicit
+                // cancellation/error path.  Do not infer a timeout or kill
+                // from inactivity.
+                TerminalProcessState::Cancelled
+            };
+            self.observability.mark_state(process_id, state, None);
+            self.observability.mark_final_receipt(process_id);
+            self.persist_observation(process_id);
             unregister_network_approval_for_entry(&entry).await;
         }
     }
@@ -500,6 +701,7 @@ impl UnifiedExecProcessManager {
             process,
             metrics_sidecar,
             permissions,
+            mutation_authorization,
         } = attempt;
         let process = Arc::new(process);
         if let Some(completion) = completion.as_ref() {
@@ -548,7 +750,6 @@ impl UnifiedExecProcessManager {
         );
         emitter.emit(event_ctx, ToolEventStage::Begin).await;
 
-        start_streaming_output(&process, context, Arc::clone(&transcript));
         let start = Instant::now();
         // Persist live sessions before the initial yield wait so interrupting the
         // turn cannot drop the last Arc and terminate the background process.
@@ -563,6 +764,7 @@ impl UnifiedExecProcessManager {
                 cwd.clone(),
                 request.turn_environment.selection.environment_id.clone(),
                 permissions,
+                mutation_authorization,
                 plugin_attribution.clone(),
                 start,
                 request.process_id,
@@ -584,6 +786,7 @@ impl UnifiedExecProcessManager {
                 metrics_sidecar,
             }
         };
+        start_streaming_output(&process, context, Arc::clone(&transcript));
 
         let yield_time_ms = clamp_yield_time(request.yield_time_ms);
         // For the initial exec_command call, we both stream output to events
@@ -890,10 +1093,15 @@ impl UnifiedExecProcessManager {
             hook_command,
             process_id,
             tty,
+            mutation_authorization: _mutation_authorization,
             ..
         } = self
             .prepare_process_handles(process_id, &locked_process)
             .await?;
+        // The invocation itself is an explicit observation edge, including an
+        // empty poll.  A subsequent TerminalInteraction event is harmlessly
+        // idempotent and keeps older event consumers in sync.
+        self.observe_write_stdin(process_id, request.input);
         let mut status_after_write = None;
 
         if !request.input.is_empty() {
@@ -1051,6 +1259,15 @@ impl UnifiedExecProcessManager {
         let process_id = entry.process_id;
 
         if entry.process.has_exited() {
+            let state = if entry.process.timed_out() {
+                TerminalProcessState::Cancelled
+            } else if entry.process.failure_message().is_some() {
+                TerminalProcessState::Failed
+            } else {
+                TerminalProcessState::Exited
+            };
+            self.observability.mark_state(process_id, state, None);
+            self.persist_observation(process_id);
             let Some(entry) = store.remove(process_id) else {
                 return ProcessStatus::Unknown;
             };
@@ -1098,6 +1315,7 @@ impl UnifiedExecProcessManager {
             hook_command: entry.hook_command.clone(),
             process_id: entry.process_id,
             tty: entry.tty,
+            mutation_authorization: entry.mutation_authorization.clone(),
         })
     }
 
@@ -1111,6 +1329,7 @@ impl UnifiedExecProcessManager {
         cwd: PathUri,
         environment_id: String,
         permissions: super::TerminalPermissions,
+        mutation_authorization: Option<ExecMutationAuthorization>,
         plugin_attribution: Option<PluginCommandAttribution>,
         started_at: Instant,
         process_id: i32,
@@ -1134,10 +1353,21 @@ impl UnifiedExecProcessManager {
             tty,
             environment_id,
             permissions,
+            mutation_authorization,
             network_approval,
+            _build_admission: process.build_admission(),
             session: Arc::downgrade(&context.session),
             last_used: started_at,
         };
+        let terminal_snapshot = self.observability.register(
+            Arc::downgrade(&context.session),
+            context.session.session_id().to_string(),
+            process_id,
+            context.call_id.clone(),
+            &command.join(" "),
+            None,
+        );
+        self.persist_observation(process_id);
         let pruned_entry = {
             let mut store = self.process_store.lock().await;
             let pruned_entry = Self::prune_processes_if_needed(&mut store);
@@ -1165,6 +1395,111 @@ impl UnifiedExecProcessManager {
             network_denial_monitor,
             plugin_metrics_sidecar,
         );
+        self.spawn_observability_heartbeat(
+            process_id,
+            Arc::clone(&process),
+            Arc::downgrade(&context.session),
+            terminal_snapshot.started_at,
+        );
+    }
+
+    fn spawn_observability_heartbeat(
+        &self,
+        process_id: i32,
+        process: Arc<UnifiedExecProcess>,
+        session: std::sync::Weak<crate::session::session::Session>,
+        _started_at: u64,
+    ) {
+        let observations = Arc::clone(&self.observability);
+        let process_store = Arc::clone(&self.process_store);
+        let interval_ms = observations.inactivity_threshold_ms().clamp(1, 1_000);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let still_stored = {
+                    let store = process_store.lock().await;
+                    store
+                        .processes
+                        .get(&process_id)
+                        .is_some_and(|entry| Arc::ptr_eq(&entry.process, &process))
+                };
+                if !still_stored {
+                    break;
+                }
+
+                let alive = !process.has_exited();
+                if !alive && process.failure_message().is_some() {
+                    observations.mark_state(process_id, TerminalProcessState::Failed, None);
+                }
+                let state_change = observations.heartbeat(process_id, alive, None);
+                if state_change.is_some_and(|change| change.entered_needs_attention)
+                    && let Some(session) = session.upgrade()
+                {
+                    let detail = observations
+                        .snapshot(process_id, None)
+                        .map(|snapshot| {
+                            format!(
+                                "terminal {} needs attention ({})",
+                                snapshot.pid, snapshot.command
+                            )
+                        })
+                        .unwrap_or_else(|| format!("terminal {process_id} needs attention"));
+                    session
+                        .services
+                        .agent_control
+                        .record_agent_activity(session.thread_id, detail);
+                    // AgentStatus has no separate needs-attention variant. Keep
+                    // the public status running while advancing the E1 causal
+                    // revision so waiters can inspect the terminal snapshot.
+                    let _ = session
+                        .services
+                        .agent_control
+                        .record_agent_needs_attention(session.thread_id);
+                    // Heartbeats remain a runtime/SQLite/watch update. The
+                    // only durable write here is the latest bounded snapshot;
+                    // no rollout or model-context item is appended.
+                    spawn_persist_terminal_observation(&observations, process_id, session);
+                }
+
+                if !alive {
+                    let should_reap = {
+                        let store = process_store.lock().await;
+                        store.processes.get(&process_id).is_some_and(|entry| {
+                            Arc::ptr_eq(&entry.process, &process)
+                                && !entry.initial_exec_command_active.load(Ordering::Acquire)
+                        })
+                    };
+                    if should_reap && process.interaction_lock().try_lock_owned().is_ok() {
+                        let receipt_ready = observations.final_receipt_emitted(process_id)
+                            || session.upgrade().is_none();
+                        if !receipt_ready {
+                            continue;
+                        }
+                        let removed = {
+                            let mut store = process_store.lock().await;
+                            let matches = store
+                                .processes
+                                .get(&process_id)
+                                .is_some_and(|entry| Arc::ptr_eq(&entry.process, &process));
+                            matches.then(|| store.remove(process_id)).flatten()
+                        };
+                        if let Some(entry) = removed {
+                            if let Some(session) = session.upgrade() {
+                                spawn_persist_terminal_observation(
+                                    &observations,
+                                    process_id,
+                                    session,
+                                );
+                            }
+                            unregister_network_approval_for_entry(&entry).await;
+                            break;
+                        }
+                    }
+                }
+            }
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1217,6 +1552,7 @@ impl UnifiedExecProcessManager {
                     network_policy_decision: None,
                 }))
             }
+            UnifiedExecError::BuildAdmissionBusy { busy } => ToolError::BuildAdmissionBusy(busy),
             other => ToolError::Rejected(other.to_string()),
         })
     }
@@ -1316,6 +1652,29 @@ impl UnifiedExecProcessManager {
             } else {
                 None
             };
+        let admission_env = request
+            .env
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect::<Vec<_>>();
+        let build_admission = self
+            .build_admission
+            .try_acquire(
+                &request.command,
+                native_cwd.as_path(),
+                &admission_env,
+                request
+                    .env
+                    .get(CODEX_SESSION_ID_ENV_VAR)
+                    .map(String::as_str)
+                    .unwrap_or_default(),
+            )
+            .map_err(|error| match error {
+                BuildAdmissionError::Busy(busy) => UnifiedExecError::build_admission_busy(busy),
+                BuildAdmissionError::Resolve(message) | BuildAdmissionError::Io(message) => {
+                    UnifiedExecError::create_process(message)
+                }
+            })?;
         let spawn_result = codex_sandboxing::spawn_process(codex_sandboxing::SpawnRequest {
             command: &request.command,
             cwd: native_cwd.as_path(),
@@ -1331,7 +1690,13 @@ impl UnifiedExecProcessManager {
         spawn_lifecycle.after_spawn();
         let spawned =
             spawn_result.map_err(|err| UnifiedExecError::create_process(err.to_string()))?;
-        UnifiedExecProcess::from_spawned(spawned, request.sandbox, spawn_lifecycle).await
+        UnifiedExecProcess::from_spawned_with_admission(
+            spawned,
+            request.sandbox,
+            spawn_lifecycle,
+            build_admission,
+        )
+        .await
     }
 
     pub(super) async fn open_session_with_sandbox(
@@ -1412,6 +1777,8 @@ impl UnifiedExecProcessManager {
             additional_permissions_preapproved: request.additional_permissions_preapproved,
             justification: request.justification.clone(),
             exec_approval_requirement,
+            mutation_authorization: request.mutation_authorization.clone(),
+            root_override_reason: request.root_override_reason.clone(),
         };
         let tool_ctx = ToolCtx {
             session: context.session.clone(),
@@ -1438,6 +1805,7 @@ impl UnifiedExecProcessManager {
                     }
                     _ => UnifiedExecError::create_process(format!("{err:?}")),
                 },
+                ToolError::BuildAdmissionBusy(busy) => UnifiedExecError::build_admission_busy(busy),
                 other => UnifiedExecError::create_process(format!("{other:?}")),
             })
     }
@@ -1639,30 +2007,55 @@ impl UnifiedExecProcessManager {
             return Some(*process_id);
         }
 
-        lru.into_iter()
-            .find(|(process_id, _, _)| !protected.contains(process_id))
-            .map(|(process_id, _, _)| process_id)
+        // A live terminal is never an implicit eviction candidate.  Reaching
+        // the soft cap may temporarily grow the store; only explicit
+        // cancellation or the exited-process reaper releases that state.
+        None
     }
 
     pub(crate) async fn terminate_all_processes(&self) {
-        let entries: Vec<ProcessEntry> = {
+        let (entries, session): (
+            Vec<ProcessEntry>,
+            Option<Arc<crate::session::session::Session>>,
+        ) = {
             let mut processes = self.process_store.lock().await;
             let entries: Vec<ProcessEntry> = processes
                 .processes
                 .drain()
                 .map(|(_, entry)| entry)
                 .collect();
+            let session = entries.iter().find_map(|entry| entry.session.upgrade());
             processes.reserved_process_ids.clear();
-            entries
+            (entries, session)
         };
 
         for entry in entries {
+            let state = if entry.process.has_exited() {
+                TerminalProcessState::Exited
+            } else {
+                TerminalProcessState::Cancelled
+            };
+            self.observability.mark_state(entry.process_id, state, None);
+            self.observability.mark_final_receipt(entry.process_id);
             unregister_network_approval_for_entry(&entry).await;
             entry.process.terminate();
+            self.observability.remove(entry.process_id);
+        }
+        self.observability.clear();
+        self.observability.wait_for_persistence().await;
+        if let Some(session) = session
+            && let Some(state_db) = session.state_db()
+            && let Err(error) = state_db
+                .workflow_store()
+                .delete_terminal_observations_for_session(&session.session_id().to_string())
+                .await
+        {
+            tracing::debug!("failed to clear terminal observations at shutdown: {error}");
         }
     }
 
     pub(crate) async fn list_processes(&self) -> Vec<BackgroundTerminalInfo> {
+        self.reap_exited_processes().await;
         let store = self.process_store.lock().await;
         let mut entries = store
             .processes
@@ -1681,6 +2074,53 @@ impl UnifiedExecProcessManager {
             .collect()
     }
 
+    /// Remove process handles whose transport has definitely exited.  The
+    /// interaction lock is checked before removal because the exit watcher
+    /// still owns the process while it publishes the final receipt.
+    pub(crate) async fn reap_exited_processes(&self) {
+        let candidates = {
+            let store = self.process_store.lock().await;
+            store
+                .processes
+                .iter()
+                .filter(|(_, entry)| {
+                    !entry.initial_exec_command_active.load(Ordering::Acquire)
+                        && entry.process.has_exited()
+                        && (self.observability.final_receipt_emitted(entry.process_id)
+                            || entry.session.upgrade().is_none())
+                })
+                .map(|(process_id, entry)| (*process_id, Arc::clone(&entry.process)))
+                .collect::<Vec<_>>()
+        };
+        for (process_id, process) in candidates {
+            if process.interaction_lock().try_lock_owned().is_err() {
+                continue;
+            }
+            let removed = {
+                let mut store = self.process_store.lock().await;
+                let matches = store.processes.get(&process_id).is_some_and(|entry| {
+                    Arc::ptr_eq(&entry.process, &process)
+                        && !entry.initial_exec_command_active.load(Ordering::Acquire)
+                        && entry.process.has_exited()
+                });
+                matches.then(|| store.remove(process_id)).flatten()
+            };
+            if let Some(entry) = removed {
+                let state = if entry.process.failure_message().is_some() {
+                    TerminalProcessState::Failed
+                } else if entry.process.timed_out() {
+                    TerminalProcessState::Cancelled
+                } else {
+                    TerminalProcessState::Exited
+                };
+                self.observability.mark_state(process_id, state, None);
+                self.observability.mark_final_receipt(process_id);
+                self.persist_observation(process_id);
+                unregister_network_approval_for_entry(&entry).await;
+            }
+        }
+    }
+
     pub(crate) async fn terminate_process(&self, process_id: i32) -> bool {
         let (process, already_exited) = {
             let store = self.process_store.lock().await;
@@ -1693,6 +2133,15 @@ impl UnifiedExecProcessManager {
         if !already_exited && process.terminate_confirmed().await.is_err() {
             return false;
         }
+
+        let final_state = if already_exited {
+            TerminalProcessState::Exited
+        } else {
+            TerminalProcessState::Cancelled
+        };
+        self.observability.mark_state(process_id, final_state, None);
+        self.observability.mark_final_receipt(process_id);
+        self.persist_observation(process_id);
 
         let entry = {
             let mut store = self.process_store.lock().await;
@@ -1714,6 +2163,56 @@ impl UnifiedExecProcessManager {
         unregister_network_approval_for_entry(&entry).await;
         true
     }
+}
+
+fn spawn_persist_terminal_observation(
+    observations: &Arc<crate::unified_exec::TerminalObservabilityStore>,
+    process_id: i32,
+    session: Arc<crate::session::session::Session>,
+) {
+    let Some(snapshot) = observations.snapshot(process_id, None) else {
+        return;
+    };
+    let Some(state_db) = session.state_db() else {
+        return;
+    };
+    let state = match snapshot.state {
+        TerminalProcessState::Running => WorkflowTerminalProcessState::Running,
+        TerminalProcessState::Waiting => WorkflowTerminalProcessState::Waiting,
+        TerminalProcessState::NeedsAttention => WorkflowTerminalProcessState::NeedsAttention,
+        TerminalProcessState::Exited => WorkflowTerminalProcessState::Exited,
+        TerminalProcessState::Failed => WorkflowTerminalProcessState::Failed,
+        TerminalProcessState::Cancelled => WorkflowTerminalProcessState::Cancelled,
+    };
+    let to_i64 = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
+    let observation = WorkflowTerminalObservation {
+        session_id: snapshot.session_id,
+        process_id: i64::from(snapshot.pid),
+        command_summary: snapshot.command,
+        started_at_ms: to_i64(snapshot.started_at),
+        elapsed_ms: to_i64(snapshot.elapsed_ms),
+        last_activity_at_ms: to_i64(snapshot.last_activity_at),
+        last_output_at_ms: snapshot.last_output_at.map(to_i64),
+        last_output_preview: snapshot.last_output_preview,
+        last_output_bytes: to_i64(snapshot.last_output_bytes),
+        output_bytes: to_i64(snapshot.output_bytes),
+        state,
+        final_receipt_emitted: observations.final_receipt_emitted(process_id),
+        updated_at_ms: to_i64(observations.now_ms()),
+    };
+    let observations = Arc::clone(observations);
+    tokio::spawn(async move {
+        let Ok(_persistence_permit) = observations.acquire_persistence().await else {
+            return;
+        };
+        if let Err(error) = state_db
+            .workflow_store()
+            .upsert_terminal_observation(&observation)
+            .await
+        {
+            tracing::debug!("failed to persist terminal observation: {error}");
+        }
+    });
 }
 
 enum ProcessStatus {

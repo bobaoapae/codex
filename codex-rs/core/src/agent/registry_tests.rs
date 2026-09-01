@@ -1,6 +1,7 @@
 use super::*;
 use codex_protocol::AgentPath;
 use codex_protocol::error::CodexErrorDetails;
+use codex_protocol::protocol::AgentStatus;
 use pretty_assertions::assert_eq;
 use std::collections::HashSet;
 
@@ -570,4 +571,204 @@ fn thread_identity_can_move_between_agent_paths() {
         .reserve_spawn_slot(Some(1))
         .expect("releasing the migrated agent should free its spawn slot");
     drop(reservation);
+}
+
+#[test]
+fn causal_revision_is_monotonic_and_deduplicates_status_events() {
+    let registry = AgentRegistry::default();
+    let thread_id = ThreadId::new();
+    let mut revision_rx = registry.subscribe_revision();
+
+    assert_eq!(registry.revision(), 0);
+    let message_revision = registry.record_message(thread_id);
+    assert_eq!(message_revision, 1);
+    assert_eq!(registry.revision(), 1);
+    assert_eq!(
+        registry.last_change(thread_id),
+        Some(AgentChange {
+            revision: 1,
+            kind: AgentChangeKind::Message,
+        })
+    );
+
+    assert_eq!(
+        registry.record_status_change(thread_id, AgentStatus::Running),
+        Some(2)
+    );
+    assert_eq!(
+        registry.record_status_change(thread_id, AgentStatus::Running),
+        None
+    );
+    assert_eq!(*revision_rx.borrow_and_update(), 2);
+    assert_eq!(
+        registry.last_change(thread_id),
+        Some(AgentChange {
+            revision: 2,
+            kind: AgentChangeKind::StatusChanged,
+        })
+    );
+
+    assert_eq!(
+        registry.record_status_change(thread_id, AgentStatus::Completed(Some("done".to_string()))),
+        Some(3)
+    );
+    assert_eq!(
+        registry.record_message(thread_id),
+        4,
+        "a mailbox redelivery gets its own root revision"
+    );
+    assert_eq!(
+        registry.last_change(thread_id),
+        Some(AgentChange {
+            revision: 4,
+            kind: AgentChangeKind::Message,
+        })
+    );
+}
+
+#[test]
+fn needs_attention_revision_is_typed_and_deduplicated() {
+    let registry = AgentRegistry::default();
+    let thread_id = ThreadId::new();
+
+    assert_eq!(
+        registry.record_status_change(thread_id, AgentStatus::Running),
+        Some(1)
+    );
+    assert_eq!(registry.record_needs_attention(thread_id), Some(2));
+    assert_eq!(registry.record_needs_attention(thread_id), None);
+    assert_eq!(registry.revision(), 2);
+    assert_eq!(
+        registry.last_change(thread_id),
+        Some(AgentChange {
+            revision: 2,
+            kind: AgentChangeKind::NeedsAttention,
+        })
+    );
+}
+
+#[test]
+fn agent_lifecycle_terminal_releases_slot_and_preserves_lineage() {
+    let registry = Arc::new(AgentRegistry::default());
+    let thread_id = ThreadId::new();
+    let reservation = registry
+        .reserve_spawn_slot(Some(1))
+        .expect("initial lifecycle slot should be available");
+    reservation.commit(AgentMetadata {
+        agent_id: Some(thread_id),
+        agent_path: Some(agent_path("/root/worker")),
+        ..Default::default()
+    });
+
+    assert!(registry.is_agent_active(thread_id));
+    let terminal_revision = registry
+        .record_status_change(thread_id, AgentStatus::Completed(Some("done".to_string())))
+        .expect("terminal status should publish a revision");
+    assert!(!registry.is_agent_active(thread_id));
+    assert_eq!(registry.revision(), terminal_revision);
+    assert_eq!(
+        registry
+            .agent_metadata_for_thread(thread_id)
+            .and_then(|metadata| metadata.agent_path),
+        Some(agent_path("/root/worker"))
+    );
+    assert_eq!(
+        registry.last_change(thread_id).map(|change| change.kind),
+        Some(AgentChangeKind::Terminal)
+    );
+
+    let replacement = registry
+        .reserve_spawn_slot(Some(1))
+        .expect("terminal agent should no longer consume the slot");
+    drop(replacement);
+}
+
+#[test]
+fn agent_lifecycle_abort_and_error_release_slots() {
+    for terminal_status in [
+        AgentStatus::Interrupted,
+        AgentStatus::Errored("provider failed".to_string()),
+    ] {
+        let registry = Arc::new(AgentRegistry::default());
+        let thread_id = ThreadId::new();
+        registry
+            .reserve_spawn_slot(Some(1))
+            .expect("initial lifecycle slot should be available")
+            .commit(AgentMetadata {
+                agent_id: Some(thread_id),
+                agent_path: Some(agent_path("/root/worker")),
+                ..Default::default()
+            });
+
+        let revision = registry
+            .record_status_change(thread_id, terminal_status)
+            .expect("terminal status should publish a revision");
+        assert!(!registry.is_agent_active(thread_id));
+        assert_eq!(registry.revision(), revision);
+        assert_eq!(
+            registry.last_change(thread_id).map(|change| change.kind),
+            Some(AgentChangeKind::Terminal)
+        );
+        drop(
+            registry
+                .reserve_spawn_slot(Some(1))
+                .expect("aborted or failed agent should release its slot"),
+        );
+    }
+}
+
+#[test]
+fn terminal_followup_advances_generation_and_active_followup_keeps_it() {
+    let registry = Arc::new(AgentRegistry::default());
+    let thread_id = ThreadId::new();
+    registry
+        .reserve_spawn_slot(Some(1))
+        .expect("initial lifecycle slot should be available")
+        .commit(AgentMetadata {
+            agent_id: Some(thread_id),
+            agent_path: Some(agent_path("/root/worker")),
+            ..Default::default()
+        });
+    registry.record_status_change(
+        thread_id,
+        AgentStatus::Completed(Some("first generation".to_string())),
+    );
+
+    let generation = registry
+        .begin_followup_generation(thread_id, AgentStatus::NotFound, Some(1))
+        .expect("terminal follow-up should reacquire a slot");
+    assert_eq!(generation, 1);
+    assert!(registry.is_agent_active(thread_id));
+    let pending_revision = registry
+        .record_status_change(thread_id, AgentStatus::PendingInit)
+        .expect("follow-up pending status should publish a revision");
+    assert_eq!(pending_revision, registry.revision());
+
+    let active_generation = registry
+        .begin_followup_generation(thread_id, AgentStatus::Completed(None), Some(1))
+        .expect("active follow-up should keep the current generation");
+    assert_eq!(active_generation, 1);
+}
+
+#[test]
+fn residency_eviction_releases_logical_spawn_slot() {
+    let registry = Arc::new(AgentRegistry::default());
+    let thread_id = ThreadId::new();
+    registry
+        .reserve_spawn_slot(Some(1))
+        .expect("resident agent slot should be available")
+        .commit(AgentMetadata {
+            agent_id: Some(thread_id),
+            agent_path: Some(agent_path("/root/resident")),
+            ..Default::default()
+        });
+
+    registry.release_active_slot(thread_id);
+
+    assert!(!registry.is_agent_active(thread_id));
+    assert!(registry.agent_metadata_for_thread(thread_id).is_some());
+    let replacement = registry
+        .reserve_spawn_slot(Some(1))
+        .expect("evicted resident should release its logical slot");
+    drop(replacement);
 }

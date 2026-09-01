@@ -1542,6 +1542,7 @@ async fn maybe_request_mcp_tool_approval(
             Ok(decision) => decision,
             Err(ToolError::Rejected(rejection)) => ReviewDecision::denied(rejection),
             Err(ToolError::Codex(_)) => ReviewDecision::Abort,
+            Err(ToolError::BuildAdmissionBusy(_)) => ReviewDecision::Abort,
         },
     )
 }

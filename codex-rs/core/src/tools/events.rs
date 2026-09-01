@@ -454,6 +454,15 @@ impl ToolEmitter {
                 let result = Err(FunctionCallError::RespondToModel(normalized));
                 (event, result)
             }
+            Err(ToolError::BuildAdmissionBusy(busy)) => {
+                let message = truncate_rejection_message(&busy.to_string());
+                let event = ToolEventStage::Failure(ToolEventFailure::Rejected {
+                    message: message.clone(),
+                    applied_patch_delta,
+                });
+                let result = Err(FunctionCallError::RespondToModel(message));
+                (event, result)
+            }
         };
         self.emit(ctx, event).await;
         result

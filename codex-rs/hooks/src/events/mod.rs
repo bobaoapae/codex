@@ -1,5 +1,6 @@
 pub(crate) mod common;
 pub mod compact;
+pub(crate) mod evidence;
 pub mod interrupt;
 pub mod permission_request;
 pub mod post_tool_use;

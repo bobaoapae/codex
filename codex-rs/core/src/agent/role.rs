@@ -7,6 +7,8 @@ use crate::config::AgentRoleConfig;
 use crate::config::Config;
 use crate::config::deserialize_config_toml_with_base;
 use anyhow::anyhow;
+use codex_agent_roles::AgentRoleCapabilities;
+use codex_agent_roles::capabilities_for_role;
 use codex_agent_roles::parse_agent_role_file_contents;
 use codex_config::ConfigLayerEntry;
 use codex_config::ConfigLayerSource;
@@ -184,6 +186,16 @@ pub(crate) fn resolve_role_config<'a>(
         .agent_roles
         .get(role_name)
         .or_else(|| built_in::configs().get(role_name))
+}
+
+/// Resolve the bounded mutation capability attached to a runtime role name.
+///
+/// The role declaration remains the source for configuration, while capability
+/// resolution is an independent closed mapping. This keeps custom role config
+/// from becoming an implicit write grant and gives future ownership enforcement
+/// one typed value to consult.
+pub(crate) fn role_capabilities(role_name: Option<&str>) -> AgentRoleCapabilities {
+    capabilities_for_role(role_name)
 }
 
 mod role_overrides {

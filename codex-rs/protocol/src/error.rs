@@ -73,6 +73,35 @@ pub struct CodexErr {
     retry_delay: Option<Duration>,
 }
 
+/// Exact upstream message which indicates that the persisted conversation contains
+/// provider-encrypted function output that this provider cannot decrypt.
+///
+/// This is intentionally an exact-match sentinel. Other stream and transport
+/// messages must retain their existing retry behavior.
+pub const ENCRYPTED_FUNCTION_OUTPUT_CONTENT_ERROR_MESSAGE: &str =
+    "Encrypted function output content could not be decrypted or decoded.";
+
+/// The legacy, user-visible message emitted for a history recovery failure.
+///
+/// Keep this stable so rollouts written before the structured reason was added
+/// can be recognized during cold resume.
+pub const HISTORY_RECOVERY_REQUIRED_ERROR_MESSAGE: &str = "stream disconnected before completion: Encrypted function output content could not be decrypted or decoded.";
+
+/// The structured reason for requiring a new history lineage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoryRecoveryReason {
+    /// The provider rejected encrypted function output from an unreadable local
+    /// provider message.
+    UndecryptableEncryptedFunctionOutput,
+}
+
+/// Recognizes the stable terminal message written by a history recovery
+/// failure, including rollouts produced before the structured reason existed.
+pub fn history_recovery_reason_from_error_message(message: &str) -> Option<HistoryRecoveryReason> {
+    (message == HISTORY_RECOVERY_REQUIRED_ERROR_MESSAGE)
+        .then_some(HistoryRecoveryReason::UndecryptableEncryptedFunctionOutput)
+}
+
 /// The semantic category and diagnostic payload for a [`CodexErr`].
 #[derive(Error, Debug, EnumDiscriminants)]
 #[strum_discriminants(name(CodexErrKind))]
@@ -99,6 +128,13 @@ pub enum CodexErrorDetails {
         "Codex ran out of room in the model's context window. Start a new thread or clear earlier history before retrying."
     )]
     ContextWindowExceeded,
+    /// The persisted history contains an encrypted function output that the
+    /// current provider cannot decrypt. The turn is terminal and requires an
+    /// explicit history recovery operation before another request is allowed.
+    #[error(
+        "stream disconnected before completion: Encrypted function output content could not be decrypted or decoded."
+    )]
+    HistoryRecoveryRequired { reason: HistoryRecoveryReason },
     #[error("no thread with id: {0}")]
     ThreadNotFound(ThreadId),
     #[error("agent thread limit reached")]
@@ -363,9 +399,24 @@ impl CodexErr {
         details.into()
     }
 
+    /// Constructs the terminal error used when a poisoned history needs an
+    /// explicit replacement lineage before it can be sampled again.
+    pub fn history_recovery_required(reason: HistoryRecoveryReason) -> Self {
+        CodexErrorDetails::HistoryRecoveryRequired { reason }.into()
+    }
+
     /// Returns the semantic failure and its diagnostic payload.
     pub fn details(&self) -> &CodexErrorDetails {
         &self.details
+    }
+
+    /// Returns the structured recovery reason when this is a history recovery
+    /// failure.
+    pub fn history_recovery_reason(&self) -> Option<HistoryRecoveryReason> {
+        match self.details() {
+            CodexErrorDetails::HistoryRecoveryRequired { reason } => Some(*reason),
+            _ => None,
+        }
     }
 
     pub fn is_retryable(&self) -> bool {
@@ -386,6 +437,7 @@ impl CodexErr {
             | CodexErrorDetails::LandlockSandboxExecutableNotProvided
             | CodexErrorDetails::RetryLimit(_)
             | CodexErrorDetails::ContextWindowExceeded
+            | CodexErrorDetails::HistoryRecoveryRequired { .. }
             | CodexErrorDetails::ThreadNotFound(_)
             | CodexErrorDetails::AgentLimitReached { .. }
             | CodexErrorDetails::Spawn

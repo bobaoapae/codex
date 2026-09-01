@@ -32,6 +32,7 @@ const MEMORIES_DB_FILENAME: &str = "memories_1.sqlite";
 const QUEUE_DB_FILENAME: &str = "queue_1.sqlite";
 const STATE_DB_FILENAME: &str = "state_5.sqlite";
 const THREAD_HISTORY_DB_FILENAME: &str = "thread_history_1.sqlite";
+const WORKFLOW_DB_FILENAME: &str = "workflow_1.sqlite";
 
 #[derive(Clone, Copy)]
 struct RuntimeDbSpec {
@@ -96,13 +97,22 @@ const THREAD_HISTORY_DB: RuntimeDbSpec = RuntimeDbSpec {
     migrate_phase: "migrate_thread_history",
 };
 
-const RUNTIME_DBS: [RuntimeDbSpec; 6] = [
+const WORKFLOW_DB: RuntimeDbSpec = RuntimeDbSpec {
+    label: "workflow DB",
+    filename: WORKFLOW_DB_FILENAME,
+    kind: DbKind::Workflow,
+    open_phase: "open_workflow",
+    migrate_phase: "migrate_workflow",
+};
+
+const RUNTIME_DBS: [RuntimeDbSpec; 7] = [
     STATE_DB,
     LOGS_DB,
     GOALS_DB,
     MEMORIES_DB,
     QUEUE_DB,
     THREAD_HISTORY_DB,
+    WORKFLOW_DB,
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -158,6 +168,11 @@ impl SqliteConfig {
     /// Return the path to the paginated thread-history database.
     pub fn thread_history_db_path(&self) -> PathBuf {
         THREAD_HISTORY_DB.path(self.home())
+    }
+
+    /// Return the path to the durable workflow database.
+    pub fn workflow_db_path(&self) -> PathBuf {
+        WORKFLOW_DB.path(self.home())
     }
 
     /// Return the paths to every database managed by the state runtime.
@@ -225,6 +240,15 @@ impl SqliteConfig {
         telemetry_override: Option<&dyn DbTelemetry>,
     ) -> anyhow::Result<SqlitePool> {
         self.open_runtime_db(THREAD_HISTORY_DB, migrator, telemetry_override)
+            .await
+    }
+
+    pub(super) async fn open_workflow_db(
+        &self,
+        migrator: &Migrator,
+        telemetry_override: Option<&dyn DbTelemetry>,
+    ) -> anyhow::Result<SqlitePool> {
+        self.open_runtime_db(WORKFLOW_DB, migrator, telemetry_override)
             .await
     }
 

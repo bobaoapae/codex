@@ -17,6 +17,7 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::GitInfo;
 use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::MultiAgentVersion;
+use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode as MemoryMode;
@@ -220,6 +221,360 @@ pub struct PreparedFork {
     pub model_context: Arc<Vec<RolloutItem>>,
     /// Blocks source deletion until the child's history reference is durable.
     _source_reservation: Box<dyn std::fmt::Debug + Send>,
+}
+
+/// Immutable rollout position used to bind a recovery preview to the exact source bytes that
+/// were inspected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryWatermark {
+    /// Immutable physical rollout identity, not the stable logical thread ID after a revert.
+    pub rollout_id: ThreadId,
+    /// First ordinal not included by the source rollout at preview time.
+    pub end_ordinal_exclusive: u64,
+    /// Byte offset immediately after the last logical JSONL record at preview time.
+    pub end_byte_offset: u64,
+}
+
+/// One bounded physical rollout record returned by the reusable recovery scanner.
+#[derive(Debug)]
+pub struct RecoveryRolloutRecord {
+    /// Sequential rollout ordinal.
+    pub ordinal: u64,
+    /// Logical JSONL byte offset at which this record starts.
+    pub start_byte_offset: u64,
+    /// Logical JSONL byte offset immediately after this record.
+    pub end_byte_offset: u64,
+    /// Decoded durable item.
+    pub item: RolloutItem,
+}
+
+/// Bounded physical rollout scan used by recovery policy builders and local tooling.
+#[derive(Debug)]
+pub struct RecoveryRolloutScan {
+    /// Canonical source session metadata, when the rollout contains one.
+    pub meta: Option<SessionMetaLine>,
+    /// Parsed records retained before the explicit bounds were reached.
+    pub records: Vec<RecoveryRolloutRecord>,
+    /// Total parsed non-empty records in the rollout.
+    pub item_count: usize,
+    /// Whether the scan stopped retaining records after a configured bound was exceeded.
+    pub buffer_limit_exceeded: bool,
+    /// First ordinal after the complete scanned rollout.
+    pub next_ordinal: u64,
+    /// Logical JSONL byte offset after the complete scanned rollout.
+    pub end_byte_offset: u64,
+}
+
+/// Limits used while preparing a recovery history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryLimits {
+    /// Maximum number of retained rollout items.
+    pub max_items: usize,
+    /// Maximum serialized JSONL byte size of retained items.
+    pub max_serialized_bytes: u64,
+}
+
+impl Default for RecoveryLimits {
+    fn default() -> Self {
+        Self {
+            max_items: 100_000,
+            max_serialized_bytes: 40 * 1024 * 1024,
+        }
+    }
+}
+
+/// A provider-attested candidate for an invalid encrypted agent message.
+///
+/// The local thread store deliberately does not infer provider capabilities from a rollout item:
+/// the source item has no reliable provider-origin field. The caller must therefore identify the
+/// local provider and the exact rollout ordinal. The store validates that the candidate really is
+/// an encrypted `ResponseItem::AgentMessage` before accepting it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryEncryptedAgentMessageCandidate {
+    /// Ordinal of the persisted response item to remove.
+    pub rollout_ordinal: u64,
+    /// Optional Responses item ID used as an additional identity check.
+    pub item_id: Option<String>,
+    /// Provider which attested that this encrypted content was produced locally and cannot be
+    /// decrypted by the target provider.
+    pub provider_id: String,
+}
+
+/// A provider-attested retry turn that repeated the same non-transient history failure.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryRetryTurnCandidate {
+    /// Turn identifier emitted by the rollout's turn-start and turn-complete records.
+    pub turn_id: String,
+    /// Exact durable terminal error message expected on the turn-complete record.
+    pub error_message: String,
+}
+
+/// Explicit turn-state proof required before a loaded local writer may be recovered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RecoveryTurnState {
+    /// The caller observed no active turn after flushing the local writer.
+    Idle,
+    /// A turn is still active and recovery must be rejected.
+    Active,
+    /// The caller could not establish whether a turn is active.
+    Unknown,
+}
+
+/// Bounded attestation that a local live writer was flushed at an idle turn boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryQuiescenceAttestation {
+    /// Stable logical thread whose local writer was flushed.
+    pub thread_id: ThreadId,
+    /// Immutable rollout selected by that writer.
+    pub rollout_id: ThreadId,
+    /// Position observed after the flush.
+    pub watermark: RecoveryWatermark,
+    /// Caller-provided turn-state observation.
+    pub turn_state: RecoveryTurnState,
+}
+
+/// Parameters for obtaining a quiescence attestation from a loaded local writer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryQuiescenceParams {
+    /// Loaded thread whose writer should be flushed and inspected.
+    pub thread_id: ThreadId,
+    /// Bounded caller proof that the thread is idle.
+    pub turn_state: RecoveryTurnState,
+}
+
+/// A provider-attested terminal error record from the turn that contained the poisoned item.
+///
+/// This record is removed as one item. It is intentionally separate from
+/// [`RecoveryRetryTurnCandidate`], because the contaminated turn's safe history before this
+/// terminal marker remains useful and must not be removed wholesale.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryTurnCompleteCandidate {
+    /// Ordinal of the persisted turn-complete event to remove.
+    pub rollout_ordinal: u64,
+    /// Turn identifier carried by the event.
+    pub turn_id: String,
+    /// Exact durable terminal error message expected on the event.
+    pub error_message: String,
+}
+
+/// Explicit recovery policy supplied by the app-server or another trusted caller.
+///
+/// This policy is intentionally data-driven. In particular, the store does not guess whether an
+/// encrypted agent message is valid for a provider, nor does it guess which failed turns are
+/// retries. It validates every supplied candidate against the immutable rollout before preparing
+/// a new history.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryPolicy {
+    /// Exact encrypted agent-message candidates attested by a local provider boundary.
+    pub encrypted_agent_messages: Vec<RecoveryEncryptedAgentMessageCandidate>,
+    /// Exact decrypt failure terminal events from the turn containing the poisoned item.
+    pub contaminated_turn_completions: Vec<RecoveryTurnCompleteCandidate>,
+    /// Exact failed turns that should be removed as retries of the poisoned history.
+    pub retry_turns: Vec<RecoveryRetryTurnCandidate>,
+    /// Hard bounds for the resulting model-visible history.
+    pub limits: RecoveryLimits,
+}
+
+/// Parameters for a read-only recovery preview.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryPreviewParams {
+    /// Stable logical thread whose currently selected rollout should be inspected.
+    pub thread_id: ThreadId,
+    /// Whether an archived selected rollout may be inspected.
+    pub include_archived: bool,
+    /// Explicit provider/candidate policy supplied by the caller.
+    pub policy: RecoveryPolicy,
+    /// Optional attestation for a loaded local writer. Without it, recovery requires a closed
+    /// writer lock that excludes other Codex processes.
+    pub quiescence: Option<RecoveryQuiescenceAttestation>,
+    /// Current graph observation. Recovery is blocked when the root still has live descendants.
+    pub has_live_descendants: bool,
+}
+
+/// Opaque-to-transport token returned by a successful recovery preview.
+///
+/// The token is not trusted state: creation re-reads and validates every field, and rejects it if
+/// the source rollout has changed since the preview watermark. Fields remain serializable so the
+/// app-server can carry the token between its preview and create requests.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryToken {
+    /// Deterministic idempotency identity for this recovery preview. It is also the reserved child
+    /// thread ID and remains valid across local processes.
+    pub token_id: ThreadId,
+    /// Fresh child thread identity reserved by this token. This is intentionally equal to
+    /// `token_id`, making repeated create requests deterministic across processes.
+    pub recovered_thread_id: ThreadId,
+    /// Stable logical source thread.
+    pub source_thread_id: ThreadId,
+    /// Exact source rollout and byte/ordinal watermark captured by preview.
+    pub watermark: RecoveryWatermark,
+    /// Whether source resolution may include archived rollouts.
+    pub include_archived: bool,
+    /// Quiescence proof captured by preview, when the source was loaded.
+    pub quiescence: Option<RecoveryQuiescenceAttestation>,
+    /// Candidate policy copied into the token and revalidated during creation.
+    pub policy: RecoveryPolicy,
+}
+
+/// Reason why a recovery preview cannot be created.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RecoveryBlockReason {
+    /// The source still has live descendants whose history may change the result.
+    LiveDescendants,
+    /// A caller-supplied candidate did not identify exactly one expected item/turn.
+    AmbiguousCandidates,
+    /// The retained history exceeds the caller's explicit safety limits.
+    ContextTooLarge,
+}
+
+/// Why one persisted rollout record will be omitted from a recovered history.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RecoveryExclusionReason {
+    /// The record is the provider-attested encrypted agent message.
+    InvalidEncryptedAgentMessage { provider_id: String },
+    /// The terminal event for the turn containing the invalid encrypted item.
+    ContaminatedTurnComplete { turn_id: String },
+    /// The record belongs to a failed retry turn with the attested error.
+    RetryTurn { turn_id: String },
+}
+
+/// One omitted record reported by a recovery preview or prepared lineage.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryExcludedItem {
+    /// Original immutable rollout ordinal.
+    pub rollout_ordinal: u64,
+    /// Original Responses item ID, when the record carried one.
+    pub item_id: Option<String>,
+    /// Explicit reason for omission.
+    pub reason: RecoveryExclusionReason,
+}
+
+/// Result of inspecting a source rollout without writing any state.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryPreview {
+    /// Stable logical source thread.
+    pub source_thread_id: ThreadId,
+    /// Immutable physical rollout used for the scan.
+    pub source_rollout_id: ThreadId,
+    /// Source position at which the preview ended.
+    pub watermark: RecoveryWatermark,
+    /// Provider recorded in source session metadata, if available.
+    pub source_model_provider: Option<String>,
+    /// Number of parsed source records, including session metadata.
+    pub source_item_count: usize,
+    /// Logical JSONL bytes scanned from the source.
+    pub source_serialized_bytes: u64,
+    /// Number of records that would remain after exclusions.
+    pub retained_item_count: usize,
+    /// Logical JSONL bytes that would remain after exclusions.
+    pub retained_serialized_bytes: u64,
+    /// Records that would be omitted when creation succeeds.
+    pub excluded_items: Vec<RecoveryExcludedItem>,
+    /// Whether the token can be used to create a new lineage.
+    pub can_recover: bool,
+    /// Safe, non-sensitive explanation when creation is blocked.
+    pub blocked_reason: Option<RecoveryBlockReason>,
+    /// Present only when all validation and limits passed.
+    pub token: Option<RecoveryToken>,
+}
+
+/// Parameters for creating a recovery lineage from a previously returned token.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryCreateParams {
+    /// Token returned by a successful read-only preview.
+    pub token: RecoveryToken,
+    /// Current quiescence proof. It must exactly match the proof captured in the token when the
+    /// source remains loaded; a closed source uses `None`.
+    pub quiescence: Option<RecoveryQuiescenceAttestation>,
+    /// Current graph observation. Creation fails closed when descendants are live.
+    pub has_live_descendants: bool,
+}
+
+/// A new thread identity and sanitized model context prepared from an immutable source rollout.
+///
+/// The source writer/lifecycle reservation is retained until this value is dropped. The caller
+/// should consume the prepared history immediately when starting the new thread; dropping it
+/// without starting the child simply releases the reservation and leaves the source untouched.
+pub struct PreparedRecovery {
+    /// Stable logical source thread.
+    pub source_thread_id: ThreadId,
+    /// Fresh thread ID reserved for the recovered lineage.
+    pub recovered_thread_id: ThreadId,
+    /// Immutable physical source rollout inspected by the token.
+    pub source_rollout_id: ThreadId,
+    /// Source watermark validated during creation.
+    pub watermark: RecoveryWatermark,
+    /// Sanitized history suitable for `InitialHistory::Forked`.
+    pub model_context: Arc<Vec<RolloutItem>>,
+    /// Records omitted from the new lineage.
+    pub excluded_items: Vec<RecoveryExcludedItem>,
+    _source_reservation: Box<dyn std::fmt::Debug + Send>,
+}
+
+/// An already materialized recovery child compatible with a deterministic token.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExistingRecovery {
+    /// Stable logical source thread.
+    pub source_thread_id: ThreadId,
+    /// Existing child identity reserved by the token.
+    pub recovered_thread_id: ThreadId,
+}
+
+/// Outcome of consuming a recovery token.
+///
+/// `Prepared` is returned when the caller must start the child. `Existing` is returned when a
+/// previous process already started the same deterministic child; callers should read and return
+/// that child instead of starting a duplicate. A mismatched occupant is reported as a conflict.
+pub enum RecoveryCreateResult {
+    /// New child identity and sanitized history are ready for Core startup.
+    Prepared(PreparedRecovery),
+    /// The deterministic child already exists and is compatible with this source/token.
+    Existing(ExistingRecovery),
+}
+
+impl std::fmt::Debug for RecoveryCreateResult {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Prepared(prepared) => formatter.debug_tuple("Prepared").field(prepared).finish(),
+            Self::Existing(existing) => formatter.debug_tuple("Existing").field(existing).finish(),
+        }
+    }
+}
+
+impl std::fmt::Debug for PreparedRecovery {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedRecovery")
+            .field("source_thread_id", &self.source_thread_id)
+            .field("recovered_thread_id", &self.recovered_thread_id)
+            .field("source_rollout_id", &self.source_rollout_id)
+            .field("watermark", &self.watermark)
+            .field("model_context_item_count", &self.model_context.len())
+            .field("excluded_items", &self.excluded_items)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PreparedRecovery {
+    pub(crate) fn new(
+        source_thread_id: ThreadId,
+        recovered_thread_id: ThreadId,
+        source_rollout_id: ThreadId,
+        watermark: RecoveryWatermark,
+        model_context: Arc<Vec<RolloutItem>>,
+        excluded_items: Vec<RecoveryExcludedItem>,
+        source_reservation: impl std::fmt::Debug + Send + 'static,
+    ) -> Self {
+        Self {
+            source_thread_id,
+            recovered_thread_id,
+            source_rollout_id,
+            watermark,
+            model_context,
+            excluded_items,
+            _source_reservation: Box::new(source_reservation),
+        }
+    }
 }
 
 impl PreparedFork {
@@ -939,6 +1294,18 @@ pub struct DeleteThreadParams {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeleteThreadsParams {
     /// Thread ids to delete, in the order their persisted data should be removed.
+    pub thread_ids: Vec<ThreadId>,
+}
+
+/// Parameters for logically tombstoning a thread without removing history.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TombstoneThreadParams {
+    pub thread_id: ThreadId,
+}
+
+/// Parameters for logically tombstoning a set of threads in caller-defined order.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TombstoneThreadsParams {
     pub thread_ids: Vec<ThreadId>,
 }
 

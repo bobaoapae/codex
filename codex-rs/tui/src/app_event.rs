@@ -15,15 +15,25 @@ use std::sync::atomic::AtomicBool;
 use crate::inline_visualization::InlineVisualizationContext;
 use codex_app_server_protocol::AddCreditsNudgeCreditType;
 use codex_app_server_protocol::AddCreditsNudgeEmailStatus;
+use codex_app_server_protocol::AgentFleetCloseResponse;
+use codex_app_server_protocol::AgentFleetResumeResponse;
+use codex_app_server_protocol::AgentFleetStatusResponse;
+use codex_app_server_protocol::AgentFleetSuspendResponse;
 use codex_app_server_protocol::ConsumeAccountRateLimitResetCreditResponse;
+use codex_app_server_protocol::ContextInspectResponse;
 use codex_app_server_protocol::DynamicToolCallResponse;
 use codex_app_server_protocol::GetAccountRateLimitsResponse;
 use codex_app_server_protocol::GetAccountTokenUsageResponse;
+use codex_app_server_protocol::Job;
+use codex_app_server_protocol::JobCancelResponse;
+use codex_app_server_protocol::JobReadResponse;
 use codex_app_server_protocol::MarketplaceAddResponse;
 use codex_app_server_protocol::MarketplaceRemoveResponse;
 use codex_app_server_protocol::MarketplaceUpgradeResponse;
 use codex_app_server_protocol::McpServerStatus;
 use codex_app_server_protocol::McpServerStatusDetail;
+use codex_app_server_protocol::PlanApproveResponse;
+use codex_app_server_protocol::PlanLifecycle;
 use codex_app_server_protocol::PlanReadResponse;
 use codex_app_server_protocol::PlanSummary;
 use codex_app_server_protocol::PluginInstallResponse;
@@ -37,6 +47,8 @@ use codex_app_server_protocol::SkillsListResponse;
 use codex_app_server_protocol::Thread;
 use codex_app_server_protocol::ThreadGoalStatus;
 use codex_app_server_protocol::ThreadItemsListResponse;
+use codex_app_server_protocol::ThreadRecoveryCreateResponse;
+use codex_app_server_protocol::ThreadRecoveryPreviewResponse;
 use codex_connectors::AppInfo;
 use codex_file_search::FileMatch;
 use codex_message_history::HistoryBatchCursor;
@@ -224,6 +236,52 @@ pub(crate) enum SavedPlanAction {
     Revise,
 }
 
+/// One typed response from an exclusive fleet lifecycle operation.
+#[derive(Debug)]
+pub(crate) enum AgentFleetOperationResponse {
+    Suspend(AgentFleetSuspendResponse),
+    Resume(AgentFleetResumeResponse),
+    Close(AgentFleetCloseResponse),
+}
+
+/// Result of one read-only `context/inspect` request.
+///
+/// The not-found state is kept distinct from transport/server failures so the TUI can explain
+/// that there is no context to inspect without presenting it as a service outage.
+#[derive(Debug)]
+pub(crate) enum ContextInspectionLoadResult {
+    Success(Box<ContextInspectResponse>),
+    NotFound,
+    Error(String),
+}
+
+/// Result of an experimental recovery preview.
+///
+/// The token is intentionally kept in this in-memory value until the user explicitly accepts
+/// recovery. `AppEventSender` records only the event variant, and the custom `Debug` impl prevents
+/// accidental token disclosure if an event is inspected while debugging tests.
+pub(crate) struct ThreadRecoveryPreviewResult {
+    pub(crate) token: Option<String>,
+    pub(crate) response: ThreadRecoveryPreviewResponse,
+}
+
+impl ThreadRecoveryPreviewResult {
+    pub(crate) fn from_response(mut response: ThreadRecoveryPreviewResponse) -> Self {
+        let token = response.token.take();
+        Self { token, response }
+    }
+}
+
+impl std::fmt::Debug for ThreadRecoveryPreviewResult {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ThreadRecoveryPreviewResult")
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("response", &self.response)
+            .finish()
+    }
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, IntoStaticStr)]
 pub(crate) enum AppEvent {
@@ -271,6 +329,46 @@ pub(crate) enum AppEvent {
     /// Interrupt a task directly from the shared dashboard.
     StopAgentsOverviewThread {
         thread_id: ThreadId,
+    },
+    /// Open lifecycle actions for the currently displayed fleet root.
+    OpenAgentsFleetActions {
+        root_thread_id: ThreadId,
+        expected_generation: i64,
+    },
+    /// Open explicit confirmation before closing a fleet root.
+    OpenAgentsFleetCloseConfirmation {
+        root_thread_id: ThreadId,
+        expected_generation: i64,
+    },
+    /// Refresh fleet status after an explicit user action.
+    RefreshAgentsFleet,
+    /// Merge one paginated fleet status request.
+    AgentsFleetStatusLoaded {
+        request_id: Uuid,
+        root_thread_id: ThreadId,
+        result: Result<AgentFleetStatusResponse, String>,
+    },
+    /// Request a generation-checked fleet suspension.
+    RequestAgentsFleetSuspend {
+        root_thread_id: ThreadId,
+        expected_generation: i64,
+    },
+    /// Request a generation-checked fleet resume.
+    RequestAgentsFleetResume {
+        root_thread_id: ThreadId,
+        expected_generation: i64,
+    },
+    /// Request a generation-checked fleet close after confirmation.
+    RequestAgentsFleetClose {
+        root_thread_id: ThreadId,
+        expected_generation: i64,
+    },
+    /// Merge a fleet lifecycle operation while rejecting stale generations.
+    AgentsFleetOperationLoaded {
+        request_id: Uuid,
+        root_thread_id: ThreadId,
+        expected_generation: i64,
+        result: Result<AgentFleetOperationResponse, String>,
     },
     /// Start the shared app-server daemon without moving the current embedded session.
     #[cfg(unix)]
@@ -427,8 +525,47 @@ pub(crate) enum AppEvent {
     /// Open the resume picker inside the running TUI session.
     OpenResumePicker,
 
+    /// FORK: inspect the current thread's recovery candidates.
+    OpenRecovery,
+
+    /// FORK: recovery preview fetched for the current thread.
+    RecoveryPreviewLoaded {
+        request_id: Uuid,
+        result: Result<ThreadRecoveryPreviewResult, String>,
+    },
+
+    /// FORK: explicitly accept a previously displayed recovery preview.
+    CreateThreadRecovery {
+        request_id: Uuid,
+    },
+
+    /// FORK: cancel a recovery preview without consuming its token.
+    CancelThreadRecovery {
+        request_id: Uuid,
+    },
+
+    /// FORK: replacement lineage created from an accepted recovery preview.
+    RecoveryCreated {
+        request_id: Uuid,
+        source_thread_id: ThreadId,
+        result: Result<ThreadRecoveryCreateResponse, String>,
+    },
+
     /// FORK: open the saved-plans picker (`/plans`).
     OpenPlansPicker,
+
+    /// Open a read-only model-context inspection for the currently displayed thread.
+    OpenContextInspection {
+        include_preview: bool,
+    },
+
+    /// Result of a read-only `context/inspect` request.
+    ContextInspectionLoaded {
+        request_id: Uuid,
+        thread_id: ThreadId,
+        include_preview: bool,
+        result: ContextInspectionLoadResult,
+    },
 
     /// FORK: saved plans fetched for the picker.
     PlansPickerLoaded {
@@ -440,19 +577,76 @@ pub(crate) enum AppEvent {
     OpenSavedPlanActions {
         id: String,
         title: String,
+        revision: u32,
+        lifecycle: PlanLifecycle,
     },
 
     /// FORK: fetch one saved plan and apply `action` when it arrives.
     LoadSavedPlan {
         id: String,
+        revision: u32,
+        lifecycle: PlanLifecycle,
         action: SavedPlanAction,
     },
 
     /// FORK: the saved plan requested by [`AppEvent::LoadSavedPlan`].
     SavedPlanLoaded {
         request_id: Uuid,
+        /// Revision selected in the picker; used to reject a stale read.
+        expected_revision: u32,
         action: SavedPlanAction,
         result: Result<PlanReadResponse, String>,
+    },
+
+    /// FORK: approve a selected draft with an explicit revision precondition.
+    ApproveSavedPlan {
+        id: String,
+        expected_revision: u32,
+        action: SavedPlanAction,
+    },
+
+    /// FORK: result of the optimistic plan approval request.
+    PlanApprovalLoaded {
+        request_id: Uuid,
+        action: SavedPlanAction,
+        result: Result<PlanApproveResponse, String>,
+    },
+
+    /// FORK: open the durable transient-jobs picker (`/jobs`).
+    OpenJobsPicker,
+
+    /// FORK: jobs returned by the paginated `job/list` flow.
+    JobsPickerLoaded {
+        request_id: Uuid,
+        result: Result<Vec<Job>, String>,
+        has_more: bool,
+    },
+
+    /// FORK: read one selected job before rendering its details.
+    ReadJob {
+        job_id: String,
+    },
+
+    /// FORK: authoritative `job/read` response for the selected job.
+    JobReadLoaded {
+        request_id: Uuid,
+        result: Result<JobReadResponse, String>,
+    },
+
+    /// FORK: show explicit cancellation confirmation for one job.
+    OpenJobCancelConfirmation {
+        job_id: String,
+    },
+
+    /// FORK: explicitly cancel one durable job through `job/cancel`.
+    CancelJob {
+        job_id: String,
+    },
+
+    /// FORK: result of the explicit `job/cancel` request.
+    JobCancelLoaded {
+        request_id: Uuid,
+        result: Result<JobCancelResponse, String>,
     },
 
     /// Open the Claude Code migration picker inside the running TUI session.

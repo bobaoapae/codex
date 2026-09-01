@@ -10,6 +10,8 @@ use codex_protocol::auth::PlanType;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::ConnectionFailedError;
+use codex_protocol::error::ENCRYPTED_FUNCTION_OUTPUT_CONTENT_ERROR_MESSAGE;
+use codex_protocol::error::HistoryRecoveryReason;
 use codex_protocol::error::RetryLimitReachedError;
 use codex_protocol::error::UnexpectedResponseError;
 use codex_protocol::error::UsageLimitReachedError;
@@ -23,12 +25,13 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
         ApiError::ContextWindowExceeded => CodexErr::ContextWindowExceeded,
         ApiError::QuotaExceeded => CodexErr::QuotaExceeded,
         ApiError::UsageNotIncluded => CodexErr::UsageNotIncluded,
-        ApiError::Retryable { message, delay } => {
-            let error = CodexErr::Stream(message);
-            match delay {
-                Some(delay) => error.with_retry_delay(delay),
-                None => error,
-            }
+        ApiError::Retryable { message, delay } => map_stream_error(message, delay),
+        ApiError::RateLimitExceeded { message, delay: _ }
+            if message == ENCRYPTED_FUNCTION_OUTPUT_CONTENT_ERROR_MESSAGE =>
+        {
+            CodexErr::history_recovery_required(
+                HistoryRecoveryReason::UndecryptableEncryptedFunctionOutput,
+            )
         }
         ApiError::RateLimitExceeded { message, delay } => {
             let error = CodexErr::new(CodexErrorDetails::RateLimitExceeded(message));
@@ -37,7 +40,7 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                 None => error,
             }
         }
-        ApiError::Stream(msg) => CodexErr::Stream(msg),
+        ApiError::Stream(message) => map_stream_error(message, None),
         ApiError::ServerOverloaded => CodexErr::ServerOverloaded,
         ApiError::Api { status, message } => {
             let user_message = api_error_user_message(status, &message);
@@ -193,6 +196,20 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
             TransportError::Network(msg) | TransportError::Build(msg) => CodexErr::Stream(msg),
         },
         ApiError::RateLimit(msg) => CodexErr::Stream(msg),
+    }
+}
+
+fn map_stream_error(message: String, retry_delay: Option<std::time::Duration>) -> CodexErr {
+    if message == ENCRYPTED_FUNCTION_OUTPUT_CONTENT_ERROR_MESSAGE {
+        return CodexErr::history_recovery_required(
+            HistoryRecoveryReason::UndecryptableEncryptedFunctionOutput,
+        );
+    }
+
+    let error = CodexErr::Stream(message);
+    match retry_delay {
+        Some(retry_delay) => error.with_retry_delay(retry_delay),
+        None => error,
     }
 }
 

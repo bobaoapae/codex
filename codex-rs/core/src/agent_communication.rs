@@ -1,5 +1,4 @@
 use codex_protocol::ThreadId;
-use codex_protocol::protocol::InterAgentCommunication;
 
 const AGENT_COMMUNICATION_TARGET: &str = "codex_otel.agent_communication";
 
@@ -44,7 +43,6 @@ pub(crate) fn logging_enabled() -> bool {
 pub(crate) fn emit_agent_communication_send(
     communication_id: &str,
     context: &AgentCommunicationContext,
-    communication: &InterAgentCommunication,
     receiver_thread_id: ThreadId,
 ) {
     tracing::info!(
@@ -56,10 +54,7 @@ pub(crate) fn emit_agent_communication_send(
             state = "send",
             sender_thread_id = %context.sender_thread_id,
             receiver_thread_id = %receiver_thread_id,
-            content = communication
-                .encrypted_content
-                .as_deref()
-                .unwrap_or("[plaintext]"),
+            content = "[redacted]",
         },
         "agent communication"
     );

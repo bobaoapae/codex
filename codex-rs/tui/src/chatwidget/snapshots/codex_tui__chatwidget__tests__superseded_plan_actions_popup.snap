@@ -1,0 +1,24 @@
+---
+source: tui/src/chatwidget/tests/saved_plans.rs
+expression: popup
+---
+  Load plan «Newer plan»?
+
+›    Implement this plan (disabled)        Switch to Default mode and start
+                                           coding from it. (disabled: This
+                                           plan revision is superseded.
+                                           Refresh /plans and choose the
+                                           current approved revision.)
+     Attach to my next message (disabled)  Include the plan as hidden context
+                                           with whatever you type next.
+                                           (disabled: This plan revision is
+                                           superseded. Refresh /plans and
+                                           choose the current approved
+                                           revision.)
+     Revise in Plan mode (disabled)        Ask the model to critique and re-
+                                           emit the plan. (disabled: This plan
+                                           revision is superseded. Refresh /
+                                           plans and choose the current
+                                           approved revision.)
+
+  Press enter to confirm or esc to go back

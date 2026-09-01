@@ -1,0 +1,11 @@
+-- Durable apply receipt for mailbox delivery.
+--
+-- `applied_at_ms` records that a claimed message's content has been handed to
+-- the recipient session (enqueued/persisted) even if the acknowledgement that
+-- normally follows was lost to a crash. Redelivery of an applied row must not
+-- re-apply its content; it only re-arms the wake and acknowledges.
+--
+-- The receipt is fenced by the live claim (owner/token/generation) when it is
+-- written, and it intentionally survives `requeue_undelivered_mailbox` and
+-- expired-claim reclaims: those reset delivery state, not application history.
+ALTER TABLE workflow_mailbox ADD COLUMN applied_at_ms INTEGER;

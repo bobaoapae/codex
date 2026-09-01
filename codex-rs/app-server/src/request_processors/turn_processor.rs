@@ -1,3 +1,5 @@
+use super::thread_goal_processor::ApprovedPlanGoalClaim;
+use super::thread_goal_processor::resolve_approved_plan;
 use super::thread_input::ensure_direct_input_allowed;
 use super::*;
 use codex_agent_extension::AgentInvocation;
@@ -83,6 +85,7 @@ pub(crate) struct TurnRequestProcessor {
     arg0_paths: Arg0DispatchPaths,
     config: Arc<Config>,
     config_manager: ConfigManager,
+    thread_goal_processor: ThreadGoalRequestProcessor,
     pending_thread_unloads: Arc<Mutex<HashSet<ThreadId>>>,
     thread_state_manager: ThreadStateManager,
     thread_watch_manager: ThreadWatchManager,
@@ -139,6 +142,7 @@ impl TurnRequestProcessor {
         arg0_paths: Arg0DispatchPaths,
         config: Arc<Config>,
         config_manager: ConfigManager,
+        thread_goal_processor: ThreadGoalRequestProcessor,
         pending_thread_unloads: Arc<Mutex<HashSet<ThreadId>>>,
         thread_state_manager: ThreadStateManager,
         thread_watch_manager: ThreadWatchManager,
@@ -156,6 +160,7 @@ impl TurnRequestProcessor {
             arg0_paths,
             config,
             config_manager,
+            thread_goal_processor,
             pending_thread_unloads,
             thread_state_manager,
             thread_watch_manager,
@@ -181,6 +186,23 @@ impl TurnRequestProcessor {
         )
         .await
         .map(|response| Some(response.into()))
+    }
+
+    /// Submit a job's initial turn without emitting a second JSON-RPC
+    /// response. The job processor owns the lifecycle response and observes
+    /// completion through the normal thread events.
+    pub(crate) async fn start_turn_for_job(
+        &self,
+        request_id: ConnectionRequestId,
+        params: TurnStartParams,
+    ) -> Result<TurnStartResponse, JSONRPCErrorError> {
+        Self::validate_job_input(&params.input)?;
+        self.turn_start_inner(request_id, params, None, None).await
+    }
+
+    pub(crate) fn validate_job_input(input: &[V2UserInput]) -> Result<(), JSONRPCErrorError> {
+        validate_user_input_image_urls(input)?;
+        Self::validate_v2_input_limit(input)
     }
 
     pub(crate) async fn thread_inject_items(
@@ -263,6 +285,18 @@ impl TurnRequestProcessor {
             self.track_error_response(request_id, error, /*error_type*/ None);
         }
         result.map(|response| response.map(Into::into))
+    }
+
+    /// Submit a whole-thread interrupt for a workflow job without resolving a
+    /// client JSON-RPC request from this helper.
+    pub(crate) async fn interrupt_for_job(
+        &self,
+        request_id: &ConnectionRequestId,
+        params: TurnInterruptParams,
+    ) -> Result<(), JSONRPCErrorError> {
+        self.turn_interrupt_inner(request_id, params)
+            .await
+            .map(|_| ())
     }
 
     pub(crate) async fn thread_realtime_start(
@@ -501,6 +535,35 @@ impl TurnRequestProcessor {
         error
     }
 
+    fn history_recovery_required_error(thread_id: ThreadId) -> JSONRPCErrorError {
+        let message = format!(
+            "thread {thread_id} requires explicit history recovery before another turn; run `codex recovery preview {thread_id}` and then `codex recovery create <token>`"
+        );
+        let mut error = invalid_request(message.clone());
+        error.data = Some(serde_json::json!({
+            "message": message,
+            "threadId": thread_id.to_string(),
+            "codexErrorInfo": CodexErrorInfo::HistoryRecoveryRequired,
+            "willRetry": false,
+            "recovery": {
+                "previewMethod": "thread/recovery/preview",
+                "createMethod": "thread/recovery/create",
+            },
+        }));
+        error
+    }
+
+    async fn rollback_approved_plan_goal(&self, claim: Option<&ApprovedPlanGoalClaim>) {
+        if let Some(claim) = claim
+            && let Err(error) = self
+                .thread_goal_processor
+                .rollback_approved_plan_goal(claim)
+                .await
+        {
+            warn!("failed to roll back approved plan goal: {}", error.message);
+        }
+    }
+
     pub(super) fn validate_v2_input_limit(items: &[V2UserInput]) -> Result<(), JSONRPCErrorError> {
         let actual_chars: usize = items.iter().map(V2UserInput::text_char_count).sum();
         if actual_chars > MAX_USER_INPUT_TEXT_CHARS {
@@ -524,6 +587,18 @@ impl TurnRequestProcessor {
                 })?;
         self.ensure_direct_input_allowed(&request_id, thread.as_ref())
             .await?;
+        let approved_plan = match params.approved_plan.as_ref() {
+            Some(reference) => {
+                self.thread_goal_processor.ensure_approved_plan_support()?;
+                Some(resolve_approved_plan(&self.config, reference).await?)
+            }
+            None => None,
+        };
+        if approved_plan.is_some() && (params.tool_output.is_some() || params.input.is_empty()) {
+            return Err(invalid_request(
+                "approved plan context requires non-empty user input",
+            ));
+        }
         if let Some(tool_output) = &params.tool_output {
             if !params.input.is_empty() {
                 return Err(invalid_request(
@@ -637,36 +712,76 @@ impl TurnRequestProcessor {
                 .await?;
         }
 
-        let submission = thread
-            .start_or_steer_turn(
-                TurnInputRequest::new(input)
-                    .with_thread_settings(thread_settings)
-                    .on_start(TurnStartOptions {
-                        turn_trigger: params.turn_trigger,
-                        final_output_json_schema: params.output_schema,
-                        service_tier: params.service_tier_for_turn,
-                        cyber_access_program: params.cyber_access_program.map(Into::into),
-                        ..Default::default()
-                    })
-                    .with_additional_context(additional_context)
-                    .with_responses_metadata(params.responsesapi_client_metadata)
-                    .with_trace(self.request_trace_context(&request_id).await),
+        let mut turn_input_request = TurnInputRequest::new(input)
+            .with_thread_settings(thread_settings)
+            .on_start(TurnStartOptions {
+                turn_trigger: params.turn_trigger,
+                final_output_json_schema: params.output_schema,
+                service_tier: params.service_tier_for_turn,
+                cyber_access_program: params.cyber_access_program.map(Into::into),
+                ..Default::default()
+            })
+            .with_additional_context(additional_context)
+            .with_responses_metadata(params.responsesapi_client_metadata)
+            .with_trace(self.request_trace_context(&request_id).await);
+        if let Some(plan) = approved_plan.as_ref() {
+            turn_input_request = turn_input_request.with_approved_plan(
+                plan.id.clone(),
+                plan.revision,
+                plan.body.clone(),
+            );
+        }
+        let goal_claim = if let Some(plan) = approved_plan.as_ref() {
+            Some(
+                self.thread_goal_processor
+                    .claim_approved_plan_goal(thread_id, plan)
+                    .await?,
             )
-            .await
-            .map_err(|err| {
-                let error = internal_error(format!("failed to submit turn input: {err}"));
+        } else {
+            None
+        };
+        let submission = match thread.start_or_steer_turn(turn_input_request).await {
+            Ok(submission) => submission,
+            Err(err) => {
+                self.rollback_approved_plan_goal(goal_claim.as_ref()).await;
+                let error = if err.history_recovery_reason().is_some() {
+                    Self::history_recovery_required_error(thread_id)
+                } else {
+                    internal_error(format!("failed to submit turn input: {err}"))
+                };
                 self.track_error_response(&request_id, &error, /*error_type*/ None);
-                error
-            })?;
+                return Err(error);
+            }
+        };
         let (turn_id, started) = match submission {
             TurnInputSubmission::Started { turn_id } => (turn_id, true),
-            TurnInputSubmission::Steered { turn_id } => (turn_id, false),
+            TurnInputSubmission::Steered { turn_id } => {
+                if goal_claim.is_some() {
+                    self.rollback_approved_plan_goal(goal_claim.as_ref()).await;
+                    return Err(invalid_request(
+                        "approved plan context requires a new idle turn",
+                    ));
+                }
+                (turn_id, false)
+            }
             TurnInputSubmission::NotSubmitted { reason } => {
+                self.rollback_approved_plan_goal(goal_claim.as_ref()).await;
                 let error = internal_error(format!("failed to submit turn input: {reason:?}"));
                 self.track_error_response(&request_id, &error, /*error_type*/ None);
                 return Err(error);
             }
         };
+
+        if let Some(claim) = goal_claim.as_ref()
+            && let Err(error) = self
+                .thread_goal_processor
+                .commit_approved_plan_goal(thread.as_ref(), claim)
+                .await
+        {
+            self.rollback_approved_plan_goal(goal_claim.as_ref()).await;
+            self.track_error_response(&request_id, &error, /*error_type*/ None);
+            return Err(error);
+        }
 
         if turn_has_input && started {
             let config_snapshot = thread.config_snapshot().await;
@@ -1056,7 +1171,11 @@ impl TurnRequestProcessor {
             )
             .await
             .map_err(|err| {
-                let error = internal_error(format!("failed to steer turn: {err}"));
+                let error = if err.history_recovery_reason().is_some() {
+                    Self::history_recovery_required_error(thread_id)
+                } else {
+                    internal_error(format!("failed to steer turn: {err}"))
+                };
                 self.track_error_response(request_id, &error, /*error_type*/ None);
                 error
             })?;

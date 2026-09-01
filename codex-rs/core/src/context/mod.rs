@@ -33,6 +33,8 @@ mod network_rule_saved;
 mod node_repl_review_evidence;
 mod permissions_instructions;
 mod personality_spec_instructions;
+/// FORK: immutable approved Plan-mode snapshot injected into model context.
+mod plan_loaded;
 /// FORK: short per-turn reminder that Plan mode is still active.
 mod plan_mode_reminder;
 mod plugin_instructions;
@@ -97,6 +99,8 @@ pub(crate) use node_repl_review_evidence::node_repl_review_evidence_mode;
 pub use permissions_instructions::ApprovalPromptContext;
 pub use permissions_instructions::PermissionsInstructions;
 pub(crate) use personality_spec_instructions::PersonalitySpecInstructions;
+pub(crate) use plan_loaded::ApprovedPlanRef;
+pub(crate) use plan_loaded::PlanLoaded;
 pub(crate) use plan_mode_reminder::PlanModeReminder;
 pub(crate) use plugin_instructions::PluginInstructions;
 pub(crate) use realtime_delegation::RealtimeDelegation;

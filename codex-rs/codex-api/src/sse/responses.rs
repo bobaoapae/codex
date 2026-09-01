@@ -9,6 +9,7 @@ use crate::telemetry::SseTelemetry;
 use codex_client::ByteStream;
 use codex_client::StreamResponse;
 use codex_protocol::ResponseUsageMetadata;
+use codex_protocol::error::ENCRYPTED_FUNCTION_OUTPUT_CONTENT_ERROR_MESSAGE;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::MisalignmentErrorDetails;
 use codex_protocol::protocol::ModelVerification;
@@ -416,7 +417,16 @@ pub fn process_responses_event(
                 if let Some(error) = resp_val.get("error")
                     && let Ok(error) = serde_json::from_value::<Error>(error.clone())
                 {
-                    if is_context_window_error(&error) {
+                    if error.message.as_deref()
+                        == Some(ENCRYPTED_FUNCTION_OUTPUT_CONTENT_ERROR_MESSAGE)
+                    {
+                        // Preserve the exact upstream sentinel for the protocol bridge. The
+                        // bridge turns it into a structured, non-retryable history-recovery
+                        // error; every other stream error keeps its existing retry behavior.
+                        response_error = ApiError::Stream(
+                            ENCRYPTED_FUNCTION_OUTPUT_CONTENT_ERROR_MESSAGE.to_string(),
+                        );
+                    } else if is_context_window_error(&error) {
                         response_error = ApiError::ContextWindowExceeded;
                     } else if is_quota_exceeded_error(&error) {
                         response_error = ApiError::QuotaExceeded;
@@ -1138,6 +1148,50 @@ mod tests {
                 _ => panic!("unexpected events for {code}: {events:?}"),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn exact_encrypted_function_output_error_is_preserved_for_history_recovery() {
+        let event = json!({
+            "type": "response.failed",
+            "response": {
+                "error": {
+                    "code": "unknown_error",
+                    "message": ENCRYPTED_FUNCTION_OUTPUT_CONTENT_ERROR_MESSAGE,
+                },
+            },
+        });
+        let sse = format!("event: response.failed\ndata: {event}\n\n");
+        let events = collect_events(&[sse.as_bytes()]).await;
+
+        assert_eq!(events.len(), 1);
+        assert_matches!(
+            &events[0],
+            Err(ApiError::Stream(message))
+                if message == ENCRYPTED_FUNCTION_OUTPUT_CONTENT_ERROR_MESSAGE
+        );
+    }
+
+    #[tokio::test]
+    async fn near_miss_encrypted_function_output_error_remains_retryable() {
+        let message = format!("{ENCRYPTED_FUNCTION_OUTPUT_CONTENT_ERROR_MESSAGE} extra");
+        let event = json!({
+            "type": "response.failed",
+            "response": {
+                "error": {
+                    "code": "unknown_error",
+                    "message": message,
+                },
+            },
+        });
+        let sse = format!("event: response.failed\ndata: {event}\n\n");
+        let events = collect_events(&[sse.as_bytes()]).await;
+
+        assert_matches!(
+            events.as_slice(),
+            [Err(ApiError::Retryable { message: actual, delay: None })]
+                if actual == &message
+        );
     }
 
     #[tokio::test]

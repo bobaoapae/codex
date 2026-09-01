@@ -339,6 +339,58 @@ impl codex_agent_graph_store::AgentGraphStore for FakeAgentGraphStore {
         let descendant_thread_ids = self.descendant_thread_ids.clone();
         Box::pin(async move { Ok(descendant_thread_ids) })
     }
+
+    fn list_thread_spawn_edge_details(
+        &self,
+        root_thread_id: ThreadId,
+        status_filter: Option<codex_agent_graph_store::ThreadSpawnEdgeStatus>,
+    ) -> codex_agent_graph_store::AgentGraphStoreFuture<
+        '_,
+        Vec<codex_agent_graph_store::ThreadSpawnEdgeDetail>,
+    > {
+        assert_eq!(root_thread_id, self.root_thread_id);
+        let descendant_thread_ids = self.descendant_thread_ids.clone();
+        let details = if status_filter
+            .is_none_or(|status| status == codex_agent_graph_store::ThreadSpawnEdgeStatus::Open)
+        {
+            descendant_thread_ids
+                .into_iter()
+                .enumerate()
+                .map(
+                    |(order, child_id)| codex_agent_graph_store::ThreadSpawnEdgeDetail {
+                        parent_id: root_thread_id,
+                        child_id,
+                        status: codex_agent_graph_store::ThreadSpawnEdgeStatus::Open,
+                        created_at: None,
+                        depth: 1,
+                        order: order as u64,
+                    },
+                )
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Box::pin(async move { Ok(details) })
+    }
+
+    fn get_thread_spawn_edge(
+        &self,
+        parent_thread_id: ThreadId,
+        child_thread_id: ThreadId,
+    ) -> codex_agent_graph_store::AgentGraphStoreFuture<
+        '_,
+        Option<codex_agent_graph_store::ThreadSpawnEdge>,
+    > {
+        let edge = (parent_thread_id == self.root_thread_id
+            && self.descendant_thread_ids.contains(&child_thread_id))
+        .then_some(codex_agent_graph_store::ThreadSpawnEdge {
+            parent_id: parent_thread_id,
+            child_id: child_thread_id,
+            status: codex_agent_graph_store::ThreadSpawnEdgeStatus::Open,
+            created_at: None,
+        });
+        Box::pin(async move { Ok(edge) })
+    }
 }
 
 fn user_msg(text: &str) -> ResponseItem {

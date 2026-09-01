@@ -1,5 +1,5 @@
 use super::*;
-use crate::agent::status::is_final;
+use crate::agent::AgentLifecycleStatus;
 use crate::session::session::Session;
 use crate::tools::handlers::multi_agents_spec::WaitAgentTimeoutOptions;
 use crate::tools::handlers::multi_agents_spec::create_wait_agent_tool_v1;
@@ -123,7 +123,7 @@ impl Handler {
             match session.services.agent_control.subscribe_status(*id).await {
                 Ok(rx) => {
                     let status = rx.borrow().clone();
-                    if is_final(&status) {
+                    if is_wait_terminal(&status) {
                         initial_final_statuses.push((*id, status));
                     }
                     status_rxs.push((*id, rx));
@@ -310,18 +310,22 @@ async fn wait_for_final_status(
     mut status_rx: Receiver<AgentStatus>,
 ) -> Option<(ThreadId, AgentStatus)> {
     let mut status = status_rx.borrow().clone();
-    if is_final(&status) {
+    if is_wait_terminal(&status) {
         return Some((thread_id, status));
     }
 
     loop {
         if status_rx.changed().await.is_err() {
             let latest = session.services.agent_control.get_status(thread_id).await;
-            return is_final(&latest).then_some((thread_id, latest));
+            return is_wait_terminal(&latest).then_some((thread_id, latest));
         }
         status = status_rx.borrow().clone();
-        if is_final(&status) {
+        if is_wait_terminal(&status) {
             return Some((thread_id, status));
         }
     }
+}
+
+fn is_wait_terminal(status: &AgentStatus) -> bool {
+    AgentLifecycleStatus::from_agent_status(status, None).is_terminal()
 }

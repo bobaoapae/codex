@@ -7,7 +7,6 @@ use super::LoadTrigger;
 use super::PickerLoadRequest;
 use super::PickerState;
 use super::Row;
-use super::SearchState;
 use super::SessionPickerAction;
 use super::SessionPickerLaunchContext;
 use super::SessionSelection;
@@ -131,7 +130,7 @@ impl PickerState {
             && !self.search_state.is_active()
         {
             let token = self.allocate_search_token();
-            self.search_state = SearchState::Active { token };
+            self.search_state.activate(token);
             self.load_more_if_needed(LoadTrigger::Search { token });
         }
     }

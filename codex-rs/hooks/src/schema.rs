@@ -9,6 +9,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Map;
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -236,6 +237,48 @@ pub(crate) struct PostToolUseHookSpecificOutputWire {
     #[serde(default)]
     #[serde(rename = "updatedMCPToolOutput")]
     pub updated_mcp_tool_output: Option<Value>,
+    #[serde(default)]
+    pub evidence: Option<PostToolUseEvidenceWire>,
+}
+
+/// A bounded, host-readable evidence contribution from a synchronous hook.
+///
+/// The host adds thread/turn and handler attribution before projecting this
+/// value into a `receipt.attached` extension item. Keeping the wire shape
+/// limited to receipt-compatible fields prevents hooks from smuggling raw tool
+/// output, command arguments, or provider envelopes into history.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PostToolUseEvidenceWire {
+    pub kind: String,
+    pub subject: String,
+    pub status: PostToolUseEvidenceStatusWire,
+    #[serde(default)]
+    pub tags: BTreeMap<String, String>,
+    #[serde(default)]
+    pub refs: Vec<PostToolUseEvidenceReferenceWire>,
+    #[serde(default)]
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+#[serde(deny_unknown_fields)]
+pub(crate) enum PostToolUseEvidenceStatusWire {
+    Pass,
+    Fail,
+    Blocked,
+    Inconclusive,
+    Informational,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PostToolUseEvidenceReferenceWire {
+    pub kind: String,
+    pub id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

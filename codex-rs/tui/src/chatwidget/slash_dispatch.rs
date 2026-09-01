@@ -36,6 +36,7 @@ const SIDE_SLASH_COMMAND_UNAVAILABLE_HINT: &str =
     "Press Ctrl+C to return to the main thread first.";
 const GOAL_USAGE_HINT: &str = "Example: /goal improve benchmark coverage";
 const RAW_USAGE: &str = "Usage: /raw [on|off]";
+const CONTEXT_USAGE: &str = "Usage: /context [preview]";
 const USAGE_CHATGPT_LOGIN_REQUIRED: &str = "Sign in with ChatGPT to use /usage.";
 
 impl ChatWidget {
@@ -312,6 +313,23 @@ impl ChatWidget {
                     return;
                 }
                 self.app_event_tx.send(AppEvent::OpenPlansPicker);
+            }
+            // FORK: browse durable transient jobs.
+            SlashCommand::Jobs => {
+                self.app_event_tx.send(AppEvent::OpenJobsPicker);
+            }
+            SlashCommand::Context => {
+                self.app_event_tx.send(AppEvent::OpenContextInspection {
+                    include_preview: false,
+                });
+            }
+            // FORK: inspect and explicitly recover the current thread.
+            SlashCommand::Recover => {
+                if let Some(reason) = self.recovery_block_reason() {
+                    self.add_error_message(reason.to_string());
+                    return;
+                }
+                self.app_event_tx.send(AppEvent::OpenRecovery);
             }
             SlashCommand::Goal => {
                 if !self.config.features.enabled(Feature::Goals) {
@@ -746,6 +764,12 @@ impl ChatWidget {
                 "verbose" => self.add_mcp_output(McpServerStatusDetail::Full),
                 _ => self.add_error_message("Usage: /mcp [verbose]".to_string()),
             },
+            SlashCommand::Context => match trimmed.to_ascii_lowercase().as_str() {
+                "preview" => self.app_event_tx.send(AppEvent::OpenContextInspection {
+                    include_preview: true,
+                }),
+                _ => self.add_error_message(CONTEXT_USAGE.to_string()),
+            },
             SlashCommand::Keymap => match trimmed.to_ascii_lowercase().as_str() {
                 "" => self.open_keymap_picker(),
                 "debug" => {
@@ -1150,6 +1174,8 @@ impl ChatWidget {
             | SlashCommand::Mcp
             | SlashCommand::Apps
             | SlashCommand::Plugins
+            | SlashCommand::Jobs
+            | SlashCommand::Context
             | SlashCommand::Rollout
             | SlashCommand::Copy
             | SlashCommand::Raw
@@ -1178,6 +1204,7 @@ impl ChatWidget {
             | SlashCommand::Personality
             | SlashCommand::Plan
             | SlashCommand::Plans
+            | SlashCommand::Recover
             | SlashCommand::Goal
             | SlashCommand::Side
             | SlashCommand::Btw

@@ -92,14 +92,39 @@ pub(crate) fn fork_turn_positions_in_rollout(items: &[RolloutItem]) -> Vec<usize
                 }
             }
             RolloutItem::InterAgentCommunication(communication) => {
-                rollback_turn_positions.push(idx);
-                if communication.trigger_turn {
+                let has_delivery_metadata = idx.checked_sub(1).is_some_and(|previous_idx| {
+                    matches!(
+                        items.get(previous_idx),
+                        Some(RolloutItem::InterAgentCommunicationMetadata {
+                            message_id: Some(metadata_message_id),
+                            ..
+                        }) if communication
+                            .id
+                            .as_ref()
+                            .is_some_and(|message_id| {
+                                message_id.as_str() == metadata_message_id.as_str()
+                            })
+                    )
+                });
+                if !has_delivery_metadata {
+                    rollback_turn_positions.push(idx);
+                }
+                if communication.trigger_turn && !has_delivery_metadata {
                     fork_turn_positions.push(idx);
                 }
             }
-            RolloutItem::InterAgentCommunicationMetadata { trigger_turn } => {
-                rollback_turn_positions.push(idx);
-                if *trigger_turn {
+            RolloutItem::InterAgentCommunicationMetadata {
+                trigger_turn,
+                wake_applied,
+                ..
+            } => {
+                // The initial metadata record is the turn boundary. A later
+                // wake-applied record is a delivery receipt and must not add a
+                // second fork boundary for the same communication.
+                if !*wake_applied {
+                    rollback_turn_positions.push(idx);
+                }
+                if *trigger_turn && !*wake_applied {
                     fork_turn_positions.push(idx);
                 }
             }

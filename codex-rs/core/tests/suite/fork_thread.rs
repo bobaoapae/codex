@@ -167,6 +167,9 @@ fn thread_settings_applied_item(
         ThreadSettingsAppliedEvent {
             thread_id: Some(thread_id),
             thread_settings: snapshot,
+            runtime_build_info: None,
+            config_layer_revision: None,
+            runtime_feature_revision: None,
         },
     ))
 }

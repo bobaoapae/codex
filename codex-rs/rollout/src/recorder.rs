@@ -65,6 +65,7 @@ use codex_git_utils::get_git_repo_root;
 use codex_protocol::protocol::GitInfo as ProtocolGitInfo;
 use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::MultiAgentVersion;
+use codex_protocol::protocol::RuntimeBuildInfo;
 use codex_protocol::protocol::SessionContextWindow;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
@@ -116,6 +117,9 @@ pub enum RolloutRecorderParams {
         history_base: Option<HistoryPosition>,
         subagent_history_start_ordinal: Option<u64>,
         initial_window_id: Option<String>,
+        runtime_build_info: Option<RuntimeBuildInfo>,
+        config_layer_revision: Option<String>,
+        runtime_feature_revision: Option<String>,
     },
     Resume {
         path: PathBuf,
@@ -213,6 +217,9 @@ impl RolloutRecorderParams {
             history_base: None,
             subagent_history_start_ordinal: None,
             initial_window_id: None,
+            runtime_build_info: Some(RuntimeBuildInfo::current()),
+            config_layer_revision: None,
+            runtime_feature_revision: None,
         }
     }
 
@@ -318,6 +325,27 @@ impl RolloutRecorderParams {
         } = &mut self
         {
             *window_id = Some(initial_window_id);
+        }
+        self
+    }
+
+    /// Attach runtime and effective-config provenance to a newly created rollout.
+    pub fn with_runtime_provenance(
+        mut self,
+        runtime_build_info: Option<RuntimeBuildInfo>,
+        config_layer_revision: Option<String>,
+        runtime_feature_revision: Option<String>,
+    ) -> Self {
+        if let Self::Create {
+            runtime_build_info: build_info,
+            config_layer_revision: config_revision,
+            runtime_feature_revision: feature_revision,
+            ..
+        } = &mut self
+        {
+            *build_info = runtime_build_info;
+            *config_revision = config_layer_revision;
+            *feature_revision = runtime_feature_revision;
         }
         self
     }
@@ -857,6 +885,9 @@ impl RolloutRecorder {
                 history_base,
                 subagent_history_start_ordinal,
                 initial_window_id,
+                runtime_build_info,
+                config_layer_revision,
+                runtime_feature_revision,
             } => {
                 let ordinal_state =
                     RolloutOrdinalState::for_new_rollout(history_mode, history_base);
@@ -901,6 +932,9 @@ impl RolloutRecorder {
                     subagent_history_start_ordinal,
                     multi_agent_version,
                     context_window: initial_window_id.map(SessionContextWindow::new),
+                    runtime_build_info,
+                    config_layer_revision,
+                    runtime_feature_revision,
                 };
 
                 RolloutWriterState {

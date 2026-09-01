@@ -15,6 +15,7 @@
 - [Skills](#skills)
 - [Apps](#apps)
 - [Auth endpoints](#auth-endpoints)
+- [Fork-only experimental v2 workflow APIs](#fork-only-experimental-v2-workflow-apis)
 - [Experimental API Opt-in](#experimental-api-opt-in)
 
 ## Protocol
@@ -263,17 +264,9 @@ Example with notification opt-out:
 - `thread/environment/connected` and `thread/environment/disconnected` — experimental; report exec-server connection transitions observed after thread startup for selected environments. Current connection state is not replayed.
 - `collaborationMode/list` — list available collaboration mode presets (experimental, no pagination). Built-in presets do not select a model; the Plan preset inherits the thread's reasoning effort unless a client overrides it. This response omits built-in developer instructions; clients should either pass `settings.developer_instructions: null` when setting a mode to use Codex's built-in instructions, or provide their own instructions explicitly.
 - `skills/list` — list skills for one or more `cwd` values (optional `forceReload`).
-- `plan/list` — fork extension; list the plans Plan mode persisted under `$CODEX_HOME/plans/`, newest first, with cursor pagination (`cursor` is the last `id` returned; `limit` defaults to 50 and is clamped to 200). Filtering by project is client-side using each entry's `cwd`.
-- `plan/read` — fork extension; read one saved plan by `id`, returning its `plan` summary plus the Markdown `markdown` body. Unknown or unsafe ids (path separators, `.`, `..`) return `-32602`. To hand a saved plan to a new thread, send it as the first `turn/start` input, using the same `## My request for Codex:` delimiter the IDE context uses:
-
-  ```
-  # Saved plan: {title} ({path})
-
-  {markdown}
-
-  ## My request for Codex:
-  Implement this plan.
-  ```
+- `plan/list` — fork-only experimental; list draft and immutable approved/superseded plans under `$CODEX_HOME/plans/`, newest first, with an opaque keyset cursor. `limit` defaults to 50 and is clamped to 200.
+- `plan/read` — fork-only experimental; read one saved plan by `id`, returning its `plan` summary and Markdown `markdown` body. Omit `revision` for the draft; provide `revision` to select an immutable approved snapshot. Unknown or unsafe ids return `-32602`.
+- `plan/approve` — fork-only experimental; approve the current draft with `expectedRevision` compare-and-swap and return the immutable `approvedPlan` reference. A stale revision is rejected.
 - `skills/extraRoots/set` — replace the app-server process runtime extra standalone skill roots. The roots are not persisted; missing directories are accepted and simply load no skills.
 - `hooks/list` — list discovered hooks for one or more `cwd` values.
 - `marketplace/add` — add a remote plugin marketplace from an HTTP(S) Git URL, SSH Git URL, or GitHub `owner/repo` shorthand, then persist it into the user marketplace config. Returns the installed root path plus whether the marketplace was already present.
@@ -2764,6 +2757,338 @@ When the upstream workspace-message feature is disabled, `featureEnabled` is `fa
 ```
 
 Use `creditType: "credits"` when workspace credits are depleted, or `creditType: "usage_limit"` when the workspace usage limit has been reached. If the owner was already notified recently, the response status is `cooldown_active`.
+
+## Fork-only experimental v2 workflow APIs
+
+The new v2 methods in this section, and the marked fields on existing v2 methods, are fork-only
+experimental surfaces. A client must advertise `capabilities.experimentalApi: true` in
+`initialize`; all request and response fields below use their camelCase wire names. The evidence,
+context, and workspace-lease methods are host-side control-plane APIs and are never exposed as
+model tools.
+
+List methods use opaque keyset cursors. `job/list`, `evidence/list`, `plan/list`,
+`agent/fleet/status`, and `workspaceLease/list` default to 50 entries and cap a page at 200;
+`thread/search` uses a 25-entry default and a 100-entry cap. These surfaces do not retry jobs,
+purge threads or receipts, or apply migrations automatically.
+
+### Capability handshake
+
+Opt in once per connection, then send the parameterless `initialized` notification before any
+other request:
+
+```json
+{ "method": "initialize", "id": 1, "params": {
+    "clientInfo": { "name": "my-client", "title": "My Client", "version": "0.1.0" },
+    "capabilities": { "experimentalApi": true }
+} }
+{ "method": "initialized" }
+```
+
+### Immutable thread-recovery lineage
+
+`thread/recovery/preview` is read-only and returns an opaque token bound to the source rollout
+watermark. A later source append makes that token stale. Send that token explicitly to
+`thread/recovery/create`; the source rollout remains immutable and the response identifies the
+replacement thread and its `recoveredFromThreadId`.
+
+```json
+{ "method": "thread/recovery/preview", "id": 2, "params": {
+    "threadId": "thr_source"
+} }
+{ "id": 2, "result": {
+    "token": "opaque-preview-token",
+    "threadId": "thr_source",
+    "sourceRolloutId": "rollout_source",
+    "sourceModelProvider": "openai",
+    "watermark": { "rolloutId": "rollout_source", "endOrdinalExclusive": 10, "endByteOffset": 2048 },
+    "sourceItemCount": 10,
+    "sourceSerializedBytes": 2048,
+    "retainedItemCount": 8,
+    "retainedSerializedBytes": 1664,
+    "excludedItems": [],
+    "counts": { "totalItems": 10, "retainedItems": 8, "excludedItems": 0, "failedTurns": 0 },
+    "canRecover": true,
+    "reason": null,
+    "blockedReason": null
+} }
+
+{ "method": "thread/recovery/create", "id": 3, "params": {
+    "token": "opaque-preview-token"
+} }
+{ "id": 3, "result": {
+    "thread": { "id": "thr_recovered", "forkedFromId": "thr_source", "turns": [] },
+    "recoveredFromThreadId": "thr_source"
+} }
+```
+
+### Durable transient jobs
+
+`job/run` creates an explicitly requested persisted job. The job's associated hidden thread has
+the `transientJob` class and the same durable identity; job responses contain lifecycle metadata,
+not stdout, tool output, or model payloads. Terminal state is not retried automatically. Use
+`job/list`, `job/read`, and `job/cancel` to inspect or explicitly stop it.
+
+```json
+{ "method": "job/run", "id": 4, "params": {
+    "input": [{ "type": "text", "text": "Run the checks" }],
+    "idempotencyKey": "job-attempt-1",
+    "cwd": "/workspace"
+} }
+{ "id": 4, "result": { "job": {
+    "id": "job_123", "threadClass": "transientJob", "threadId": "job_123",
+    "status": "pending", "outcome": null, "version": 1
+} } }
+
+{ "method": "job/list", "id": 5, "params": {
+    "status": "running", "limit": 50, "cursor": null
+} }
+{ "id": 5, "result": { "data": [
+    { "id": "job_123", "threadClass": "transientJob", "threadId": "job_123", "status": "running", "outcome": null, "version": 2 }
+], "nextCursor": null } }
+
+{ "method": "job/read", "id": 6, "params": { "jobId": "job_123" } }
+{ "id": 6, "result": { "job": { "id": "job_123", "threadClass": "transientJob", "status": "running", "outcome": null, "version": 2 } } }
+
+{ "method": "job/cancel", "id": 7, "params": { "jobId": "job_123" } }
+{ "id": 7, "result": { "job": { "id": "job_123", "threadClass": "transientJob", "status": "cancelled", "outcome": "cancelled", "version": 3 } } }
+```
+
+The default `thread/list` and `thread/search` views hide `transientJob` threads. Include
+`threadClasses: ["transientJob"]` when a thread projection must include them.
+
+### Thread search and index state
+
+`thread/search` requires a non-empty `searchTerm`. It accepts `modelProviders`, `sourceKinds`,
+`archived`, `cwd` (one path or an array), `projectId` (`null` means unassigned),
+`rootThreadId`, `ancestorThreadId`, `threadClasses`, `terminalOutcomes`, `sortKey`,
+`sortDirection`, `cursor`, and `limit`. `ancestorThreadId` selects descendants and excludes the
+ancestor itself. `indexState` is `building`, `ready`, `unavailable`, or `recoverable`; `partial`
+is `true` when the active index is not ready or a bounded fallback was needed.
+
+```json
+{ "method": "thread/search", "id": 8, "params": {
+    "searchTerm": "deploy",
+    "modelProviders": ["openai"],
+    "sourceKinds": ["cli", "appServer"],
+    "archived": false,
+    "cwd": ["/workspace"],
+    "projectId": null,
+    "rootThreadId": "thr_root",
+    "threadClasses": ["interactive", "transientJob"],
+    "terminalOutcomes": ["succeeded"],
+    "sortKey": "updated_at",
+    "sortDirection": "desc",
+    "limit": 100,
+    "cursor": null
+} }
+{ "id": 8, "result": {
+    "data": [{ "thread": { "id": "thr_123" }, "snippet": "deploy completed" }],
+    "nextCursor": null,
+    "backwardsCursor": null,
+    "indexState": "ready",
+    "partial": false
+} }
+```
+
+### Saved plans and approved-plan references
+
+`plan/list` returns drafts and immutable approved or superseded revisions; `plan/read` omits
+`revision` for the draft and accepts `revision` to select an approved snapshot. `plan/approve`
+uses a compare-and-swap against the current draft's `expectedRevision`; a stale revision is
+rejected. Its `approvedPlan` result is the immutable `{id, revision}` reference used by the
+first turn of `thread/start` or by a new idle `turn/start`.
+
+```json
+{ "method": "plan/list", "id": 9, "params": { "limit": 50, "cursor": null } }
+{ "id": 9, "result": { "data": [{
+    "id": "plan.md", "title": "Release plan", "path": "/codex/plans/plan.md",
+    "threadId": "thr_123", "turnId": "turn_1", "cwd": "/workspace", "model": null,
+    "createdAt": 1730831111, "updatedAt": 1730831111, "revision": 1, "lifecycle": "draft"
+}], "nextCursor": null } }
+
+{ "method": "plan/read", "id": 10, "params": { "id": "plan.md", "revision": 1 } }
+{ "id": 10, "result": { "plan": { "id": "plan.md", "revision": 1, "lifecycle": "approved" }, "markdown": "# Release plan\n" } }
+
+{ "method": "plan/approve", "id": 11, "params": {
+    "id": "plan.md", "expectedRevision": 1
+} }
+{ "id": 11, "result": { "plan": { "id": "plan.md", "revision": 1, "lifecycle": "approved" },
+    "approvedPlan": { "id": "plan.md", "revision": 1 }
+} }
+
+{ "method": "thread/start", "id": 12, "params": {
+    "approvedPlan": { "id": "plan.md", "revision": 1 }, "cwd": "/workspace"
+} }
+{ "method": "turn/start", "id": 13, "params": {
+    "threadId": "thr_123", "approvedPlan": { "id": "plan.md", "revision": 1 },
+    "input": [{ "type": "text", "text": "Continue with the approved plan" }]
+} }
+```
+
+The approved snapshot is resolved before admission and a typed `plan.loaded` fragment is persisted
+before the user input. A non-complete Goal conflicts with loading an approved plan.
+
+### Evidence and artifacts
+
+Evidence methods operate on bounded metadata-only `receipt.attached` records. `evidence/attach`
+appends the canonical receipt before acknowledging it; `evidence/list` and the explicit-selection
+`evidence/export` return metadata projections. Forbidden raw-data keys are rejected on attach and
+removed from returned/exported JSON when sanitizing legacy data. `evidence/export` reports this as
+`redacted` and `redactedCount`.
+
+```json
+{ "method": "evidence/attach", "id": 14, "params": {
+    "threadId": "thr_123", "receiptId": "receipt_1", "schemaVersion": 1,
+    "kind": "test", "subject": "focused gate", "status": "pass", "source": "ci",
+    "metadata": { "summary": "ok" }
+} }
+{ "id": 14, "result": { "evidence": {
+    "receiptId": "receipt_1", "schemaVersion": 1, "kind": "test", "subject": "focused gate",
+    "status": "pass", "threadId": "thr_123", "turnId": "receipt_1", "jobId": null,
+    "planSnapshotId": null, "createdAt": 1730831111, "source": "ci",
+    "provenance": null, "tags": {}, "refs": [], "metadata": { "summary": "ok" }
+} } }
+
+{ "method": "evidence/list", "id": 15, "params": {
+    "threadId": "thr_123", "status": "pass", "limit": 50, "cursor": null
+} }
+{ "id": 15, "result": { "data": [{ "receiptId": "receipt_1", "status": "pass" }], "nextCursor": null } }
+
+{ "method": "evidence/export", "id": 16, "params": { "receiptIds": ["receipt_1"] } }
+{ "id": 16, "result": { "data": [{ "receiptId": "receipt_1", "status": "pass" }],
+    "redacted": false, "redactedCount": 0
+} }
+
+{ "method": "artifact/read", "id": 17, "params": {
+    "artifactId": "artifact_opaque", "limit": 16384, "cursor": null
+} }
+{ "id": 17, "result": { "artifact": {
+    "artifactId": "artifact_opaque", "threadId": "thr_123", "artifactType": "report",
+    "identityKey": "report-1", "createdAt": 1730831111
+}, "chunk": "{\"ok\":true}", "nextCursor": null, "totalBytes": 11 } }
+```
+
+`artifact/read` accepts only an opaque artifact id, never a filesystem path or alternate thread
+authority. It defaults to a 16 KiB UTF-8 chunk and caps a requested chunk at 64 KiB. Evidence and
+artifact payloads are not model tools.
+
+### Agent-fleet lifecycle and generations
+
+`agent/fleet/status` returns the current tree and root `generation`. `suspend`, `resume`, and
+`close` each require the caller's `expectedGeneration`; a successful operation advances the
+generation, while a stale generation is rejected. `close` seals the root and reconciles the
+entire tree.
+
+```json
+{ "method": "agent/fleet/status", "id": 18, "params": {
+    "rootThreadId": "thr_root", "limit": 50, "cursor": null
+} }
+{ "id": 18, "result": {
+    "rootThreadId": "thr_root", "generation": 4, "sealed": false, "operationId": null,
+    "data": [{ "memberId": "thr_root", "threadId": "thr_root", "runId": "thr_root",
+        "parentMemberId": null, "state": "running", "depth": 0, "orderIndex": 0,
+        "updatedAt": 1730831111 }],
+    "nextCursor": null
+} }
+
+{ "method": "agent/fleet/suspend", "id": 19, "params": {
+    "rootThreadId": "thr_root", "expectedGeneration": 4
+} }
+{ "id": 19, "result": { "rootThreadId": "thr_root", "generation": 5,
+    "sealed": false, "operationId": "op_suspend", "results": [], "nextCursor": null } }
+
+{ "method": "agent/fleet/resume", "id": 20, "params": {
+    "rootThreadId": "thr_root", "expectedGeneration": 5
+} }
+{ "id": 20, "result": { "rootThreadId": "thr_root", "generation": 6,
+    "sealed": false, "operationId": "op_resume", "results": [], "nextCursor": null } }
+{ "method": "agent/fleet/close", "id": 21, "params": {
+    "rootThreadId": "thr_root", "expectedGeneration": 6
+} }
+{ "id": 21, "result": { "rootThreadId": "thr_root", "generation": 7,
+    "sealed": true, "operationId": "op_close", "results": [], "nextCursor": null } }
+```
+
+Each mutation response has the same `generation`, `sealed`, `operationId`, `results`, and
+`nextCursor` fields. The fleet projection is host-side control-plane state and is not a model tool.
+
+### Workspace leases and token isolation
+
+`workspaceLease/list` returns display-safe lease summaries only. `workspaceLease/grant` atomically
+claims normalized absolute paths and returns a fencing `token`; `workspaceLease/release` requires
+that token and the current `generation`. Tokens never appear in list or release responses.
+
+```json
+{ "method": "workspaceLease/list", "id": 22, "params": {
+    "rootThreadId": "thr_root", "ownerThreadId": "thr_worker", "path": "/workspace",
+    "limit": 50, "cursor": null
+} }
+{ "id": 22, "result": { "data": [{
+    "leaseId": "lease_1", "rootThreadId": "thr_root", "ownerThreadId": "thr_worker",
+    "normalizedPaths": ["/workspace"], "mode": "write", "state": "active", "generation": 1,
+    "environmentId": null, "issuedAt": 1730831111, "expiresAt": 1730832011, "releasedAt": null
+}], "nextCursor": null } }
+
+{ "method": "workspaceLease/grant", "id": 23, "params": {
+    "rootThreadId": "thr_root", "ownerThreadId": "thr_worker", "paths": ["/workspace"],
+    "mode": "write", "ttlSeconds": 900
+} }
+{ "id": 23, "result": { "leases": [{
+    "lease": { "leaseId": "lease_1", "rootThreadId": "thr_root", "ownerThreadId": "thr_worker",
+        "normalizedPaths": ["/workspace"], "mode": "write", "state": "active", "generation": 1,
+        "environmentId": null, "issuedAt": 1730831111, "expiresAt": 1730832011, "releasedAt": null },
+    "token": "opaque-fencing-token"
+}] } }
+
+{ "method": "workspaceLease/release", "id": 24, "params": {
+    "rootThreadId": "thr_root", "leaseId": "lease_1", "token": "opaque-fencing-token", "generation": 1
+} }
+{ "id": 24, "result": { "lease": {
+    "leaseId": "lease_1", "rootThreadId": "thr_root", "ownerThreadId": "thr_worker",
+    "normalizedPaths": ["/workspace"], "mode": "write", "state": "released", "generation": 1,
+    "environmentId": null, "issuedAt": 1730831111, "expiresAt": 1730832011, "releasedAt": 1730832020
+} } }
+```
+
+Lease grants default to a 15-minute TTL and cap it at 24 hours. Lease methods are host-side
+control-plane APIs and are not model tools.
+
+### Context inspection
+
+`context/inspect` is read-only. Omitting `includePreview` (or setting it to `false`) returns no
+previews; setting it to `true` opts into bounded previews. The server caps each preview at 512
+Unicode characters and enforces a 10,000-character aggregate preview budget across base
+instructions, tools, and items. Encrypted previews are omitted. An unloaded stored thread is
+inspected cold without loading it or writing state.
+
+```json
+{ "method": "context/inspect", "id": 25, "params": { "threadId": "thr_123" } }
+{ "id": 25, "result": { "context": {
+    "threadId": "thr_123", "snapshotKind": "speculative", "partial": true,
+    "itemCount": 3, "baseInstructions": { "preview": null }, "tools": { "preview": null },
+    "items": [{ "index": 0, "preview": null }]
+} } }
+
+{ "method": "context/inspect", "id": 26, "params": {
+    "threadId": "thr_123", "includePreview": true
+} }
+```
+
+### Rollout migration and compression
+
+`codex migrate-rollouts` is a read-only preview by default. Publishing the migration requires a
+separate explicit `--apply` invocation:
+
+```bash
+codex migrate-rollouts --json
+codex migrate-rollouts --json --apply
+```
+
+Local rollout compression uses `Standalone` mode by default when shared compression is not
+enabled; it leaves referenced or fork-pointer shared lineages plain. `IncludeShared` is permitted
+only when every configured reader (Cargo, Bazel, TUI, app-server, and Desktop) explicitly supports
+shared compressed lineages. Any missing or unknown reader capability keeps shared compression
+disabled.
 
 ## Experimental API Opt-in
 

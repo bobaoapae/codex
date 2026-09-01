@@ -2164,6 +2164,20 @@ pub struct ThreadSettingsAppliedEvent {
     #[ts(optional)]
     pub thread_id: Option<ThreadId>,
     pub thread_settings: ThreadSettingsSnapshot,
+    /// Build and configuration provenance for the settings snapshot.
+    ///
+    /// This is optional so older rollout events remain readable and so clients
+    /// can distinguish an absent provenance record from a value supplied by a
+    /// newer runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub runtime_build_info: Option<RuntimeBuildInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub config_layer_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub runtime_feature_revision: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
@@ -2993,6 +3007,29 @@ pub struct HistoryPosition {
 /// NOTE: There used to be an `instructions` field here, which stored user_instructions, but we
 /// now save that on TurnContext. base_instructions stores the base instructions for the session,
 /// and should be used when there is no config override.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
+pub struct RuntimeBuildInfo {
+    /// User-facing runtime version, including a source-build commit when one
+    /// was stamped into the final executable.
+    pub version: String,
+    /// Git commit stamped into the final executable, or a source-build marker.
+    pub build_commit: String,
+    /// Host target identity for the process that created the record.
+    pub target: String,
+}
+
+impl RuntimeBuildInfo {
+    /// Resolve the build identity initialized by the final executable.
+    pub fn current() -> Self {
+        let build_info = codex_build_info::BuildInfo::get();
+        Self {
+            version: build_info.display_version(),
+            build_commit: build_info.build_commit().to_string(),
+            target: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, TS)]
 pub struct SessionMeta {
     pub session_id: SessionId,
@@ -3055,6 +3092,18 @@ pub struct SessionMeta {
     /// Initial context-window identity for consumers that tail rollout JSONL before compaction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<SessionContextWindow>,
+    /// Runtime build provenance for this session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub runtime_build_info: Option<RuntimeBuildInfo>,
+    /// Revision of the enabled configuration-layer stack at session creation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub config_layer_revision: Option<String>,
+    /// Revision of effective runtime feature enablement at session creation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub runtime_feature_revision: Option<String>,
 }
 
 impl Default for SessionMeta {
@@ -3085,6 +3134,9 @@ impl Default for SessionMeta {
             subagent_history_start_ordinal: None,
             multi_agent_version: None,
             context_window: None,
+            runtime_build_info: None,
+            config_layer_revision: None,
+            runtime_feature_revision: None,
         }
     }
 }
@@ -5920,6 +5972,47 @@ mod tests {
         let mut unknown = serialized;
         unknown["history_mode"] = json!("future");
         assert!(serde_json::from_value::<SessionMeta>(unknown).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn session_meta_runtime_build_info_is_optional_and_round_trips() -> Result<()> {
+        let legacy: SessionMeta = serde_json::from_value(json!({
+            "session_id": "00000000-0000-0000-0000-000000000001",
+            "id": "00000000-0000-0000-0000-000000000001",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "cwd": "/tmp",
+            "originator": "codex",
+            "cli_version": "0.0.0",
+            "model_provider": null,
+            "base_instructions": null
+        }))?;
+        assert_eq!(legacy.runtime_build_info, None);
+        assert_eq!(legacy.config_layer_revision, None);
+        assert_eq!(legacy.runtime_feature_revision, None);
+
+        let current = SessionMeta {
+            runtime_build_info: Some(RuntimeBuildInfo {
+                version: "v2026.08.30".to_string(),
+                build_commit: "abc123".to_string(),
+                target: "windows-x86_64".to_string(),
+            }),
+            config_layer_revision: Some("sha256:config".to_string()),
+            runtime_feature_revision: Some("sha256:features".to_string()),
+            ..SessionMeta::default()
+        };
+        let serialized = serde_json::to_value(&current)?;
+        let restored: SessionMeta = serde_json::from_value(serialized.clone())?;
+        assert_eq!(restored.runtime_build_info, current.runtime_build_info);
+        assert_eq!(
+            restored.config_layer_revision,
+            current.config_layer_revision
+        );
+        assert_eq!(
+            restored.runtime_feature_revision,
+            current.runtime_feature_revision
+        );
+        assert_eq!(serialized["runtime_build_info"]["build_commit"], "abc123");
         Ok(())
     }
 

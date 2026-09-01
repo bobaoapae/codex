@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use codex_app_server_protocol::ApprovedPlanRef;
 use codex_app_server_protocol::AskForApproval;
 use codex_app_server_protocol::CommandExecutionApprovalDecision;
 use codex_app_server_protocol::FileChangeApprovalDecision;
@@ -42,6 +43,7 @@ pub(crate) enum AppCommand {
         final_output_json_schema: Option<Value>,
         collaboration_mode: Option<CollaborationMode>,
         personality: Option<Personality>,
+        approved_plan: Option<ApprovedPlanRef>,
     },
     OverrideTurnContext {
         cwd: Option<PathBuf>,
@@ -124,6 +126,7 @@ impl AppCommand {
         final_output_json_schema: Option<Value>,
         collaboration_mode: Option<CollaborationMode>,
         personality: Option<Personality>,
+        approved_plan: Option<ApprovedPlanRef>,
     ) -> Self {
         Self::UserTurn {
             items,
@@ -138,6 +141,7 @@ impl AppCommand {
             final_output_json_schema,
             collaboration_mode,
             personality,
+            approved_plan,
         }
     }
 

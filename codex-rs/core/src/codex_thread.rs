@@ -3,6 +3,8 @@ use crate::config::ConstraintResult;
 use crate::context::ContextualUserFragment;
 use crate::context::GuardianReviewEvidence;
 use crate::elicitation::ElicitationRegistration;
+use crate::ownership::OwnershipError;
+use crate::ownership::WorkspaceOwnershipService;
 use crate::session::SessionIo;
 use crate::session::SessionSettingsUpdate;
 use crate::session::new_submission_id;
@@ -631,12 +633,40 @@ impl CodexThread {
         self.session.token_usage_info().await
     }
 
+    /// Inspect the model context without refreshing contributors or persisting
+    /// any rollout items.
+    pub async fn inspect_context(
+        &self,
+        options: crate::context_inspection::ContextInspectionOptions,
+    ) -> CodexResult<crate::context_inspection::ContextInspection> {
+        crate::context_inspection::inspect_thread(self, options).await
+    }
+
     /// Records a context fragment without creating a new user turn boundary.
     pub(crate) async fn inject_fragment_without_turn(&self, fragment: impl ContextualUserFragment) {
         let item = ContextualUserFragment::into(fragment);
         self.session
             .inject_no_new_turn(vec![item], /*current_turn_context*/ None)
             .await;
+    }
+
+    /// Inject an approved Plan-mode snapshot without creating a user turn.
+    pub async fn inject_approved_plan(
+        &self,
+        plan_id: String,
+        revision: u32,
+        body: String,
+    ) -> CodexResult<()> {
+        self.session
+            .inject_approved_plan(plan_id, revision, body)
+            .await
+    }
+
+    /// Return the currently active approved plan reference, if one is loaded.
+    pub async fn approved_plan_ref(&self) -> Option<(String, u32)> {
+        self.session
+            .approved_plan_ref()
+            .map(|plan| (plan.id, plan.revision))
     }
 
     /// Record raw Responses API items without starting a new turn.
@@ -753,6 +783,13 @@ impl CodexThread {
 
     pub fn state_db(&self) -> Option<StateDbHandle> {
         self.session.state_db()
+    }
+
+    /// Return the root-scoped ownership service for this thread's workspace.
+    pub async fn ownership_service(
+        &self,
+    ) -> Result<Arc<WorkspaceOwnershipService>, OwnershipError> {
+        self.session.ownership_service().await
     }
 
     pub async fn config_snapshot(&self) -> ThreadConfigSnapshot {

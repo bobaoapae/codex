@@ -9,3 +9,6 @@ pub mod parse_command;
 pub mod powershell;
 
 pub use command_safety::is_dangerous_command;
+pub use command_safety::mutation_intent::MutationIntent;
+pub use command_safety::mutation_intent::classify_command;
+pub use command_safety::mutation_intent::classify_mutation_intent;

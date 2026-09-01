@@ -26,6 +26,7 @@ pub(crate) mod history;
 mod host;
 mod session_host;
 mod sessions;
+mod teardown;
 // FORK: shared with the `chatgpt_web` provider.
 pub(crate) mod state_file;
 mod tools;
@@ -385,7 +386,9 @@ pub(crate) fn resolve_account_alias(
 ///
 /// `bypassPermissions` makes the CLI suppress `can_use_tool` entirely, so it
 /// must never be paired with the permission prompt tool — there would be nothing
-/// to answer.
+/// to answer. The session-host preparation path upgrades a writable subagent to
+/// `auto` after it acquires a mutation guard; this mapping remains the root and
+/// no-host policy mapping so root `Never` keeps its existing behavior.
 pub(crate) fn permission_mode_for(
     sandbox: &SandboxPolicy,
     approval_policy: AskForApproval,
@@ -400,6 +403,24 @@ pub(crate) fn permission_mode_for(
             AskForApproval::Never => "bypassPermissions",
             _ => "auto",
         },
+    }
+}
+
+/// Resolve the Claude mode after provider-side ownership admission.
+///
+/// A mutable subagent must use `auto` even when the parent policy is `Never`,
+/// because only that mode reaches the host's `can_use_tool` callback. The host
+/// applies the parent policy after the ownership guard; root callers retain the
+/// regular [`permission_mode_for`] mapping.
+pub(crate) fn permission_mode_for_access(
+    sandbox: &SandboxPolicy,
+    approval_policy: AskForApproval,
+    requires_tool_authorization: bool,
+) -> &'static str {
+    if requires_tool_authorization && !matches!(sandbox, SandboxPolicy::ReadOnly { .. }) {
+        "auto"
+    } else {
+        permission_mode_for(sandbox, approval_policy)
     }
 }
 
@@ -780,7 +801,7 @@ async fn run_turn(
         // would stall every turn until the request timed out. `translate_stream`
         // watches for the answer instead, and drops the bridge if the CLI says
         // it cannot do it.
-        let (control, initialize_request_id) = if control_protocol_enabled {
+        let (mut control, initialize_request_id) = if control_protocol_enabled {
             let request_id = control
                 .send_request(
                     "initialize",
@@ -814,7 +835,7 @@ async fn run_turn(
                 state: &state,
                 pinned_account: workspace.pinned_account.as_deref(),
                 idle_timeout: workspace.idle_timeout,
-                control: control.clone(),
+                control: control.as_ref(),
                 cwd: workspace.cwd_uri.clone(),
                 host: workspace.host.clone(),
                 bridge: bridge.clone(),
@@ -824,25 +845,34 @@ async fn run_turn(
         )
         .await;
 
-        // Ending the turn: let the CLI shut its session down cleanly if it knows
-        // how, then close stdin, which is the backstop that makes it exit.
-        if let Some(control) = control.as_ref() {
-            // Also fire-and-forget: nothing is reading stdout any more, so there
-            // is no answer to wait for. Closing stdin below is what actually
-            // ends the CLI; this only lets it shut its session down cleanly.
-            let _ = control
-                .send_request("end_session", serde_json::json!({}))
-                .await;
+        // Ending the turn: close every sender before joining the writer. In
+        // particular, `ControlChannel` owns a clone of `tx_stdin`; dropping only
+        // the local sender leaves the writer waiting for an EOF that can never
+        // arrive. Cancellation is the one explicit path that requests process
+        // termination; a writer timeout is reported, not silently converted into
+        // a kill.
+        let termination = if consumer_dropped.is_cancelled() {
+            teardown::TerminationRequest::ExplicitCancellation
+        } else {
+            teardown::TerminationRequest::WaitForExit
+        };
+        let teardown_result =
+            teardown::finish(&mut child, control.take(), tx_stdin, writer, termination).await;
+        if let Err(error) = teardown_result {
+            if !error.state.child_exited {
+                // `finish` deliberately does not kill a child that ignored
+                // EOF. Keep ownership in a bounded reaper so it is eventually
+                // collected, while stream cancellation remains the explicit
+                // process-tree termination path.
+                teardown::spawn_reaper(child, consumer_dropped.clone());
+            }
+            if !matches!(outcome, AttemptOutcome::ConsumerGone) {
+                let _ = tx_event
+                    .send(Err(CodexErr::UnsupportedOperation(error.to_string())))
+                    .await;
+            }
+            return;
         }
-        drop(tx_stdin);
-        let _ = writer.await;
-
-        // The consumer stopped polling (an interrupt, or an error upstream):
-        // the CLI would otherwise keep running its tool loop unattended.
-        if consumer_dropped.is_cancelled() {
-            kill_process_tree(&mut child);
-        }
-        let _ = child.wait().await;
 
         match outcome {
             AttemptOutcome::Completed => {
@@ -909,32 +939,6 @@ async fn run_turn(
             failures.join("; ")
         ))))
         .await;
-}
-
-/// FORK: kills the CLI *and* everything it started.
-///
-/// `Child::start_kill` only signals the direct child, so Claude's shells, build
-/// and test processes keep running against the workspace. On Unix the child is
-/// its own process group; on Windows `taskkill /T` walks the tree.
-fn kill_process_tree(child: &mut Child) {
-    let pid = child.id();
-    let _ = child.start_kill();
-    let Some(pid) = pid else {
-        return;
-    };
-    #[cfg(unix)]
-    {
-        // Negative pid = the whole process group created with `process_group(0)`.
-        unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
-    }
-    #[cfg(windows)]
-    {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/T", "/F", "/PID", &pid.to_string()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-    }
 }
 
 /// FORK: reads a child's stderr to completion in the background.
@@ -1165,7 +1169,7 @@ struct AttemptContext<'a> {
     idle_timeout: Option<std::time::Duration>,
     /// FORK: the control channel for this attempt, when the CLI speaks the
     /// protocol. `None` reproduces the pre-control behavior exactly.
-    control: Option<control::ControlChannel>,
+    control: Option<&'a control::ControlChannel>,
     /// FORK: directory the CLI runs in, shown on the exec cells of the commands
     /// it runs — the CLI does not report one per call.
     cwd: codex_utils_path_uri::PathUri,
@@ -1249,7 +1253,7 @@ async fn translate_stream(
             }
             Err(()) => {
                 let seconds = idle_timeout.map(|idle| idle.as_secs()).unwrap_or_default();
-                kill_process_tree(child);
+                teardown::cancel_process_tree(child).await;
                 return AttemptOutcome::Failed {
                     detail: format!(
                         "claude_code turn produced no output for {seconds}s and was stopped"
@@ -1707,6 +1711,22 @@ mod tests {
         );
         assert_eq!(
             permission_mode_for(&read_only, AskForApproval::OnRequest),
+            "plan"
+        );
+
+        // A leased writable subagent uses the control callback even when the
+        // parent itself is configured not to prompt. Root keeps the ordinary
+        // `Never` mapping above.
+        assert_eq!(
+            permission_mode_for_access(&workspace, AskForApproval::Never, true),
+            "auto"
+        );
+        assert_eq!(
+            permission_mode_for_access(&workspace, AskForApproval::Never, false),
+            "bypassPermissions"
+        );
+        assert_eq!(
+            permission_mode_for_access(&read_only, AskForApproval::Never, true),
             "plan"
         );
 

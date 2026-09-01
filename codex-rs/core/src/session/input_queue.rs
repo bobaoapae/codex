@@ -10,6 +10,7 @@ use codex_protocol::turn_input::TurnStartOptions;
 use codex_protocol::user_input::UserInput;
 use serde::Deserialize;
 use serde::Serialize;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -79,10 +80,27 @@ pub(crate) struct TurnInputQueue {
 pub(crate) struct InputQueue {
     activity_tx: watch::Sender<InputQueueActivity>,
     mailbox_pending_mails: Mutex<VecDeque<PendingMailboxCommunication>>,
+    mailbox_pending_wakes: Mutex<VecDeque<PendingMailboxWake>>,
+    mailbox_wake_ids: Mutex<HashSet<String>>,
+    persisted_mailbox_ids: Mutex<HashSet<String>>,
+    /// One-way, session-scoped record of durable mailbox UUIDs whose content
+    /// has been enqueued into this session. Guards against the same message
+    /// being enqueued twice when the durable delivery path and the legacy
+    /// fallback (or a later redelivery) both run within one process.
+    enqueued_mailbox_ids: Mutex<HashSet<String>>,
 }
 
 struct PendingMailboxCommunication {
     communication: InterAgentCommunication,
+    start_options: TurnStartOptions,
+    _diagnostics_guard: GaugeGuard,
+}
+
+/// A durable mailbox trigger whose content is already present in canonical
+/// history. Wakes deliberately carry no model input: replaying one should
+/// start the recipient once without reapplying the communication content.
+struct PendingMailboxWake {
+    message_id: String,
     start_options: TurnStartOptions,
     _diagnostics_guard: GaugeGuard,
 }
@@ -93,6 +111,10 @@ impl InputQueue {
         Self {
             activity_tx,
             mailbox_pending_mails: Mutex::new(VecDeque::new()),
+            mailbox_pending_wakes: Mutex::new(VecDeque::new()),
+            mailbox_wake_ids: Mutex::new(HashSet::new()),
+            persisted_mailbox_ids: Mutex::new(HashSet::new()),
+            enqueued_mailbox_ids: Mutex::new(HashSet::new()),
         }
     }
 
@@ -135,8 +157,63 @@ impl InputQueue {
         self.activity_tx.send_replace(InputQueueActivity::Mailbox);
     }
 
+    /// Queue one already-persisted trigger as a wake without re-enqueuing its
+    /// communication content. Returns false when this UUID is already queued.
+    pub(crate) async fn enqueue_mailbox_wake(
+        &self,
+        message_id: String,
+        start_options: TurnStartOptions,
+    ) -> bool {
+        if !self
+            .mailbox_wake_ids
+            .lock()
+            .await
+            .insert(message_id.clone())
+        {
+            return false;
+        }
+        self.mailbox_pending_wakes
+            .lock()
+            .await
+            .push_back(PendingMailboxWake {
+                message_id,
+                start_options,
+                _diagnostics_guard: PENDING_MAILBOX_MESSAGES.track(),
+            });
+        self.activity_tx.send_replace(InputQueueActivity::Mailbox);
+        true
+    }
+
+    /// Record that a durable mailbox message's content is being enqueued into
+    /// this session. Returns true only the first time an id is seen; callers
+    /// must skip the enqueue on false. The set is never drained: it is
+    /// bounded by the number of distinct messages a session receives, and a
+    /// fresh process starts empty so legitimate cross-restart redelivery is
+    /// never suppressed here.
+    pub(crate) async fn note_mailbox_enqueued(&self, message_id: &str) -> bool {
+        self.enqueued_mailbox_ids
+            .lock()
+            .await
+            .insert(message_id.to_string())
+    }
+
+    pub(crate) async fn mark_mailbox_persisted(&self, message_id: String) {
+        self.persisted_mailbox_ids.lock().await.insert(message_id);
+    }
+
+    pub(crate) async fn take_mailbox_persisted(&self, message_id: &str) -> bool {
+        self.persisted_mailbox_ids.lock().await.remove(message_id)
+    }
+
     pub(crate) async fn has_pending_mailbox_items(&self) -> bool {
-        !self.mailbox_pending_mails.lock().await.is_empty()
+        if !self.mailbox_pending_mails.lock().await.is_empty() {
+            return true;
+        }
+        !self.mailbox_pending_wakes.lock().await.is_empty()
+    }
+
+    pub(crate) async fn has_pending_mailbox_wakes(&self) -> bool {
+        !self.mailbox_pending_wakes.lock().await.is_empty()
     }
 
     /// FORK: the agents that currently have mail waiting.
@@ -158,11 +235,16 @@ impl InputQueue {
     }
 
     pub(crate) async fn has_trigger_turn_mailbox_items(&self) -> bool {
-        self.mailbox_pending_mails
+        if self
+            .mailbox_pending_mails
             .lock()
             .await
             .iter()
             .any(|mail| mail.communication.trigger_turn)
+        {
+            return true;
+        }
+        !self.mailbox_pending_wakes.lock().await.is_empty()
     }
 
     pub(crate) async fn drain_mailbox_input_items(&self) -> (Vec<TurnInput>, TurnStartOptions) {
@@ -172,7 +254,25 @@ impl InputQueue {
             .await
             .drain(..)
             .collect::<Vec<_>>();
+        let pending_wakes = self
+            .mailbox_pending_wakes
+            .lock()
+            .await
+            .drain(..)
+            .collect::<Vec<_>>();
+        let wake_ids = pending_wakes
+            .iter()
+            .map(|wake| wake.message_id.as_str())
+            .collect::<Vec<_>>();
+        let mut mailbox_wake_ids = self.mailbox_wake_ids.lock().await;
+        for message_id in wake_ids {
+            mailbox_wake_ids.remove(message_id);
+        }
+        drop(mailbox_wake_ids);
         // A later follow-up supersedes the earlier choice, including an omitted choice.
+        let has_trigger_mail = pending_mails
+            .iter()
+            .any(|mail| mail.communication.trigger_turn);
         let mut start_options = pending_mails
             .iter()
             .rev()
@@ -197,6 +297,9 @@ impl InputQueue {
             })
             .reduce(|expected, candidate| expected.filter(|id| candidate == Some(*id)))
             .and_then(|id| id.filter(|id| !id.trim().is_empty()).map(str::to_string));
+        if !has_trigger_mail && let Some(wake) = pending_wakes.last() {
+            start_options = wake.start_options.clone();
+        }
         let items = pending_mails
             .into_iter()
             .map(|mail| TurnInput::InterAgentCommunication(mail.communication))

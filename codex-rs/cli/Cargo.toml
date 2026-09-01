@@ -32,6 +32,7 @@ codex-app-server-daemon = { workspace = true }
 codex-app-server-protocol = { workspace = true }
 codex-app-server-test-client = { workspace = true }
 codex-arg0 = { workspace = true }
+codex-build-info = { workspace = true }
 codex-api = { workspace = true }
 codex-backend-client = { workspace = true }
 codex-chatgpt = { workspace = true }
@@ -47,6 +48,7 @@ codex-http-client = { workspace = true }
 codex-exec = { workspace = true }
 codex-exec-server = { workspace = true }
 codex-execpolicy = { workspace = true }
+codex-extension-items = { workspace = true }
 codex-extension-api = { workspace = true }
 codex-features = { workspace = true }
 codex-git-attribution = { workspace = true }
@@ -98,6 +100,7 @@ tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }
 unicode-segmentation = { workspace = true }
+uuid = { workspace = true, features = ["v5"] }
 url = { workspace = true }
 which = { workspace = true }
 

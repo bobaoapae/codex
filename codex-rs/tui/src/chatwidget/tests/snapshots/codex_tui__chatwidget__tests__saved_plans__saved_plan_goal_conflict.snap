@@ -1,0 +1,5 @@
+---
+source: tui/src/chatwidget/tests/saved_plans.rs
+expression: history
+---
+■ The approved plan could not start because this thread already has an unfinished goal. Resolve that goal before retrying the pinned plan.

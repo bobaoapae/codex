@@ -8,7 +8,6 @@ version.workspace = true
 doctest = false
 name = "codex_agent_roles"
 path = "src/lib.rs"
-test = false
 
 [lints]
 workspace = true

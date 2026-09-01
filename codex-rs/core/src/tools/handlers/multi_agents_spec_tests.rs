@@ -412,6 +412,7 @@ fn wait_agent_tool_v2_uses_timeout_only_summary_output() {
     // being woken by any sibling's mail and having to wait again.
     assert!(properties.contains_key("targets"));
     assert!(properties.contains_key("timeout_ms"));
+    assert!(properties.contains_key("afterRevision"));
     assert!(description.contains("Pass `targets` to wake only for specific agents"));
     assert!(description.contains("Does not return the content"));
     assert_eq!(
@@ -465,7 +466,7 @@ fn list_agents_tool_includes_path_prefix_and_agent_fields() {
     );
     assert_eq!(
         output_schema.expect("list_agents output schema")["properties"]["agents"]["items"]["required"],
-        json!(["agent_name", "agent_status"])
+        json!(["agent_name", "agent_status", "status", "generation"])
     );
 }
 

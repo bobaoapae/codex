@@ -44,6 +44,7 @@ use codex_login::default_client::originator;
 use codex_model_provider::create_model_provider;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::OPENAI_PROVIDER_ID;
+use codex_models_manager::ModelsManagerConfig;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_models_manager::manager::SharedModelsManager;
 use codex_protocol::ThreadId;
@@ -58,6 +59,7 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::RuntimeBuildInfo;
 use codex_protocol::protocol::SessionConfiguredEvent;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
@@ -346,6 +348,10 @@ pub(crate) struct ThreadManagerState {
     thread_id_generator: ThreadIdGenerator,
     auth_manager: Arc<AuthManager>,
     models_manager: SharedModelsManager,
+    models_manager_config: ModelsManagerConfig,
+    configured_model: Option<String>,
+    config_layer_revision: Option<String>,
+    runtime_feature_revision: Option<String>,
     environment_manager: Arc<EnvironmentManager>,
     starting_mcp_runtimes: std::sync::Mutex<Vec<std::sync::Weak<AtomicBool>>>,
     skills_service: Arc<HostSkillsService>,
@@ -487,6 +493,12 @@ impl ThreadManager {
                 thread_created_tx,
                 thread_id_generator: default_thread_id_generator(),
                 models_manager,
+                models_manager_config: config.to_models_manager_config(),
+                configured_model: config.model.clone(),
+                config_layer_revision: Some(config.config_layer_stack.revision()),
+                runtime_feature_revision: Some(
+                    config.config_layer_stack.runtime_feature_revision(),
+                ),
                 environment_manager,
                 starting_mcp_runtimes: std::sync::Mutex::new(Vec::new()),
                 skills_service,
@@ -634,6 +646,10 @@ impl ThreadManager {
                 thread_id_generator: default_thread_id_generator(),
                 models_manager: create_model_provider(provider, Some(auth_manager.clone()))
                     .models_manager(codex_home, /*config_model_catalog*/ None),
+                models_manager_config: ModelsManagerConfig::default(),
+                configured_model: None,
+                config_layer_revision: None,
+                runtime_feature_revision: None,
                 environment_manager,
                 starting_mcp_runtimes: std::sync::Mutex::new(Vec::new()),
                 skills_service,
@@ -823,6 +839,103 @@ impl ThreadManager {
 
     pub async fn get_thread(&self, thread_id: ThreadId) -> CodexResult<Arc<CodexThread>> {
         self.state.get_thread(thread_id).await
+    }
+
+    /// Inspect the latest persisted model context without loading a runtime session.
+    ///
+    /// This path is intentionally detached from [`CodexThread`]. It reads the store-owned
+    /// metadata and model-context suffix, reconstructs the same post-compaction history used by
+    /// resume, and projects it through Core's read-only inspection builder. It does not start a
+    /// session, refresh contributors or providers, append rollout items, or mutate durable state.
+    pub async fn inspect_stored_context(
+        &self,
+        thread_id: ThreadId,
+        options: crate::context_inspection::ContextInspectionOptions,
+    ) -> CodexResult<crate::context_inspection::ContextInspection> {
+        // Read metadata first so tombstoned local threads are rejected before a store that can
+        // still expose their historical model-context rows (for example the in-memory test store)
+        // is asked to load them.
+        let stored_thread = self
+            .state
+            .read_stored_thread(ReadThreadParams {
+                thread_id,
+                include_archived: true,
+                include_history: false,
+            })
+            .await?;
+        let stored = self
+            .state
+            .load_latest_model_context(LoadThreadHistoryParams {
+                thread_id,
+                include_archived: true,
+            })
+            .await?;
+        let model = stored_thread
+            .model
+            .filter(|model| !model.trim().is_empty())
+            .or_else(|| latest_persisted_model(&stored.items))
+            .or_else(|| self.state.configured_model.clone());
+        let model = match model {
+            Some(model) => Some(model),
+            None => self
+                .state
+                .models_manager
+                .get_remote_models()
+                .await
+                .into_iter()
+                .min_by_key(|model| model.priority)
+                .map(|model| model.slug),
+        };
+        let inherited_rollout_count = if let Some(parent_thread_id) =
+            crate::context_inspection::persisted_parent_thread_id(&stored.items)
+        {
+            self.stored_fork_context_inherited_count(parent_thread_id, thread_id)
+                .await
+        } else {
+            None
+        };
+
+        crate::context_inspection::inspect_stored_context(
+            thread_id,
+            stored,
+            model,
+            self.state.models_manager.as_ref(),
+            &self.state.models_manager_config,
+            Some(RuntimeBuildInfo::current()),
+            self.state.config_layer_revision.clone(),
+            self.state.runtime_feature_revision.clone(),
+            inherited_rollout_count,
+            options,
+        )
+        .await
+    }
+
+    async fn stored_fork_context_inherited_count(
+        &self,
+        parent_thread_id: ThreadId,
+        child_thread_id: ThreadId,
+    ) -> Option<usize> {
+        let state_db = self.state.state_db().await?;
+        let control = self.agent_control();
+        // The control handle is detached and only borrows the workflow store for read-only fork
+        // metrics. No session root or runtime agent is registered on this path.
+        control.install_workflow_store(Some(&state_db));
+        control
+            .fork_context_inherited_count(parent_thread_id, child_thread_id)
+            .await
+    }
+
+    /// Return the root-scoped ownership service for a loaded thread.
+    pub async fn ownership_service(
+        &self,
+        thread_id: ThreadId,
+    ) -> Result<Arc<crate::ownership::WorkspaceOwnershipService>, crate::ownership::OwnershipError>
+    {
+        self.get_thread(thread_id)
+            .await
+            .map_err(|_| crate::ownership::OwnershipError::Unavailable)?
+            .ownership_service()
+            .await
     }
 
     /// Updates metadata for loaded and cold threads through one entrypoint.
@@ -1416,6 +1529,29 @@ impl ThreadManager {
         )
     }
 
+    /// Return the control plane owned by a thread for fleet operations.
+    ///
+    /// An unloaded root gets a fresh control handle with the durable workflow
+    /// store attached. Resume callers must provide the base config explicitly.
+    pub(crate) async fn fleet_agent_control(
+        &self,
+        root_thread_id: ThreadId,
+        config: Option<Config>,
+    ) -> CodexResult<AgentControl> {
+        if let Ok(thread) = self.state.get_thread(root_thread_id).await {
+            return Ok(thread.session.services.agent_control.clone());
+        }
+        let control = match config.as_ref() {
+            Some(config) => self.agent_control_for_config(config),
+            None => self.agent_control(),
+        };
+        control.register_session_root(root_thread_id, None);
+        if let Some(state_db) = self.state.state_db().await {
+            control.install_workflow_store(Some(&state_db));
+        }
+        Ok(control)
+    }
+
     fn agent_control_for_config(&self, config: &Config) -> AgentControl {
         AgentControl::new(
             Arc::downgrade(&self.state),
@@ -1443,6 +1579,14 @@ impl ThreadManager {
 }
 
 impl ThreadManagerState {
+    pub(crate) async fn state_db(&self) -> Option<StateDbHandle> {
+        let store = self
+            .thread_store
+            .as_any()
+            .downcast_ref::<LocalThreadStore>()?;
+        store.state_db().await
+    }
+
     pub(crate) fn agent_graph_store(&self) -> Option<Arc<dyn AgentGraphStore>> {
         self.agent_graph_store.clone()
     }
@@ -2148,6 +2292,15 @@ fn stored_thread_to_initial_history(
         history: Arc::new(history.items),
         rollout_path: rollout_path.or(stored_thread.rollout_path),
     }))
+}
+
+fn latest_persisted_model(items: &[RolloutItem]) -> Option<String> {
+    items.iter().rev().find_map(|item| match item {
+        RolloutItem::TurnContext(context) if !context.model.trim().is_empty() => {
+            Some(context.model.clone())
+        }
+        _ => None,
+    })
 }
 
 fn thread_store_rollout_read_error(err: ThreadStoreError) -> CodexErr {

@@ -24,14 +24,19 @@ use crate::outgoing_message::OutgoingMessageSender;
 use crate::outgoing_message::RequestContext;
 use crate::request_processors::AccountRequestProcessor;
 use crate::request_processors::AppsRequestProcessor;
+use crate::request_processors::ArtifactRequestProcessor;
 use crate::request_processors::CatalogRequestProcessor;
 use crate::request_processors::CommandExecRequestProcessor;
 use crate::request_processors::ConfigRequestProcessor;
+use crate::request_processors::ContextRequestProcessor;
 use crate::request_processors::EnvironmentRequestProcessor;
+use crate::request_processors::EvidenceRequestProcessor;
 use crate::request_processors::FeedbackRequestProcessor;
+use crate::request_processors::FleetRequestProcessor;
 use crate::request_processors::FsRequestProcessor;
 use crate::request_processors::GitRequestProcessor;
 use crate::request_processors::InitializeRequestProcessor;
+use crate::request_processors::JobRequestProcessor;
 use crate::request_processors::MarketplaceRequestProcessor;
 use crate::request_processors::McpEventStreamReady;
 use crate::request_processors::McpEventStreams;
@@ -44,9 +49,12 @@ use crate::request_processors::RemoteControlRequestProcessor;
 use crate::request_processors::SearchRequestProcessor;
 use crate::request_processors::ThreadGoalRequestProcessor;
 use crate::request_processors::ThreadQueueRequestProcessor;
+use crate::request_processors::ThreadRecoveryRequestProcessor;
+use crate::request_processors::ThreadRecoveryRequestProcessorArgs;
 use crate::request_processors::ThreadRequestProcessor;
 use crate::request_processors::TurnRequestProcessor;
 use crate::request_processors::WindowsSandboxRequestProcessor;
+use crate::request_processors::WorkspaceLeaseRequestProcessor;
 use crate::request_processors::read_server_diagnostics;
 use crate::request_serialization::QueuedInitializedRequest;
 use crate::request_serialization::RequestSerializationQueueKey;
@@ -93,6 +101,7 @@ use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 use tokio::sync::broadcast;
 use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
@@ -140,16 +149,21 @@ pub(crate) struct MessageProcessor {
     skills_watcher: Arc<SkillsWatcher>,
     account_processor: AccountRequestProcessor,
     apps_processor: AppsRequestProcessor,
+    artifact_processor: ArtifactRequestProcessor,
     catalog_processor: CatalogRequestProcessor,
     command_exec_processor: CommandExecRequestProcessor,
     process_exec_processor: ProcessExecRequestProcessor,
     config_processor: ConfigRequestProcessor,
+    context_processor: ContextRequestProcessor,
     environment_processor: EnvironmentRequestProcessor,
+    evidence_processor: EvidenceRequestProcessor,
+    fleet_processor: FleetRequestProcessor,
     external_agent_config_processor: ExternalAgentConfigRequestProcessor,
     feedback_processor: FeedbackRequestProcessor,
     fs_processor: FsRequestProcessor,
     git_processor: GitRequestProcessor,
     initialize_processor: InitializeRequestProcessor,
+    job_processor: JobRequestProcessor,
     marketplace_processor: MarketplaceRequestProcessor,
     mcp_processor: McpRequestProcessor,
     plugin_processor: PluginRequestProcessor,
@@ -159,9 +173,12 @@ pub(crate) struct MessageProcessor {
     search_processor: SearchRequestProcessor,
     thread_goal_processor: ThreadGoalRequestProcessor,
     thread_queue_processor: ThreadQueueRequestProcessor,
+    thread_recovery_processor: ThreadRecoveryRequestProcessor,
     thread_processor: ThreadRequestProcessor,
     turn_processor: TurnRequestProcessor,
     windows_sandbox_processor: WindowsSandboxRequestProcessor,
+    workspace_lease_processor: WorkspaceLeaseRequestProcessor,
+    transient_job_recovery_task: Mutex<Option<JoinHandle<()>>>,
     request_serialization_queues: RequestSerializationQueues,
 }
 
@@ -364,6 +381,14 @@ impl MessageProcessor {
                 None => manager,
             }
         });
+        let evidence_processor = EvidenceRequestProcessor::new(
+            state_db.clone(),
+            Arc::clone(&thread_manager),
+            Arc::clone(&thread_store),
+        );
+        let artifact_processor = ArtifactRequestProcessor::new(state_db.clone());
+        let context_processor =
+            ContextRequestProcessor::new(Arc::clone(&thread_manager), state_db.clone());
         let models_manager = thread_manager.get_models_manager();
         let models_refresh_worker =
             crate::models_refresh_worker::spawn(&models_manager, config.http_client_factory());
@@ -381,6 +406,19 @@ impl MessageProcessor {
         let pending_thread_unloads = Arc::new(Mutex::new(HashSet::new()));
         let thread_watch_manager =
             crate::thread_status::ThreadWatchManager::new_with_outgoing(outgoing.clone());
+        let fleet_processor = FleetRequestProcessor::new(
+            Arc::clone(&thread_manager),
+            Arc::clone(&thread_store),
+            Arc::clone(&config),
+            thread_watch_manager.clone(),
+            thread_state_manager.clone(),
+        );
+        let workspace_lease_processor = WorkspaceLeaseRequestProcessor::new(
+            Arc::clone(&thread_manager),
+            Arc::clone(&thread_store),
+            Arc::clone(&config),
+            state_db.clone(),
+        );
         let thread_list_state_permit = Arc::new(Semaphore::new(/*permits*/ 1));
         let app_list_shutdown_token = CancellationToken::new();
         let request_serialization_queues = RequestSerializationQueues::default();
@@ -482,6 +520,20 @@ impl MessageProcessor {
             outgoing.clone(),
             queue_service,
         );
+        let thread_recovery_processor =
+            ThreadRecoveryRequestProcessor::new(ThreadRecoveryRequestProcessorArgs {
+                thread_store: Arc::clone(&thread_store),
+                config: Arc::clone(&config),
+                config_manager: config_manager.clone(),
+                thread_manager: Arc::clone(&thread_manager),
+                outgoing: outgoing.clone(),
+                pending_thread_unloads: Arc::clone(&pending_thread_unloads),
+                thread_state_manager: thread_state_manager.clone(),
+                thread_watch_manager: thread_watch_manager.clone(),
+                thread_list_state_permit: Arc::clone(&thread_list_state_permit),
+                skills_watcher: Arc::clone(&skills_watcher),
+                turn_cost_worker: turn_cost_worker.as_ref().map(TurnCostWorker::handle),
+            });
         let plan_processor = PlanRequestProcessor::new(Arc::clone(&config));
         let project_processor = ProjectRequestProcessor::new(
             Arc::clone(&thread_store),
@@ -515,12 +567,50 @@ impl MessageProcessor {
             arg0_paths.clone(),
             Arc::clone(&config),
             config_manager.clone(),
+            thread_goal_processor.clone(),
             pending_thread_unloads,
             thread_state_manager,
             thread_watch_manager,
             thread_list_state_permit,
             Arc::clone(&skills_watcher),
             turn_cost_worker.as_ref().map(TurnCostWorker::handle),
+        );
+        let transient_job_recovery_task = if let Some(state_db) = state_db.as_ref() {
+            let workflow = state_db.workflow_store().clone();
+            let thread_manager = Arc::clone(&thread_manager);
+            let startup_started_at_ms = chrono::Utc::now().timestamp_millis();
+            Some(tokio::spawn(async move {
+                let loaded_thread_ids = thread_manager.list_thread_ids().await;
+                match crate::transient_job_lifecycle::recover_unloaded_transient_jobs(
+                    &workflow,
+                    &loaded_thread_ids,
+                    startup_started_at_ms,
+                )
+                .await
+                {
+                    Ok(recovered) if recovered > 0 => {
+                        tracing::info!(
+                            recovered,
+                            "marked transient jobs without loaded threads inconclusive"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            "failed to recover transient jobs without loaded threads: {error}"
+                        );
+                    }
+                }
+            }))
+        } else {
+            None
+        };
+        let job_processor = JobRequestProcessor::new(
+            state_db.clone(),
+            Arc::clone(&thread_manager),
+            thread_processor.clone(),
+            turn_processor.clone(),
+            Arc::clone(&config),
         );
         if matches!(plugin_startup_tasks, crate::PluginStartupTasks::Start) {
             // Keep plugin startup warmups aligned at app-server startup.
@@ -564,16 +654,21 @@ impl MessageProcessor {
             skills_watcher,
             account_processor,
             apps_processor,
+            artifact_processor,
             catalog_processor,
             command_exec_processor,
             process_exec_processor,
             config_processor,
+            context_processor,
             environment_processor,
+            evidence_processor,
+            fleet_processor,
             external_agent_config_processor,
             feedback_processor,
             fs_processor,
             git_processor,
             initialize_processor,
+            job_processor,
             marketplace_processor,
             mcp_processor,
             plugin_processor,
@@ -583,9 +678,12 @@ impl MessageProcessor {
             search_processor,
             thread_goal_processor,
             thread_queue_processor,
+            thread_recovery_processor,
             thread_processor,
             turn_processor,
             windows_sandbox_processor,
+            workspace_lease_processor,
+            transient_job_recovery_task: Mutex::new(transient_job_recovery_task),
             request_serialization_queues,
         }
     }
@@ -774,7 +872,16 @@ impl MessageProcessor {
         if let Some(worker) = &self.turn_cost_worker {
             worker.shutdown();
         }
+        let transient_job_recovery_task = {
+            let mut task = self.transient_job_recovery_task.lock().await;
+            task.take()
+        };
+        if let Some(task) = transient_job_recovery_task {
+            task.abort();
+            let _ = task.await;
+        }
         self.thread_processor.drain_background_tasks().await;
+        self.job_processor.drain_background_tasks().await;
     }
 
     pub(crate) async fn cancel_active_login(&self) {
@@ -951,7 +1058,31 @@ impl MessageProcessor {
         Ok(())
     }
 
+    /// Dispatch an initialized request from a heap-backed future.
+    ///
+    /// The request enum has many arms whose async state machines are large (in particular thread
+    /// lifecycle operations). Keeping this boundary boxed prevents the transport worker's small
+    /// test/runtime stacks from having to reserve the largest arm even when handling a request
+    /// that only needs a small response.
     async fn handle_initialized_client_request(
+        self: Arc<Self>,
+        connection_request_id: ConnectionRequestId,
+        codex_request: ClientRequest,
+        request_context: RequestContext,
+        session: Arc<ConnectionSessionState>,
+        event_stream_ready: Option<McpEventStreamReady>,
+    ) -> Result<(), JSONRPCErrorError> {
+        Box::pin(self.dispatch_initialized_client_request_inner(
+            connection_request_id,
+            codex_request,
+            request_context,
+            session,
+            event_stream_ready,
+        ))
+        .await
+    }
+
+    async fn dispatch_initialized_client_request_inner(
         self: Arc<Self>,
         connection_request_id: ConnectionRequestId,
         codex_request: ClientRequest,
@@ -972,6 +1103,9 @@ impl MessageProcessor {
                 panic!("Initialize should be handled before initialized request dispatch");
             }
             ClientRequest::ServerDiagnostics { .. } => Ok(Some(read_server_diagnostics().into())),
+            ClientRequest::ContextInspect { params, .. } => {
+                self.context_processor.context_inspect(params).await
+            }
             ClientRequest::ConfigRead { params, .. } => self
                 .config_processor
                 .read(params)
@@ -1128,6 +1262,58 @@ impl MessageProcessor {
                         request_context,
                     )
                     .await
+            }
+            ClientRequest::JobRun { params, .. } => {
+                self.job_processor
+                    .job_run(
+                        request_id.clone(),
+                        params,
+                        app_server_client_name.clone(),
+                        client_version.clone(),
+                        client_mcp_extensions.clone(),
+                        request_context.clone(),
+                    )
+                    .await
+            }
+            ClientRequest::JobList { params, .. } => self.job_processor.job_list(params).await,
+            ClientRequest::JobRead { params, .. } => self.job_processor.job_read(params).await,
+            ClientRequest::JobCancel { params, .. } => {
+                self.job_processor
+                    .job_cancel(request_id.clone(), params)
+                    .await
+            }
+            ClientRequest::EvidenceList { params, .. } => {
+                self.evidence_processor.evidence_list(params).await
+            }
+            ClientRequest::EvidenceAttach { params, .. } => {
+                self.evidence_processor.evidence_attach(params).await
+            }
+            ClientRequest::EvidenceExport { params, .. } => {
+                self.evidence_processor.evidence_export(params).await
+            }
+            ClientRequest::ArtifactRead { params, .. } => {
+                self.artifact_processor.artifact_read(params).await
+            }
+            ClientRequest::AgentFleetStatus { params, .. } => {
+                self.fleet_processor.fleet_status(params).await
+            }
+            ClientRequest::AgentFleetSuspend { params, .. } => {
+                self.fleet_processor.fleet_suspend(params).await
+            }
+            ClientRequest::AgentFleetResume { params, .. } => {
+                self.fleet_processor.fleet_resume(params).await
+            }
+            ClientRequest::AgentFleetClose { params, .. } => {
+                self.fleet_processor.fleet_close(params).await
+            }
+            ClientRequest::WorkspaceLeaseList { params, .. } => {
+                self.workspace_lease_processor.list(params).await
+            }
+            ClientRequest::WorkspaceLeaseGrant { params, .. } => {
+                self.workspace_lease_processor.grant(params).await
+            }
+            ClientRequest::WorkspaceLeaseRelease { params, .. } => {
+                self.workspace_lease_processor.release(params).await
             }
             ClientRequest::ThreadUnsubscribe { params, .. } => {
                 let thread_id = params.thread_id.clone();
@@ -1297,6 +1483,21 @@ impl MessageProcessor {
                     )
                     .await
             }
+            ClientRequest::ThreadRecoveryPreview { params, .. } => self
+                .thread_recovery_processor
+                .preview(params)
+                .await
+                .map(|response| Some(response.into())),
+            ClientRequest::ThreadRecoveryCreate { params, .. } => self
+                .thread_recovery_processor
+                .create(
+                    &request_id,
+                    params,
+                    client_mcp_extensions,
+                    request_context.request_trace(),
+                )
+                .await
+                .map(|response| Some(response.into())),
             ClientRequest::ThreadList { params, .. } => {
                 self.thread_processor.thread_list(params).await
             }
@@ -1357,6 +1558,9 @@ impl MessageProcessor {
             // FORK extension: saved Plan-mode plans.
             ClientRequest::PlanList { params, .. } => self.plan_processor.plan_list(params).await,
             ClientRequest::PlanRead { params, .. } => self.plan_processor.plan_read(params).await,
+            ClientRequest::PlanApprove { params, .. } => {
+                self.plan_processor.plan_approve(params).await
+            }
             ClientRequest::SkillsList { params, .. } => {
                 self.catalog_processor.skills_list(params).await
             }

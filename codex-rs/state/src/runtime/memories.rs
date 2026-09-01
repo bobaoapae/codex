@@ -604,6 +604,7 @@ SELECT
     threads.git_origin_url
 FROM threads
 WHERE threads.id = ? AND threads.memory_mode = 'enabled'
+  AND threads.visible = 1 AND threads.tombstoned_at IS NULL
             "#,
         )
         .bind(thread_id.to_string())

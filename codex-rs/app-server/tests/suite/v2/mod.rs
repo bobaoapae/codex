@@ -18,6 +18,7 @@ mod config_rpc;
 mod connection_handling_websocket;
 #[cfg(unix)]
 mod connection_handling_websocket_unix;
+mod context_inspect;
 #[cfg(unix)]
 mod curated_mcp_sync;
 mod current_time;
@@ -44,6 +45,7 @@ mod hooks_list;
 mod host_skills;
 mod imagegen_extension;
 mod initialize;
+mod jobs;
 mod marketplace_add;
 mod marketplace_remove;
 mod marketplace_upgrade;

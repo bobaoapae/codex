@@ -8,10 +8,12 @@ use codex_rollout::RolloutItem;
 use codex_rollout::RolloutRecorder;
 use codex_rollout::RolloutRecorderParams;
 use codex_rollout::is_persisted_rollout_item;
+use tokio::sync::OwnedMutexGuard;
 use tracing::warn;
 
 use super::LocalThreadStore;
 use super::create_thread;
+use super::search_index;
 use crate::AppendThreadItemsParams;
 use crate::CreateThreadParams;
 use crate::ReadThreadParams;
@@ -42,6 +44,19 @@ pub(super) async fn resume_thread(
     params: ResumeThreadParams,
 ) -> ThreadStoreResult<()> {
     let _live_writer_guard = store.live_writer_locks.lock(params.thread_id).await;
+    resume_thread_locked(store, params, &_live_writer_guard).await
+}
+
+/// Reopen a cold writer while the caller holds the per-thread writer mutex.
+///
+/// The borrowed guard is deliberately part of this private boundary: receipt
+/// append uses it to keep the scan and write atomic with respect to normal
+/// appends and shutdowns.
+pub(super) async fn resume_thread_locked(
+    store: &LocalThreadStore,
+    params: ResumeThreadParams,
+    _live_writer_guard: &OwnedMutexGuard<()>,
+) -> ThreadStoreResult<()> {
     store.ensure_live_recorder_absent(params.thread_id).await?;
     let writer_lock = store.writer_lock_coordinator.acquire(params.thread_id)?;
     let history_mode = if let Some(history) = params.history.as_deref() {
@@ -174,6 +189,7 @@ pub(super) async fn shutdown_thread(
             warn!("failed to project durable rollout during shutdown for {thread_id}: {err}");
         }
     }
+    search_index::project_live_rollout(store, thread_id, rollout_id, rollout_path.as_path()).await;
     sync_materialized_rollout_path(store, thread_id, rollout_path.as_path()).await?;
     if let Some(metrics) = codex_otel::global()
         && let Ok(metadata) = tokio::fs::metadata(&rollout_path).await
@@ -191,6 +207,7 @@ pub(super) async fn shutdown_thread(
         }
     };
     store.live_recorders.lock().await.remove(&thread_id);
+    search_index::forget_live_rollout(store, thread_id).await;
     drop(_live_writer_guard);
     if !rollout_exists && pending_metadata.take().is_some() {
         store.pending_thread_metadata.remove(thread_id).await;
@@ -207,13 +224,17 @@ pub(super) async fn discard_thread(
     if pending_metadata.take().is_some() {
         store.pending_thread_metadata.remove(thread_id).await;
     }
-    store
+    let removed = store
         .live_recorders
         .lock()
         .await
         .remove(&thread_id)
         .map(|_| ())
-        .ok_or(ThreadStoreError::ThreadNotFound { thread_id })
+        .ok_or(ThreadStoreError::ThreadNotFound { thread_id });
+    if removed.is_ok() {
+        search_index::forget_live_rollout(store, thread_id).await;
+    }
+    removed
 }
 
 pub(super) async fn rollout_path(
@@ -289,7 +310,7 @@ fn thread_store_io_error(err: std::io::Error) -> ThreadStoreError {
 ///
 /// Each can advance the rollout JSONL file on disk, so we need to make sure we materialize the
 /// new data into the SQLite history tables (turns and items) as necessary.
-enum RolloutWriteOp {
+pub(super) enum RolloutWriteOp {
     AppendItems(Vec<RolloutItem>),
     Persist,
     Flush,
@@ -315,6 +336,15 @@ async fn write_and_project(
     // shutdown/discard/delete removes it. Keep the lookup defensive so late writes fail after
     // teardown.
     let _live_writer_guard = store.live_writer_locks.lock(thread_id).await;
+    write_and_project_locked(store, thread_id, write_op, &_live_writer_guard).await
+}
+
+pub(super) async fn write_and_project_locked(
+    store: &LocalThreadStore,
+    thread_id: ThreadId,
+    write_op: RolloutWriteOp,
+    _live_writer_guard: &OwnedMutexGuard<()>,
+) -> ThreadStoreResult<()> {
     let (recorder, rollout_id, history_mode) = live_writer_parts(store, thread_id).await?;
     let sync_rollout_path = matches!(&write_op, RolloutWriteOp::Persist | RolloutWriteOp::Flush);
     let write_op = match write_op {
@@ -345,6 +375,7 @@ async fn write_and_project(
             warn!("failed to project durable rollout for {thread_id}: {err}");
         }
     }
+    search_index::project_live_rollout(store, thread_id, rollout_id, recorder.rollout_path()).await;
     if sync_rollout_path {
         sync_materialized_rollout_path(store, thread_id, recorder.rollout_path()).await?;
     }

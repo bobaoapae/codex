@@ -18,7 +18,8 @@ use crate::SortDirection;
 
 const PROJECT_SELECT: &str = "SELECT projects.*,
     (SELECT MAX(recency_at_ms) FROM threads
-     WHERE project_id = projects.id AND archived = 0) AS recency_at_ms
+     WHERE project_id = projects.id AND archived = 0
+       AND visible = 1 AND tombstoned_at IS NULL) AS recency_at_ms
     FROM projects";
 
 impl StateRuntime {
@@ -350,13 +351,19 @@ impl StateRuntime {
             return Ok(None);
         }
         let active_thread_ids = sqlx::query_scalar::<_, String>(
-            "SELECT id FROM threads WHERE project_id = ? AND archived = 0 ORDER BY id ASC",
+            "SELECT id FROM threads
+             WHERE project_id = ? AND archived = 0
+               AND visible = 1 AND tombstoned_at IS NULL
+             ORDER BY id ASC",
         )
         .bind(id)
         .fetch_all(&mut *tx)
         .await?;
         let archived_thread_ids = sqlx::query_scalar::<_, String>(
-            "SELECT id FROM threads WHERE project_id = ? AND archived = 1 ORDER BY id ASC",
+            "SELECT id FROM threads
+             WHERE project_id = ? AND archived = 1
+               AND visible = 1 AND tombstoned_at IS NULL
+             ORDER BY id ASC",
         )
         .bind(id)
         .fetch_all(&mut *tx)

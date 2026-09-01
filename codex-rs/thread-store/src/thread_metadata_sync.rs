@@ -660,6 +660,9 @@ mod tests {
                         },
                     },
                 },
+                runtime_build_info: None,
+                config_layer_revision: None,
+                runtime_feature_revision: None,
             },
         ));
 

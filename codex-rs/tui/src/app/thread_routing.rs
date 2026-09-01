@@ -665,9 +665,12 @@ impl App {
                 final_output_json_schema,
                 collaboration_mode,
                 personality,
+                approved_plan,
             } => {
                 let mut should_start_turn = true;
-                if let Some(turn_id) = self.active_turn_id_for_thread(thread_id).await {
+                if approved_plan.is_none()
+                    && let Some(turn_id) = self.active_turn_id_for_thread(thread_id).await
+                {
                     let mut steer_turn_id = turn_id;
                     let mut retried_after_turn_mismatch = false;
                     loop {
@@ -758,6 +761,7 @@ impl App {
                             collaboration_mode.clone(),
                             *personality,
                             final_output_json_schema.clone(),
+                            approved_plan.clone(),
                         )
                         .await?;
                     if self.active_thread_id == Some(thread_id)

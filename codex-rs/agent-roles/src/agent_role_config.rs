@@ -35,6 +35,17 @@ pub struct ResolvedAgentRoleFile {
     pub config: TomlValue,
 }
 
+impl ResolvedAgentRoleFile {
+    /// Resolve the closed mutation capability for this role declaration.
+    ///
+    /// The parsed configuration remains independent from authority. Custom
+    /// role names therefore stay read-only unless a future typed capability
+    /// declaration is introduced explicitly.
+    pub fn capabilities(&self) -> crate::AgentRoleCapabilities {
+        crate::capabilities_for_canonical_role(&self.role_name)
+    }
+}
+
 pub fn parse_agent_role_file_contents(
     contents: &str,
     role_file_label: &Path,

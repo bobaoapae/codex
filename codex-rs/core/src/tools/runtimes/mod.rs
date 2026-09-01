@@ -31,6 +31,7 @@ use std::path::Path;
 
 pub(crate) mod apply_patch;
 pub(crate) mod unified_exec;
+pub(crate) mod unified_exec_ownership;
 pub(crate) mod zsh_fork;
 
 pub(crate) fn exec_env_for_sandbox_permissions(

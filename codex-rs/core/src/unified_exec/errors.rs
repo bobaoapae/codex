@@ -3,6 +3,8 @@ use codex_utils_path_uri::PathUri;
 use std::num::NonZeroUsize;
 use thiserror::Error;
 
+use super::BuildAdmissionBusy;
+
 #[derive(Debug, Error)]
 pub(crate) enum UnifiedExecError {
     #[error("Failed to create unified exec process: {message}")]
@@ -22,6 +24,8 @@ pub(crate) enum UnifiedExecError {
     StdinClosed,
     #[error("missing command line for unified exec request")]
     MissingCommandLine,
+    #[error("{busy}")]
+    BuildAdmissionBusy { busy: BuildAdmissionBusy },
     #[error("Command denied by sandbox: {message}")]
     SandboxDenied {
         message: String,
@@ -40,6 +44,10 @@ impl UnifiedExecError {
 
     pub(crate) fn process_failed(message: String) -> Self {
         Self::ProcessFailed { message }
+    }
+
+    pub(crate) fn build_admission_busy(busy: BuildAdmissionBusy) -> Self {
+        Self::BuildAdmissionBusy { busy }
     }
 
     pub(crate) fn sandbox_denied(message: String, output: ExecToolCallOutput) -> Self {

@@ -141,6 +141,7 @@ async fn extract_metadata_from_rollout_uses_session_meta() {
         subagent_history_start_ordinal: None,
         multi_agent_version: None,
         context_window: None,
+        ..SessionMeta::default()
     };
     let session_meta_line = SessionMetaLine {
         meta: session_meta,
@@ -240,6 +241,7 @@ async fn extract_metadata_from_rollout_returns_latest_memory_mode() {
         subagent_history_start_ordinal: None,
         multi_agent_version: None,
         context_window: None,
+        ..SessionMeta::default()
     };
     let polluted_meta = SessionMeta {
         memory_mode: Some("polluted".to_string()),
@@ -581,6 +583,7 @@ fn write_rollout_in_sessions_with_cwd(
         subagent_history_start_ordinal: None,
         multi_agent_version: None,
         context_window: None,
+        ..SessionMeta::default()
     };
     let session_meta_line = SessionMetaLine {
         meta: session_meta,

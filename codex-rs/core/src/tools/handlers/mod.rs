@@ -1,4 +1,5 @@
 pub(crate) mod apply_patch;
+mod apply_patch_ownership;
 pub(crate) mod apply_patch_spec;
 mod claude_accounts;
 pub(crate) mod claude_accounts_spec;

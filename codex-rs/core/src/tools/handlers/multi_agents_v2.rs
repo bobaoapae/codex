@@ -32,6 +32,9 @@ use serde_json::Value as JsonValue;
 pub(crate) use followup_task::Handler as FollowupTaskHandler;
 pub(crate) use interrupt_agent::Handler as InterruptAgentHandler;
 pub(crate) use list_agents::Handler as ListAgentsHandler;
+pub(crate) use ownership::GrantAgentOwnershipHandler;
+pub(crate) use ownership::OverrideAgentOwnershipHandler;
+pub(crate) use ownership::ReleaseAgentOwnershipHandler;
 pub(crate) use send_message::Handler as SendMessageHandler;
 pub(crate) use spawn::Handler as SpawnAgentHandler;
 pub(crate) use wait::Handler as WaitAgentHandler;
@@ -41,9 +44,12 @@ mod followup_task;
 mod interrupt_agent;
 mod list_agents;
 mod message_tool;
+mod ownership;
+mod ownership_spec;
 mod send_message;
 mod spawn;
 pub(crate) mod wait;
+mod wait_state;
 
 pub(crate) async fn emit_sub_agent_activity(
     session: &crate::session::session::Session,
@@ -93,15 +99,25 @@ fn non_empty_message(message: String) -> Result<String, FunctionCallError> {
 pub(crate) fn require_readable_message_form(
     config: &crate::config::Config,
     form: ToolMessageForm,
+    source: &crate::tools::context::ToolCallSource,
     tool_name: &str,
 ) -> Result<(), FunctionCallError> {
-    // FORK: `chatgpt_web` children cannot decrypt either.
+    require_readable_message_form_for_locality(is_locally_served(config), form, source, tool_name)
+}
+
+fn require_readable_message_form_for_locality(
+    is_local: bool,
+    form: ToolMessageForm,
+    source: &crate::tools::context::ToolCallSource,
+    tool_name: &str,
+) -> Result<(), FunctionCallError> {
+    // FORK: `chatgpt_web` and Claude children cannot decrypt either.
     if form == ToolMessageForm::Plaintext
-        || !matches!(
-            config.model_provider.wire_api,
-            codex_model_provider_info::WireApi::ClaudeCode
-                | codex_model_provider_info::WireApi::ChatGptWeb
+        || matches!(
+            source,
+            crate::tools::context::ToolCallSource::DirectPlaintextMessage
         )
+        || !is_local
     {
         return Ok(());
     }

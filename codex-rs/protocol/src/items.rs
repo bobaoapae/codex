@@ -714,6 +714,8 @@ impl TurnItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_extension_items::receipt::ReceiptAttachedItem;
+    use codex_extension_items::receipt::ReceiptStatus;
     use codex_extension_items::sleep::SleepItem;
     use pretty_assertions::assert_eq;
     use serde_json::json;
@@ -732,6 +734,37 @@ mod tests {
                 "kind": "clock.sleep",
                 "id": "sleep-1",
                 "durationMs": 1_000,
+            })
+        );
+    }
+
+    #[test]
+    fn receipt_extension_item_preserves_id_and_canonical_payload() {
+        let receipt = ReceiptAttachedItem::new(
+            "receipt-1",
+            7,
+            "future.check",
+            "smoke",
+            ReceiptStatus::Informational,
+            "2026-08-31T12:00:00Z",
+            "tester",
+        )
+        .expect("valid receipt");
+        let item = TurnItem::Extension(ExtensionItem::ReceiptAttached(receipt));
+
+        assert_eq!(item.id(), "receipt-1");
+        assert_eq!(
+            serde_json::to_value(item).expect("serialize receipt extension item"),
+            json!({
+                "type": "Extension",
+                "kind": "receipt.attached",
+                "receiptId": "receipt-1",
+                "schemaVersion": 7,
+                "receiptKind": "future.check",
+                "subject": "smoke",
+                "status": "informational",
+                "createdAt": "2026-08-31T12:00:00Z",
+                "source": "tester",
             })
         );
     }

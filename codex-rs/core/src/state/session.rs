@@ -19,6 +19,7 @@ use crate::session::session::SessionConfiguration;
 use crate::session::time_reminder::CurrentTimeReminderState;
 use crate::session_startup_prewarm::SessionStartupPrewarmHandle;
 use codex_history::ResponseItemEnvelope;
+use codex_protocol::error::HistoryRecoveryReason;
 use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
@@ -47,6 +48,10 @@ pub(crate) struct SessionState {
     pub(crate) active_connector_selection: HashSet<String>,
     pub(crate) pending_session_start_sources: VecDeque<codex_hooks::SessionStartSource>,
     granted_permissions_by_environment_id: HashMap<String, AdditionalPermissionProfile>,
+    /// A poisoned persisted history requires explicit recovery before another
+    /// model request is admitted. This marker survives turn completion and is
+    /// hydrated from the rollout on cold resume.
+    history_recovery_required: Option<HistoryRecoveryReason>,
     next_turn_is_first: bool,
 }
 
@@ -80,6 +85,7 @@ impl SessionState {
             active_connector_selection: HashSet::new(),
             pending_session_start_sources: VecDeque::new(),
             granted_permissions_by_environment_id: HashMap::new(),
+            history_recovery_required: None,
             next_turn_is_first: true,
         }
     }
@@ -101,6 +107,14 @@ impl SessionState {
         previous_turn_settings: Option<PreviousTurnSettings>,
     ) {
         self.previous_turn_settings = previous_turn_settings;
+    }
+
+    pub(crate) fn history_recovery_required(&self) -> Option<HistoryRecoveryReason> {
+        self.history_recovery_required
+    }
+
+    pub(crate) fn set_history_recovery_required(&mut self, reason: HistoryRecoveryReason) {
+        self.history_recovery_required = Some(reason);
     }
 
     pub(crate) fn set_next_turn_is_first(&mut self, value: bool) {

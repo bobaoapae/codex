@@ -153,6 +153,16 @@ impl ConfiguredHandler {
         self.execution_mode() == HookExecutionMode::Sync
     }
 
+    /// Evidence is accepted only from a synchronously dispatched local hook.
+    ///
+    /// Discovery admits local handlers only when their trust state is managed
+    /// or trusted, unless the caller explicitly opted into bypassing that
+    /// gate. Executor-scoped handlers are always asynchronous and therefore
+    /// cannot contribute host-attached evidence.
+    pub(crate) fn can_emit_evidence(&self) -> bool {
+        self.can_apply_control_effects() && matches!(self.source_path, HandlerSourcePath::Local(_))
+    }
+
     pub fn run_id(&self) -> String {
         format!(
             "{}:{}:{}",
@@ -179,7 +189,7 @@ impl ConfiguredHandler {
         }
     }
 
-    fn handler_type(&self) -> HookHandlerType {
+    pub(crate) fn handler_type(&self) -> HookHandlerType {
         match &self.kind {
             ConfiguredHandlerKind::Command { .. } => HookHandlerType::Command,
             ConfiguredHandlerKind::McpTool { .. } => HookHandlerType::McpTool,

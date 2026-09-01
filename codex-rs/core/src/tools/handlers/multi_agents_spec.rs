@@ -315,7 +315,7 @@ pub fn create_wait_agent_tool_v1(options: WaitAgentTimeoutOptions) -> ToolSpec {
 pub fn create_wait_agent_tool_v2(options: WaitAgentTimeoutOptions) -> ToolSpec {
     ToolSpec::Function(ResponsesApiTool {
         name: "wait_agent".to_string(),
-        description: "Wait for a mailbox update from a live agent, including queued messages and final-status notifications. Pass `targets` to wake only for specific agents; without it any agent's mail ends the wait. The wait also ends early when new user input is steered into the active turn. Does not return the content; returns a summary plus what each live agent was last observed doing. Prefer one long wait per round over repeated short ones, and read `agents` before deciding an agent is stuck."
+        description: "Wait for a causal update from a live agent, including queued messages, status changes, terminal status, and quiet terminals that need attention. Pass `targets` to wake only for specific agents; relative names and their canonical paths (for example `worker` and `/root/worker`) are equivalent and are deduplicated. The response returns canonical target paths and a root-scoped `revision`; use that path and pass `afterRevision` on a later wait instead of repeating a wait with the same revision. Without targets, any agent's update ends the wait. The wait also ends early when new user input is steered into the active turn. Does not return the content or message body. Prefer one long wait per round, and read target idle/status details before deciding an agent is stuck."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -336,7 +336,7 @@ pub fn create_list_agents_tool() -> ToolSpec {
     ToolSpec::Function(ResponsesApiTool {
         name: "list_agents".to_string(),
         description:
-            "List live agents in the current root thread tree. Optionally filter by task-path prefix."
+            "List known non-closed agents in the current root thread tree, including terminal agents retained for follow-up or resume. Optionally filter by task-path prefix."
                 .to_string(),
         strict: false,
         defer_loading: None,
@@ -509,6 +509,16 @@ fn list_agents_output_schema() -> Value {
                             "description": "Last known status of the agent.",
                             "allOf": [agent_status_output_schema()]
                         },
+                        "status": {
+                            "type": "string",
+                            "enum": ["running", "waitingForTool", "waitingForApproval", "waitingForUser", "completed", "failed", "interrupted", "notFound"],
+                            "description": "Typed lifecycle projection shared with wait_agent."
+                        },
+                        "generation": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "Logical follow-up generation for this agent identity."
+                        },
                         // FORK: enough to decide whether an agent needs help,
                         // needs waiting on, or is genuinely stuck.
                         "agent_role": {
@@ -532,10 +542,10 @@ fn list_agents_output_schema() -> Value {
                             "description": "Seconds since that observation. Small means the agent is working, not stuck."
                         }
                     },
-                    "required": ["agent_name", "agent_status"],
+                    "required": ["agent_name", "agent_status", "status", "generation"],
                     "additionalProperties": false
                 },
-                "description": "Live agents visible in the current root thread tree."
+                "description": "Known non-closed agents visible in the current root thread tree."
             }
         },
         "required": ["agents"],
@@ -583,7 +593,61 @@ fn wait_output_schema_v2() -> Value {
             },
             "timed_out": {
                 "type": "boolean",
-                "description": "Whether the wait call returned because no mailbox update arrived before the timeout."
+                "description": "Whether the wait call returned because no matching causal update arrived before the timeout."
+            },
+            "revision": {
+                "type": "integer",
+                "description": "Root-scoped causal revision. A timeout with no matching progress preserves the input revision."
+            },
+            "reason": {
+                "type": "string",
+                "enum": ["message", "statusChanged", "terminal", "timeout", "needsAttention"],
+                "description": "The matching causal event or timeout disposition."
+            },
+            "targets": {
+                "type": "array",
+                "description": "Typed status snapshots for the requested canonical targets.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "canonicalPath": { "type": "string" },
+                        "status": {
+                            "type": "string",
+                            "enum": ["running", "waitingForTool", "waitingForApproval", "waitingForUser", "completed", "failed", "interrupted", "notFound"]
+                        },
+                        "generation": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "Logical follow-up generation for this target."
+                        },
+                        "lastActivityAt": { "type": ["integer", "null"] },
+                        "idleMs": { "type": ["integer", "null"] },
+                        "waitingTerminal": {
+                            "type": ["object", "null"],
+                            "properties": {
+                                "sessionId": { "type": "string" },
+                                "pid": { "type": "integer" },
+                                "command": { "type": "string" },
+                                "startedAt": { "type": "integer", "minimum": 0 },
+                                "elapsedMs": { "type": "integer", "minimum": 0 },
+                                "lastActivityAt": { "type": "integer", "minimum": 0 },
+                                "lastOutputAt": { "type": ["integer", "null"], "minimum": 0 },
+                                "lastOutputPreview": { "type": ["string", "null"] },
+                                "lastOutputBytes": { "type": "integer", "minimum": 0 },
+                                "outputBytes": { "type": "integer", "minimum": 0 },
+                                "state": {
+                                    "type": "string",
+                                    "enum": ["running", "waiting", "needsAttention", "exited", "failed", "cancelled"]
+                                }
+                            },
+                            "required": ["sessionId", "pid", "command", "startedAt", "elapsedMs", "lastActivityAt", "lastOutputAt", "lastOutputPreview", "lastOutputBytes", "outputBytes", "state"],
+                            "additionalProperties": false
+                        },
+                        "waitingTool": { "type": ["string", "null"] }
+                    },
+                    "required": ["canonicalPath", "status", "generation", "lastActivityAt", "idleMs", "waitingTerminal", "waitingTool"],
+                    "additionalProperties": false
+                }
             },
             // FORK: on a timeout the parent used to learn nothing at all, so it
             // could not tell a working child from a wedged one.
@@ -594,15 +658,20 @@ fn wait_output_schema_v2() -> Value {
                     "type": "object",
                     "properties": {
                         "agent_name": { "type": "string" },
+                        "status": {
+                            "type": "string",
+                            "enum": ["running", "waitingForTool", "waitingForApproval", "waitingForUser", "completed", "failed", "interrupted", "notFound"]
+                        },
+                        "generation": { "type": "integer", "minimum": 0 },
                         "last_activity": { "type": ["string", "null"] },
                         "idle_seconds": { "type": ["integer", "null"] }
                     },
-                    "required": ["agent_name"],
+                    "required": ["agent_name", "status", "generation"],
                     "additionalProperties": false
                 }
             }
         },
-        "required": ["message", "timed_out", "agents"],
+        "required": ["message", "timed_out", "revision", "reason", "targets", "agents"],
         "additionalProperties": false
     })
 }
@@ -801,7 +870,7 @@ Requests for depth, thoroughness, research, investigation, or detailed codebase 
 - For code-edit subtasks, decompose work so each delegated task has a disjoint write set.
 
 ### After you delegate
-- Call wait_agent very sparingly. Only call wait_agent when you need the result immediately for the next critical-path step and you are blocked until it returns.
+- Call wait_agent very sparingly. Only call wait_agent when you need the result immediately for the next critical-path step and you are blocked until it returns. Reuse a returned canonical target path and pass its returned revision as `afterRevision`; do not repeat a wait with the same revision.
 - Do not redo delegated subagent tasks yourself; focus on integrating results or tackling non-overlapping work.
 - While the subagent is running in the background, do meaningful non-overlapping work immediately.
 - Do not repeatedly wait by reflex.
@@ -962,6 +1031,12 @@ fn wait_agent_tool_parameters_v2(options: WaitAgentTimeoutOptions) -> JsonSchema
                         .to_string(),
                 ),
             ),
+        ),
+        (
+            "afterRevision".to_string(),
+            JsonSchema::number(Some(
+                "Only updates with a root-scoped revision greater than this value wake the wait. Use the revision returned by the previous wait.".to_string(),
+            )),
         ),
     ]);
 

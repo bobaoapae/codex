@@ -42,6 +42,8 @@ pub(crate) struct PostToolUseOutput {
     pub invalid_block_reason: Option<String>,
     pub additional_context: Option<String>,
     pub invalid_reason: Option<String>,
+    pub evidence: Option<crate::schema::PostToolUseEvidenceWire>,
+    pub invalid_evidence: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -205,7 +207,7 @@ pub(crate) fn parse_permission_request(stdout: &str) -> Option<PermissionRequest
 }
 
 pub(crate) fn parse_post_tool_use(stdout: &str) -> Option<PostToolUseOutput> {
-    let wire: PostToolUseCommandOutputWire = parse_json(stdout)?;
+    let (wire, invalid_evidence) = parse_post_tool_use_wire(stdout)?;
     let universal = UniversalOutput::from(wire.universal);
     let invalid_reason = unsupported_post_tool_use_universal(&universal).or_else(|| {
         wire.hook_specific_output
@@ -224,6 +226,18 @@ pub(crate) fn parse_post_tool_use(stdout: &str) -> Option<PostToolUseOutput> {
     } else {
         None
     };
+    let evidence_wire = wire
+        .hook_specific_output
+        .as_ref()
+        .and_then(|output| output.evidence.clone());
+    let (evidence, invalid_evidence_from_validation) = match evidence_wire {
+        Some(evidence) => match crate::events::evidence::validate_wire(&evidence) {
+            Ok(()) => (Some(evidence), false),
+            Err(_) => (None, true),
+        },
+        None => (None, false),
+    };
+    let invalid_evidence = invalid_evidence || invalid_evidence_from_validation;
     let additional_context = wire
         .hook_specific_output
         .and_then(|output| output.additional_context);
@@ -235,7 +249,42 @@ pub(crate) fn parse_post_tool_use(stdout: &str) -> Option<PostToolUseOutput> {
         invalid_block_reason,
         additional_context,
         invalid_reason,
+        evidence,
+        invalid_evidence,
     })
+}
+
+fn parse_post_tool_use_wire(stdout: &str) -> Option<(PostToolUseCommandOutputWire, bool)> {
+    let value = parse_object_value(stdout)?;
+    match serde_json::from_value::<PostToolUseCommandOutputWire>(value.clone()) {
+        Ok(wire) => Some((wire, false)),
+        Err(_) if post_tool_use_evidence_present(&value) => {
+            let mut without_evidence = value;
+            without_evidence
+                .get_mut("hookSpecificOutput")
+                .and_then(serde_json::Value::as_object_mut)
+                .map(|output| output.remove("evidence"))?;
+            let wire = serde_json::from_value(without_evidence).ok()?;
+            Some((wire, true))
+        }
+        Err(_) => None,
+    }
+}
+
+fn parse_object_value(stdout: &str) -> Option<serde_json::Value> {
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    value.is_object().then_some(value)
+}
+
+fn post_tool_use_evidence_present(value: &serde_json::Value) -> bool {
+    value
+        .get("hookSpecificOutput")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|output| output.contains_key("evidence"))
 }
 
 pub(crate) fn parse_pre_compact(stdout: &str) -> Option<StatelessHookOutput> {

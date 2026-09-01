@@ -10,16 +10,24 @@ mod paginated_fork;
 mod pending_thread_metadata;
 mod projects;
 mod read_thread;
+mod receipt_append;
+mod receipt_projection;
+mod recovery;
+pub(crate) mod recovery_scan;
 mod revert_thread;
 mod rollout_migration;
 // This lands before the reader PRs that consume the shared lineage resolver.
 #[allow(dead_code)]
 mod rollout_lineage;
+mod search_index;
+mod search_index_extractor;
+mod search_index_projection;
 mod search_threads;
 mod thread_history;
 mod thread_history_materialization;
 mod thread_rollout_resolver;
 mod thread_sections;
+mod tombstone_thread;
 mod unarchive_thread;
 mod update_thread_metadata;
 mod writer_lock;
@@ -27,6 +35,9 @@ mod writer_lock;
 #[cfg(test)]
 #[path = "pending_thread_metadata_tests.rs"]
 mod pending_thread_metadata_tests;
+#[cfg(test)]
+#[path = "receipt_append_tests.rs"]
+mod receipt_append_tests;
 #[cfg(test)]
 mod test_support;
 
@@ -46,6 +57,8 @@ use tokio::sync::OwnedRwLockReadGuard;
 use tokio::sync::OwnedRwLockWriteGuard;
 use tokio::sync::RwLock;
 
+use crate::AppendReceiptOutcome;
+use crate::AppendReceiptParams;
 use crate::AppendThreadItemsParams;
 use crate::ArchiveThreadParams;
 use crate::ArchiveThreadsParams;
@@ -73,6 +86,12 @@ use crate::PreparedFork;
 use crate::ProjectMoveOutcome;
 use crate::ReadThreadByRolloutPathParams;
 use crate::ReadThreadParams;
+use crate::RecoveryCreateParams;
+use crate::RecoveryCreateResult;
+use crate::RecoveryPreview;
+use crate::RecoveryPreviewParams;
+use crate::RecoveryQuiescenceAttestation;
+use crate::RecoveryQuiescenceParams;
 use crate::RenameThreadSectionParams;
 use crate::ResumeThreadParams;
 use crate::RevertThreadParams;
@@ -94,6 +113,8 @@ use crate::ThreadStoreError;
 use crate::ThreadStoreFuture;
 use crate::ThreadStoreResult;
 use crate::TimelinePage;
+use crate::TombstoneThreadParams;
+use crate::TombstoneThreadsParams;
 use crate::TurnPage;
 use crate::UpdateProjectParams;
 use crate::UpdateThreadMetadataParams;
@@ -101,10 +122,21 @@ use crate::UpdatedProject;
 use crate::local::writer_lock::WriterLockCoordinator;
 use crate::local::writer_lock::WriterLockGuard;
 
+pub use rollout_migration::FROZEN_PREVIEW_SCHEMA_VERSION;
+pub use rollout_migration::FrozenPreview;
+pub use rollout_migration::RolloutMigrationApplyReceipt;
 pub use rollout_migration::RolloutMigrationFailureReason;
 pub use rollout_migration::RolloutMigrationMode;
 pub use rollout_migration::RolloutMigrationOptions;
 pub use rollout_migration::RolloutMigrationOutcome;
+pub use rollout_migration::RolloutMigrationPreviewCounts;
+pub use rollout_migration::RolloutMigrationPreviewEntry;
+pub use rollout_migration::RolloutMigrationPreviewOptions;
+pub use rollout_migration::RolloutMigrationPreviewReport;
+pub use rollout_migration::RolloutMigrationPreviewRepresentation;
+pub use rollout_migration::RolloutMigrationPreviewStatus;
+pub use rollout_migration::RolloutMigrationPreviewThreadClass;
+pub use rollout_migration::RolloutMigrationPreviewWatermark;
 pub use rollout_migration::RolloutMigrationProgress;
 pub use rollout_migration::RolloutMigrationReport;
 pub use rollout_migration::RolloutMigrationStatus;
@@ -131,6 +163,7 @@ pub struct LocalThreadStore {
     writer_lock_coordinator: Arc<WriterLockCoordinator>,
     state_db: Option<StateDbHandle>,
     thread_history_db: Arc<OnceCell<sqlx::SqlitePool>>,
+    search_index_cursors: Arc<Mutex<HashMap<ThreadId, search_index::LiveSearchProjectionState>>>,
 }
 
 struct LiveRecorderEntry {
@@ -244,6 +277,7 @@ impl LocalThreadStore {
             writer_lock_coordinator,
             state_db,
             thread_history_db: Arc::new(OnceCell::new()),
+            search_index_cursors: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -466,6 +500,13 @@ impl ThreadStore for LocalThreadStore {
         Box::pin(async move { live_writer::append_items(self, params).await })
     }
 
+    fn append_receipt(
+        &self,
+        params: AppendReceiptParams,
+    ) -> ThreadStoreFuture<'_, AppendReceiptOutcome> {
+        Box::pin(async move { receipt_append::append_receipt(self, params).await })
+    }
+
     fn persist_thread(
         &self,
         thread_id: ThreadId,
@@ -502,6 +543,27 @@ impl ThreadStore for LocalThreadStore {
 
     fn prepare_fork(&self, params: PrepareForkParams) -> ThreadStoreFuture<'_, PreparedFork> {
         Box::pin(async move { paginated_fork::prepare(self, params).await })
+    }
+
+    fn preview_recovery(
+        &self,
+        params: RecoveryPreviewParams,
+    ) -> ThreadStoreFuture<'_, RecoveryPreview> {
+        Box::pin(async move { recovery::preview(self, params).await })
+    }
+
+    fn attest_recovery_quiescence(
+        &self,
+        params: RecoveryQuiescenceParams,
+    ) -> ThreadStoreFuture<'_, RecoveryQuiescenceAttestation> {
+        Box::pin(async move { recovery::attest_quiescence(self, params).await })
+    }
+
+    fn create_recovery(
+        &self,
+        params: RecoveryCreateParams,
+    ) -> ThreadStoreFuture<'_, RecoveryCreateResult> {
+        Box::pin(async move { recovery::create(self, params).await })
     }
 
     fn revert_thread(&self, params: RevertThreadParams) -> ThreadStoreFuture<'_, ()> {
@@ -673,6 +735,14 @@ impl ThreadStore for LocalThreadStore {
 
     fn delete_threads(&self, params: DeleteThreadsParams) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move { delete_thread::delete_threads(self, params).await })
+    }
+
+    fn tombstone_thread(&self, params: TombstoneThreadParams) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async move { tombstone_thread::tombstone_thread(self, params.thread_id).await })
+    }
+
+    fn tombstone_threads(&self, params: TombstoneThreadsParams) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async move { tombstone_thread::tombstone_threads(self, params).await })
     }
 }
 

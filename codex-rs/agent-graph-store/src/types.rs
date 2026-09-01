@@ -1,3 +1,4 @@
+use codex_protocol::ThreadId;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -9,6 +10,31 @@ pub enum ThreadSpawnEdgeStatus {
     Open,
     /// The child thread has been closed from the parent/child graph's perspective.
     Closed,
+}
+
+/// A single persisted spawn edge without traversal metadata.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadSpawnEdge {
+    pub parent_id: ThreadId,
+    pub child_id: ThreadId,
+    pub status: ThreadSpawnEdgeStatus,
+    /// Reserved for state backends that persist edge creation timestamps.
+    pub created_at: Option<i64>,
+}
+
+/// A spawn edge annotated with its deterministic position in a root traversal.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadSpawnEdgeDetail {
+    pub parent_id: ThreadId,
+    pub child_id: ThreadId,
+    pub status: ThreadSpawnEdgeStatus,
+    pub created_at: Option<i64>,
+    /// Number of edges between the root and this child. Direct children are depth one.
+    pub depth: u32,
+    /// Zero-based breadth-first traversal order, stable for a fixed graph.
+    pub order: u64,
 }
 
 #[cfg(test)]

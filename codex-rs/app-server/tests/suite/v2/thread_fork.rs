@@ -108,6 +108,9 @@ async fn list_threads(mcp: &mut TestAppServer) -> Result<ThreadListResponse> {
             search_term: None,
             parent_thread_id: None,
             ancestor_thread_id: None,
+            thread_classes: None,
+            root_thread_id: None,
+            terminal_outcomes: None,
         })
         .await?;
     let list_resp: JSONRPCResponse = timeout(

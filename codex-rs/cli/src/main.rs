@@ -50,6 +50,7 @@ mod account_cmd;
 mod app_cmd;
 mod chatgpt_web_cmd;
 mod cloud_config;
+mod debug_context;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod desktop_app;
 mod doctor;
@@ -59,6 +60,7 @@ mod mcp_cmd;
 mod migrate_rollouts;
 mod plugin_cmd;
 mod queue_cmd;
+mod recovery_cmd;
 mod remote_control_cmd;
 #[cfg(target_os = "windows")]
 mod sandbox_setup;
@@ -67,6 +69,7 @@ mod state_db_recovery;
 mod wsl_paths;
 
 use crate::account_cmd::AccountCli;
+use crate::debug_context::DebugContextCommand;
 use crate::mcp_cmd::McpCli;
 use crate::plugin_cmd::PluginCli;
 use crate::plugin_cmd::PluginSubcommand;
@@ -206,6 +209,9 @@ enum Subcommand {
     /// Queue a message for an existing session.
     Queue(QueueCommand),
 
+    /// Preview or create a replacement lineage for a corrupted session.
+    Recovery(recovery_cmd::RecoveryCommand),
+
     /// Archive a saved session by id or session name.
     Archive(SessionArchiveCommand),
 
@@ -263,6 +269,9 @@ enum DebugSubcommand {
 
     /// Render the model-visible prompt input list as JSON.
     PromptInput(DebugPromptInputCommand),
+
+    /// Inspect the model-visible context as JSON.
+    Context(DebugContextCommand),
 
     /// Replay a rollout trace bundle and write reduced state JSON.
     #[clap(hide = true)]
@@ -1048,6 +1057,7 @@ fn stage_str(stage: Stage) -> &'static str {
 }
 
 fn main() -> anyhow::Result<()> {
+    codex_build_info::initialize!();
     let remote_control_disabled = codex_app_server::take_remote_control_disabled_env();
     arg0_dispatch_or_else(move |arg0_paths: Arg0DispatchPaths| async move {
         cli_main(arg0_paths, remote_control_disabled).await?;
@@ -1462,6 +1472,14 @@ async fn cli_main(
             .await?;
             println!("{output}");
         }
+        Some(Subcommand::Recovery(command)) => {
+            reject_remote_mode_for_subcommand(
+                root_remote.as_deref(),
+                root_remote_auth_token_env.as_deref(),
+                "recovery",
+            )?;
+            recovery_cmd::run(command, root_config_overrides)?;
+        }
         Some(Subcommand::Delete(DeleteCommand { session, force })) => {
             let action = delete_action(&session.target, force)?;
             let output = run_session_archive_cli_command(
@@ -1734,6 +1752,15 @@ async fn cli_main(
                 )
                 .await?;
             }
+            DebugSubcommand::Context(cmd) => {
+                reject_remote_mode_for_subcommand(
+                    root_remote.as_deref(),
+                    root_remote_auth_token_env.as_deref(),
+                    "debug context",
+                )?;
+                debug_context::run(cmd, root_config_overrides, interactive, arg0_paths.clone())
+                    .await?;
+            }
             DebugSubcommand::TraceReduce(cmd) => {
                 reject_remote_mode_for_subcommand(
                     root_remote.as_deref(),
@@ -1878,10 +1905,10 @@ fn profile_v2_for_subcommand<'a>(
         | Subcommand::Mcp(_)
         | Subcommand::Sandbox(_)
         | Subcommand::Debug(DebugCommand {
-            subcommand: DebugSubcommand::PromptInput(_),
+            subcommand: DebugSubcommand::PromptInput(_) | DebugSubcommand::Context(_),
         }) => Ok(Some(profile_v2)),
         _ => anyhow::bail!(
-            "--profile only applies to runtime commands and `codex mcp`: `codex`, `codex exec`, `codex review`, `codex resume`, `codex queue`, `codex archive`, `codex delete`, `codex unarchive`, `codex fork`, `codex mcp`, `codex sandbox`, and `codex debug prompt-input`."
+            "--profile only applies to runtime commands and `codex mcp`: `codex`, `codex exec`, `codex review`, `codex resume`, `codex queue`, `codex archive`, `codex delete`, `codex unarchive`, `codex fork`, `codex mcp`, `codex sandbox`, and `codex debug prompt-input` or `codex debug context`."
         ),
     }
 }
@@ -2454,6 +2481,7 @@ fn unsupported_subcommand_name_for_strict_config(
         | Some(Subcommand::ExecServer(_))
         | Some(Subcommand::Resume(_))
         | Some(Subcommand::Queue(_))
+        | Some(Subcommand::Recovery(_))
         | Some(Subcommand::Archive(_))
         | Some(Subcommand::Delete(_))
         | Some(Subcommand::Unarchive(_))
@@ -3204,6 +3232,12 @@ mod tests {
             Some("work")
         );
         assert_eq!(
+            profile_v2_for_args(&["codex", "--profile", "work", "debug", "context"])
+                .expect("debug context supports profile-v2")
+                .as_deref(),
+            Some("work")
+        );
+        assert_eq!(
             profile_v2_for_args(&["codex", "--profile", "work", "mcp", "list"])
                 .expect("mcp supports profile-v2")
                 .as_deref(),
@@ -3486,6 +3520,35 @@ mod tests {
             cmd.images,
             vec![PathBuf::from("/tmp/a.png"), PathBuf::from("/tmp/b.png")]
         );
+    }
+
+    #[test]
+    fn debug_context_parses_prompt_images_and_preview_flag() {
+        let cli = MultitoolCli::try_parse_from([
+            "codex",
+            "debug",
+            "context",
+            "hello",
+            "--image",
+            "/tmp/a.png,/tmp/b.png",
+            "--include-preview",
+        ])
+        .expect("parse");
+
+        let Some(Subcommand::Debug(DebugCommand {
+            subcommand: DebugSubcommand::Context(command),
+        })) = cli.subcommand
+        else {
+            panic!("expected debug context subcommand");
+        };
+
+        assert_eq!(command.prompt.as_deref(), Some("hello"));
+        assert_eq!(
+            command.images,
+            vec![PathBuf::from("/tmp/a.png"), PathBuf::from("/tmp/b.png")]
+        );
+        assert!(command.include_preview);
+        assert!(command.thread_id.is_none());
     }
 
     #[test]

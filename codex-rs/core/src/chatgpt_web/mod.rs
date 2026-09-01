@@ -893,7 +893,11 @@ fn target_to_item(target: &CallTarget, call_id: &str) -> ResponseItem {
             name: name.clone(),
             namespace: namespace.clone(),
             arguments: arguments.to_string(),
-            encrypted_function_args: None,
+            // Calls delivered by the local connector are already plaintext.
+            // Preserve the explicit empty marker so the normal tool router
+            // does not mistake a connector's `message` argument for backend
+            // ciphertext.
+            encrypted_function_args: Some(Vec::new()),
             call_id: call_id.to_string(),
             internal_chat_message_metadata_passthrough: None,
         },
@@ -1658,11 +1662,13 @@ mod tests {
                 namespace,
                 arguments,
                 call_id,
+                encrypted_function_args,
                 ..
             } => {
                 assert_eq!(name, "get_file");
                 assert_eq!(namespace.as_deref(), Some("figma"));
                 assert_eq!(call_id, "call_1");
+                assert_eq!(encrypted_function_args, Some(Vec::new()));
                 // Arguments are re-serialized to the JSON string the loop wants.
                 assert_eq!(
                     serde_json::from_str::<serde_json::Value>(&arguments).unwrap(),

@@ -84,10 +84,83 @@ pub async fn inter_agent_communication(
     communication: InterAgentCommunication,
     start_options: codex_protocol::turn_input::TurnStartOptions,
 ) {
+    // When the durable path was attempted, any failure falls through to the
+    // legacy in-memory delivery below: a message must never be dropped
+    // because the workflow store or thread persistence had a problem. The
+    // per-session `note_mailbox_enqueued` guard keeps the fallback from
+    // double-queueing a message the durable path already delivered.
+    let mut durable_attempted_id: Option<String> = None;
+    if let Some(communication_id) = communication.id.as_ref().map(ToString::to_string)
+        && sess.state_db().is_some()
+    {
+        match crate::agent::mailbox::durable_message_channel_for_session(sess, &communication_id)
+            .await
+        {
+            Ok(Some(codex_state::WorkflowMailboxChannel::Data)) => {
+                match crate::agent::mailbox::deliver_pending(sess).await {
+                    Ok(outcome)
+                        if !outcome
+                            .undecodable_message_ids
+                            .contains(&communication_id) =>
+                    {
+                        crate::agent_communication::emit_agent_communication_receive(
+                            &communication_id,
+                        );
+                        if outcome.has_trigger_turn {
+                            sess.maybe_start_turn_for_pending_work_with_sub_id(sub_id)
+                                .await;
+                        }
+                        return;
+                    }
+                    Ok(_) => {
+                        // This op's own row was dead-lettered as undecodable;
+                        // the op still carries the identical content, so
+                        // deliver it through the legacy path.
+                        warn!(
+                            message_id = %communication_id,
+                            "durable mailbox row was undecodable; delivering op content directly"
+                        );
+                        durable_attempted_id = Some(communication_id);
+                    }
+                    Err(error) => {
+                        warn!(
+                            message_id = %communication_id,
+                            "durable inter-agent mailbox delivery failed; falling back to in-memory delivery: {error}"
+                        );
+                        durable_attempted_id = Some(communication_id);
+                    }
+                }
+            }
+            Ok(Some(codex_state::WorkflowMailboxChannel::Control)) => {
+                warn!(
+                    message_id = %communication_id,
+                    "control mailbox message was not routed through model input"
+                );
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!(
+                    message_id = %communication_id,
+                    "durable inter-agent mailbox lookup failed; falling back to in-memory delivery: {error}"
+                );
+                durable_attempted_id = Some(communication_id);
+            }
+        }
+    }
     let trigger_turn = communication.trigger_turn;
-    sess.input_queue
-        .enqueue_mailbox_communication(communication, start_options)
-        .await;
+    sess.services
+        .agent_control
+        .record_agent_message(&communication.author);
+    let enqueue = match durable_attempted_id.as_deref() {
+        Some(communication_id) => sess.input_queue.note_mailbox_enqueued(communication_id).await,
+        None => true,
+    };
+    if enqueue {
+        sess.input_queue
+            .enqueue_mailbox_communication(communication, start_options)
+            .await;
+    }
     crate::agent_communication::emit_agent_communication_receive(&sub_id);
     if trigger_turn || sess.has_outstanding_durable_sleep() {
         sess.maybe_start_turn_for_pending_work_with_sub_id(sub_id)

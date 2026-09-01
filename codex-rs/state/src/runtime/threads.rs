@@ -53,6 +53,8 @@ SELECT
     threads.git_origin_url
 FROM threads
 WHERE threads.id = ?
+  AND threads.visible = 1
+  AND threads.tombstoned_at IS NULL
             "#,
         )
         .bind(id.to_string())
@@ -121,6 +123,8 @@ WHERE id = ? AND preview = ''
     }
 
     /// Persist or replace the directional parent-child edge for a spawned thread.
+    ///
+    /// Closed edges are terminal and remain closed if a later caller requests Open.
     pub async fn upsert_thread_spawn_edge(
         &self,
         parent_thread_id: ThreadId,
@@ -136,7 +140,10 @@ INSERT INTO thread_spawn_edges (
 ) VALUES (?, ?, ?)
 ON CONFLICT(child_thread_id) DO UPDATE SET
     parent_thread_id = excluded.parent_thread_id,
-    status = excluded.status
+    status = CASE
+        WHEN thread_spawn_edges.status = 'closed' THEN thread_spawn_edges.status
+        ELSE excluded.status
+    END
             "#,
         )
         .bind(parent_thread_id.to_string())
@@ -148,17 +155,90 @@ ON CONFLICT(child_thread_id) DO UPDATE SET
     }
 
     /// Update the persisted lifecycle status of a spawned thread's incoming edge.
+    ///
+    /// A closed edge is terminal and cannot be reopened.
     pub async fn set_thread_spawn_edge_status(
         &self,
         child_thread_id: ThreadId,
         status: crate::DirectionalThreadSpawnEdgeStatus,
     ) -> anyhow::Result<()> {
-        sqlx::query("UPDATE thread_spawn_edges SET status = ? WHERE child_thread_id = ?")
+        sqlx::query(
+            "UPDATE thread_spawn_edges SET status = CASE WHEN status = 'closed' THEN status ELSE ? END WHERE child_thread_id = ?",
+        )
             .bind(status.as_ref())
             .bind(child_thread_id.to_string())
             .execute(self.pool.as_ref())
             .await?;
         Ok(())
+    }
+
+    /// List detailed direct edges for a parent in deterministic child-id order.
+    pub async fn list_thread_spawn_edge_records(
+        &self,
+        parent_thread_id: ThreadId,
+        status: Option<crate::DirectionalThreadSpawnEdgeStatus>,
+    ) -> anyhow::Result<Vec<crate::DirectionalThreadSpawnEdge>> {
+        let mut builder = QueryBuilder::<Sqlite>::new(
+            "SELECT parent_thread_id, child_thread_id, status FROM thread_spawn_edges WHERE parent_thread_id = ",
+        );
+        builder.push_bind(parent_thread_id.to_string());
+        if let Some(status) = status {
+            builder.push(" AND status = ").push_bind(status.to_string());
+        }
+        builder.push(" ORDER BY child_thread_id");
+
+        let rows = builder.build().fetch_all(self.pool.as_ref()).await?;
+        rows.into_iter()
+            .map(|row| {
+                let parent_thread_id =
+                    ThreadId::try_from(row.try_get::<String, _>("parent_thread_id")?)?;
+                let child_thread_id =
+                    ThreadId::try_from(row.try_get::<String, _>("child_thread_id")?)?;
+                let status = row
+                    .try_get::<String, _>("status")?
+                    .parse::<crate::DirectionalThreadSpawnEdgeStatus>()
+                    .map_err(|error| {
+                        anyhow::anyhow!("unknown thread spawn edge status: {error}")
+                    })?;
+                Ok(crate::DirectionalThreadSpawnEdge {
+                    parent_thread_id,
+                    child_thread_id,
+                    status,
+                    created_at: None,
+                })
+            })
+            .collect()
+    }
+
+    /// Read one persisted direct edge without changing its lifecycle status.
+    pub async fn get_thread_spawn_edge(
+        &self,
+        parent_thread_id: ThreadId,
+        child_thread_id: ThreadId,
+    ) -> anyhow::Result<Option<crate::DirectionalThreadSpawnEdge>> {
+        let row = sqlx::query(
+            "SELECT parent_thread_id, child_thread_id, status FROM thread_spawn_edges WHERE parent_thread_id = ? AND child_thread_id = ?",
+        )
+        .bind(parent_thread_id.to_string())
+        .bind(child_thread_id.to_string())
+        .fetch_optional(self.pool.as_ref())
+        .await?;
+        row.map(|row| {
+            let parent_thread_id =
+                ThreadId::try_from(row.try_get::<String, _>("parent_thread_id")?)?;
+            let child_thread_id = ThreadId::try_from(row.try_get::<String, _>("child_thread_id")?)?;
+            let status = row
+                .try_get::<String, _>("status")?
+                .parse::<crate::DirectionalThreadSpawnEdgeStatus>()
+                .map_err(|error| anyhow::anyhow!("unknown thread spawn edge status: {error}"))?;
+            Ok(crate::DirectionalThreadSpawnEdge {
+                parent_thread_id,
+                child_thread_id,
+                status,
+                created_at: None,
+            })
+        })
+        .transpose()
     }
 
     /// List direct spawned children of `parent_thread_id` whose edge matches `status`.
@@ -388,6 +468,7 @@ ON CONFLICT(child_thread_id) DO NOTHING
             }
             None => {}
         }
+        builder.push(" AND tombstoned_at IS NULL AND visible = 1");
         let row = builder.build().fetch_optional(self.pool.as_ref()).await?;
         Ok(row
             .and_then(|r| r.try_get::<String, _>("rollout_path").ok())
@@ -1378,7 +1459,7 @@ fn push_thread_filters_with_preview<'a>(
         sort_direction,
         search_term,
     } = options;
-    builder.push(" WHERE 1 = 1");
+    builder.push(" WHERE 1 = 1 AND threads.visible = 1 AND threads.tombstoned_at IS NULL");
     if archived_only {
         builder.push(" AND threads.archived = 1");
     } else {
@@ -2589,6 +2670,9 @@ mod tests {
                 subagent_history_start_ordinal: None,
                 multi_agent_version: None,
                 context_window: None,
+                runtime_build_info: None,
+                config_layer_revision: None,
+                runtime_feature_revision: None,
             },
             git: None,
         })];
@@ -2660,6 +2744,9 @@ mod tests {
                 subagent_history_start_ordinal: None,
                 multi_agent_version: None,
                 context_window: None,
+                runtime_build_info: None,
+                config_layer_revision: None,
+                runtime_feature_revision: None,
             },
             git: Some(GitInfo {
                 commit_hash: Some(codex_git_utils::GitSha::new("rollout-sha")),

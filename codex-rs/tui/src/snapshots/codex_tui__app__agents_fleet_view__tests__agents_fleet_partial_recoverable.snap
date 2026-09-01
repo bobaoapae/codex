@@ -1,0 +1,28 @@
+---
+source: tui/src/app/agents_fleet_view_tests.rs
+expression: popup
+---
+  Agent fleet
+  root 00000000-0000-0000-0000-000000000801  generation 43  sealed  operationId operation-43
+  ────────────────────────────────────────────────────────────────────────────────────────────────────
+  › Ⅱ 00000000-0000-0000-0000-000000000801  suspended  00000000-0000-0000-0000-000000000801
+    ×   00000000-0000-0000-0000-000000000802  failed  00000000-0000-0000-0000-000000000802
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  Fleet suspend completed partially: 1 member(s) are recoverable (operation-43).
+  New task › Describe a task and press enter to dispatch it
+  ↑ ↓ navigate  enter open  → manage  ctrl+f search  ctrl+s group  ctrl+n new  ctrl+r rename  ctrl+x s

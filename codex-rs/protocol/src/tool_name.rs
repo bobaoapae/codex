@@ -6,6 +6,24 @@ use std::fmt;
 /// Namespace used for top-level function and custom tools.
 pub const DEFAULT_FUNCTION_NAMESPACE: &str = "functions";
 
+/// Tool names whose arguments may contain inter-agent message contents.
+///
+/// The list lives at the protocol boundary so core dispatch, telemetry, and
+/// rollout tracing apply the same redaction policy without depending on one
+/// another.
+pub const SENSITIVE_MULTI_AGENT_TOOL_NAMES: &[&str] = &[
+    "spawn_agent",
+    "send_message",
+    "followup_task",
+    "send_input",
+    "assign_task",
+];
+
+/// Returns whether a tool's arguments may contain inter-agent message text.
+pub fn is_sensitive_multi_agent_tool(name: &str) -> bool {
+    SENSITIVE_MULTI_AGENT_TOOL_NAMES.contains(&name)
+}
+
 /// Identifies a callable tool, preserving the namespace split when the model
 /// provides one.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]

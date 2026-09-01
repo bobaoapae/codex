@@ -1,0 +1,28 @@
+---
+source: tui/src/app/agents_fleet_view_tests.rs
+expression: popup
+---
+  Agent fleet
+  root 00000000-0000-0000-0000-000000000801  generation 7  open
+  ────────────────────────────────────────────────────────────────────────────────────────────────────
+  No fleet members found.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  No members were returned by the fleet store.
+  New task › Describe a task and press enter to dispatch it
+  ↑ ↓ navigate  enter open  → manage  ctrl+f search  ctrl+s group  ctrl+n new  ctrl+r rename  ctrl+x s

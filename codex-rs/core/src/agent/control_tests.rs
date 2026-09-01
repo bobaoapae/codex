@@ -117,7 +117,16 @@ fn captured_op_matches(actual: &(ThreadId, Op), expected: &(ThreadId, Op)) -> bo
                 communication: expected,
                 ..
             },
-        ) => actual == expected,
+        ) => {
+            // The durable mailbox stamps a message id onto the communication
+            // at send time; an expected communication without an id matches
+            // regardless of the stamped value.
+            let mut actual = actual.clone();
+            if expected.id.is_none() {
+                actual.id = None;
+            }
+            actual == *expected
+        }
         _ => false,
     }
 }
@@ -721,6 +730,83 @@ async fn send_inter_agent_communication_without_turn_queues_message_without_trig
     ));
 }
 
+/// Regression test for the durable mailbox on Paginated threads — the
+/// Desktop's default history mode, where `load_history` is unsupported by
+/// design. Delivery must complete off the workflow row's apply receipt: the
+/// message reaches the input queue and the row is acknowledged (`delivered`,
+/// `applied_at_ms` set) instead of wedging in `delivering`.
+#[tokio::test]
+async fn send_inter_agent_communication_to_paginated_thread_delivers_and_acks_durably() {
+    let harness = AgentControlHarness::new().await;
+    let (thread_id, thread) = harness.start_paginated_thread().await;
+    // Use the session's own control: production sends go through the handle
+    // that had the workflow store installed at session construction.
+    let control = thread.session.services.agent_control.clone();
+    let communication = InterAgentCommunication::new(
+        AgentPath::root(),
+        AgentPath::try_from("/root/worker").expect("agent path"),
+        Vec::new(),
+        "hello durable mailbox".to_string(),
+        /*trigger_turn*/ false,
+    );
+
+    let submission_id = control
+        .send_inter_agent_communication(
+            thread_id,
+            communication,
+            AgentCommunicationContext::new(AgentCommunicationKind::Message, ThreadId::new()),
+            Default::default(),
+        )
+        .await
+        .expect("send_inter_agent_communication should succeed");
+    assert!(!submission_id.is_empty());
+
+    // The durable path stamps the mailbox UUID onto the submitted op.
+    let message_id = harness
+        .manager
+        .captured_ops()
+        .into_iter()
+        .find_map(|(captured_thread_id, op)| match op {
+            Op::InterAgentCommunication { communication, .. }
+                if captured_thread_id == thread_id =>
+            {
+                communication.id.as_ref().map(ToString::to_string)
+            }
+            _ => None,
+        })
+        .expect("durable send should stamp a message id");
+
+    let workflow = harness
+        .state_db
+        .as_ref()
+        .expect("test harness state db")
+        .workflow_store()
+        .clone();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let row_delivered = workflow
+                .get_mailbox_message(&message_id)
+                .await
+                .expect("read mailbox row")
+                .is_some_and(|message| {
+                    message.state == codex_state::WorkflowMailboxState::Delivered
+                        && message.applied_at_ms.is_some()
+                });
+            let queued = thread
+                .session
+                .input_queue
+                .has_pending_input(&thread.session.active_turn)
+                .await;
+            if row_delivered && queued {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("durable delivery should queue the message and ack the mailbox row");
+}
+
 #[tokio::test]
 async fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent() {
     check_v2_agent_reload(V2ReloadRoute::Sender).await;
@@ -1095,7 +1181,8 @@ async fn resume_agent_from_rollout_does_not_reopen_v2_descendants() {
 
     let closed_worker = resumed_control.ensure_agent_known(worker_thread_id);
     let surviving_sibling = resumed_control.ensure_agent_known(sibling_thread_id);
-    assert!(closed_worker.is_err());
+    assert!(closed_worker.is_ok());
+    assert!(resumed_control.is_agent_closed(worker_thread_id));
     assert!(surviving_sibling.is_ok());
     assert_thread_not_loaded(&resumed_manager, sibling_thread_id).await;
 }
@@ -1220,6 +1307,9 @@ async fn spawn_agent_fork_from_paginated_parent_uses_model_context_prefix() {
                             },
                         },
                     },
+                    runtime_build_info: None,
+                    config_layer_revision: None,
+                    runtime_feature_revision: None,
                 },
             )),
         ])
@@ -4204,7 +4294,7 @@ async fn resume_agent_from_rollout_does_not_reopen_closed_descendants() {
 }
 
 #[tokio::test]
-async fn resume_closed_child_reopens_open_descendants() {
+async fn resume_closed_child_keeps_closed_descendants_unloaded() {
     let harness = AgentControlHarness::new().await;
     let (parent_thread_id, parent_thread) = harness.start_thread().await;
 
@@ -4283,9 +4373,28 @@ async fn resume_closed_child_reopens_open_descendants() {
         harness.control.get_status(child_thread_id).await,
         AgentStatus::NotFound
     );
-    assert_ne!(
-        harness.control.get_status(grandchild_thread_id).await,
-        AgentStatus::NotFound
+    assert_thread_not_loaded(&harness.manager, grandchild_thread_id).await;
+
+    let graph = crate::local_agent_graph_store_from_state_db(harness.state_db.as_ref())
+        .expect("test harness should configure an agent graph store");
+    let edges = graph
+        .list_thread_spawn_edge_details(parent_thread_id, None)
+        .await
+        .expect("closed subtree edges should load");
+    assert_eq!(
+        edges
+            .iter()
+            .map(|edge| (edge.parent_id, edge.child_id))
+            .collect::<Vec<_>>(),
+        vec![
+            (parent_thread_id, child_thread_id),
+            (child_thread_id, grandchild_thread_id),
+        ]
+    );
+    assert!(
+        edges
+            .iter()
+            .all(|edge| { edge.status == codex_agent_graph_store::ThreadSpawnEdgeStatus::Closed })
     );
 
     let _ = harness

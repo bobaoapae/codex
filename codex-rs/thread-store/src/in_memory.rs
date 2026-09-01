@@ -21,6 +21,8 @@ use codex_protocol::protocol::ThreadMemoryMode;
 use codex_rollout::RolloutItem;
 use codex_rollout::persisted_rollout_items;
 
+use crate::AppendReceiptOutcome;
+use crate::AppendReceiptParams;
 use crate::AppendThreadItemsParams;
 use crate::ArchiveThreadParams;
 use crate::CreateThreadParams;
@@ -43,8 +45,13 @@ use crate::ThreadStore;
 use crate::ThreadStoreError;
 use crate::ThreadStoreFuture;
 use crate::ThreadStoreResult;
+use crate::TombstoneThreadParams;
 use crate::UpdateThreadMetadataParams;
 use crate::error::reject_paginated_history_mode;
+use crate::receipt_append::canonical_receipt_item;
+use crate::receipt_append::receipt_from_rollout_item;
+use crate::receipt_append::receipts_equivalent;
+use crate::receipt_append::validate_append_receipt;
 
 static IN_MEMORY_THREAD_STORES: OnceLock<Mutex<HashMap<String, Arc<InMemoryThreadStore>>>> =
     OnceLock::new();
@@ -486,6 +493,7 @@ pub struct InMemoryThreadStoreCalls {
     pub archive_thread: usize,
     pub unarchive_thread: usize,
     pub delete_thread: usize,
+    pub tombstone_thread: usize,
 }
 
 /// In-memory [`ThreadStore`] implementation for tests and debug configs.
@@ -510,6 +518,7 @@ struct InMemoryThreadStoreState {
     section_entered_at: HashMap<ThreadId, DateTime<Utc>>,
     names: HashMap<ThreadId, Option<String>>,
     rollout_paths: HashMap<PathBuf, ThreadId>,
+    tombstoned: HashSet<ThreadId>,
 }
 
 impl InMemoryThreadStore {
@@ -615,6 +624,57 @@ impl InMemoryThreadStore {
         Ok(())
     }
 
+    async fn append_receipt(
+        &self,
+        params: AppendReceiptParams,
+    ) -> ThreadStoreResult<AppendReceiptOutcome> {
+        validate_append_receipt(&params)?;
+        let thread_id_string = params.thread_id.to_string();
+        if params.receipt.thread_id.as_deref() != Some(thread_id_string.as_str()) {
+            return Err(ThreadStoreError::InvalidRequest {
+                message: "receipt thread id does not match append thread".to_string(),
+            });
+        }
+        let mut state = self.state.lock().await;
+        let history_mode = history_mode_from_state(&state, params.thread_id);
+        reject_paginated_history_mode(history_mode)?;
+        let history =
+            state
+                .histories
+                .get(&params.thread_id)
+                .ok_or(ThreadStoreError::ThreadNotFound {
+                    thread_id: params.thread_id,
+                })?;
+        if let Some(existing) = history
+            .iter()
+            .filter_map(receipt_from_rollout_item)
+            .find(|existing| existing.receipt_id == params.receipt.receipt_id)
+        {
+            if receipts_equivalent(existing, &params.receipt) {
+                return Ok(AppendReceiptOutcome::Existing(existing.clone()));
+            }
+            return Err(ThreadStoreError::Conflict {
+                message: "receipt id already exists with different content".to_string(),
+            });
+        }
+
+        let item =
+            canonical_receipt_item(params.thread_id, &params.receipt, params.completed_at_ms);
+        let persisted = persisted_rollout_items(std::slice::from_ref(&item), history_mode);
+        if persisted.is_empty() {
+            return Err(ThreadStoreError::InvalidRequest {
+                message: "receipt item is not persistable for this thread".to_string(),
+            });
+        }
+        state.calls.append_items += 1;
+        state
+            .histories
+            .entry(params.thread_id)
+            .or_default()
+            .extend(persisted);
+        Ok(AppendReceiptOutcome::Created(params.receipt))
+    }
+
     async fn load_history(
         &self,
         params: LoadThreadHistoryParams,
@@ -658,6 +718,11 @@ impl InMemoryThreadStore {
     async fn read_thread(&self, params: ReadThreadParams) -> ThreadStoreResult<StoredThread> {
         let mut state = self.state.lock().await;
         state.calls.read_thread += 1;
+        if state.tombstoned.contains(&params.thread_id) {
+            return Err(ThreadStoreError::ThreadNotFound {
+                thread_id: params.thread_id,
+            });
+        }
         if params.include_history {
             state.calls.read_thread_with_history += 1;
             reject_paginated_history_mode(history_mode_from_state(&state, params.thread_id))?;
@@ -680,6 +745,9 @@ impl InMemoryThreadStore {
                 ),
             });
         };
+        if state.tombstoned.contains(&thread_id) {
+            return Err(ThreadStoreError::ThreadNotFound { thread_id });
+        }
         if params.include_history {
             reject_paginated_history_mode(history_mode_from_state(&state, thread_id))?;
         }
@@ -693,6 +761,7 @@ impl InMemoryThreadStore {
         let mut items = state
             .created_threads
             .keys()
+            .filter(|thread_id| !state.tombstoned.contains(thread_id))
             .map(|thread_id| {
                 stored_thread_from_state(&state, *thread_id, /*include_history*/ false)
             })
@@ -843,6 +912,21 @@ impl InMemoryThreadStore {
             })
         }
     }
+
+    async fn tombstone_thread(&self, params: TombstoneThreadParams) -> ThreadStoreResult<()> {
+        let mut state = self.state.lock().await;
+        state.calls.tombstone_thread += 1;
+        let exists = state.created_threads.contains_key(&params.thread_id)
+            || state.histories.contains_key(&params.thread_id)
+            || state.tombstoned.contains(&params.thread_id);
+        if !exists {
+            return Err(ThreadStoreError::ThreadNotFound {
+                thread_id: params.thread_id,
+            });
+        }
+        state.tombstoned.insert(params.thread_id);
+        Ok(())
+    }
 }
 
 impl ThreadStore for InMemoryThreadStore {
@@ -860,6 +944,13 @@ impl ThreadStore for InMemoryThreadStore {
 
     fn append_items(&self, params: AppendThreadItemsParams) -> ThreadStoreFuture<'_, ()> {
         Box::pin(InMemoryThreadStore::append_items(self, params))
+    }
+
+    fn append_receipt(
+        &self,
+        params: AppendReceiptParams,
+    ) -> ThreadStoreFuture<'_, AppendReceiptOutcome> {
+        Box::pin(InMemoryThreadStore::append_receipt(self, params))
     }
 
     fn persist_thread(
@@ -1007,6 +1098,10 @@ impl ThreadStore for InMemoryThreadStore {
     fn delete_thread(&self, params: DeleteThreadParams) -> ThreadStoreFuture<'_, ()> {
         Box::pin(InMemoryThreadStore::delete_thread(self, params))
     }
+
+    fn tombstone_thread(&self, params: TombstoneThreadParams) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(InMemoryThreadStore::tombstone_thread(self, params))
+    }
 }
 
 fn stored_thread_from_state(
@@ -1131,3 +1226,7 @@ fn git_info_from_patch(patch: &ThreadMetadataPatch) -> Option<codex_protocol::pr
         repository_url: origin_url,
     })
 }
+
+#[cfg(test)]
+#[path = "in_memory_receipt_tests.rs"]
+mod receipt_tests;

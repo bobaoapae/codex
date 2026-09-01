@@ -20,6 +20,8 @@ use crate::compact;
 use crate::compact::CompactedHistoryMetadata;
 use crate::config::ManagedFeatures;
 use crate::config::resolve_tool_suggest_config_from_layer_stack;
+use crate::context::ApprovedPlanRef;
+use crate::context::CarriedPlan;
 use crate::context::ContextualUserFragment;
 use crate::context::DeveloperInstructions;
 use crate::context::GuardianPolicy;
@@ -27,6 +29,7 @@ use crate::context::ManagedDeveloperInstructions;
 use crate::context::ModelSwitchInstructions;
 use crate::context::MultiAgentRoleInstructions;
 use crate::context::NetworkRuleSaved;
+use crate::context::PlanLoaded;
 use crate::context::RecommendedPluginsInstructions;
 use crate::context::world_state::WorldState;
 use crate::current_time::TimeProvider;
@@ -38,6 +41,11 @@ use crate::image_preparation::ImagePreparationMode;
 use crate::image_preparation::ImageResizeNoticeMode;
 use crate::image_preparation::prepare_response_items as prepare_image_response_items;
 use crate::image_preparation::unified_image_budget_enabled;
+use crate::ownership::AuthorizedWorkspaceRoots;
+use crate::ownership::OwnershipError;
+use crate::ownership::OwnershipOverrideReceipt;
+use crate::ownership::OwnershipReceiptSink;
+use crate::ownership::WorkspaceOwnershipService;
 use crate::parse_turn_item;
 use crate::realtime_conversation::RealtimeConversationManager;
 use crate::session::step_context::StepContext;
@@ -52,6 +60,7 @@ use crate::turn_timing::now_unix_timestamp_ms;
 use async_channel::Receiver;
 use async_channel::Sender;
 use chrono::Local;
+use chrono::SecondsFormat;
 use chrono::Utc;
 use codex_analytics::AnalyticsEventsClient;
 use codex_analytics::ImagePreparationFact;
@@ -69,6 +78,10 @@ use codex_extension_api::ExtensionDataInit;
 use codex_extension_api::LoadedUserInstructions;
 use codex_extension_api::PromptSlot;
 use codex_extension_api::TurnContextContributionInput;
+use codex_extension_items::ExtensionItem;
+use codex_extension_items::receipt::ReceiptAttachedItem;
+use codex_extension_items::receipt::ReceiptReference;
+use codex_extension_items::receipt::ReceiptStatus;
 use codex_features::FEATURES;
 use codex_features::Feature;
 use codex_features::unstable_features_warning_event;
@@ -173,6 +186,8 @@ use futures::future::Shared;
 use futures::prelude::*;
 use rmcp::model::RequestId;
 use serde_json::Value;
+use sha2::Digest;
+use sha2::Sha256;
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 use tokio::sync::oneshot;
@@ -230,7 +245,7 @@ pub(crate) mod multi_agents;
 mod plan_reminder;
 mod review;
 mod rollout_budget;
-mod rollout_reconstruction;
+pub(crate) mod rollout_reconstruction;
 #[allow(clippy::module_inception)]
 pub(crate) mod session;
 mod step_activation;
@@ -264,6 +279,9 @@ use self::turn::agent_message_text;
 use self::turn::collect_explicit_app_ids_from_skill_items;
 use self::turn::realtime_text_for_event;
 use self::turn_context::TurnContext;
+mod plan_reconstruction;
+#[cfg(test)]
+mod plan_tests;
 #[cfg(test)]
 mod rollout_reconstruction_tests;
 
@@ -1197,6 +1215,9 @@ impl Session {
     }
 
     pub(crate) fn mark_interrupted(&self) {
+        self.services
+            .agent_control
+            .record_agent_status_change(self.thread_id, AgentStatus::Interrupted);
         self.agent_status.send_replace(AgentStatus::Interrupted);
     }
 
@@ -1210,6 +1231,16 @@ impl Session {
 
     pub(crate) fn state_db(&self) -> Option<state_db::StateDbHandle> {
         self.services.state_db.clone()
+    }
+
+    pub(crate) async fn ownership_service(
+        &self,
+    ) -> Result<std::sync::Arc<WorkspaceOwnershipService>, OwnershipError> {
+        let config = self.get_config().await;
+        let authorized_roots = AuthorizedWorkspaceRoots::new(config.effective_workspace_roots())?;
+        self.services
+            .agent_control
+            .ownership_service(authorized_roots)
     }
 
     pub(crate) fn live_thread_for_persistence(
@@ -1364,6 +1395,8 @@ impl Session {
         }
         let turn_context = match conversation_history {
             InitialHistory::New | InitialHistory::Cleared => {
+                self.set_last_plan(None);
+                self.set_approved_plan(None);
                 // Defer initial context insertion until the first real turn starts so
                 // turn/start overrides can be merged before we write model-visible context.
                 self.set_previous_turn_settings(/*previous_turn_settings*/ None)
@@ -1380,6 +1413,9 @@ impl Session {
                     }),
                     Some(AgentStatus::Interrupted)
                 ) {
+                    self.services
+                        .agent_control
+                        .record_agent_status_change(self.thread_id, AgentStatus::Interrupted);
                     self.agent_status.send_replace(AgentStatus::Interrupted);
                 }
                 let previous_turn_settings = self
@@ -1500,8 +1536,11 @@ impl Session {
         let rollout_reconstruction::RolloutReconstruction {
             mut history,
             previous_turn_settings,
+            last_plan,
+            approved_plan,
             reference_context_item,
             world_state_baseline,
+            history_recovery_reason,
             window_number,
             first_window_id,
             previous_window_id,
@@ -1509,6 +1548,11 @@ impl Session {
         } = self
             .reconstruct_history_from_rollout(turn_context, rollout_items)
             .await;
+        let last_plan = turn_context
+            .config
+            .tools_update_plan_survives_compaction
+            .then_some(last_plan)
+            .flatten();
         // Keep the recorded rollout unchanged. Prepare its reconstructed history before
         // installing it, so legacy media is processed once for this resume or fork and
         // will be processed again if the rollout is reconstructed in a future session.
@@ -1555,6 +1599,11 @@ impl Session {
                 },
             );
             state.set_previous_turn_settings(previous_turn_settings.clone());
+        }
+        self.set_last_plan(last_plan);
+        self.set_approved_plan(approved_plan);
+        if let Some(reason) = history_recovery_reason {
+            self.mark_history_recovery_required(reason).await;
         }
         let prefix_tokens = if matches!(
             turn_context.config.model_auto_compact_token_limit_scope,
@@ -1991,6 +2040,10 @@ impl Session {
 
     /// Persist the event to rollout and send it to clients.
     pub(crate) async fn send_event(&self, turn_context: &TurnContext, msg: EventMsg) {
+        self.services
+            .agent_control
+            .record_fork_event(self.thread_id, &msg)
+            .await;
         let legacy_source = msg.clone();
         if let EventMsg::Error(error) = &legacy_source
             && error
@@ -2079,6 +2132,9 @@ impl Session {
         let status = match turn_context.terminal_error.lock().await.take() {
             Some(error) => {
                 let status = AgentStatus::Errored(error.message);
+                self.services
+                    .agent_control
+                    .record_agent_status_change(self.thread_id, status.clone());
                 self.agent_status.send_replace(status.clone());
                 status
             }
@@ -2275,6 +2331,106 @@ impl Session {
             .await;
     }
 
+    /// Append a root ownership override receipt before a state override token
+    /// is issued. Paths and reasons are represented only by bounded digests.
+    pub(crate) async fn persist_ownership_override_receipt(
+        &self,
+        receipt: OwnershipOverrideReceipt,
+    ) -> anyhow::Result<()> {
+        let path_reference = ownership_reference("ownership.paths", |digest| {
+            for path in &receipt.paths {
+                digest.update(path.display.as_bytes());
+                digest.update([0]);
+                digest.update(path.comparison_key.as_bytes());
+                digest.update([0]);
+            }
+        });
+        let owner_reference = ownership_reference("ownership.owners", |digest| {
+            for owner in &receipt.conflict_owner_run_ids {
+                digest.update(owner.as_bytes());
+                digest.update([0]);
+            }
+        });
+        let reason_reference = ownership_reference("ownership.reason", |digest| {
+            digest.update(receipt.reason.as_bytes());
+        });
+        let mut item = ReceiptAttachedItem::new(
+            receipt.receipt_id.clone(),
+            1,
+            "ownership.override",
+            "workspace ownership override",
+            ReceiptStatus::Informational,
+            Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            "codex.core",
+        )?;
+        item.thread_id = Some(receipt.root_run_id.to_string());
+        item.refs = vec![path_reference, owner_reference];
+        item.provenance = Some(serde_json::json!({
+            "operationDigest": receipt.operation_digest,
+            "reasonDigest": reason_reference.id,
+        }));
+        item.metadata = Some(serde_json::json!({
+            "pathCount": receipt.paths.len(),
+            "ownerCount": receipt.conflict_owner_run_ids.len(),
+        }));
+        item.validate()?;
+        let turn_id = receipt.root_run_id.to_string();
+        let event = Event {
+            id: receipt.receipt_id,
+            msg: EventMsg::ItemCompleted(ItemCompletedEvent {
+                thread_id: receipt.root_run_id,
+                turn_id,
+                item: TurnItem::Extension(ExtensionItem::ReceiptAttached(item)),
+                started_at_ms: None,
+                completed_at_ms: now_unix_timestamp_ms(),
+            }),
+        };
+        self.live_thread_for_persistence("persist ownership override receipt")?
+            .append_items(&[RolloutItem::EventMsg(event.msg.clone())])
+            .await?;
+        self.deliver_event_raw(event).await;
+        Ok(())
+    }
+
+    /// Persists trusted hook evidence as local receipt items without routing it
+    /// through provider, MCP, telemetry, or analytics observation paths.
+    pub(crate) async fn persist_hook_evidence_receipts(
+        &self,
+        turn_context: &TurnContext,
+        evidence: &[codex_hooks::PostToolUseEvidence],
+    ) {
+        let mut receipts = Vec::new();
+        for contribution in evidence {
+            let Ok(receipt) = crate::evidence::receipt_event_for_hook_evidence(
+                self.thread_id,
+                &turn_context.sub_id,
+                contribution,
+            ) else {
+                warn!(
+                    thread_id = %self.thread_id,
+                    turn_id = %turn_context.sub_id,
+                    "rejected invalid PostToolUse evidence receipt"
+                );
+                continue;
+            };
+            if self.reserve_derived_receipt_id(&receipt.id) {
+                receipts.push(receipt);
+            }
+        }
+        if receipts.is_empty() {
+            return;
+        }
+
+        let rollout_items = receipts
+            .iter()
+            .map(|receipt| RolloutItem::EventMsg(receipt.event.msg.clone()))
+            .collect::<Vec<_>>();
+        self.persist_rollout_items(&rollout_items).await;
+        for receipt in receipts {
+            self.deliver_event_raw(receipt.event).await;
+        }
+    }
+
     /// Delivers an event without creating a local rollout for a thread that has not materialized.
     pub(crate) async fn send_event_raw_without_materializing_rollout(&self, event: Event) {
         let persist = match self.current_rollout_path().await {
@@ -2290,26 +2446,59 @@ impl Session {
 
     async fn send_event_raw_with_persistence(&self, event: Event, persist: bool) {
         self.services.mcp_runtime.observe_event(&event.msg);
+        let derived_receipt = persist
+            .then(|| crate::evidence::receipt_event_for_event(self.thread_id, &event.msg))
+            .flatten()
+            .filter(|receipt| self.reserve_derived_receipt_id(&receipt.id));
         // Persist the event into rollout storage; the store applies its persistence policy.
         if persist {
-            let rollout_items = vec![RolloutItem::EventMsg(event.msg.clone())];
+            let mut rollout_items = vec![RolloutItem::EventMsg(event.msg.clone())];
+            if let Some(receipt) = &derived_receipt {
+                rollout_items.push(RolloutItem::EventMsg(receipt.event.msg.clone()));
+            }
             self.persist_rollout_items(&rollout_items).await;
         }
         self.services
             .rollout_thread_trace
             .record_protocol_event(&event.msg);
         self.deliver_event_raw(event).await;
+        if let Some(receipt) = derived_receipt {
+            // Derived receipts are local history projections. Deliver them
+            // directly so they never enter provider, MCP, OTEL, or analytics
+            // observation paths intended for the source event.
+            self.deliver_event_raw(receipt.event).await;
+        }
+    }
+
+    fn reserve_derived_receipt_id(&self, receipt_id: &str) -> bool {
+        self.derived_receipt_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(receipt_id.to_string())
     }
 
     async fn deliver_event_raw(&self, event: Event) {
+        // Unified-exec observations are runtime state, not model context. Feed
+        // the local manager before forwarding the event so output/input and
+        // final command receipts update the bounded terminal snapshot without
+        // manufacturing heartbeat rollout items.
+        let terminal_activity_event = matches!(
+            &event.msg,
+            EventMsg::ExecCommandOutputDelta(_) | EventMsg::TerminalInteraction(_)
+        );
+        self.services.unified_exec_manager.observe_event(&event.msg);
         // Record the last known agent status.
         if let Some(status) = agent_status_from_event(&event.msg) {
+            self.services
+                .agent_control
+                .record_agent_status_change(self.thread_id, status.clone());
             self.agent_status.send_replace(status);
         }
         // FORK: remember what this agent was last seen doing, so its parent can
         // tell "compiling" from "wedged" before reaching for `interrupt_agent`.
         // Only for subagents: the root's activity is on screen already.
         if self.is_subagent
+            && !terminal_activity_event
             && let Some(label) = crate::session::turn::fork_activity_label(&event.msg)
         {
             self.services
@@ -2321,6 +2510,32 @@ impl Session {
         }
     }
 
+    /// Subscribe to runtime-only unified-exec observation changes.  Heartbeat
+    /// updates use this watch channel and never append to rollout history.
+    pub(crate) fn subscribe_terminal_observability_revision(&self) -> watch::Receiver<u64> {
+        self.services
+            .unified_exec_manager
+            .subscribe_observability_revision()
+    }
+
+    /// Return bounded, redacted snapshots for every process retained by this
+    /// session's unified-exec manager.
+    pub(crate) fn terminal_observability_snapshots(
+        &self,
+    ) -> Vec<crate::unified_exec::TerminalProcessSnapshot> {
+        self.services.unified_exec_manager.terminal_snapshots()
+    }
+
+    /// Return one bounded, redacted terminal snapshot by its logical PID.
+    pub(crate) fn terminal_observability_snapshot(
+        &self,
+        process_id: i32,
+    ) -> Option<crate::unified_exec::TerminalProcessSnapshot> {
+        self.services
+            .unified_exec_manager
+            .terminal_snapshot(process_id)
+    }
+
     /// FORK: counts one Desktop thread creation and returns the running total.
     pub(crate) fn record_desktop_thread_created(&self) -> usize {
         self.desktop_threads_created
@@ -2330,10 +2545,14 @@ impl Session {
 
     /// FORK: remembers the checklist so a compaction can carry it forward.
     pub(crate) fn record_last_plan(&self, plan: codex_protocol::plan_tool::UpdatePlanArgs) {
+        self.set_last_plan(Some(plan));
+    }
+
+    pub(crate) fn set_last_plan(&self, plan: Option<codex_protocol::plan_tool::UpdatePlanArgs>) {
         *self
             .last_plan
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(plan);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = plan;
     }
 
     /// FORK: the checklist to re-inject after a compaction, if there is one.
@@ -2342,6 +2561,27 @@ impl Session {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    /// Record the active approved plan snapshot independently from the mutable
+    /// `update_plan` checklist.
+    pub(crate) fn set_approved_plan(&self, plan: Option<PlanLoaded>) {
+        *self
+            .approved_plan
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = plan;
+    }
+
+    pub(crate) fn approved_plan(&self) -> Option<PlanLoaded> {
+        self.approved_plan
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn approved_plan_ref(&self) -> Option<ApprovedPlanRef> {
+        self.approved_plan()
+            .map(|plan| plan.approved_plan().clone())
     }
 
     pub(crate) async fn emit_turn_item_started(&self, turn_context: &TurnContext, item: &TurnItem) {
@@ -3556,6 +3796,11 @@ impl Session {
         turn_context: &TurnContext,
         communication: InterAgentCommunication,
     ) {
+        let already_persisted = if let Some(id) = communication.id.as_ref() {
+            self.input_queue.take_mailbox_persisted(id.as_str()).await
+        } else {
+            false
+        };
         let response_item = communication.to_model_input_item();
         let (items, _) = self.prepare_conversation_items_for_history(
             turn_context,
@@ -3571,14 +3816,132 @@ impl Session {
                 turn_context.model_info().truncation_policy.into(),
             );
         }
-        self.persist_rollout_items(&[
-            RolloutItem::InterAgentCommunicationMetadata {
-                trigger_turn: communication.trigger_turn,
-            },
-            RolloutItem::ResponseItem(response_item.into()),
-        ])
-        .await;
+        if !already_persisted {
+            self.persist_rollout_items(&[
+                RolloutItem::InterAgentCommunicationMetadata {
+                    message_id: communication.id.as_ref().map(ToString::to_string),
+                    trigger_turn: communication.trigger_turn,
+                    wake_applied: false,
+                },
+                RolloutItem::ResponseItem(response_item.into()),
+            ])
+            .await;
+        }
         self.send_raw_response_items(turn_context, items).await;
+    }
+
+    /// Applies a claimed durable mailbox message to this session: dedupes a
+    /// redelivery best-effort, then appends the content to the rollout when
+    /// persistence can take it.
+    ///
+    /// This method never fails: the workflow mailbox row (whose payload
+    /// survives even after delivery) is the durability authority, so a
+    /// canonical-history read that the thread store cannot serve — Paginated
+    /// history mode rejects full-history reads by design, and an
+    /// unmaterialized thread has no rollout to resolve — must degrade to
+    /// "unknown" instead of blocking delivery. A failed append is logged and
+    /// left to the consumption path (`record_inter_agent_communication`),
+    /// which persists any queued message the durable path did not.
+    pub(crate) async fn apply_durable_mailbox_content(
+        &self,
+        turn_context: &TurnContext,
+        communication: &InterAgentCommunication,
+    ) -> crate::agent::mailbox::DurableMailboxPersistence {
+        let not_yet_persisted = crate::agent::mailbox::DurableMailboxPersistence {
+            already_persisted: false,
+            trigger_turn: communication.trigger_turn,
+            wake_applied: false,
+        };
+        let Some(message_id) = communication.id.as_ref().map(ResponseItemId::as_str) else {
+            return not_yet_persisted;
+        };
+        let Ok(live_thread) = self.live_thread_for_persistence("apply durable mailbox content")
+        else {
+            // Persistence disabled: the mailbox row payload is the only
+            // durable copy, which is enough to redeliver after a crash.
+            return not_yet_persisted;
+        };
+        // Best-effort dedupe #1: the canonical rollout, when the store can
+        // read it (Legacy mode, materialized). This honors receipts written
+        // by earlier builds.
+        match crate::agent::mailbox::canonical_mailbox_state(live_thread, message_id).await {
+            Ok(canonical_state) if canonical_state.content_present => {
+                return crate::agent::mailbox::DurableMailboxPersistence {
+                    already_persisted: true,
+                    trigger_turn: canonical_state.trigger_turn,
+                    wake_applied: canonical_state.wake_applied,
+                };
+            }
+            Ok(_) => {}
+            Err(error) => {
+                debug!(
+                    message_id,
+                    "canonical mailbox state unavailable; treating as unknown: {error}"
+                );
+            }
+        }
+        // Best-effort dedupe #2: the in-memory model context. A resumed
+        // session rebuilds it from persisted history before `rehydrate` runs,
+        // so this covers Paginated threads, where the canonical read above is
+        // unsupported.
+        {
+            let history = self.clone_history().await;
+            if crate::agent::mailbox::model_context_contains_mailbox_id(
+                history.raw_items(),
+                message_id,
+            ) {
+                return crate::agent::mailbox::DurableMailboxPersistence {
+                    already_persisted: true,
+                    trigger_turn: communication.trigger_turn,
+                    wake_applied: false,
+                };
+            }
+        }
+
+        let mut communication = communication.clone();
+        communication.set_turn_id_if_missing(&turn_context.sub_id);
+        let trigger_turn = communication.trigger_turn;
+        let append_result = live_thread
+            .append_items(&[
+                RolloutItem::InterAgentCommunicationMetadata {
+                    message_id: Some(message_id.to_string()),
+                    trigger_turn,
+                    wake_applied: false,
+                },
+                RolloutItem::InterAgentCommunication(communication),
+            ])
+            .await;
+        let flush_result = match append_result {
+            Ok(()) => live_thread
+                .flush()
+                .await
+                .map_err(|error| anyhow::anyhow!(error)),
+            Err(error) => Err(anyhow::anyhow!(error)),
+        };
+        match flush_result {
+            Ok(()) => {
+                // Suppress the second append the consumption path would
+                // otherwise perform for this UUID.
+                self.input_queue
+                    .mark_mailbox_persisted(message_id.to_string())
+                    .await;
+            }
+            Err(error) => {
+                // Not marking the id as persisted means consumption will
+                // append it again; if this failure happened after the bytes
+                // were queued, the rollout can end up with a duplicate copy —
+                // duplicated bytes, never duplicated model input.
+                warn!(
+                    message_id,
+                    "durable mailbox append failed; content persists on consumption: {error}"
+                );
+            }
+        }
+        crate::agent::mailbox::DurableMailboxPersistence {
+            already_persisted: false,
+            trigger_turn,
+            wake_applied: false,
+        }
     }
 
     async fn maybe_warn_on_server_model_mismatch(
@@ -3659,6 +4022,27 @@ impl Session {
         world_state_baseline: Option<Arc<WorldState>>,
         metadata: CompactedHistoryMetadata,
     ) {
+        // Serialize the active-plan snapshot with plan injection and settings
+        // checkpoints so replacement history and in-memory state move together.
+        let _settings_guard = thread_settings::acquire_persistence_lock(self).await;
+        items.retain(|envelope| !PlanLoaded::is_response_item(&envelope.item));
+        if let Some(plan) = self.approved_plan() {
+            let insert_at = items
+                .iter()
+                .position(|envelope| {
+                    let ResponseItem::Message { content, .. } = &envelope.item else {
+                        return false;
+                    };
+                    content.iter().any(|content| {
+                        matches!(content, ContentItem::InputText { text } if CarriedPlan::matches_text(text))
+                    })
+                })
+                .unwrap_or(items.len());
+            items.insert(
+                insert_at,
+                ResponseItemEnvelope::new(ContextualUserFragment::into(plan)),
+            );
+        }
         for envelope in &mut items {
             Self::assign_missing_response_item_id(&mut envelope.item);
         }
@@ -3674,9 +4058,6 @@ impl Session {
                 .map(|id| id.to_string()),
             window_id: Some(metadata.window_ids.window_id.to_string()),
         };
-        // Wait for accepted updates to finish persisting, then keep later updates from
-        // overtaking the current settings snapshot while its checkpoint is written.
-        let _settings_guard = thread_settings::acquire_persistence_lock(self).await;
         // Compaction starts a new history window, so its WorldState baseline must be full.
         let mut world_state_item = None;
         {
@@ -4041,6 +4422,75 @@ impl Session {
         state.clone_history()
     }
 
+    /// Return the last request-scoped context captured for the active turn.
+    ///
+    /// Context inspection is read-only: this snapshot deliberately does not refresh agents,
+    /// MCP, extensions, or any other dynamic contributor. A missing value means the session is
+    /// idle (or no sampling step has been captured yet), so callers must report a speculative
+    /// partial view rather than manufacturing a new step.
+    pub(crate) async fn last_known_step_context(&self) -> Option<Arc<StepContext>> {
+        let turn_state = {
+            let active_turn = self.active_turn.lock().await;
+            active_turn.as_ref()?.turn_state.clone()
+        };
+        turn_state.lock().await.last_known_step_context.clone()
+    }
+
+    /// Return the current configured model metadata without creating a turn or refreshing any
+    /// dynamic context contributors.
+    pub(crate) async fn configured_model_info(&self) -> Arc<ModelInfo> {
+        let (model, overrides, personality) = {
+            let state = self.state.lock().await;
+            (
+                state
+                    .session_configuration
+                    .step_settings
+                    .collaboration_mode
+                    .model()
+                    .to_string(),
+                state.session_configuration.model_info_overrides.clone(),
+                state.session_configuration.step_settings.personality,
+            )
+        };
+        Arc::new(
+            self.services
+                .models_manager
+                .get_model_info(
+                    &model,
+                    &overrides
+                        .models_manager_config(personality, self.enabled(Feature::Personality)),
+                )
+                .await,
+        )
+    }
+
+    /// Return the persisted fork boundary used by the current session, when one is available.
+    ///
+    /// The item count is the boundary captured by E6 fork metrics/persistence. It is a hint for
+    /// read-only projections; callers must keep the origin unknown when the boundary is absent.
+    pub(crate) fn inherited_history_item_count(&self) -> Option<usize> {
+        match &self.fork_persistence {
+            ForkPersistence::Referenced {
+                inherited_item_count,
+                ..
+            } => Some(*inherited_item_count),
+            ForkPersistence::Copied => None,
+        }
+    }
+
+    /// Return the current context-window identity without advancing or otherwise mutating it.
+    pub(crate) async fn context_window_snapshot(&self) -> (String, u64, Uuid, Uuid, Option<Uuid>) {
+        let state = self.state.lock().await;
+        let ids = state.auto_compact_window_ids();
+        (
+            format!("{}:{}", self.thread_id, state.auto_compact_window_number()),
+            state.auto_compact_window_number(),
+            ids.first_window_id,
+            ids.window_id,
+            ids.previous_window_id,
+        )
+    }
+
     pub(crate) async fn conversation_history_snapshot(
         &self,
     ) -> Arc<dyn ConversationHistorySnapshot> {
@@ -4243,6 +4693,10 @@ impl Session {
         token_usage: Option<&TokenUsage>,
     ) -> CodexResult<()> {
         if let Some(token_usage) = token_usage {
+            self.services
+                .agent_control
+                .record_fork_provider_usage(self.thread_id, token_usage)
+                .await;
             let token_info = {
                 let mut state = self.state.lock().await;
                 state
@@ -4477,6 +4931,29 @@ impl Session {
 
     fn show_raw_agent_reasoning(&self) -> bool {
         self.services.show_raw_agent_reasoning
+    }
+}
+
+fn ownership_reference(kind: &str, update: impl FnOnce(&mut Sha256)) -> ReceiptReference {
+    let mut digest = Sha256::new();
+    update(&mut digest);
+    let id = digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    ReceiptReference {
+        kind: kind.to_string(),
+        id,
+    }
+}
+
+impl OwnershipReceiptSink for Session {
+    fn append_ownership_override_receipt(
+        &self,
+        receipt: OwnershipOverrideReceipt,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>> {
+        Box::pin(async move { self.persist_ownership_override_receipt(receipt).await })
     }
 }
 

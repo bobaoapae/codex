@@ -6,14 +6,14 @@
 //! `try_run_sampling_request`, where all of it is in scope, and handed to the
 //! adapter as an `Arc<dyn ClaudeHost>`.
 //!
-//! Why this matters: without a host, a `--permission-mode auto` CLI has no one
-//! to ask, so every "ask" decision it reaches is final. That is the mechanism
-//! behind the "dotnet requires approval" dead ends — the child was not blocked
-//! by policy, it was blocked by having no prompt surface.
-
+//! The host supplies the approval surface required by Claude's `auto` mode.
+use super::ClaudeCodeWorkspace;
 use codex_protocol::approvals::ExecApprovalKind;
+use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::ReviewDecision;
+use codex_tools::ToolName;
+use codex_tools::ToolSpec;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use serde_json::Value as JsonValue;
@@ -21,30 +21,29 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-
-use codex_tools::ToolName;
-use codex_tools::ToolSpec;
-
+#[path = "session_host_prepare.rs"]
+mod prepare;
 use super::bridge::BRIDGE_SERVER_NAME;
 use super::control::CanUseTool;
 use super::control::ToolPermissionDecision;
 use super::host::APPROVAL_TIMEOUT;
 use super::host::ClaudeHost;
+use crate::ownership::ClaudeProviderAccess;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolPayload;
 use crate::tools::router::ToolCall;
-
 pub(crate) struct SessionClaudeHost {
     session: Arc<Session>,
     step_context: Arc<StepContext>,
     tracker: SharedTurnDiffTracker,
     cancel: CancellationToken,
-    /// Distinguishes the child's bridge calls from one another in the parent's
-    /// transcript.
+    /// Distinguishes the child's bridge calls in the parent's transcript.
     bridge_calls: std::sync::atomic::AtomicU64,
+    provider_access: ClaudeProviderAccess,
+    cwd: codex_utils_absolute_path::AbsolutePathBuf,
 }
 
 impl std::fmt::Debug for SessionClaudeHost {
@@ -59,6 +58,8 @@ impl SessionClaudeHost {
         step_context: Arc<StepContext>,
         tracker: SharedTurnDiffTracker,
         cancel: CancellationToken,
+        provider_access: ClaudeProviderAccess,
+        cwd: codex_utils_absolute_path::AbsolutePathBuf,
     ) -> Self {
         Self {
             session,
@@ -66,7 +67,19 @@ impl SessionClaudeHost {
             tracker,
             cancel,
             bridge_calls: std::sync::atomic::AtomicU64::new(0),
+            provider_access,
+            cwd,
         }
+    }
+
+    /// Build the per-turn workspace and permission host before launching Claude.
+    pub(crate) async fn prepare(
+        session: Arc<Session>,
+        step_context: Arc<StepContext>,
+        tracker: SharedTurnDiffTracker,
+        cancel: CancellationToken,
+    ) -> Result<(ClaudeCodeWorkspace, Arc<Self>), String> {
+        prepare::prepare(session, step_context, tracker, cancel).await
     }
 
     fn next_bridge_call_id(&self) -> u64 {
@@ -128,6 +141,29 @@ impl ClaudeHost for SessionClaudeHost {
         request: &'a CanUseTool,
     ) -> BoxFuture<'a, ToolPermissionDecision> {
         async move {
+            if let Err(error) = self
+                .provider_access
+                .authorize_claude_tool(&request.tool_name, &request.input, &self.cwd)
+                .await
+            {
+                return ToolPermissionDecision::Deny {
+                    message: error,
+                    interrupt: false,
+                };
+            }
+
+            // A writable subagent is deliberately launched in `auto` mode even
+            // when the parent policy is `Never`, because `bypassPermissions`
+            // would suppress this callback and bypass ownership admission. The
+            // parent policy still means no user prompt: after the receiver-side
+            // guard above succeeds, allow the tool directly.
+            if self.step_context.settings.approval_policy() == AskForApproval::Never {
+                return ToolPermissionDecision::Allow {
+                    updated_input: None,
+                    updated_permissions: None,
+                };
+            }
+
             // `tool_use_id` is what the CLI will use to correlate the answer;
             // reusing it as the approval id keeps the two views in step.
             let call_id = request
@@ -154,7 +190,7 @@ impl ClaudeHost for SessionClaudeHost {
                 }
             };
 
-            match decision {
+            let allowed = match decision {
                 ReviewDecision::Approved
                 | ReviewDecision::ApprovedExecpolicyAmendment { .. }
                 | ReviewDecision::ApprovedMcpPolicyAmendment
@@ -184,7 +220,19 @@ impl ClaudeHost for SessionClaudeHost {
                     message: "The parent session ended this turn.".to_string(),
                     interrupt: true,
                 },
+            };
+            if matches!(allowed, ToolPermissionDecision::Allow { .. })
+                && let Err(error) = self
+                    .provider_access
+                    .authorize_claude_tool(&request.tool_name, &request.input, &self.cwd)
+                    .await
+            {
+                return ToolPermissionDecision::Deny {
+                    message: error,
+                    interrupt: false,
+                };
             }
+            allowed
         }
         .boxed()
     }

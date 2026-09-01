@@ -1,7 +1,10 @@
 use super::*;
+use crate::agent::registry::AgentMetadata;
 use crate::config::ConfigBuilder;
 use crate::plugins::plugins_manager_for_config;
 use crate::skills_load_input_from_config;
+use codex_agent_roles::AgentMutationCapability;
+use codex_agent_roles::AgentRoleCapabilities;
 use codex_config::test_support::CloudConfigBundleFixture;
 use codex_login::test_support::auth_manager_from_optional_auth;
 use codex_model_provider_info::WireApi;
@@ -45,6 +48,68 @@ fn session_flags_layer_count(config: &Config) -> usize {
         .all_layers_low_to_high()
         .filter(|layer| layer.name == ConfigLayerSource::SessionFlags)
         .count()
+}
+
+#[test]
+fn role_capabilities_are_typed_and_fail_closed() {
+    for role_name in ["explorer", "tester", "claude-fable", "chatgpt-pro"] {
+        assert_eq!(
+            role_capabilities(Some(role_name)),
+            AgentRoleCapabilities {
+                mutation: AgentMutationCapability::ReadOnly,
+            }
+        );
+    }
+    for role_name in [
+        "executor_luna",
+        "executor_sonnet",
+        "claude-opus",
+        "doc-writer",
+        "worker",
+        "luna",
+    ] {
+        let capabilities = role_capabilities(Some(role_name));
+        assert_eq!(
+            capabilities,
+            AgentRoleCapabilities {
+                mutation: AgentMutationCapability::RequiresWorkspaceLease,
+            }
+        );
+        assert!(!capabilities.effective_mutation_allowed(false));
+    }
+    for role_name in [Some("default"), Some("custom"), Some("unknown"), None] {
+        let capabilities = role_capabilities(role_name);
+        assert_eq!(
+            capabilities,
+            AgentRoleCapabilities {
+                mutation: AgentMutationCapability::ReadOnly,
+            }
+        );
+        assert!(!capabilities.effective_mutation_allowed(true));
+    }
+}
+
+#[test]
+fn runtime_agent_metadata_does_not_turn_a_role_into_a_write_grant() {
+    let executor = AgentMetadata {
+        agent_role: Some("executor_luna".to_string()),
+        ..Default::default()
+    };
+    assert_eq!(
+        executor.role_capabilities().mutation,
+        AgentMutationCapability::RequiresWorkspaceLease
+    );
+    assert!(!executor.effective_mutation_allowed(false));
+
+    let custom = AgentMetadata {
+        agent_role: Some("custom-editor".to_string()),
+        ..Default::default()
+    };
+    assert_eq!(
+        custom.role_capabilities().mutation,
+        AgentMutationCapability::ReadOnly
+    );
+    assert!(!custom.effective_mutation_allowed(true));
 }
 
 #[tokio::test]
@@ -744,7 +809,7 @@ fn built_in_config_file_contents_resolves_explorer_only() {
 
 /// FORK: the local Claude Code CLI is the one provider a role may select.
 #[tokio::test]
-async fn apply_role_selects_the_local_claude_provider() {
+async fn fork_invariant_claude_code_provider_can_be_selected_by_role() {
     let (home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
     let role_path = write_role_config(
         &home,
@@ -774,7 +839,7 @@ model_provider = "claude_code"
 
 /// FORK: ChatGPT Web is the other locally served provider a role may select.
 #[tokio::test]
-async fn apply_role_selects_the_chatgpt_web_provider() {
+async fn fork_invariant_chatgpt_web_provider_can_be_selected_by_role() {
     let (home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
     let role_path = write_role_config(
         &home,

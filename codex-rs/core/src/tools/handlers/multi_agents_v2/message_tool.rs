@@ -82,6 +82,16 @@ pub(super) async fn handle_message_string_tool(
     let receiver_agent_path = receiver_agent.agent_path.clone().ok_or_else(|| {
         FunctionCallError::RespondToModel("target agent is missing an agent_path".to_string())
     })?;
+    if mode == MessageDeliveryMode::TriggerTurn
+        && session
+            .services
+            .agent_control
+            .is_agent_closed(receiver_thread_id)
+    {
+        return Err(FunctionCallError::RespondToModel(
+            "target agent is closed; resume it before sending a follow-up".to_string(),
+        ));
+    }
     let resume_config = build_agent_resume_config(turn.as_ref())?;
     session
         .services
@@ -89,6 +99,26 @@ pub(super) async fn handle_message_string_tool(
         .ensure_v2_agent_loaded(resume_config, receiver_thread_id, /*parent*/ None)
         .await
         .map_err(|err| collab_agent_error(receiver_thread_id, err))?;
+    let receiver_config = session
+        .services
+        .agent_control
+        .get_agent_config(receiver_thread_id)
+        .await
+        .ok_or_else(|| {
+            FunctionCallError::RespondToModel(
+                "cannot verify the receiver provider; retry with plaintext_message".to_string(),
+            )
+        })?;
+    require_readable_message_form(receiver_config.as_ref(), message_form, &source, tool_name)?;
+    require_readable_message_form(&turn.config, message_form, &source, tool_name)?;
+    if mode == MessageDeliveryMode::TriggerTurn {
+        session
+            .services
+            .agent_control
+            .begin_followup_generation(receiver_thread_id, receiver_config.as_ref())
+            .await
+            .map_err(|err| collab_agent_error(receiver_thread_id, err))?;
+    }
     let author = turn
         .session_source
         .get_agent_path()

@@ -1,0 +1,28 @@
+---
+source: tui/src/app/agents_fleet_view_tests.rs
+expression: popup
+---
+  Agent fleet
+  root 00000000-0000-0000-0000-000000000801  generation 43  open
+  ────────────────────────────────────────────────────────────────────────────────────────────────────
+  › ○ 00000000-0000-0000-0000-000000000801  idle  00000000-0000-0000-0000-000000000801
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  Fleet status changed; refresh before sending this action again.
+  New task › Describe a task and press enter to dispatch it
+  ↑ ↓ navigate  enter open  → manage  ctrl+f search  ctrl+s group  ctrl+n new  ctrl+r rename  ctrl+x s

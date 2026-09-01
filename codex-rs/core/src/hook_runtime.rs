@@ -312,6 +312,8 @@ pub(crate) async fn run_post_tool_use_hooks(
 
     let outcome = hooks.run_post_tool_use(request).await;
     emit_hook_completed_events(sess, turn_context, outcome.hook_events.clone()).await;
+    sess.persist_hook_evidence_receipts(turn_context, &outcome.evidence)
+        .await;
     outcome
 }
 

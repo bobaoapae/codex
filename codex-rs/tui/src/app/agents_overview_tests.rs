@@ -425,8 +425,11 @@ async fn filtered_dashboard_actions_use_configured_shortcuts() {
 #[tokio::test]
 async fn failed_root_switch_keeps_background_requests_on_the_active_session() -> Result<()> {
     let mut app = make_test_app().await;
-    let mut app_server =
-        crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref()).await?;
+    let mut server_config = app.chat_widget.config_ref().clone();
+    let _ = server_config
+        .features
+        .disable(codex_features::Feature::Plugins);
+    let mut app_server = crate::start_embedded_app_server_for_picker(&server_config).await?;
     app.primary_thread_id = Some(ThreadId::new());
     app.ensure_thread_channel(ThreadId::new())
         .store

@@ -2,6 +2,22 @@ use super::*;
 use pretty_assertions::assert_eq;
 
 #[test]
+fn multi_agent_arguments_are_redacted_before_telemetry() {
+    assert_eq!(
+        redact_tool_arguments(&ToolName::plain("send_message"), "ciphertext"),
+        "[redacted]"
+    );
+    assert_eq!(
+        redact_tool_arguments(&ToolName::plain("spawn_agent"), "plaintext"),
+        "[redacted]"
+    );
+    assert_eq!(
+        redact_tool_arguments(&ToolName::plain("exec_command"), "arguments"),
+        "arguments"
+    );
+}
+
+#[test]
 fn telemetry_preview_returns_original_within_limits() {
     // A literal marker in the tool's own output must not imply telemetry truncation.
     for content in ["", "first\r\nsecond\r\n", TRUNCATION_NOTICE] {

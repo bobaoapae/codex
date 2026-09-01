@@ -192,4 +192,5 @@ fn plan_ids_reject_path_separators_and_dot_entries() {
     assert!(!is_valid_plan_id("a/b"));
     assert!(!is_valid_plan_id("a\\b"));
     assert!(!is_valid_plan_id("a:b"));
+    assert!(!is_valid_plan_id("a."));
 }

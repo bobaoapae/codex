@@ -2,11 +2,14 @@ use super::thread_input::DIRECT_INPUT_TO_MULTI_AGENT_V2_SUBAGENT_ERROR;
 use super::thread_input::can_accept_direct_input;
 use super::thread_input::ensure_direct_input_allowed;
 use super::*;
+use codex_app_server_protocol::ApprovedPlanRef;
+use codex_core::CodexThread;
 use codex_goal_extension::GoalObjectiveUpdate;
 use codex_goal_extension::GoalService;
 use codex_goal_extension::GoalServiceError;
 use codex_goal_extension::GoalSetRequest;
 use codex_goal_extension::GoalTokenBudgetUpdate;
+use codex_plans::PlanApprovalError;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadSettingsAppliedEvent;
@@ -16,6 +19,103 @@ use codex_rollout::RolloutRecorder;
 enum GoalAccess {
     Read,
     Mutate,
+}
+
+/// An approved plan snapshot resolved before thread or turn admission.
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedApprovedPlan {
+    pub(crate) id: String,
+    pub(crate) revision: u32,
+    pub(crate) title: String,
+    pub(crate) body: String,
+}
+
+/// A goal claim held between validation and successful plan admission.
+pub(crate) struct ApprovedPlanGoalClaim {
+    thread_id: ThreadId,
+    outcome: codex_goal_extension::GoalSetOutcome,
+    state_db: StateDbHandle,
+    listener_command_tx: Option<tokio::sync::mpsc::UnboundedSender<ThreadListenerCommand>>,
+}
+
+/// Resolve exactly the requested immutable approved snapshot.
+pub(crate) async fn resolve_approved_plan(
+    config: &Config,
+    reference: &ApprovedPlanRef,
+) -> Result<ResolvedApprovedPlan, JSONRPCErrorError> {
+    if reference.revision == 0 || !codex_plans::is_valid_plan_id(&reference.id) {
+        return Err(invalid_request(format!(
+            "approved plan reference is invalid: {}@{}",
+            reference.id, reference.revision
+        )));
+    }
+    let summaries = codex_plans::list_approved_plans(&config.codex_home)
+        .await
+        .map_err(approved_plan_storage_error)?;
+    let Some(summary) = summaries
+        .into_iter()
+        .find(|summary| summary.id == reference.id && summary.revision == reference.revision)
+    else {
+        return Err(invalid_request(format!(
+            "approved plan snapshot is missing or stale: {}@{}",
+            reference.id, reference.revision
+        )));
+    };
+    if summary.superseded_by.is_some() {
+        return Err(invalid_request(format!(
+            "approved plan snapshot is superseded: {}@{}",
+            reference.id, reference.revision
+        )));
+    }
+    let plan = codex_plans::read_approved_plan(
+        &config.codex_home,
+        &reference.id,
+        Some(reference.revision),
+    )
+    .await
+    .map_err(approved_plan_storage_error)?
+    .ok_or_else(|| {
+        invalid_request(format!(
+            "approved plan snapshot is missing or stale: {}@{}",
+            reference.id, reference.revision
+        ))
+    })?;
+    codex_plans::render_plan_fragment(
+        &reference.id,
+        reference.revision,
+        &summary.title,
+        &plan.markdown,
+    )
+    .map_err(|error| invalid_request(format!("approved plan cannot be admitted: {error}")))?;
+    Ok(ResolvedApprovedPlan {
+        id: reference.id.clone(),
+        revision: reference.revision,
+        title: summary.title,
+        body: plan.markdown,
+    })
+}
+
+fn approved_plan_storage_error(error: PlanApprovalError) -> JSONRPCErrorError {
+    match error {
+        PlanApprovalError::Io(error) => {
+            internal_error(format!("approved plan storage failed: {error}"))
+        }
+        PlanApprovalError::InvalidId(id) => invalid_request(format!("invalid plan id: {id}")),
+        PlanApprovalError::DraftNotFound(id) => {
+            invalid_request(format!("approved plan snapshot is missing: {id}"))
+        }
+        PlanApprovalError::StaleDraft {
+            id,
+            expected,
+            actual,
+        } => invalid_request(format!(
+            "approved plan {id} is stale: expected revision {expected}, current revision {actual}"
+        )),
+        PlanApprovalError::Conflict(message) => invalid_request(message),
+        PlanApprovalError::TooLarge { actual, maximum } => invalid_request(format!(
+            "approved plan is too large: {actual} tokens (maximum {maximum})"
+        )),
+    }
 }
 
 #[derive(Clone)]
@@ -45,6 +145,97 @@ impl ThreadGoalRequestProcessor {
             state_db,
             goal_service,
         }
+    }
+
+    pub(crate) fn ensure_approved_plan_support(&self) -> Result<(), JSONRPCErrorError> {
+        if !self.config.features.enabled(Feature::Goals) {
+            return Err(invalid_request("approved plans require the goals feature"));
+        }
+        if self.state_db.is_none() {
+            return Err(internal_error(
+                "approved plans require sqlite state persistence",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn claim_approved_plan_goal(
+        &self,
+        thread_id: ThreadId,
+        plan: &ResolvedApprovedPlan,
+    ) -> Result<ApprovedPlanGoalClaim, JSONRPCErrorError> {
+        self.ensure_approved_plan_support()?;
+        let state_db = self
+            .state_db_for_materialized_thread(thread_id, GoalAccess::Mutate)
+            .await?;
+        self.reconcile_thread_goal_rollout(thread_id, &state_db)
+            .await?;
+        let listener_command_tx = {
+            let thread_state = self.thread_state_manager.thread_state(thread_id).await;
+            let thread_state = thread_state.lock().await;
+            thread_state.listener_command_tx()
+        };
+        let outcome = self
+            .goal_service
+            .claim_approved_plan_goal(&state_db, thread_id, &plan.id, plan.revision, &plan.title)
+            .await
+            .map_err(goal_service_error)?;
+        outcome.apply_runtime_effects(&self.goal_service).await;
+        Ok(ApprovedPlanGoalClaim {
+            thread_id,
+            outcome,
+            state_db,
+            listener_command_tx,
+        })
+    }
+
+    pub(crate) async fn commit_approved_plan_goal(
+        &self,
+        thread: &CodexThread,
+        claim: &ApprovedPlanGoalClaim,
+    ) -> Result<(), JSONRPCErrorError> {
+        thread
+            .append_rollout_items(&[claim.outcome.thread_goal_updated_item()])
+            .await
+            .map_err(|error| {
+                internal_error(format!("failed to persist approved plan goal: {error}"))
+            })?;
+        thread.flush_rollout().await.map_err(|error| {
+            internal_error(format!("failed to flush approved plan goal: {error}"))
+        })?;
+        self.emit_thread_goal_updated_ordered(
+            claim.thread_id,
+            claim.outcome.goal.clone().into(),
+            claim.listener_command_tx.clone(),
+        )
+        .await;
+        Ok(())
+    }
+
+    pub(crate) async fn rollback_approved_plan_goal(
+        &self,
+        claim: &ApprovedPlanGoalClaim,
+    ) -> Result<(), JSONRPCErrorError> {
+        let rolled_back = claim
+            .outcome
+            .rollback_claim_if_unchanged(&claim.state_db)
+            .await
+            .map_err(goal_service_error)?;
+        if rolled_back {
+            if let Err(error) = self
+                .goal_service
+                .restore_thread_runtime_after_resume(claim.outcome.goal.thread_id)
+                .await
+            {
+                warn!(
+                    "failed to restore approved plan goal runtime for {}: {error}",
+                    claim.outcome.goal.thread_id
+                );
+            }
+            self.emit_thread_goal_snapshot(claim.outcome.goal.thread_id)
+                .await;
+        }
+        Ok(())
     }
 
     pub(crate) async fn thread_goal_set(
@@ -489,6 +680,9 @@ fn thread_settings_applied_item(
         ThreadSettingsAppliedEvent {
             thread_id: Some(thread_id),
             thread_settings,
+            runtime_build_info: None,
+            config_layer_revision: None,
+            runtime_feature_revision: None,
         },
     ))
 }

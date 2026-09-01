@@ -18,6 +18,7 @@ use codex_protocol::items::McpToolCallItem;
 use codex_protocol::items::McpToolCallStatus as CoreMcpToolCallStatus;
 use codex_protocol::items::ReasoningItem;
 use codex_protocol::items::SubAgentActivityItem;
+use codex_protocol::items::TurnItem as CoreTurnItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::items::UserMessageItem;
 use codex_protocol::items::WebSearchItem as CoreWebSearchItem;
@@ -2251,6 +2252,40 @@ fn client_request_turn_start_granular_approval_policy_is_marked_experimental() {
 }
 
 #[test]
+fn approved_plan_thread_and_turn_fields_are_experimental_and_camel_case() {
+    let approved_plan = ApprovedPlanRef {
+        id: "plan-1.md".to_string(),
+        revision: 7,
+    };
+    let thread = ThreadStartParams {
+        approved_plan: Some(approved_plan.clone()),
+        ..Default::default()
+    };
+    assert_eq!(
+        crate::experimental_api::ExperimentalApi::experimental_reason(&thread),
+        Some("thread/start.approvedPlan")
+    );
+    assert_eq!(
+        serde_json::to_value(&thread).expect("thread params should serialize")["approvedPlan"],
+        json!({"id": "plan-1.md", "revision": 7})
+    );
+
+    let turn = TurnStartParams {
+        thread_id: "thread-1".to_string(),
+        approved_plan: Some(approved_plan),
+        ..Default::default()
+    };
+    assert_eq!(
+        crate::experimental_api::ExperimentalApi::experimental_reason(&turn),
+        Some("turn/start.approvedPlan")
+    );
+    assert_eq!(
+        serde_json::to_value(&turn).expect("turn params should serialize")["approvedPlan"],
+        json!({"id": "plan-1.md", "revision": 7})
+    );
+}
+
+#[test]
 fn mcp_server_elicitation_response_round_trips_rmcp_result() {
     let rmcp_result = rmcp::model::ElicitResult::new(rmcp::model::ElicitationAction::Accept)
         .with_content(json!({
@@ -3328,6 +3363,30 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
             codex_extension_items::ExtensionItem::WebSearch(expected_search_item.clone()),
         )),
         ThreadItem::WebSearch(expected_search_item)
+    );
+
+    let receipt = codex_extension_items::receipt::ReceiptAttachedItem::new(
+        "receipt-1",
+        1,
+        "future.check",
+        "host evidence",
+        codex_extension_items::receipt::ReceiptStatus::Informational,
+        "2026-08-31T12:00:00Z",
+        "tester",
+    )
+    .expect("valid receipt");
+    let receipt_item = ThreadItem::from(CoreTurnItem::Extension(
+        codex_extension_items::ExtensionItem::ReceiptAttached(receipt),
+    ));
+    assert_eq!(
+        serde_json::to_value(receipt_item).expect("serialize hidden receipt projection"),
+        json!({
+            "type": "functionCallOutput",
+            "id": "receipt-1",
+            "name": "receipt.attached",
+            "namespace": null,
+            "output": "",
+        })
     );
 
     let image_view_item = TurnItem::ImageView(ImageViewItem {
@@ -4510,6 +4569,14 @@ fn codex_error_info_serializes_http_status_code_in_camel_case() {
 }
 
 #[test]
+fn codex_error_info_serializes_history_recovery_as_explicit_status() {
+    assert_eq!(
+        serde_json::to_value(CodexErrorInfo::HistoryRecoveryRequired).unwrap(),
+        json!("historyRecoveryRequired")
+    );
+}
+
+#[test]
 fn core_error_info_converts_to_camel_case() {
     for (core, expected) in [
         (CoreCodexErrorInfo::CyberPolicy, json!("cyberPolicy")),
@@ -4742,6 +4809,7 @@ fn turn_start_params_preserve_explicit_null_service_tier() {
 
     let without_override = TurnStartParams {
         thread_id: "thread_123".to_string(),
+        approved_plan: None,
         client_user_message_id: None,
         input: vec![],
         turn_trigger: None,
@@ -5103,5 +5171,339 @@ fn tool_request_user_input_params_default_legacy_missing_is_blocking_to_true() {
             is_blocking: true,
             auto_resolution_ms: Some(60_000),
         }
+    );
+}
+
+#[test]
+fn transient_job_params_round_trip_all_supported_wire_fields() {
+    let params = serde_json::from_value::<JobRunParams>(json!({
+        "input": [{"type": "text", "text": "run this"}],
+        "idempotencyKey": "job-key",
+        "model": "gpt-test",
+        "modelProvider": "openai",
+        "cwd": "/workspace",
+        "approvalPolicy": "on-request",
+        "sandbox": "workspace-write",
+        "permissions": "workspace",
+        "config": {"custom": true},
+        "outputSchema": {"type": "object"},
+    }))
+    .expect("job/run params should deserialize");
+
+    assert_eq!(params.input.len(), 1);
+    assert_eq!(params.idempotency_key.as_deref(), Some("job-key"));
+    assert_eq!(params.model.as_deref(), Some("gpt-test"));
+    assert_eq!(params.model_provider.as_deref(), Some("openai"));
+    assert_eq!(params.cwd, Some(PathBuf::from("/workspace")));
+    assert_eq!(params.permissions.as_deref(), Some("workspace"));
+    assert_eq!(
+        params.config,
+        Some(HashMap::from([(String::from("custom"), json!(true))]))
+    );
+    assert_eq!(params.output_schema, Some(json!({"type": "object"})));
+
+    let serialized = serde_json::to_value(&params).expect("job/run params should serialize");
+    assert_eq!(serialized["idempotencyKey"], "job-key");
+    assert_eq!(serialized["model"], "gpt-test");
+    assert_eq!(serialized["modelProvider"], "openai");
+    assert_eq!(serialized["cwd"], "/workspace");
+    assert_eq!(serialized["approvalPolicy"], "on-request");
+    assert_eq!(serialized["sandbox"], "workspace-write");
+    assert_eq!(serialized["permissions"], "workspace");
+    assert_eq!(serialized["config"], json!({"custom": true}));
+    assert_eq!(serialized["outputSchema"], json!({"type": "object"}));
+}
+
+#[test]
+fn transient_job_params_accept_legacy_provider_alias() {
+    let params = serde_json::from_value::<JobRunParams>(json!({
+        "input": [],
+        "provider": "openai",
+    }))
+    .expect("modelProvider compatibility alias should deserialize");
+
+    assert_eq!(params.model_provider.as_deref(), Some("openai"));
+    assert_eq!(
+        serde_json::to_value(params).expect("params should serialize")["modelProvider"],
+        "openai"
+    );
+}
+
+#[test]
+fn transient_job_lifecycle_types_are_camel_case_and_never_contain_output() {
+    assert_eq!(
+        serde_json::to_value(ThreadClass::TransientJob).unwrap(),
+        "transientJob"
+    );
+    assert_eq!(serde_json::to_value(JobStatus::Running).unwrap(), "running");
+    assert_eq!(
+        serde_json::to_value(TerminalOutcome::Inconclusive).unwrap(),
+        "inconclusive"
+    );
+
+    let job = Job {
+        id: "job-1".to_string(),
+        thread_class: ThreadClass::TransientJob,
+        thread_id: "job-1".to_string(),
+        root_thread_id: None,
+        parent_run_id: None,
+        status: JobStatus::Succeeded,
+        outcome: Some(TerminalOutcome::Succeeded),
+        idempotency_key: None,
+        model_provider: Some("openai".to_string()),
+        model: Some("gpt-test".to_string()),
+        cwd: Some("/workspace".to_string()),
+        created_at: 1,
+        updated_at: 2,
+        started_at: Some(1),
+        finished_at: Some(2),
+        version: 1,
+    };
+    let serialized = serde_json::to_value(job).expect("job should serialize");
+    assert_eq!(serialized["threadClass"], "transientJob");
+    assert_eq!(serialized["status"], "succeeded");
+    assert_eq!(serialized["outcome"], "succeeded");
+    assert_eq!(serialized["modelProvider"], "openai");
+    assert!(serialized.get("stdout").is_none());
+    assert!(serialized.get("stderr").is_none());
+}
+
+#[test]
+fn thread_class_workflow_fields_are_optional_and_experimental() {
+    let start = serde_json::from_value::<ThreadStartParams>(json!({
+        "threadClass": "transientJob",
+    }))
+    .expect("thread/start params should deserialize");
+    assert_eq!(start.thread_class, Some(ThreadClass::TransientJob));
+    assert_eq!(
+        crate::experimental_api::ExperimentalApi::experimental_reason(&start),
+        Some("thread/start.threadClass")
+    );
+    assert_eq!(
+        serde_json::to_value(start).expect("thread/start params should serialize")["threadClass"],
+        "transientJob"
+    );
+
+    let list = serde_json::from_value::<ThreadListParams>(json!({
+        "threadClasses": ["interactive", "transientJob"],
+    }))
+    .expect("thread/list params should deserialize");
+    assert_eq!(
+        list.thread_classes,
+        Some(vec![ThreadClass::Interactive, ThreadClass::TransientJob])
+    );
+    assert_eq!(
+        crate::experimental_api::ExperimentalApi::experimental_reason(&list),
+        Some("thread/list.threadClasses")
+    );
+
+    let search = serde_json::from_value::<ThreadSearchParams>(json!({
+        "searchTerm": "durable",
+        "threadClasses": ["legacyExec"],
+    }))
+    .expect("thread/search params should deserialize");
+    assert_eq!(search.thread_classes, Some(vec![ThreadClass::LegacyExec]));
+    assert_eq!(
+        crate::experimental_api::ExperimentalApi::experimental_reason(&search),
+        Some("thread/search.threadClasses")
+    );
+}
+
+#[test]
+fn thread_search_fts_filters_and_index_state_are_camel_case_and_experimental() {
+    let list = serde_json::from_value::<ThreadListParams>(json!({
+        "modelProviders": ["openai", "chatgpt_web"],
+        "cwd": ["/workspace", "/other-workspace"],
+        "projectId": "project-1",
+        "rootThreadId": "root-1",
+        "ancestorThreadId": "ancestor-1",
+        "threadClasses": ["interactive", "transientJob"],
+        "terminalOutcomes": ["succeeded", "blocked"],
+    }))
+    .expect("thread/list FTS filters should deserialize");
+    assert_eq!(
+        list.model_providers,
+        Some(vec!["openai".to_string(), "chatgpt_web".to_string()])
+    );
+    assert_eq!(
+        list.cwd,
+        Some(ThreadListCwdFilter::Many(vec![
+            "/workspace".to_string(),
+            "/other-workspace".to_string(),
+        ]))
+    );
+    assert_eq!(list.project_id, Some(Some("project-1".to_string())));
+    assert_eq!(list.root_thread_id.as_deref(), Some("root-1"));
+    assert_eq!(list.ancestor_thread_id.as_deref(), Some("ancestor-1"));
+    assert_eq!(
+        list.thread_classes,
+        Some(vec![ThreadClass::Interactive, ThreadClass::TransientJob])
+    );
+    assert_eq!(
+        list.terminal_outcomes,
+        Some(vec![TerminalOutcome::Succeeded, TerminalOutcome::Blocked])
+    );
+    let list_json = serde_json::to_value(&list).expect("thread/list FTS filters should serialize");
+    assert_eq!(
+        list_json["modelProviders"],
+        json!(["openai", "chatgpt_web"])
+    );
+    assert_eq!(list_json["cwd"], json!(["/workspace", "/other-workspace"]));
+    assert_eq!(list_json["projectId"], "project-1");
+    assert_eq!(list_json["rootThreadId"], "root-1");
+    assert_eq!(list_json["ancestorThreadId"], "ancestor-1");
+    assert_eq!(
+        list_json["threadClasses"],
+        json!(["interactive", "transientJob"])
+    );
+    assert_eq!(
+        list_json["terminalOutcomes"],
+        json!(["succeeded", "blocked"])
+    );
+    for field in [
+        "modelProviders",
+        "cwd",
+        "projectId",
+        "rootThreadId",
+        "ancestorThreadId",
+        "threadClasses",
+        "terminalOutcomes",
+    ] {
+        assert!(
+            ThreadListParams::EXPERIMENTAL_FIELDS
+                .iter()
+                .any(|entry| entry.field_name == field),
+            "thread/list field {field} should be experimental"
+        );
+    }
+
+    let search = serde_json::from_value::<ThreadSearchParams>(json!({
+        "searchTerm": "durable",
+        "modelProviders": ["openai"],
+        "cwd": "/workspace",
+        "projectId": null,
+        "rootThreadId": "root-1",
+        "ancestorThreadId": "ancestor-1",
+        "threadClasses": ["legacyExec"],
+        "terminalOutcomes": ["failed", "inconclusive"],
+    }))
+    .expect("thread/search FTS filters should deserialize");
+    assert_eq!(search.model_providers, Some(vec!["openai".to_string()]));
+    assert_eq!(
+        search.cwd,
+        Some(ThreadListCwdFilter::One("/workspace".to_string()))
+    );
+    assert_eq!(search.project_id, Some(None));
+    assert_eq!(search.root_thread_id.as_deref(), Some("root-1"));
+    assert_eq!(search.ancestor_thread_id.as_deref(), Some("ancestor-1"));
+    assert_eq!(search.thread_classes, Some(vec![ThreadClass::LegacyExec]));
+    assert_eq!(
+        search.terminal_outcomes,
+        Some(vec![TerminalOutcome::Failed, TerminalOutcome::Inconclusive])
+    );
+    let search_json =
+        serde_json::to_value(&search).expect("thread/search FTS filters should serialize");
+    assert_eq!(search_json["modelProviders"], json!(["openai"]));
+    assert_eq!(search_json["cwd"], "/workspace");
+    assert_eq!(search_json["projectId"], serde_json::Value::Null);
+    assert_eq!(search_json["rootThreadId"], "root-1");
+    assert_eq!(search_json["ancestorThreadId"], "ancestor-1");
+    assert_eq!(search_json["threadClasses"], json!(["legacyExec"]));
+    assert_eq!(
+        search_json["terminalOutcomes"],
+        json!(["failed", "inconclusive"])
+    );
+    for field in [
+        "modelProviders",
+        "cwd",
+        "projectId",
+        "rootThreadId",
+        "ancestorThreadId",
+        "threadClasses",
+        "terminalOutcomes",
+    ] {
+        assert!(
+            ThreadSearchParams::EXPERIMENTAL_FIELDS
+                .iter()
+                .any(|entry| entry.field_name == field),
+            "thread/search field {field} should be experimental"
+        );
+    }
+
+    for (state, wire_value) in [
+        (IndexState::Building, "building"),
+        (IndexState::Ready, "ready"),
+        (IndexState::Unavailable, "unavailable"),
+        (IndexState::Recoverable, "recoverable"),
+    ] {
+        assert_eq!(serde_json::to_value(state).unwrap(), wire_value);
+    }
+
+    let response = ThreadSearchResponse {
+        data: Vec::new(),
+        next_cursor: Some("next".to_string()),
+        backwards_cursor: Some("backwards".to_string()),
+        index_state: IndexState::Building,
+        partial: true,
+    };
+    assert_eq!(
+        serde_json::to_value(response).unwrap(),
+        json!({
+            "data": [],
+            "nextCursor": "next",
+            "backwardsCursor": "backwards",
+            "indexState": "building",
+            "partial": true,
+        })
+    );
+    for field in ["indexState", "partial"] {
+        assert!(
+            ThreadSearchResponse::EXPERIMENTAL_FIELDS
+                .iter()
+                .any(|entry| entry.field_name == field),
+            "thread/search response field {field} should be experimental"
+        );
+    }
+    for field in ["indexState", "partial"] {
+        assert!(
+            ThreadListResponse::EXPERIMENTAL_FIELDS
+                .iter()
+                .any(|entry| entry.field_name == field),
+            "thread/list response field {field} should be experimental"
+        );
+    }
+}
+
+#[test]
+fn plan_contract_round_trips_lifecycle_revision_and_approved_ref() {
+    let response = PlanApproveResponse {
+        plan: PlanSummary {
+            id: "plan-1.md".to_string(),
+            title: "Ship it".to_string(),
+            path: "plans/plan-1.md".to_string(),
+            thread_id: Some("thread-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            cwd: Some("/workspace".to_string()),
+            model: Some("gpt-5".to_string()),
+            created_at: 1,
+            updated_at: 2,
+            revision: 3,
+            lifecycle: PlanLifecycle::Approved,
+        },
+        approved_plan: ApprovedPlanRef {
+            id: "plan-1.md".to_string(),
+            revision: 3,
+        },
+    };
+    let value = serde_json::to_value(&response).expect("plan response should serialize");
+    assert_eq!(value["plan"]["lifecycle"], json!("approved"));
+    assert_eq!(value["plan"]["revision"], json!(3));
+    assert_eq!(
+        value["approvedPlan"],
+        json!({"id": "plan-1.md", "revision": 3})
+    );
+    assert_eq!(
+        serde_json::from_value::<PlanApproveResponse>(value).expect("plan response should decode"),
+        response
     );
 }

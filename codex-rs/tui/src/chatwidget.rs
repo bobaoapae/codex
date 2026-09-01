@@ -382,7 +382,13 @@ mod plugins;
 use self::plugins::PluginInstallAuthFlowState;
 use self::plugins::PluginListFetchState;
 use self::plugins::PluginsCacheState;
+/// Read-only `/context` inspection and request state.
+mod context_inspection;
+/// FORK: `/jobs` — durable transient job picker and request state.
+pub(crate) mod jobs;
 mod plan_implementation;
+/// FORK: current-thread recovery preview and confirmation state.
+mod recovery;
 /// FORK: `/plans` — plans persisted by Plan mode.
 pub(crate) mod saved_plans;
 use self::plan_implementation::PLAN_IMPLEMENTATION_TITLE;
@@ -641,6 +647,12 @@ pub(crate) struct ChatWidget {
     ide_context: IdeContextState,
     /// FORK: state for `/plans`.
     saved_plans: saved_plans::SavedPlansState,
+    /// FORK: state for `/jobs`.
+    jobs: jobs::JobsState,
+    /// Read-only request state for `/context`.
+    context_inspection: context_inspection::ContextInspectionState,
+    /// FORK: state for `/recover`.
+    recovery: recovery::RecoveryState,
     plugins_cache: PluginsCacheState,
     plugins_fetch_state: PluginListFetchState,
     plugin_remote_sections_loading: bool,

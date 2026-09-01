@@ -74,6 +74,20 @@ fn executor_capability_discovery_is_an_opt_in_map_feature() {
 }
 
 #[test]
+fn fork_invariant_multi_agent_v2_is_explicitly_opt_in() {
+    let mut features = Features::with_defaults();
+    assert!(!features.enabled(Feature::MultiAgentV2));
+    assert_eq!(
+        feature_for_key("multi_agent_v2"),
+        Some(Feature::MultiAgentV2)
+    );
+
+    features.apply_map(&BTreeMap::from([("multi_agent_v2".to_string(), true)]));
+
+    assert!(features.enabled(Feature::MultiAgentV2));
+}
+
+#[test]
 fn cwd_relative_turn_diffs_is_an_opt_in_map_feature() {
     let mut features = Features::with_defaults();
     assert!(!features.enabled(Feature::CwdRelativeTurnDiffs));

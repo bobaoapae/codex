@@ -60,11 +60,20 @@ pub struct GoalSetRequest<'a> {
 #[derive(Clone, Debug)]
 pub struct GoalSetOutcome {
     pub goal: ThreadGoal,
-    state_goal: codex_state::ThreadGoal,
-    previous_goal: Option<PreviousGoalSnapshot>,
+    /// Durable identifier of the state-db goal represented by `goal`.
+    pub goal_id: String,
+    pub(crate) state_goal: codex_state::ThreadGoal,
+    pub(crate) previous_goal: Option<PreviousGoalSnapshot>,
+    pub(crate) previous_state_goal: Option<codex_state::ThreadGoal>,
+    pub(crate) rollback_claim: bool,
 }
 
 impl GoalSetOutcome {
+    /// Return the durable goal identifier for plan/evidence linkage.
+    pub fn goal_id(&self) -> &str {
+        &self.goal_id
+    }
+
     pub fn thread_goal_updated_item(&self) -> RolloutItem {
         RolloutItem::EventMsg(EventMsg::ThreadGoalUpdated(ThreadGoalUpdatedEvent {
             thread_id: self.goal.thread_id,
@@ -284,8 +293,11 @@ impl GoalService {
         }
         Ok(GoalSetOutcome {
             goal: protocol_goal_from_state(goal.clone()),
+            goal_id: goal.goal_id.clone(),
             state_goal: goal,
             previous_goal,
+            previous_state_goal: None,
+            rollback_claim: false,
         })
     }
 

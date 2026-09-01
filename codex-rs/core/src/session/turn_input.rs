@@ -15,11 +15,16 @@ use super::session::SessionSettingsUpdate;
 use super::thread_settings;
 use super::turn_context::NewTurnContextOptions;
 use super::turn_context::TurnContext;
+use crate::context::ApprovedPlanRef;
+use crate::context::ContextualUserFragment;
+use crate::context::PlanLoaded;
 use crate::state::ActiveTurn;
 use crate::state::TurnState;
 use crate::tasks::RegularTask;
+use codex_history::ResponseItemEnvelope;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::error::CodexErr;
+use codex_protocol::error::HistoryRecoveryReason;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AdditionalContextEntry;
@@ -29,6 +34,7 @@ use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::NonSteerableTurnKind;
 use codex_protocol::protocol::ThreadSettingsOverrides;
+use codex_protocol::turn_input::ApprovedPlanContext;
 use codex_protocol::turn_input::NotSubmittedReason;
 use codex_protocol::turn_input::TurnInput as SubmittedTurnInput;
 use codex_protocol::turn_input::TurnInputMode;
@@ -52,6 +58,35 @@ enum TurnStartKind {
     User,
     Automatic,
     Recovery,
+}
+
+/// A plan snapshot that survived validation and is ready to be admitted with a new user turn.
+///
+/// An already-active, byte-identical snapshot returns `None` instead, so retrying an equivalent
+/// request cannot add a duplicate `plan.loaded` item.
+fn prepare_approved_plan(
+    session: &Session,
+    context: Option<ApprovedPlanContext>,
+) -> CodexResult<Option<PlanLoaded>> {
+    let Some(context) = context else {
+        return Ok(None);
+    };
+    let plan = PlanLoaded::new(
+        ApprovedPlanRef::new(context.id, context.revision),
+        context.body,
+    )
+    .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?;
+    if let Some(existing) = session.approved_plan() {
+        if existing == plan {
+            return Ok(None);
+        }
+        if existing.approved_plan() == plan.approved_plan() {
+            return Err(CodexErr::InvalidRequest(
+                "approved plan snapshot body does not match its existing reference".to_string(),
+            ));
+        }
+    }
+    Ok(Some(plan))
 }
 
 impl TurnStartKind {
@@ -200,8 +235,20 @@ pub(super) async fn handle(
     mode: TurnInputMode,
     submission_id: String,
 ) -> CodexResult<TurnInputSubmission> {
+    if let Some(reason) = session.history_recovery_reason().await {
+        return Err(CodexErr::history_recovery_required(reason));
+    }
+
     match mode {
-        TurnInputMode::StartOrSteer => start_or_steer(session, request, submission_id).await,
+        TurnInputMode::StartOrSteer => {
+            if request.approved_plan.is_some() {
+                // An approved snapshot is part of a new-turn contract. Never let this request
+                // fall through to same-turn steering, even when the caller chose StartOrSteer.
+                start_if_idle(session, request, submission_id, TurnStartKind::User).await
+            } else {
+                start_or_steer(session, request, submission_id).await
+            }
+        }
         TurnInputMode::StartIfIdle => {
             let kind = match &request.input {
                 SubmittedTurnInput::UserInput { content, .. } if !content.is_empty() => {
@@ -225,6 +272,10 @@ pub(super) async fn handle_recovery(
     start_options: TurnStartOptions,
     submission_id: String,
 ) -> CodexResult<TurnInputSubmission> {
+    if let Some(reason) = session.history_recovery_reason().await {
+        return Err(CodexErr::history_recovery_required(reason));
+    }
+
     let request = TurnInputRequest::user_input(Vec::new())
         .with_thread_settings(thread_settings)
         .on_start(TurnStartOptions {
@@ -336,9 +387,19 @@ async fn start_if_idle(
         start,
         additional_context,
         responsesapi_client_metadata,
+        approved_plan,
         ..
     } = request;
     let can_start_root_turn = start.parent_turn_id.is_none() && start.root_turn_id.is_none();
+    let approved_plan = prepare_approved_plan(session, approved_plan)?;
+    if approved_plan.is_some()
+        && (kind != TurnStartKind::User
+            || !matches!(&input, SubmittedTurnInput::UserInput { content, .. } if !content.is_empty()))
+    {
+        return Err(CodexErr::InvalidRequest(
+            "approved plan context requires a non-empty user input".to_string(),
+        ));
+    }
     if session.input_queue.has_trigger_turn_mailbox_items().await {
         return Ok(TurnInputSubmission::NotSubmitted {
             reason: NotSubmittedReason::PendingTriggerTurn,
@@ -396,6 +457,14 @@ async fn start_if_idle(
             return Err(error);
         }
     };
+    // Serialize publication of the active snapshot and its first turn input with compaction.
+    // The settings helper has already released its own permit by this point, so this does not
+    // deadlock when thread settings are part of the same request.
+    let _approved_plan_guard = if approved_plan.is_some() {
+        Some(thread_settings::acquire_persistence_lock(session).await)
+    } else {
+        None
+    };
     if let Some(responsesapi_client_metadata) = responsesapi_client_metadata {
         turn_context
             .turn_metadata_state
@@ -421,6 +490,13 @@ async fn start_if_idle(
             session.clear_connector_selection().await;
             if let SubmittedTurnInput::UserInput { content, .. } = &input {
                 turn_context.session_telemetry.user_prompt(content);
+            }
+            if let Some(plan) = approved_plan {
+                // This item is intentionally adjacent to the user input. It is admitted only
+                // after the idle reservation and start settings commit, and the active state is
+                // published before the task can observe the new turn.
+                append_approved_plan_input(&mut task_input, &plan);
+                session.set_approved_plan(Some(plan));
             }
             task_input.push(pending_turn_input(input));
         }
@@ -448,6 +524,12 @@ async fn start_if_idle(
     })
 }
 
+fn append_approved_plan_input(task_input: &mut Vec<TurnInput>, plan: &PlanLoaded) {
+    task_input.push(TurnInput::ResponseItem(ResponseItemEnvelope::new(
+        ContextualUserFragment::into(plan.clone()),
+    )));
+}
+
 async fn steer(
     session: &Arc<Session>,
     request: TurnInputRequest,
@@ -460,8 +542,14 @@ async fn steer(
         start,
         additional_context,
         responsesapi_client_metadata,
+        approved_plan,
         ..
     } = request;
+    if approved_plan.is_some() {
+        return Err(CodexErr::InvalidRequest(
+            "approved plan context requires a new idle turn".to_string(),
+        ));
+    }
     if !matches!(&input, SubmittedTurnInput::UserInput { .. }) {
         return Err(CodexErr::InvalidRequest(
             "only user input can steer a turn".to_string(),
@@ -492,6 +580,16 @@ async fn steer(
 }
 
 impl Session {
+    pub(crate) async fn history_recovery_reason(&self) -> Option<HistoryRecoveryReason> {
+        let state = self.state.lock().await;
+        state.history_recovery_required()
+    }
+
+    pub(crate) async fn mark_history_recovery_required(&self, reason: HistoryRecoveryReason) {
+        let mut state = self.state.lock().await;
+        state.set_history_recovery_required(reason);
+    }
+
     pub(crate) async fn route_realtime_text_input(self: &Arc<Self>, text: String) {
         let submission_id = Uuid::now_v7().to_string();
         let submission = handle(

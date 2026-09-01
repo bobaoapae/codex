@@ -1,0 +1,11 @@
+---
+source: tui/src/app/agents_fleet_view_tests.rs
+expression: confirmation
+---
+  Close agent fleet?
+  This closes idle/final members at generation 42.
+
+› 1. Close fleet  Preserve all rollouts while closing the fleet edges.
+  2. Cancel
+
+  Press enter to confirm or esc to go back

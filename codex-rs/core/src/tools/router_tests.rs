@@ -50,13 +50,72 @@ fn tool_log_payload_redacts_plaintext_multi_agent_messages() {
         arguments: json!({"target": "/root/worker", "message": "secret message"}).to_string(),
     };
     assert_eq!(
-        tool_log_payload(&payload, &ToolCallSource::DirectPlaintextMessage),
-        "[plaintext arguments]"
+        tool_log_payload(
+            &ToolName::plain("send_message"),
+            &payload,
+            &ToolCallSource::DirectPlaintextMessage,
+        ),
+        "[redacted]"
     );
     assert_eq!(
-        tool_log_payload(&payload, &ToolCallSource::Direct),
+        tool_log_payload(
+            &ToolName::plain("exec_command"),
+            &payload,
+            &ToolCallSource::Direct
+        ),
         payload.log_payload()
     );
+}
+
+#[test]
+fn tool_log_payload_redacts_encrypted_multi_agent_messages_too() {
+    let payload = ToolPayload::Function {
+        arguments: json!({"target": "/root/worker", "message": "ciphertext"}).to_string(),
+    };
+    assert_eq!(
+        tool_log_payload(
+            &ToolName::namespaced("collab_agents", "send_message"),
+            &payload,
+            &ToolCallSource::Direct,
+        ),
+        "[redacted]"
+    );
+}
+
+#[test]
+fn plaintext_multi_agent_arguments_do_not_depend_on_namespace_name() {
+    for namespace in ["collaboration", "collab_agents"] {
+        let call = ToolCall {
+            tool_name: ToolName::namespaced(namespace, "send_message"),
+            call_id: "call-plaintext".to_string(),
+            payload: ToolPayload::Function {
+                arguments: json!({"target": "/root/worker", "message": "secret"}).to_string(),
+            },
+            encrypted_function_args: Some(Vec::new()),
+        };
+
+        assert_eq!(
+            call.direct_source(),
+            ToolCallSource::DirectPlaintextMessage,
+            "configured namespace {namespace} should preserve the plaintext marker"
+        );
+    }
+}
+
+#[test]
+fn absent_or_non_empty_argument_markers_remain_encrypted_or_unspecified() {
+    for encrypted_function_args in [None, Some(vec!["message".to_string()])] {
+        let call = ToolCall {
+            tool_name: ToolName::namespaced("collab_agents", "send_message"),
+            call_id: "call-marked".to_string(),
+            payload: ToolPayload::Function {
+                arguments: "{}".to_string(),
+            },
+            encrypted_function_args,
+        };
+
+        assert_eq!(call.direct_source(), ToolCallSource::Direct);
+    }
 }
 
 impl codex_extension_api::ToolContributor for ExtensionEchoContributor {

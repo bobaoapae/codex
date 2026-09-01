@@ -192,4 +192,21 @@ mod tests {
             None
         );
     }
+
+    #[test]
+    fn fork_invariant_experimental_capability_gate_is_unambiguous() {
+        for reason in [
+            "thread/recovery/preview",
+            "thread/recovery/create",
+            "plan/list",
+            "plan/read",
+            "plan/approve",
+            "context/inspect",
+        ] {
+            assert_eq!(
+                super::experimental_required_message(reason),
+                format!("{reason} requires experimentalApi capability")
+            );
+        }
+    }
 }

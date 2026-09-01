@@ -36,6 +36,7 @@ use chrono::DateTime;
 use chrono::Utc;
 use codex_app_server_client::AppServerRequestHandle;
 use codex_app_server_protocol::ClientRequest;
+use codex_app_server_protocol::IndexState;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::Thread;
 use codex_app_server_protocol::ThreadArchiveParams;
@@ -76,9 +77,14 @@ use uuid::Uuid;
 
 mod archive;
 mod page_loading;
+#[path = "resume_search.rs"]
+mod resume_search;
+#[path = "resume_search_state.rs"]
+mod resume_search_state;
 
 use page_loading::PageLoadMode;
 use page_loading::PaginationState;
+use resume_search_state::SearchSession;
 
 #[path = "resume_picker_transcript_preview.rs"]
 mod transcript_preview;
@@ -166,6 +172,7 @@ struct PageLoadRequest {
     cursor: Option<PageCursor>,
     request_token: usize,
     search_token: Option<usize>,
+    query: Option<String>,
     mode: PageLoadMode,
     cwd_filter: Option<PathBuf>,
     status: SessionStatus,
@@ -191,7 +198,7 @@ enum PickerLoadRequest {
 }
 
 #[derive(Clone)]
-enum ProviderFilter {
+pub(super) enum ProviderFilter {
     Any,
     MatchDefault(String),
 }
@@ -221,7 +228,7 @@ impl SessionFilterMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SessionStatus {
+pub(super) enum SessionStatus {
     Active,
     Archived,
 }
@@ -311,16 +318,20 @@ enum BackgroundEvent {
 }
 
 #[derive(Clone)]
-enum PageCursor {
+pub(super) enum PageCursor {
     AppServer(String),
 }
 
-struct PickerPage {
-    rows: Vec<Row>,
-    history_modes: HashMap<ThreadId, ThreadHistoryMode>,
-    next_cursor: Option<PageCursor>,
-    num_scanned_files: usize,
-    reached_scan_cap: bool,
+pub(super) struct PickerPage {
+    pub(super) rows: Vec<Row>,
+    pub(super) history_modes: HashMap<ThreadId, ThreadHistoryMode>,
+    pub(super) snippets: HashMap<ThreadId, String>,
+    pub(super) next_cursor: Option<PageCursor>,
+    pub(super) num_scanned_files: usize,
+    pub(super) reached_scan_cap: bool,
+    pub(super) index_state: IndexState,
+    pub(super) partial: bool,
+    pub(super) from_search: bool,
 }
 
 #[derive(Clone)]
@@ -356,9 +367,9 @@ struct SessionPickerRunOptions {
 /// picker deduplicates across pages to handle overlapping windows when new
 /// sessions appear during pagination.
 ///
-/// Filtering happens in two layers:
-/// 1. Provider, source, and eligible working-directory filtering at the backend.
-/// 2. Typed search filtering over loaded rows in the picker.
+/// Provider, source, status, class, and eligible working-directory filtering
+/// happens at the backend. A non-empty query uses `thread/search`; while that
+/// request is pending, only already-loaded metadata is filtered locally.
 pub async fn run_resume_picker_with_app_server(
     tui: &mut Tui,
     config: &Config,
@@ -666,16 +677,27 @@ fn spawn_app_server_page_loader(
             match request {
                 PickerLoadRequest::Page(request) => {
                     let cursor = request.cursor.map(|PageCursor::AppServer(cursor)| cursor);
-                    let params = thread_list_params(
-                        cursor,
-                        request.cwd_filter.as_deref(),
-                        request.status,
-                        request.provider_filter,
-                        request.sort_key,
-                        include_non_interactive,
-                        matches!(request.mode, PageLoadMode::StateDbOnly),
-                    );
-                    let page = load_app_server_page(&mut app_server, params).await;
+                    let page = if let Some(query) = request.query.as_deref() {
+                        let params = resume_search::PickerSearchFilters::for_picker(
+                            request.cwd_filter.as_deref(),
+                            request.status,
+                            &request.provider_filter,
+                            include_non_interactive,
+                        )
+                        .search_params(cursor, query, request.sort_key);
+                        resume_search::load_search_page(&mut app_server, params).await
+                    } else {
+                        let params = thread_list_params(
+                            cursor,
+                            request.cwd_filter.as_deref(),
+                            request.status,
+                            request.provider_filter,
+                            request.sort_key,
+                            include_non_interactive,
+                            matches!(request.mode, PageLoadMode::StateDbOnly),
+                        );
+                        resume_search::load_list_page(&mut app_server, params).await
+                    };
                     let _ = bg_tx.send(BackgroundEvent::Page {
                         request_token: request.request_token,
                         search_token: request.search_token,
@@ -790,12 +812,12 @@ struct PickerState {
     filtered_rows: Vec<Row>,
     thread_history_modes: HashMap<ThreadId, ThreadHistoryMode>,
     seen_rows: HashSet<SeenRowKey>,
+    search_state: SearchSession,
     selected: usize,
     scroll_top: usize,
     pending_page_down_target: Option<usize>,
     frozen_footer_percent: Option<u8>,
     query: String,
-    search_state: SearchState,
     next_request_token: usize,
     next_search_token: usize,
     picker_loader: PickerLoader,
@@ -828,12 +850,6 @@ struct PickerState {
     chord_matcher: crate::keymap::KeyChordMatcher,
 }
 
-#[derive(Clone, Copy, Debug)]
-enum SearchState {
-    Idle,
-    Active { token: usize },
-}
-
 #[derive(Clone)]
 enum TranscriptPreviewState {
     Loading,
@@ -864,50 +880,8 @@ enum LoadTrigger {
     Search { token: usize },
 }
 
-async fn load_app_server_page(
-    app_server: &mut AppServerSession,
-    params: ThreadListParams,
-) -> std::io::Result<PickerPage> {
-    let response = app_server
-        .thread_list(params)
-        .await
-        .map_err(std::io::Error::other)?;
-    let num_scanned_files = response.data.len();
-    let (rows, history_modes): (Vec<_>, HashMap<_, _>) = response
-        .data
-        .into_iter()
-        .filter_map(|thread| {
-            let history_mode = thread.history_mode;
-            let row = row_from_app_server_thread(thread)?;
-            let thread_id = row.thread_id?;
-            Some((row, (thread_id, history_mode)))
-        })
-        .unzip();
-
-    Ok(PickerPage {
-        rows,
-        history_modes,
-        next_cursor: response.next_cursor.map(PageCursor::AppServer),
-        num_scanned_files,
-        reached_scan_cap: false,
-    })
-}
-
-impl SearchState {
-    fn active_token(&self) -> Option<usize> {
-        match self {
-            SearchState::Idle => None,
-            SearchState::Active { token } => Some(*token),
-        }
-    }
-
-    fn is_active(&self) -> bool {
-        self.active_token().is_some()
-    }
-}
-
 #[derive(Clone)]
-struct Row {
+pub(super) struct Row {
     path: Option<PathBuf>,
     preview: String,
     thread_id: Option<ThreadId>,
@@ -986,12 +960,12 @@ impl PickerState {
             filtered_rows: Vec::new(),
             thread_history_modes: HashMap::new(),
             seen_rows: HashSet::new(),
+            search_state: SearchSession::default(),
             selected: 0,
             scroll_top: 0,
             pending_page_down_target: None,
             frozen_footer_percent: None,
             query: String::new(),
-            search_state: SearchState::Idle,
             next_request_token: 0,
             next_search_token: 0,
             picker_loader,
@@ -1381,41 +1355,7 @@ impl PickerState {
     }
 
     fn start_initial_load(&mut self) {
-        self.relative_time_reference = Some(Utc::now());
-        self.reset_pagination();
-        self.all_rows.clear();
-        self.filtered_rows.clear();
-        self.thread_history_modes.clear();
-        self.seen_rows.clear();
-        self.selected = 0;
-        self.pending_page_down_target = None;
-        self.frozen_footer_percent = None;
-
-        let search_token = if self.query.is_empty() {
-            self.search_state = SearchState::Idle;
-            None
-        } else {
-            let token = self.allocate_search_token();
-            self.search_state = SearchState::Active { token };
-            Some(token)
-        };
-
-        let request_token = self.allocate_request_token();
-        let mode = self.initial_page_mode;
-        self.pagination
-            .start_load(request_token, search_token, mode);
-        self.request_frame();
-
-        (self.picker_loader)(PickerLoadRequest::Page(PageLoadRequest {
-            cursor: None,
-            request_token,
-            search_token,
-            mode,
-            cwd_filter: self.active_cwd_filter(),
-            status: self.status,
-            provider_filter: self.provider_filter.clone(),
-            sort_key: self.sort_key,
-        }));
+        self.start_initial_load_with(/*preserve_loaded_rows*/ false);
     }
 
     async fn handle_background_event(
@@ -1434,8 +1374,10 @@ impl PickerState {
                 let page_has_rows = matches!(&page, Ok(page) if !page.rows.is_empty());
                 // Fall back only when the initial DB listing is unusable. Once SQLite returns
                 // rows, its pagination is authoritative and an empty later page ends the list.
-                let should_restart_from_store = pending.mode == PageLoadMode::StateDbOnly
-                    && self.all_rows.is_empty()
+                let page_is_search = matches!(&page, Ok(page) if page.from_search);
+                let should_restart_from_store = !page_is_search
+                    && pending.mode == PageLoadMode::StateDbOnly
+                    && (self.all_rows.is_empty() || self.search_state.has_replace_on_next_page())
                     && !page_has_rows;
                 if should_restart_from_store {
                     let request_token = self.allocate_request_token();
@@ -1450,6 +1392,8 @@ impl PickerState {
                         cursor: None,
                         request_token,
                         search_token,
+                        query: (!self.query.trim().is_empty())
+                            .then(|| self.query.trim().to_string()),
                         mode: PageLoadMode::StoreDefault,
                         cwd_filter: self.active_cwd_filter(),
                         status: self.status,
@@ -1515,31 +1459,6 @@ impl PickerState {
         self.frozen_footer_percent = None;
     }
 
-    fn ingest_page(&mut self, page: PickerPage) {
-        let PickerPage {
-            rows,
-            history_modes,
-            next_cursor,
-            num_scanned_files,
-            reached_scan_cap,
-        } = page;
-        self.pagination
-            .complete_page(next_cursor, num_scanned_files, reached_scan_cap);
-        self.thread_history_modes.extend(history_modes);
-
-        for row in rows {
-            if let Some(seen_key) = row.seen_key() {
-                if self.seen_rows.insert(seen_key) {
-                    self.all_rows.push(row);
-                }
-            } else {
-                self.all_rows.push(row);
-            }
-        }
-
-        self.apply_filter();
-    }
-
     fn complete_pending_page_down(&mut self) {
         let Some(target) = self.pending_page_down_target else {
             return;
@@ -1559,111 +1478,6 @@ impl PickerState {
         self.ensure_selected_visible();
         self.maybe_load_more_for_scroll();
         self.request_frame();
-    }
-
-    fn apply_filter(&mut self) {
-        let base_iter = self
-            .all_rows
-            .iter()
-            .filter(|row| self.row_matches_filter(row));
-        if self.query.is_empty() {
-            self.filtered_rows = base_iter.cloned().collect();
-        } else {
-            let q = self.query.to_lowercase();
-            self.filtered_rows = base_iter.filter(|r| r.matches_query(&q)).cloned().collect();
-        }
-        if self.selected >= self.filtered_rows.len() {
-            self.selected = self.filtered_rows.len().saturating_sub(1);
-        }
-        if self.filtered_rows.is_empty() {
-            self.scroll_top = 0;
-        }
-        self.ensure_selected_visible();
-        self.request_frame();
-    }
-
-    fn row_matches_filter(&self, row: &Row) -> bool {
-        if self.filter_mode == SessionFilterMode::All {
-            return true;
-        }
-        let Some(filter_cwd) = self.local_filter_cwd.as_ref() else {
-            return true;
-        };
-        let Some(row_cwd) = row.cwd.as_ref() else {
-            return false;
-        };
-        paths_match(row_cwd, filter_cwd)
-    }
-
-    fn set_query(&mut self, new_query: String) {
-        if self.query == new_query {
-            return;
-        }
-        self.query = new_query;
-        self.selected = 0;
-        self.apply_filter();
-        if self.query.is_empty() {
-            self.search_state = SearchState::Idle;
-            return;
-        }
-        if !self.filtered_rows.is_empty() {
-            self.search_state = SearchState::Idle;
-            return;
-        }
-        if self.pagination.reached_scan_cap || self.pagination.next_cursor.is_none() {
-            self.search_state = SearchState::Idle;
-            return;
-        }
-        let token = self.allocate_search_token();
-        self.search_state = SearchState::Active { token };
-        self.load_more_if_needed(LoadTrigger::Search { token });
-    }
-
-    fn clear_query_preserving_selection(&mut self) {
-        let selected_key = self
-            .filtered_rows
-            .get(self.selected)
-            .and_then(Row::seen_key);
-        self.query.clear();
-        self.search_state = SearchState::Idle;
-        self.apply_filter();
-        if let Some(selected_key) = selected_key
-            && let Some(index) = self
-                .filtered_rows
-                .iter()
-                .position(|row| row.seen_key().as_ref() == Some(&selected_key))
-        {
-            self.selected = index;
-            self.ensure_selected_visible();
-            self.request_frame();
-        }
-    }
-
-    fn continue_search_if_needed(&mut self) {
-        let Some(token) = self.search_state.active_token() else {
-            return;
-        };
-        if !self.filtered_rows.is_empty() {
-            self.search_state = SearchState::Idle;
-            return;
-        }
-        if self.pagination.reached_scan_cap || self.pagination.next_cursor.is_none() {
-            self.search_state = SearchState::Idle;
-            return;
-        }
-        self.load_more_if_needed(LoadTrigger::Search { token });
-    }
-
-    fn continue_search_if_token_matches(&mut self, completed_token: Option<usize>) {
-        let Some(active) = self.search_state.active_token() else {
-            return;
-        };
-        if let Some(token) = completed_token
-            && token != active
-        {
-            return;
-        }
-        self.continue_search_if_needed();
     }
 
     fn ensure_selected_visible(&mut self) {
@@ -1742,6 +1556,7 @@ impl PickerState {
             cursor: Some(cursor),
             request_token,
             search_token,
+            query: (!self.query.trim().is_empty()).then(|| self.query.trim().to_string()),
             mode,
             cwd_filter: self.active_cwd_filter(),
             status: self.status,
@@ -1948,7 +1763,7 @@ impl PickerState {
     }
 }
 
-fn row_from_app_server_thread(thread: Thread) -> Option<Row> {
+pub(super) fn row_from_app_server_thread(thread: Thread) -> Option<Row> {
     let thread_id = match ThreadId::from_string(&thread.id) {
         Ok(thread_id) => thread_id,
         Err(err) => {
@@ -2002,6 +1817,9 @@ fn thread_list_params(
         cwd: cwd_filter.map(|cwd| ThreadListCwdFilter::One(cwd.to_string_lossy().into_owned())),
         use_state_db_only,
         search_term: None,
+        thread_classes: resume_search::picker_thread_classes(include_non_interactive),
+        root_thread_id: None,
+        terminal_outcomes: None,
     }
 }
 
@@ -2292,8 +2110,23 @@ fn picker_footer_progress_label(state: &PickerState, list_height: u16, width: u1
         state.filtered_rows.len().to_string()
     };
     let percent = picker_footer_percent(state, list_height);
+    let index_status =
+        if state.search_state.partial || state.search_state.index_state != IndexState::Ready {
+            Some(resume_search::index_status_label(
+                state.search_state.index_state,
+                state.search_state.partial,
+            ))
+        } else {
+            None
+        };
     let labels = [
-        format!(" {position} / {total} · {percent}% "),
+        format!(
+            " {position} / {total} · {percent}%{} ",
+            index_status
+                .as_deref()
+                .map(|status| format!(" · {status}"))
+                .unwrap_or_default()
+        ),
         format!(" {position}/{total} · {percent}% "),
         format!(" {percent}% "),
     ];
@@ -2767,7 +2600,7 @@ fn render_comfortable_session_lines(
     width: u16,
 ) -> Vec<Line<'static>> {
     let marker = selection_marker(is_selected, is_expanded);
-    let title = truncate_text(row.display_preview(), width.saturating_sub(2) as usize);
+    let title = truncate_text(state.display_preview(row), width.saturating_sub(2) as usize);
     let title = if is_selected {
         selected_session_title_span(title)
     } else {
@@ -2859,7 +2692,7 @@ fn render_dense_session_lines(
     let mut lines = vec![dense_summary_line(DenseSummaryInput {
         marker,
         date: &date,
-        title: row.display_preview(),
+        title: state.display_preview(row),
         is_selected,
         is_zebra,
         width,
@@ -3410,20 +3243,28 @@ fn format_timestamp(ts: DateTime<Utc>) -> String {
 }
 
 fn render_empty_state_line(state: &PickerState) -> Line<'static> {
-    if !state.query.is_empty() {
+    if !state.query.trim().is_empty() {
+        let status = resume_search::index_status_label(
+            state.search_state.index_state,
+            state.search_state.partial,
+        );
         if state.search_state.is_active()
             || (state.pagination.is_loading() && state.pagination.next_cursor.is_some())
         {
-            return vec!["Searching…".italic().dim()].into();
+            return vec!["Searching…".italic().dim(), format!(" · {status}").dim()].into();
         }
         if state.pagination.reached_scan_cap {
             let msg = format!(
                 "Search scanned first {} sessions; more may exist",
                 state.pagination.num_scanned_files
             );
-            return vec![Span::from(msg).italic().dim()].into();
+            return vec![Span::from(msg).italic().dim(), format!(" · {status}").dim()].into();
         }
-        return vec!["No results for your search".italic().dim()].into();
+        return vec![
+            "No results for your search".italic().dim(),
+            format!(" · {status}").dim(),
+        ]
+        .into();
     }
 
     if state.pagination.is_loading() {
@@ -3467,9 +3308,13 @@ mod tests {
         PickerPage {
             rows,
             history_modes: HashMap::new(),
+            snippets: HashMap::new(),
             next_cursor: next_cursor.map(|cursor| PageCursor::AppServer(cursor.to_string())),
             num_scanned_files,
             reached_scan_cap,
+            index_state: IndexState::Ready,
+            partial: false,
+            from_search: false,
         }
     }
 
@@ -6910,3 +6755,7 @@ session_picker_view = "dense"
         );
     }
 }
+
+#[cfg(test)]
+#[path = "resume_picker_search_tests.rs"]
+mod search_tests;

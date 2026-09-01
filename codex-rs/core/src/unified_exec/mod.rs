@@ -38,6 +38,8 @@ use rand::rng;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
+use crate::ownership::MutationGuard;
+use crate::ownership::WorkspaceOwnershipService;
 use crate::sandboxing::SandboxPermissions;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
@@ -48,6 +50,8 @@ use crate::tools::network_approval::DeferredNetworkApproval;
 use codex_core_plugins::PluginMetricsSidecar;
 
 mod async_watcher;
+mod build_admission;
+mod build_admission_lock;
 mod errors;
 mod head_tail_buffer;
 mod oneshot;
@@ -56,11 +60,17 @@ mod process_manager;
 mod process_state;
 mod shell_snapshot;
 mod stdin_approval;
+mod terminal_observability;
+mod terminal_redaction;
 
 pub(crate) fn set_deterministic_process_ids_for_tests(enabled: bool) {
     process_manager::set_deterministic_process_ids_for_tests(enabled);
 }
 
+pub(crate) use build_admission::BuildAdmission;
+pub(crate) use build_admission::BuildAdmissionBusy;
+pub(crate) use build_admission::BuildAdmissionError;
+pub(crate) use build_admission::BuildAdmissionGuard;
 pub(crate) use errors::UnifiedExecError;
 pub(crate) use process::NoopSpawnLifecycle;
 #[cfg(unix)]
@@ -69,6 +79,14 @@ pub(crate) use process::SpawnLifecycleHandle;
 pub(crate) use process::UnifiedExecProcess;
 pub(crate) use stdin_approval::TerminalPermissions;
 pub(crate) use stdin_approval::TerminalSandboxSource;
+pub(crate) use terminal_observability::DEFAULT_INACTIVITY_THRESHOLD_MS;
+pub(crate) use terminal_observability::MAX_COMMAND_SUMMARY_BYTES;
+pub(crate) use terminal_observability::SystemTerminalClock;
+pub(crate) use terminal_observability::TerminalClock;
+pub(crate) use terminal_observability::TerminalObservabilityStore;
+pub(crate) use terminal_observability::TerminalProcessSnapshot;
+pub(crate) use terminal_observability::TerminalProcessState;
+pub(crate) use terminal_redaction::redact_and_truncate;
 
 pub(crate) const MIN_YIELD_TIME_MS: u64 = 250;
 pub(crate) const WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS: u64 = 10_000;
@@ -123,6 +141,25 @@ pub(crate) struct ExecCommandRequest {
     pub additional_permissions_preapproved: bool,
     pub justification: Option<String>,
     pub prefix_rule: Option<Vec<String>>,
+    pub mutation_authorization: Option<ExecMutationAuthorization>,
+    pub root_override_reason: Option<String>,
+}
+
+/// Ownership admission retained alongside a unified-exec process until its
+/// process entry is removed. Spawn revalidates the guard after approval;
+/// stdin continuation uses this same immutable admission.
+#[derive(Clone)]
+pub(crate) struct ExecMutationAuthorization {
+    pub(crate) service: Arc<WorkspaceOwnershipService>,
+    pub(crate) guard: MutationGuard,
+}
+
+impl std::fmt::Debug for ExecMutationAuthorization {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExecMutationAuthorization")
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
@@ -160,14 +197,30 @@ impl ProcessStore {
 }
 
 pub(crate) struct UnifiedExecProcessManager {
-    process_store: Mutex<ProcessStore>,
+    process_store: Arc<Mutex<ProcessStore>>,
+    observability: Arc<TerminalObservabilityStore>,
+    build_admission: Arc<BuildAdmission>,
     max_write_stdin_yield_time_ms: u64,
 }
 
 impl UnifiedExecProcessManager {
     pub(crate) fn new(max_write_stdin_yield_time_ms: u64) -> Self {
+        Self::new_with_observability(
+            max_write_stdin_yield_time_ms,
+            Arc::new(SystemTerminalClock),
+            DEFAULT_INACTIVITY_THRESHOLD_MS,
+        )
+    }
+
+    pub(crate) fn new_with_observability(
+        max_write_stdin_yield_time_ms: u64,
+        clock: Arc<dyn TerminalClock>,
+        inactivity_threshold_ms: u64,
+    ) -> Self {
         Self {
-            process_store: Mutex::new(ProcessStore::default()),
+            process_store: Arc::new(Mutex::new(ProcessStore::default())),
+            observability: TerminalObservabilityStore::new(clock, inactivity_threshold_ms),
+            build_admission: BuildAdmission::new(),
             max_write_stdin_yield_time_ms: max_write_stdin_yield_time_ms
                 .max(MIN_EMPTY_YIELD_TIME_MS),
         }
@@ -191,7 +244,9 @@ struct ProcessEntry {
     tty: bool,
     environment_id: String,
     permissions: TerminalPermissions,
+    mutation_authorization: Option<ExecMutationAuthorization>,
     network_approval: Option<DeferredNetworkApproval>,
+    _build_admission: Option<Arc<BuildAdmissionGuard>>,
     session: Weak<Session>,
     last_used: tokio::time::Instant,
 }

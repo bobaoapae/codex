@@ -386,6 +386,16 @@ impl ChatWidget {
         if !self.input_queue.user_turn_pending_start {
             return false;
         }
+        let message = if message.contains("goalConflict") || message.contains("unfinished goal") {
+            "The approved plan could not start because this thread already has an unfinished goal. Resolve that goal before retrying the pinned plan."
+                .to_string()
+        } else if message.contains("approved plan snapshot is superseded")
+            || message.contains("approved plan snapshot is missing or stale")
+        {
+            super::saved_plans::SAVED_PLAN_SUPERSEDED.to_string()
+        } else {
+            message
+        };
         self.on_error(message);
         true
     }

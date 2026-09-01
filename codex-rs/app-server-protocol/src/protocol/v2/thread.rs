@@ -1,9 +1,12 @@
 use super::ActivePermissionProfile;
 use super::ApprovalsReviewer;
+use super::ApprovedPlanRef;
 use super::AskForApproval;
 use super::SandboxMode;
 use super::SandboxPolicy;
+use super::TerminalOutcome;
 use super::Thread;
+use super::ThreadClass;
 use super::ThreadHistoryMode;
 use super::ThreadItem;
 use super::ThreadRealtimeItem;
@@ -64,6 +67,10 @@ pub struct ThreadStartParams {
     pub model: Option<String>,
     #[ts(optional = nullable)]
     pub model_provider: Option<String>,
+    /// Pin an immutable approved plan snapshot for the first user turn.
+    #[experimental("thread/start.approvedPlan")]
+    #[ts(optional = nullable)]
+    pub approved_plan: Option<ApprovedPlanRef>,
     /// Allow a provider with an authoritative static model catalog to replace an unavailable
     /// requested model with its default.
     #[experimental("thread/start.allowProviderModelFallback")]
@@ -121,6 +128,11 @@ pub struct ThreadStartParams {
     /// Optional client-supplied analytics source classification for this thread.
     #[ts(optional = nullable)]
     pub thread_source: Option<ThreadSource>,
+    /// Optional workflow classification for this thread. Omission preserves
+    /// the normal interactive-thread default.
+    #[experimental("thread/start.threadClass")]
+    #[ts(optional = nullable)]
+    pub thread_class: Option<ThreadClass>,
     /// Optional project identity for this new thread. Durable threads persist
     /// the assignment; ephemeral threads expose it only in live responses.
     #[experimental("thread/start.projectId")]
@@ -1275,6 +1287,104 @@ pub struct ThreadRevertResponse {
     pub items_backwards_cursor: Option<String>,
 }
 
+/// Describes the immutable position at which a recovery preview was produced.
+///
+/// The recovery token is valid only while the source rollout still ends at this
+/// position. A later append invalidates the token and the create operation must
+/// fail closed instead of attempting to recover from a moving history.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadRecoveryWatermark {
+    /// Rollout identity used by the recovery engine.
+    pub rollout_id: String,
+    /// Exclusive rollout item ordinal covered by the preview.
+    pub end_ordinal_exclusive: u64,
+    /// Exclusive byte offset covered by the preview.
+    pub end_byte_offset: u64,
+}
+
+/// One persisted item or turn that the recovery engine will omit.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadRecoveryExcludedItem {
+    /// Original immutable rollout ordinal.
+    pub rollout_ordinal: u64,
+    /// Stable item identity, when the invalid item has one.
+    pub item_id: Option<String>,
+    /// Turn identity, when the omitted entry represents a failed continuation.
+    pub turn_id: Option<String>,
+    /// Bounded, provider-neutral explanation for the omission.
+    pub reason: String,
+}
+
+/// Counts returned with a recovery preview.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadRecoveryCounts {
+    pub total_items: u64,
+    pub retained_items: u64,
+    pub excluded_items: u64,
+    pub failed_turns: u64,
+}
+
+/// Request a read-only analysis of a thread's recoverability.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadRecoveryPreviewParams {
+    pub thread_id: String,
+}
+
+/// Read-only recovery preview. No rollout or thread state is changed.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadRecoveryPreviewResponse {
+    /// Opaque token to pass unchanged to `thread/recovery/create`.
+    pub token: Option<String>,
+    /// Source thread examined by the preview.
+    pub thread_id: String,
+    /// Physical rollout examined by the preview.
+    pub source_rollout_id: String,
+    /// Provider recorded in the source session metadata, when available.
+    pub source_model_provider: Option<String>,
+    pub watermark: ThreadRecoveryWatermark,
+    pub source_item_count: u64,
+    pub source_serialized_bytes: u64,
+    pub retained_item_count: u64,
+    pub retained_serialized_bytes: u64,
+    pub excluded_items: Vec<ThreadRecoveryExcludedItem>,
+    pub counts: ThreadRecoveryCounts,
+    /// False means the server will reject a create request for this preview.
+    pub can_recover: bool,
+    /// Safe, bounded explanation when recovery is unavailable or ambiguous.
+    pub reason: Option<String>,
+    /// Machine-readable block reason, when the preview cannot be consumed.
+    pub blocked_reason: Option<String>,
+}
+
+/// Consume an opaque recovery preview token and create a replacement lineage.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadRecoveryCreateParams {
+    /// Token returned by `thread/recovery/preview`.
+    pub token: String,
+}
+
+/// Newly created replacement lineage after a successful recovery.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadRecoveryCreateResponse {
+    pub thread: Thread,
+    /// Immutable source lineage retained for audit and user navigation.
+    pub recovered_from_thread_id: String,
+}
+
 /// Parameters for listing independently persisted thread sections.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
@@ -1380,6 +1490,7 @@ pub struct ThreadListParams {
     pub sort_direction: Option<SortDirection>,
     /// Optional provider filter; when set, only sessions recorded under these
     /// providers are returned. When present but empty, includes all providers.
+    #[experimental("thread/list.modelProviders")]
     #[ts(optional = nullable)]
     pub model_providers: Option<Vec<String>>,
     /// Optional source filter; when set, only sessions from these source kinds
@@ -1413,6 +1524,7 @@ pub struct ThreadListParams {
     pub project_id: Option<Option<String>>,
     /// Optional cwd filter or filters; when set, only threads whose session cwd
     /// exactly matches one of these paths are returned.
+    #[experimental("thread/list.cwd")]
     #[ts(optional = nullable, type = "string | Array<string> | null")]
     pub cwd: Option<ThreadListCwdFilter>,
     /// If true, return from the state DB without scanning JSONL rollouts to
@@ -1432,9 +1544,22 @@ pub struct ThreadListParams {
     #[experimental("thread/list.ancestorThreadId")]
     #[ts(optional = nullable)]
     pub ancestor_thread_id: Option<String>,
+    /// Optional workflow classifications to include. Omission preserves the
+    /// default interactive-thread view.
+    #[experimental("thread/list.threadClasses")]
+    #[ts(optional = nullable)]
+    pub thread_classes: Option<Vec<ThreadClass>>,
+    /// Optional root thread filter. Returns threads belonging to this agent-tree root.
+    #[experimental("thread/list.rootThreadId")]
+    #[ts(optional = nullable)]
+    pub root_thread_id: Option<String>,
+    /// Optional terminal outcomes to include in the result.
+    #[experimental("thread/list.terminalOutcomes")]
+    #[ts(optional = nullable)]
+    pub terminal_outcomes: Option<Vec<TerminalOutcome>>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, ExperimentalApi)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ThreadSearchParams {
@@ -1450,6 +1575,36 @@ pub struct ThreadSearchParams {
     /// Optional sort direction; defaults to descending (newest first).
     #[ts(optional = nullable)]
     pub sort_direction: Option<SortDirection>,
+    /// Optional provider filter; when set, only sessions recorded under these
+    /// providers are returned. When present but empty, includes all providers.
+    #[experimental("thread/search.modelProviders")]
+    #[ts(optional = nullable)]
+    pub model_providers: Option<Vec<String>>,
+    /// Optional cwd filter or filters; when set, only threads whose session cwd
+    /// exactly matches one of these paths are returned.
+    #[experimental("thread/search.cwd")]
+    #[ts(optional = nullable, type = "string | Array<string> | null")]
+    pub cwd: Option<ThreadListCwdFilter>,
+    /// Omit to include every project, set to null for unassigned threads, or
+    /// provide a project ID to return only threads in that project.
+    #[experimental("thread/search.projectId")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::protocol::serde_helpers::serialize_double_option",
+        deserialize_with = "crate::protocol::serde_helpers::deserialize_double_option"
+    )]
+    #[ts(optional = nullable, type = "string | null")]
+    pub project_id: Option<Option<String>>,
+    /// Optional root thread filter. Returns threads belonging to this agent-tree root.
+    #[experimental("thread/search.rootThreadId")]
+    #[ts(optional = nullable)]
+    pub root_thread_id: Option<String>,
+    /// Optional ancestor thread filter. Returns spawned descendants at any depth,
+    /// excluding the ancestor itself.
+    #[experimental("thread/search.ancestorThreadId")]
+    #[ts(optional = nullable)]
+    pub ancestor_thread_id: Option<String>,
     /// Optional source filter; when set, only sessions from these source kinds
     /// are returned. When omitted or empty, defaults to interactive sources.
     #[ts(optional = nullable)]
@@ -1460,6 +1615,15 @@ pub struct ThreadSearchParams {
     pub archived: Option<bool>,
     /// Required substring/full-text query for thread search.
     pub search_term: String,
+    /// Optional workflow classifications to include. Omission preserves the
+    /// default interactive-thread view.
+    #[experimental("thread/search.threadClasses")]
+    #[ts(optional = nullable)]
+    pub thread_classes: Option<Vec<ThreadClass>>,
+    /// Optional terminal outcomes to include in the result.
+    #[experimental("thread/search.terminalOutcomes")]
+    #[ts(optional = nullable)]
+    pub terminal_outcomes: Option<Vec<TerminalOutcome>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
@@ -1514,7 +1678,22 @@ pub enum SortDirection {
     Desc,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+/// State of the persisted full-text index used by thread listing and search.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub enum IndexState {
+    /// The index is being built or rebuilt and results may be incomplete.
+    Building,
+    /// The active index is complete for the published generation.
+    Ready,
+    /// No usable index is available; callers may use a fallback search path.
+    Unavailable,
+    /// Index construction failed, but a resumable rebuild can make progress.
+    Recoverable,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, ExperimentalApi)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ThreadListResponse {
@@ -1527,6 +1706,12 @@ pub struct ThreadListResponse {
     /// Use it with the opposite `sortDirection`; for timestamp sorts it anchors
     /// at the start of the page timestamp so same-second updates are not skipped.
     pub backwards_cursor: Option<String>,
+    /// State of the index that produced this page.
+    #[experimental("thread/list.indexState")]
+    pub index_state: IndexState,
+    /// Whether the page may be incomplete because the index is not ready.
+    #[experimental("thread/list.partial")]
+    pub partial: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -1537,7 +1722,7 @@ pub struct ThreadSearchResult {
     pub snippet: String,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, ExperimentalApi)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ThreadSearchResponse {
@@ -1550,6 +1735,12 @@ pub struct ThreadSearchResponse {
     /// Use it with the opposite `sortDirection`; for timestamp sorts it anchors
     /// at the start of the page timestamp so same-second updates are not skipped.
     pub backwards_cursor: Option<String>,
+    /// State of the index that produced this page.
+    #[experimental("thread/search.indexState")]
+    pub index_state: IndexState,
+    /// Whether the page may be incomplete because the index is not ready.
+    #[experimental("thread/search.partial")]
+    pub partial: bool,
 }
 
 /// Parameters for searching visible message occurrences within one paginated thread.

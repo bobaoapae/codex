@@ -29,6 +29,7 @@ use codex_utils_pty::ExecCommandSession;
 use codex_utils_pty::ProcessSignal as PtyProcessSignal;
 use codex_utils_pty::SpawnedPty;
 
+use super::BuildAdmissionGuard;
 use super::UNIFIED_EXEC_OUTPUT_MAX_BYTES;
 use super::UNIFIED_EXEC_OUTPUT_MAX_TOKENS;
 use super::UnifiedExecError;
@@ -99,6 +100,7 @@ pub(crate) struct UnifiedExecProcess {
     sandbox_type: SandboxType,
     timed_out: AtomicBool,
     _spawn_lifecycle: Option<SpawnLifecycleHandle>,
+    build_admission: Option<Arc<BuildAdmissionGuard>>,
 }
 
 impl std::fmt::Debug for UnifiedExecProcess {
@@ -116,6 +118,7 @@ impl UnifiedExecProcess {
         process_handle: ProcessHandle,
         sandbox_type: SandboxType,
         spawn_lifecycle: Option<SpawnLifecycleHandle>,
+        build_admission: Option<Arc<BuildAdmissionGuard>>,
     ) -> Self {
         let output = OutputHandles {
             output_buffer: Arc::new(Mutex::new(HeadTailBuffer::default())),
@@ -140,6 +143,7 @@ impl UnifiedExecProcess {
             sandbox_type,
             timed_out: AtomicBool::new(false),
             _spawn_lifecycle: spawn_lifecycle,
+            build_admission,
         }
     }
 
@@ -281,6 +285,10 @@ impl UnifiedExecProcess {
         self.sandbox_type
     }
 
+    pub(super) fn build_admission(&self) -> Option<Arc<BuildAdmissionGuard>> {
+        self.build_admission.clone()
+    }
+
     pub(super) fn failure_message(&self) -> Option<String> {
         self.state_rx.borrow().failure_message.clone()
     }
@@ -341,6 +349,21 @@ impl UnifiedExecProcess {
         sandbox_type: SandboxType,
         spawn_lifecycle: SpawnLifecycleHandle,
     ) -> Result<Self, UnifiedExecError> {
+        Self::from_spawned_with_admission(
+            spawned,
+            sandbox_type,
+            spawn_lifecycle,
+            /*build_admission*/ None,
+        )
+        .await
+    }
+
+    pub(super) async fn from_spawned_with_admission(
+        spawned: SpawnedPty,
+        sandbox_type: SandboxType,
+        spawn_lifecycle: SpawnLifecycleHandle,
+        build_admission: Option<Arc<BuildAdmissionGuard>>,
+    ) -> Result<Self, UnifiedExecError> {
         let SpawnedPty {
             session: process_handle,
             stdout_rx,
@@ -352,6 +375,7 @@ impl UnifiedExecProcess {
             ProcessHandle::Local(Box::new(process_handle)),
             sandbox_type,
             Some(spawn_lifecycle),
+            build_admission,
         );
         managed.output_task = Some(Self::spawn_local_output_task(
             output_rx,
@@ -400,7 +424,12 @@ impl UnifiedExecProcess {
         // Older peers do not report this field. In that case, skip local
         // classification rather than attributing a violation to a guessed backend.
         let sandbox_type = started.sandbox_type.unwrap_or(SandboxType::None);
-        let mut managed = Self::new(process_handle, sandbox_type, /*spawn_lifecycle*/ None);
+        let mut managed = Self::new(
+            process_handle,
+            sandbox_type,
+            /*spawn_lifecycle*/ None,
+            /*build_admission*/ None,
+        );
         let output_handles = managed.output_handles().clone();
         managed.output_task = Some(Self::spawn_exec_server_output_task(
             started,

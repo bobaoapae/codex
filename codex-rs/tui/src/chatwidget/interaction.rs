@@ -25,8 +25,10 @@ impl ChatWidget {
             let should_pause_active_goal = self
                 .bottom_pane
                 .active_view_will_interrupt_turn_on_key_event(key_event);
+            let recovery_popup_was_active = self.recovery_popup_active();
             self.flush_completed_command_activity();
             self.bottom_pane.handle_key_event(key_event);
+            self.clear_recovery_after_popup_cancel(recovery_popup_was_active, key_event);
             if should_pause_active_goal {
                 self.pause_active_goal_for_interrupt();
             }
@@ -60,7 +62,9 @@ impl ChatWidget {
                 kind: KeyEventKind::Press,
                 ..
             } if modifiers.contains(KeyModifiers::CONTROL) && c.eq_ignore_ascii_case(&'c') => {
+                let recovery_popup_was_active = self.recovery_popup_active();
                 self.on_ctrl_c();
+                self.clear_recovery_after_popup_cancel(recovery_popup_was_active, key_event);
                 return;
             }
             KeyEvent {

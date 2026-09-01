@@ -14,6 +14,7 @@ use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::HistoryPosition;
+use codex_protocol::protocol::RuntimeBuildInfo;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
@@ -209,6 +210,7 @@ async fn state_db_init_backfills_before_returning() -> anyhow::Result<()> {
             subagent_history_start_ordinal: None,
             multi_agent_version: None,
             context_window: None,
+            ..SessionMeta::default()
         },
         git: None,
     };
@@ -712,6 +714,48 @@ async fn recorder_materializes_on_flush_with_pending_items() -> std::io::Result<
     assert_eq!(text_after_second_persist, text);
 
     recorder.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn recorder_persists_runtime_provenance_in_session_meta() -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let config = test_config(home.path());
+    let build_info = RuntimeBuildInfo {
+        version: "v-test".to_string(),
+        build_commit: "test-commit".to_string(),
+        target: "test-target".to_string(),
+    };
+    let recorder = RolloutRecorder::new(
+        &config,
+        RolloutRecorderParams::new(
+            ThreadId::new(),
+            /*forked_from_id*/ None,
+            /*parent_thread_id*/ None,
+            SessionSource::Exec,
+            /*thread_source*/ None,
+            "test_originator".to_string(),
+            BaseInstructions::default(),
+            Vec::new(),
+        )
+        .with_runtime_provenance(
+            Some(build_info.clone()),
+            Some("sha256:config".to_string()),
+            Some("sha256:features".to_string()),
+        ),
+    )
+    .await?;
+    let rollout_path = recorder.rollout_path().to_path_buf();
+    recorder.persist().await?;
+    recorder.shutdown().await?;
+
+    let meta = crate::read_session_meta_line(&rollout_path).await?.meta;
+    assert_eq!(meta.runtime_build_info, Some(build_info));
+    assert_eq!(meta.config_layer_revision.as_deref(), Some("sha256:config"));
+    assert_eq!(
+        meta.runtime_feature_revision.as_deref(),
+        Some("sha256:features")
+    );
     Ok(())
 }
 

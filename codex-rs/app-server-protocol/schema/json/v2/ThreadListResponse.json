@@ -150,6 +150,13 @@
           "type": "object"
         },
         {
+          "description": "Persisted history requires an explicit recovery lineage before another turn can start.",
+          "enum": [
+            "historyRecoveryRequired"
+          ],
+          "type": "string"
+        },
+        {
           "additionalProperties": false,
           "description": "Returned when `turn/start` or `turn/steer` is submitted while the current active turn cannot accept same-turn steering, for example `/review` or manual `/compact`.",
           "properties": {
@@ -627,6 +634,39 @@
           ],
           "title": "UsageLimitExceededImageGenerationFailure",
           "type": "object"
+        }
+      ]
+    },
+    "IndexState": {
+      "description": "State of the persisted full-text index used by thread listing and search.",
+      "oneOf": [
+        {
+          "description": "The index is being built or rebuilt and results may be incomplete.",
+          "enum": [
+            "building"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The active index is complete for the published generation.",
+          "enum": [
+            "ready"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "No usable index is available; callers may use a fallback search path.",
+          "enum": [
+            "unavailable"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Index construction failed, but a resumable rebuild can make progress.",
+          "enum": [
+            "recoverable"
+          ],
+          "type": "string"
         }
       ]
     },

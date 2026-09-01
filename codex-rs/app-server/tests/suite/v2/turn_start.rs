@@ -3184,6 +3184,7 @@ async fn turn_start_explicit_local_environment_updates_legacy_cwd_between_turns(
                 collaboration_mode: None,
                 multi_agent_mode: None,
                 cyber_access_program: None,
+                approved_plan: None,
             },
         })
         .await?;
@@ -3231,6 +3232,7 @@ async fn turn_start_explicit_local_environment_updates_legacy_cwd_between_turns(
                 collaboration_mode: None,
                 multi_agent_mode: None,
                 cyber_access_program: None,
+                approved_plan: None,
             },
         })
         .await?;
@@ -4366,6 +4368,9 @@ async fn direct_input_to_multi_agent_v2_subagent_is_rejected(
                 search_term: None,
                 parent_thread_id: Some(thread.id.clone()),
                 ancestor_thread_id: None,
+                thread_classes: None,
+                root_thread_id: None,
+                terminal_outcomes: None,
             },
         })
         .await?;

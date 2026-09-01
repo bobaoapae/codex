@@ -205,6 +205,12 @@ mod agent_message_consolidation;
 mod agent_navigation;
 mod agent_picker;
 mod agent_status_feed;
+mod agents_fleet;
+mod agents_fleet_actions;
+#[cfg(test)]
+#[path = "app/agents_fleet_tests.rs"]
+mod agents_fleet_tests;
+mod agents_fleet_view;
 mod agents_overview;
 mod agents_overview_view;
 pub(crate) use agents_overview::AGENTS_OVERVIEW_VIEW_ID;
@@ -214,12 +220,16 @@ pub(crate) mod app_server_requests;
 mod background_requests;
 mod config_persistence;
 mod connector_mentions;
+/// Read-only `/context` inspection request orchestration.
+mod context_inspection;
 mod event_dispatch;
 mod exit_summary;
 mod file_change_approvals;
 mod history_pagination;
 mod history_ui;
 mod input;
+/// FORK: `/jobs` — durable transient job history and controls.
+mod jobs_picker;
 mod loaded_threads;
 mod pending_interactive_replay;
 mod permission_shortcuts;
@@ -228,6 +238,7 @@ mod plans_picker;
 mod platform_actions;
 mod plugin_mentions;
 mod recap;
+mod recovery;
 mod replay_filter;
 mod resize_reflow;
 mod safety_buffering;

@@ -7,6 +7,7 @@
 use std::fmt::Display;
 use std::sync::Arc;
 
+use codex_protocol::is_sensitive_multi_agent_tool;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::SandboxPermissions;
@@ -15,6 +16,8 @@ use serde::Serialize;
 use serde_json::Value as JsonValue;
 use serde_json::json;
 use tracing::warn;
+
+const REDACTED_TOOL_ARGUMENTS: &str = "[redacted]";
 
 use crate::model::AgentThreadId;
 use crate::model::CodeModeRuntimeToolId;
@@ -202,8 +205,8 @@ fn record_started(context: &EnabledToolDispatchTraceContext, invocation: ToolDis
     let tool_namespace = invocation.tool_namespace;
     let kind = dispatched_tool_kind(&tool_name, &invocation.payload);
     let label = dispatched_tool_label(&tool_name, tool_namespace.as_deref(), &invocation.payload);
-    let input_preview = Some(invocation.payload.log_payload_preview());
-    let payload = invocation.payload.into_json_payload();
+    let input_preview = Some(invocation.payload.log_payload_preview(&tool_name));
+    let payload = invocation.payload.into_json_payload(&tool_name);
     let request = DispatchedToolTraceRequest {
         tool_name: tool_name.as_str(),
         tool_namespace: tool_namespace.as_deref(),
@@ -288,7 +291,10 @@ fn dispatched_tool_label(
 }
 
 impl ToolDispatchPayload {
-    fn log_payload_preview(&self) -> String {
+    fn log_payload_preview(&self, tool_name: &str) -> String {
+        if is_sensitive_multi_agent_tool(tool_name) {
+            return REDACTED_TOOL_ARGUMENTS.to_string();
+        }
         match self {
             ToolDispatchPayload::Function { arguments } => truncate_preview(arguments),
             ToolDispatchPayload::ToolSearch { arguments } => truncate_preview(&arguments.query),
@@ -297,11 +303,15 @@ impl ToolDispatchPayload {
         }
     }
 
-    fn into_json_payload(self) -> JsonValue {
+    fn into_json_payload(self, tool_name: &str) -> JsonValue {
         match self {
             ToolDispatchPayload::Function { arguments } => json!({
                 "type": "function",
-                "arguments": arguments,
+                "arguments": if is_sensitive_multi_agent_tool(tool_name) {
+                    REDACTED_TOOL_ARGUMENTS.to_string()
+                } else {
+                    arguments
+                },
             }),
             ToolDispatchPayload::ToolSearch { arguments } => json!({
                 "type": "tool_search",
@@ -448,6 +458,28 @@ mod tests {
                 },
             ),
             ToolCallKind::ImageGeneration
+        );
+    }
+
+    #[test]
+    fn multi_agent_arguments_are_redacted_from_trace_payloads() {
+        let payload = ToolDispatchPayload::Function {
+            arguments: "ciphertext".to_string(),
+        };
+        assert_eq!(payload.log_payload_preview("send_message"), "[redacted]");
+
+        let payload = ToolDispatchPayload::Function {
+            arguments: "plaintext".to_string(),
+        };
+        let json = payload.into_json_payload("spawn_agent");
+        assert_eq!(json["arguments"], "[redacted]");
+
+        let payload = ToolDispatchPayload::Function {
+            arguments: "safe arguments".to_string(),
+        };
+        assert_eq!(
+            payload.log_payload_preview("exec_command"),
+            "safe arguments"
         );
     }
 

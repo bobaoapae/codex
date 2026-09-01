@@ -508,6 +508,14 @@ client_request_definitions! {
         response: v2::ServerDiagnosticsResponse,
     },
 
+    #[experimental("context/inspect")]
+    /// Read the model context projection for one loaded or persisted thread.
+    ContextInspect => "context/inspect" {
+        params: v2::ContextInspectParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ContextInspectResponse,
+    },
+
     /// NEW APIs
     // Thread lifecycle
     // Uses `inspect_params` because only some fields are experimental.
@@ -697,6 +705,125 @@ client_request_definitions! {
         serialization: thread_id(params.thread_id),
         response: v2::ThreadRevertResponse,
     },
+    #[experimental("thread/recovery/preview")]
+    /// Preview a safe recovery lineage without modifying the source thread.
+    ThreadRecoveryPreview => "thread/recovery/preview" {
+        params: v2::ThreadRecoveryPreviewParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadRecoveryPreviewResponse,
+    },
+    #[experimental("thread/recovery/create")]
+    /// Create a replacement lineage from an immutable recovery preview token.
+    ThreadRecoveryCreate => "thread/recovery/create" {
+        params: v2::ThreadRecoveryCreateParams,
+        serialization: global("thread-recovery"),
+        response: v2::ThreadRecoveryCreateResponse,
+    },
+    #[experimental("job/run")]
+    /// Start an explicitly requested durable transient job.
+    JobRun => "job/run" {
+        params: v2::JobRunParams,
+        serialization: global("workflow"),
+        response: v2::JobRunResponse,
+    },
+    #[experimental("job/list")]
+    /// List durable transient jobs without including their output payloads.
+    JobList => "job/list" {
+        params: v2::JobListParams,
+        serialization: global_shared_read("workflow"),
+        response: v2::JobListResponse,
+    },
+    #[experimental("job/read")]
+    /// Read durable lifecycle metadata for one transient job.
+    JobRead => "job/read" {
+        params: v2::JobReadParams,
+        serialization: global_shared_read("workflow"),
+        response: v2::JobReadResponse,
+    },
+    #[experimental("job/cancel")]
+    /// Explicitly cancel one durable transient job.
+    JobCancel => "job/cancel" {
+        params: v2::JobCancelParams,
+        serialization: global("workflow"),
+        response: v2::JobCancelResponse,
+    },
+    #[experimental("artifact/read")]
+    /// Read a bounded UTF-8 JSON chunk from an opaque state-owned artifact.
+    ArtifactRead => "artifact/read" {
+        params: v2::ArtifactReadParams,
+        serialization: global_shared_read("artifacts"),
+        response: v2::ArtifactReadResponse,
+    },
+    #[experimental("evidence/list")]
+    /// List host-owned metadata-only evidence receipts.
+    EvidenceList => "evidence/list" {
+        params: v2::EvidenceListParams,
+        serialization: global_shared_read("workflow"),
+        response: v2::EvidenceListResponse,
+    },
+    #[experimental("evidence/attach")]
+    /// Attach a trusted metadata-only evidence receipt to a thread rollout.
+    EvidenceAttach => "evidence/attach" {
+        params: v2::EvidenceAttachParams,
+        serialization: global("workflow"),
+        response: v2::EvidenceAttachResponse,
+    },
+    #[experimental("evidence/export")]
+    /// Export an explicit selection of redacted evidence receipts.
+    EvidenceExport => "evidence/export" {
+        params: v2::EvidenceExportParams,
+        serialization: global_shared_read("workflow"),
+        response: v2::EvidenceExportResponse,
+    },
+    #[experimental("agent/fleet/status")]
+    /// Read the current durable agent-fleet tree.
+    AgentFleetStatus => "agent/fleet/status" {
+        params: v2::AgentFleetStatusParams,
+        serialization: global_shared_read("fleet"),
+        response: v2::AgentFleetStatusResponse,
+    },
+    #[experimental("agent/fleet/suspend")]
+    /// Suspend a fleet tree using generation compare-and-swap.
+    AgentFleetSuspend => "agent/fleet/suspend" {
+        params: v2::AgentFleetSuspendParams,
+        serialization: global("fleet"),
+        response: v2::AgentFleetSuspendResponse,
+    },
+    #[experimental("agent/fleet/resume")]
+    /// Resume a fleet tree using generation compare-and-swap.
+    AgentFleetResume => "agent/fleet/resume" {
+        params: v2::AgentFleetResumeParams,
+        serialization: global("fleet"),
+        response: v2::AgentFleetResumeResponse,
+    },
+    #[experimental("agent/fleet/close")]
+    /// Close a fleet tree using generation compare-and-swap.
+    AgentFleetClose => "agent/fleet/close" {
+        params: v2::AgentFleetCloseParams,
+        serialization: global("fleet"),
+        response: v2::AgentFleetCloseResponse,
+    },
+    #[experimental("workspaceLease/list")]
+    /// List display-safe workspace leases for one root.
+    WorkspaceLeaseList => "workspaceLease/list" {
+        params: v2::WorkspaceLeaseListParams,
+        serialization: global_shared_read("workspace-leases"),
+        response: v2::WorkspaceLeaseListResponse,
+    },
+    #[experimental("workspaceLease/grant")]
+    /// Atomically grant one or more workspace path leases.
+    WorkspaceLeaseGrant => "workspaceLease/grant" {
+        params: v2::WorkspaceLeaseGrantParams,
+        serialization: global("workspace-leases"),
+        response: v2::WorkspaceLeaseGrantResponse,
+    },
+    #[experimental("workspaceLease/release")]
+    /// Release one workspace path lease with its fencing token.
+    WorkspaceLeaseRelease => "workspaceLease/release" {
+        params: v2::WorkspaceLeaseReleaseParams,
+        serialization: global("workspace-leases"),
+        response: v2::WorkspaceLeaseReleaseResponse,
+    },
     ThreadList => "thread/list" {
         params: v2::ThreadListParams,
         inspect_params: true,
@@ -806,17 +933,26 @@ client_request_definitions! {
         serialization: thread_id(params.thread_id),
         response: v2::ThreadInjectItemsResponse,
     },
+    #[experimental("plan/list")]
     /// Fork extension: list the plans persisted by Plan mode, newest first.
     PlanList => "plan/list" {
         params: v2::PlanListParams,
         serialization: global_shared_read("plans"),
         response: v2::PlanListResponse,
     },
+    #[experimental("plan/read")]
     /// Fork extension: read one saved plan, including its Markdown body.
     PlanRead => "plan/read" {
         params: v2::PlanReadParams,
         serialization: global_shared_read("plans"),
         response: v2::PlanReadResponse,
+    },
+    #[experimental("plan/approve")]
+    /// Fork extension: approve a draft revision as an immutable snapshot.
+    PlanApprove => "plan/approve" {
+        params: v2::PlanApproveParams,
+        serialization: global("plans"),
+        response: v2::PlanApproveResponse,
     },
     SkillsList => "skills/list" {
         params: v2::SkillsListParams,

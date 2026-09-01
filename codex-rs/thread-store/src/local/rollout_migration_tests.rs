@@ -49,6 +49,7 @@ use super::RolloutMigrationFailureReason;
 use super::RolloutMigrationMode;
 use super::RolloutMigrationOptions;
 use super::RolloutMigrationPaths;
+use super::RolloutMigrationPreviewOptions;
 use super::RolloutMigrationProgress;
 use super::RolloutMigrationStatus;
 #[cfg(unix)]
@@ -266,6 +267,68 @@ fn apply_options() -> RolloutMigrationOptions {
     }
 }
 
+async fn frozen_preview(
+    store: &LocalThreadStore,
+    options: &RolloutMigrationOptions,
+) -> crate::ThreadStoreResult<super::FrozenPreview> {
+    store
+        .preview_rollout_migration(RolloutMigrationPreviewOptions {
+            thread_ids: options.thread_ids.clone(),
+            max_mib_per_second: options.max_mib_per_second,
+        })
+        .await
+}
+
+async fn apply_frozen_rollouts(
+    store: &LocalThreadStore,
+    preview: super::FrozenPreview,
+    options: RolloutMigrationOptions,
+) -> crate::ThreadStoreResult<super::RolloutMigrationReport> {
+    if store.state_db().await.is_some() {
+        return store.migrate_rollouts_from_preview(preview, options).await;
+    }
+
+    apply_known_rollouts(store, preview, options, RolloutMigrationTrigger::Manual).await
+}
+
+async fn apply_known_rollouts(
+    store: &LocalThreadStore,
+    preview: super::FrozenPreview,
+    options: RolloutMigrationOptions,
+    trigger: RolloutMigrationTrigger,
+) -> crate::ThreadStoreResult<super::RolloutMigrationReport> {
+    let paths = preview
+        .entries
+        .into_iter()
+        .map(|entry| entry.rollout_path)
+        .collect();
+    store
+        .migrate_rollouts_with_progress_for_trigger(
+            options,
+            |_| {},
+            trigger,
+            RolloutMigrationPaths::Known(paths),
+        )
+        .await
+}
+
+async fn apply_rollouts(
+    store: &LocalThreadStore,
+    options: RolloutMigrationOptions,
+) -> crate::ThreadStoreResult<super::RolloutMigrationReport> {
+    let preview = frozen_preview(store, &options).await?;
+    apply_frozen_rollouts(store, preview, options).await
+}
+
+async fn apply_rollouts_from_known_preview(
+    store: &LocalThreadStore,
+    options: RolloutMigrationOptions,
+    trigger: RolloutMigrationTrigger,
+) -> crate::ThreadStoreResult<super::RolloutMigrationReport> {
+    let preview = frozen_preview(store, &options).await?;
+    apply_known_rollouts(store, preview, options, trigger).await
+}
+
 fn assert_failed_with_reason(
     outcome: &super::RolloutMigrationOutcome,
     failure_reason: RolloutMigrationFailureReason,
@@ -319,9 +382,12 @@ async fn migration_publishes_canonical_projected_history_and_is_idempotent() {
         ],
     );
     let store = indexed_store(home.path()).await;
+    let options = apply_options();
+    let preview = frozen_preview(&store, &options)
+        .await
+        .expect("preview legacy rollout");
 
-    let report = store
-        .migrate_rollouts(apply_options())
+    let report = apply_frozen_rollouts(&store, preview.clone(), options.clone())
         .await
         .expect("migrate legacy rollout");
     assert_eq!(report.outcomes.len(), 1);
@@ -352,8 +418,7 @@ async fn migration_publishes_canonical_projected_history_and_is_idempotent() {
     assert_eq!(turns.turns[0].items.len(), 2);
 
     let bytes = fs::read(&path).expect("read first migration");
-    let second = store
-        .migrate_rollouts(apply_options())
+    let second = apply_frozen_rollouts(&store, preview, options)
         .await
         .expect("rerun migration");
     assert_eq!(
@@ -392,8 +457,7 @@ async fn migration_projects_explicit_and_implicit_legacy_completed_items() {
     );
     let store = indexed_store(home.path()).await;
 
-    store
-        .migrate_rollouts(apply_options())
+    apply_rollouts(&store, apply_options())
         .await
         .expect("migrate legacy completion events");
 
@@ -465,8 +529,7 @@ async fn migration_preserves_image_generation_failure_metadata() {
     );
     let store = indexed_store(home.path()).await;
 
-    store
-        .migrate_rollouts(apply_options())
+    apply_rollouts(&store, apply_options())
         .await
         .expect("migrate legacy image completion");
 
@@ -503,8 +566,7 @@ async fn migration_keeps_late_completions_in_their_original_turn() {
     );
     let store = indexed_store(home.path()).await;
 
-    store
-        .migrate_rollouts(apply_options())
+    apply_rollouts(&store, apply_options())
         .await
         .expect("migrate late completion");
 
@@ -558,9 +620,12 @@ async fn migration_hoists_delayed_session_meta_before_paginated_history() {
     )
     .expect("write pre-header rollout");
     let store = indexed_store(home.path()).await;
+    let options = apply_options();
+    let preview = frozen_preview(&store, &options)
+        .await
+        .expect("preview delayed session metadata");
 
-    store
-        .migrate_rollouts(apply_options())
+    apply_frozen_rollouts(&store, preview.clone(), options.clone())
         .await
         .expect("migrate delayed session metadata");
 
@@ -585,8 +650,7 @@ async fn migration_hoists_delayed_session_meta_before_paginated_history() {
         .expect("read migrated turns");
     assert_eq!(turns.turns.len(), 1);
 
-    let second = store
-        .migrate_rollouts(apply_options())
+    let second = apply_frozen_rollouts(&store, preview, options)
         .await
         .expect("rerun migration");
     assert_eq!(
@@ -622,8 +686,7 @@ async fn migration_preserves_valid_final_record_without_newline() {
         .expect("append final record");
     let store = indexed_store(home.path()).await;
 
-    store
-        .migrate_rollouts(apply_options())
+    apply_rollouts(&store, apply_options())
         .await
         .expect("migrate legacy rollout");
 
@@ -666,8 +729,7 @@ async fn migration_applies_historical_rollbacks_before_sqlite_projection() {
     );
     let store = indexed_store(home.path()).await;
 
-    let report = store
-        .migrate_rollouts(apply_options())
+    let report = apply_rollouts(&store, apply_options())
         .await
         .expect("migrate rolled-back thread");
     assert_eq!(report.outcomes[0].status, RolloutMigrationStatus::Migrated);
@@ -751,8 +813,7 @@ async fn migration_rolls_back_response_and_inter_agent_user_boundaries() {
     );
     let store = indexed_store(home.path()).await;
 
-    store
-        .migrate_rollouts(apply_options())
+    apply_rollouts(&store, apply_options())
         .await
         .expect("migrate legacy rollback boundaries");
 
@@ -801,8 +862,7 @@ async fn migration_drops_trailing_context_when_rollback_arrives_before_next_turn
     );
     let store = indexed_store(home.path()).await;
 
-    store
-        .migrate_rollouts(apply_options())
+    apply_rollouts(&store, apply_options())
         .await
         .expect("migrate trailing rollback context");
 
@@ -837,8 +897,7 @@ async fn migration_coalesces_response_first_user_message_rollback_boundary() {
     );
     let store = indexed_store(home.path()).await;
 
-    store
-        .migrate_rollouts(apply_options())
+    apply_rollouts(&store, apply_options())
         .await
         .expect("migrate response-first rollback");
 
@@ -868,8 +927,7 @@ async fn migration_does_not_coalesce_distinct_adjacent_user_records() {
     );
     let store = indexed_store(home.path()).await;
 
-    store
-        .migrate_rollouts(apply_options())
+    apply_rollouts(&store, apply_options())
         .await
         .expect("migrate distinct adjacent user records");
 
@@ -919,8 +977,7 @@ async fn migration_keeps_late_completions_for_surviving_turns_across_rollback() 
     );
     let store = indexed_store(home.path()).await;
 
-    store
-        .migrate_rollouts(apply_options())
+    apply_rollouts(&store, apply_options())
         .await
         .expect("migrate late completion rollback");
 
@@ -1017,7 +1074,11 @@ async fn migration_rolls_back_inter_agent_metadata_with_its_delivery() {
         thread_id,
         SessionSource::Cli,
         vec![
-            RolloutItem::InterAgentCommunicationMetadata { trigger_turn: true },
+            RolloutItem::InterAgentCommunicationMetadata {
+                message_id: None,
+                trigger_turn: true,
+                wake_applied: false,
+            },
             rollout_response_item(delivery.to_model_input_item()),
             RolloutItem::EventMsg(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
                 num_turns: 1,
@@ -1027,8 +1088,7 @@ async fn migration_rolls_back_inter_agent_metadata_with_its_delivery() {
     );
     let store = indexed_store(home.path()).await;
 
-    store
-        .migrate_rollouts(apply_options())
+    apply_rollouts(&store, apply_options())
         .await
         .expect("migrate rolled-back inter-agent delivery");
 
@@ -1092,8 +1152,7 @@ async fn migration_rolls_back_pre_compaction_turns_from_sqlite_history() {
     );
     let store = indexed_store(home.path()).await;
 
-    store
-        .migrate_rollouts(apply_options())
+    apply_rollouts(&store, apply_options())
         .await
         .expect("migrate rollback through compaction");
 
@@ -1139,8 +1198,7 @@ async fn migration_preserves_reverse_replay_anchor_after_pre_compaction_rollback
     );
     let store = indexed_store(home.path()).await;
 
-    store
-        .migrate_rollouts(apply_options())
+    apply_rollouts(&store, apply_options())
         .await
         .expect("migrate pre-compaction rollback");
 
@@ -1180,8 +1238,7 @@ async fn migration_keeps_empty_replay_anchor_from_rolled_back_turn() {
     );
     let store = indexed_store(home.path()).await;
 
-    store
-        .migrate_rollouts(apply_options())
+    apply_rollouts(&store, apply_options())
         .await
         .expect("migrate rolled-back replay anchor");
 
@@ -1242,8 +1299,7 @@ async fn migration_uses_turn_context_to_select_reverse_replay_anchor() {
     );
     let store = indexed_store(home.path()).await;
 
-    store
-        .migrate_rollouts(apply_options())
+    apply_rollouts(&store, apply_options())
         .await
         .expect("migrate turn-context replay anchor");
 
@@ -1294,8 +1350,7 @@ async fn migration_applies_cumulative_and_overflowing_rollbacks() {
     );
     let store = indexed_store(home.path()).await;
 
-    store
-        .migrate_rollouts(apply_options())
+    apply_rollouts(&store, apply_options())
         .await
         .expect("migrate cumulative rollbacks");
 
@@ -1358,8 +1413,7 @@ async fn migration_drops_copied_user_fork_metadata_without_creating_a_history_ba
         .collect::<Vec<_>>();
     let store = indexed_store(home.path()).await;
 
-    let report = store
-        .migrate_rollouts(apply_options())
+    let report = apply_rollouts(&store, apply_options())
         .await
         .expect("migrate copied user fork");
 
@@ -1472,8 +1526,7 @@ async fn migration_compacts_subagent_prefix_and_does_not_project_it() {
     .expect("append malformed record");
     let store = indexed_store(home.path()).await;
 
-    store
-        .migrate_rollouts(apply_options())
+    apply_rollouts(&store, apply_options())
         .await
         .expect("migrate legacy subagent");
 
@@ -1523,8 +1576,7 @@ async fn migration_keeps_small_uncompacted_subagent_replay_as_prefix() {
     );
     let store = indexed_store(home.path()).await;
 
-    store
-        .migrate_rollouts(apply_options())
+    apply_rollouts(&store, apply_options())
         .await
         .expect("migrate uncompacted legacy subagent");
 
@@ -1560,8 +1612,7 @@ async fn migration_projects_memory_consolidation_as_ordinary_history() {
     );
     let store = indexed_store(home.path()).await;
 
-    store
-        .migrate_rollouts(apply_options())
+    apply_rollouts(&store, apply_options())
         .await
         .expect("migrate memory consolidation rollout");
 
@@ -1704,8 +1755,7 @@ async fn migration_preserves_compressed_rollouts_during_publish_and_recovery() {
     let compressed_path = compress_rollout(&path);
     let store = indexed_store(home.path()).await;
 
-    let report = store
-        .migrate_rollouts(apply_options())
+    let report = apply_rollouts(&store, apply_options())
         .await
         .expect("migrate compressed rollout");
 
@@ -1731,10 +1781,13 @@ async fn migration_preserves_compressed_rollouts_during_publish_and_recovery() {
     write_migration_journal(&journal_path)
         .await
         .expect("simulate pending migration journal");
-    let recovered = store
-        .migrate_rollouts(apply_options())
-        .await
-        .expect("recover compressed rollout");
+    let recovered = apply_rollouts_from_known_preview(
+        &store,
+        apply_options(),
+        RolloutMigrationTrigger::Startup,
+    )
+    .await
+    .expect("recover compressed rollout");
 
     assert_eq!(
         recovered.outcomes[0].status,
@@ -1762,8 +1815,7 @@ async fn migration_migrates_archived_rollouts_without_unarchiving_them() {
     let archived_path = move_to_archived(home.path(), active_path.clone());
     let store = indexed_store(home.path()).await;
 
-    let report = store
-        .migrate_rollouts(apply_options())
+    let report = apply_rollouts(&store, apply_options())
         .await
         .expect("migrate archived rollout");
 
@@ -1857,8 +1909,7 @@ async fn migration_preserves_legacy_displayed_thread_names() {
         .await
         .expect("write legacy index name");
 
-    store
-        .migrate_rollouts(apply_options())
+    apply_rollouts(&store, apply_options())
         .await
         .expect("migrate named rollouts");
 
@@ -1917,8 +1968,7 @@ async fn migration_repairs_a_missing_paginated_name_when_rerun() {
         })
         .await
         .expect("rename legacy thread");
-    store
-        .migrate_rollouts(apply_options())
+    apply_rollouts(&store, apply_options())
         .await
         .expect("migrate named rollout");
     let state_db = store.state_db().await.expect("state runtime");
@@ -1931,10 +1981,13 @@ async fn migration_repairs_a_missing_paginated_name_when_rerun() {
         .await
         .expect("clear migrated name");
 
-    let report = store
-        .migrate_rollouts(apply_options())
-        .await
-        .expect("repair migrated name");
+    let report = apply_rollouts_from_known_preview(
+        &store,
+        apply_options(),
+        RolloutMigrationTrigger::Startup,
+    )
+    .await
+    .expect("repair migrated name");
 
     assert_eq!(
         report.outcomes[0].status,
@@ -1996,8 +2049,7 @@ async fn migration_skips_threads_with_an_active_writer() {
         .expect("acquire live writer lock");
     let original = fs::read(&path).expect("read active rollout");
 
-    let report = store
-        .migrate_rollouts(apply_options())
+    let report = apply_rollouts(&store, apply_options())
         .await
         .expect("inspect active writer");
 
@@ -2024,8 +2076,7 @@ async fn migration_apply_conflicts_with_rollout_maintenance() {
         .expect("claim rollout maintenance lock");
     let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
 
-    let error = store
-        .migrate_rollouts(apply_options())
+    let error = apply_rollouts(&store, apply_options())
         .await
         .expect_err("reject concurrent rollout maintenance");
 
@@ -2047,8 +2098,7 @@ async fn migration_recovers_a_published_rollout_with_missing_projection() {
         ],
     );
     let store = indexed_store(home.path()).await;
-    store
-        .migrate_rollouts(apply_options())
+    apply_rollouts(&store, apply_options())
         .await
         .expect("publish canonical rollout");
     thread_history::delete_thread(&store, thread_id)
@@ -2063,18 +2113,24 @@ async fn migration_recovers_a_published_rollout_with_missing_projection() {
         .writer_lock_coordinator
         .acquire(thread_id)
         .expect("acquire live writer lock");
-    let busy = store
-        .migrate_rollouts(apply_options())
-        .await
-        .expect("inspect busy published recovery");
+    let busy = apply_rollouts_from_known_preview(
+        &store,
+        apply_options(),
+        RolloutMigrationTrigger::Startup,
+    )
+    .await
+    .expect("inspect busy published recovery");
     assert_eq!(busy.outcomes[0].status, RolloutMigrationStatus::SkippedBusy);
     assert!(journal_path.exists());
     drop(writer);
 
-    let report = store
-        .migrate_rollouts(apply_options())
-        .await
-        .expect("recover published rollout");
+    let report = apply_rollouts_from_known_preview(
+        &store,
+        apply_options(),
+        RolloutMigrationTrigger::Startup,
+    )
+    .await
+    .expect("recover published rollout");
 
     assert_eq!(report.outcomes[0].status, RolloutMigrationStatus::Migrated);
     assert!(!journal_path.exists());
@@ -2114,13 +2170,15 @@ async fn migration_recovers_pending_rollouts_before_new_work() {
     .expect("move newer rollout");
     let store = indexed_store(home.path()).await;
 
-    store
-        .migrate_rollouts(RolloutMigrationOptions {
+    apply_rollouts(
+        &store,
+        RolloutMigrationOptions {
             thread_ids: vec![pending_thread_id],
             ..apply_options()
-        })
-        .await
-        .expect("publish pending rollout");
+        },
+    )
+    .await
+    .expect("publish pending rollout");
     thread_history::delete_thread(&store, pending_thread_id)
         .await
         .expect("simulate missing projection");
@@ -2128,10 +2186,13 @@ async fn migration_recovers_pending_rollouts_before_new_work() {
         .await
         .expect("simulate pending migration journal");
 
-    let report = store
-        .migrate_rollouts(apply_options())
-        .await
-        .expect("recover pending rollout before new work");
+    let report = apply_rollouts_from_known_preview(
+        &store,
+        apply_options(),
+        RolloutMigrationTrigger::Startup,
+    )
+    .await
+    .expect("recover pending rollout before new work");
 
     assert_eq!(
         report
@@ -2163,8 +2224,7 @@ async fn migration_recovers_a_compressed_published_rollout() {
         ],
     );
     let store = indexed_store(home.path()).await;
-    store
-        .migrate_rollouts(apply_options())
+    apply_rollouts(&store, apply_options())
         .await
         .expect("publish canonical rollout");
     thread_history::delete_thread(&store, thread_id)
@@ -2193,10 +2253,13 @@ async fn migration_recovers_a_compressed_published_rollout() {
         .expect("simulate pending migration journal");
     let compressed_path = compress_rollout(&path);
 
-    let report = store
-        .migrate_rollouts(apply_options())
-        .await
-        .expect("recover compressed published rollout");
+    let report = apply_rollouts_from_known_preview(
+        &store,
+        apply_options(),
+        RolloutMigrationTrigger::Startup,
+    )
+    .await
+    .expect("recover compressed published rollout");
 
     assert_eq!(report.outcomes[0].status, RolloutMigrationStatus::Migrated);
     assert!(!path.exists());
@@ -2249,8 +2312,7 @@ async fn migration_skips_oversized_jsonl_records() {
     drop(file);
     let store = indexed_store(home.path()).await;
 
-    let report = store
-        .migrate_rollouts(apply_options())
+    let report = apply_rollouts(&store, apply_options())
         .await
         .expect("migrate oversized rollout record");
 
@@ -2276,8 +2338,7 @@ async fn migration_skips_empty_rollout_files() {
     fs::File::create(&path).expect("create empty rollout");
     let store = indexed_store(home.path()).await;
 
-    let report = store
-        .migrate_rollouts(apply_options())
+    let report = apply_rollouts(&store, apply_options())
         .await
         .expect("inspect empty rollout");
 
@@ -2286,6 +2347,42 @@ async fn migration_skips_empty_rollout_files() {
         RolloutMigrationStatus::SkippedEmpty
     );
     assert_eq!(fs::metadata(&path).expect("read empty rollout").len(), 0);
+    assert!(
+        store
+            .state_db
+            .as_ref()
+            .expect("state db")
+            .get_thread(thread_id)
+            .await
+            .expect("read thread metadata")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn migration_skips_empty_compressed_rollout_files() {
+    let home = TempDir::new().expect("create Codex home");
+    let thread_id = ThreadId::new();
+    let directory = home.path().join("sessions/2025/01/03");
+    fs::create_dir_all(&directory).expect("create rollout directory");
+    let plain_path = directory.join(format!("rollout-2025-01-03T12-00-00-{thread_id}.jsonl"));
+    let compressed_path = plain_path.with_extension("jsonl.zst");
+    fs::write(
+        &compressed_path,
+        zstd::stream::encode_all(&[][..], 3).expect("compress empty rollout"),
+    )
+    .expect("create empty compressed rollout");
+    let store = indexed_store(home.path()).await;
+
+    let report = apply_rollouts(&store, apply_options())
+        .await
+        .expect("inspect empty compressed rollout");
+
+    assert_eq!(
+        report.outcomes[0].status,
+        RolloutMigrationStatus::SkippedEmpty
+    );
+    assert!(compressed_path.exists());
     assert!(
         store
             .state_db
@@ -2317,8 +2414,7 @@ async fn migration_reports_missing_sqlite_metadata() {
         .await
         .expect("remove thread metadata");
 
-    let report = store
-        .migrate_rollouts(apply_options())
+    let report = apply_rollouts(&store, apply_options())
         .await
         .expect("inspect rollout with missing metadata");
 
@@ -2338,8 +2434,7 @@ async fn migration_reports_invalid_session_metadata() {
     fs::write(path, "not a rollout record\n").expect("write malformed rollout");
     let store = indexed_store(home.path()).await;
 
-    let report = store
-        .migrate_rollouts(apply_options())
+    let report = apply_rollouts(&store, apply_options())
         .await
         .expect("inspect rollout with invalid metadata");
 
@@ -2380,8 +2475,7 @@ async fn migration_skips_malformed_lines_and_trailing_partial_tail() {
     drop(file);
     let store = indexed_store(home.path()).await;
 
-    let report = store
-        .migrate_rollouts(apply_options())
+    let report = apply_rollouts(&store, apply_options())
         .await
         .expect("migrate malformed legacy rollout");
 

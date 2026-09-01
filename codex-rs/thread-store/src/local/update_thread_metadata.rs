@@ -20,6 +20,7 @@ use super::helpers::git_info_from_parts;
 use super::helpers::permission_profile_to_metadata_value;
 use super::live_writer;
 use super::pending_thread_metadata;
+use super::search_index;
 use super::thread_rollout_resolver;
 use super::thread_rollout_resolver::ResolvedThreadRollout;
 use super::thread_rollout_resolver::RolloutLocation;
@@ -102,6 +103,7 @@ pub(super) async fn update_thread_metadata(
         history_mode,
     )
     .await?;
+    search_index::refresh_live_metadata(store, thread_id).await;
     if paginated
         && requires_rollout_compat
         && let Some(git_info) = patch.git_info.as_ref()

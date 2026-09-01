@@ -4,11 +4,13 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 
 use super::AdditionalContextUserFragment;
+use super::CarriedPlan;
 use super::ContextualUserFragment;
 use super::InternalModelContextFragment;
 use super::LegacyApplyPatchExecCommandWarning;
 use super::LegacyModelMismatchWarning;
 use super::LegacyUnifiedExecProcessLimitWarning;
+use super::PlanLoaded;
 use super::RecommendedPluginsInstructions;
 use super::SubagentNotification;
 use super::TurnAborted;
@@ -29,6 +31,8 @@ const CONTEXTUAL_USER_FRAGMENT_MATCHERS: &[fn(&str) -> bool] = &[
     LegacyUnifiedExecProcessLimitWarning::matches_text,
     LegacyApplyPatchExecCommandWarning::matches_text,
     LegacyModelMismatchWarning::matches_text,
+    CarriedPlan::matches_text,
+    PlanLoaded::matches_text,
 ];
 
 /// Uses host annotations rather than text markers to identify user authorization changes.

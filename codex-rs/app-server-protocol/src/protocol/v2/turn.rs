@@ -1,4 +1,5 @@
 use super::ApprovalsReviewer;
+use super::ApprovedPlanRef;
 use super::AskForApproval;
 use super::SandboxPolicy;
 use super::Turn;
@@ -151,6 +152,10 @@ pub struct TurnToolOutput {
 #[ts(export_to = "v2/")]
 pub struct TurnStartParams {
     pub thread_id: String,
+    /// Pin an immutable approved plan snapshot to this new user turn.
+    #[experimental("turn/start.approvedPlan")]
+    #[ts(optional = nullable)]
+    pub approved_plan: Option<ApprovedPlanRef>,
     #[ts(optional = nullable)]
     pub client_user_message_id: Option<String>,
     pub input: Vec<UserInput>,

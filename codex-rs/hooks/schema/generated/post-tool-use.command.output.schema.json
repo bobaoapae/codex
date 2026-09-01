@@ -8,12 +8,84 @@
       ],
       "type": "string"
     },
+    "PostToolUseEvidenceReferenceWire": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "kind"
+      ],
+      "type": "object"
+    },
+    "PostToolUseEvidenceStatusWire": {
+      "enum": [
+        "pass",
+        "fail",
+        "blocked",
+        "inconclusive",
+        "informational"
+      ],
+      "type": "string"
+    },
+    "PostToolUseEvidenceWire": {
+      "additionalProperties": false,
+      "description": "A bounded, host-readable evidence contribution from a synchronous hook.\n\nThe host adds thread/turn and handler attribution before projecting this value into a `receipt.attached` extension item. Keeping the wire shape limited to receipt-compatible fields prevents hooks from smuggling raw tool output, command arguments, or provider envelopes into history.",
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "metadata": {
+          "default": null
+        },
+        "refs": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/PostToolUseEvidenceReferenceWire"
+          },
+          "type": "array"
+        },
+        "status": {
+          "$ref": "#/definitions/PostToolUseEvidenceStatusWire"
+        },
+        "subject": {
+          "type": "string"
+        },
+        "tags": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "type": "object"
+        }
+      },
+      "required": [
+        "kind",
+        "status",
+        "subject"
+      ],
+      "type": "object"
+    },
     "PostToolUseHookSpecificOutputWire": {
       "additionalProperties": false,
       "properties": {
         "additionalContext": {
           "default": null,
           "type": "string"
+        },
+        "evidence": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/PostToolUseEvidenceWire"
+            }
+          ],
+          "default": null
         },
         "hookEventName": {
           "const": "PostToolUse",

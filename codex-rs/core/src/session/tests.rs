@@ -2422,7 +2422,9 @@ async fn record_inter_agent_communication_sets_turn_id_in_rollout_and_resume() {
         .collect::<Vec<_>>();
     let expected_persisted_items = vec![
         RolloutItem::InterAgentCommunicationMetadata {
+            message_id: None,
             trigger_turn: false,
+            wake_applied: false,
         },
         RolloutItem::ResponseItem(expected_item.clone().into()),
     ];
@@ -6549,7 +6551,9 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         forked_from_ordinal_exclusive: None,
         next_internal_sub_id: AtomicU64::new(0),
         is_subagent: false,
+        derived_receipt_ids: std::sync::Mutex::new(std::collections::HashSet::new()),
         last_plan: std::sync::Mutex::new(None),
+        approved_plan: std::sync::Mutex::new(None),
         desktop_threads_created: AtomicU64::new(0),
     };
     let per_turn_config =
@@ -8832,7 +8836,9 @@ where
         forked_from_ordinal_exclusive: None,
         next_internal_sub_id: AtomicU64::new(0),
         is_subagent: false,
+        derived_receipt_ids: std::sync::Mutex::new(std::collections::HashSet::new()),
         last_plan: std::sync::Mutex::new(None),
+        approved_plan: std::sync::Mutex::new(None),
         desktop_threads_created: AtomicU64::new(0),
     });
     let per_turn_config =

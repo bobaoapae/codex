@@ -1,0 +1,5 @@
+---
+source: tui/src/chatwidget/tests/saved_plans.rs
+expression: history
+---
+■ Could not approve the selected plan revision: plan revision changed; expected revision 2. Refresh /plans and choose it again.

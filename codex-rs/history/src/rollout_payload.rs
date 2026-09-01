@@ -33,7 +33,7 @@ pub(super) enum RolloutItemWire<'a> {
         payload: Cow<'a, InterAgentCommunication>,
     },
     InterAgentCommunicationMetadata {
-        payload: InterAgentCommunicationMetadataPayload,
+        payload: InterAgentCommunicationMetadataPayload<'a>,
     },
     Compacted {
         payload: Cow<'a, CompactedItem>,
@@ -68,13 +68,17 @@ impl<'a> From<&'a RolloutItem> for RolloutItemWire<'a> {
             RolloutItem::InterAgentCommunication(payload) => Self::InterAgentCommunication {
                 payload: Cow::Borrowed(payload),
             },
-            RolloutItem::InterAgentCommunicationMetadata { trigger_turn } => {
-                Self::InterAgentCommunicationMetadata {
-                    payload: InterAgentCommunicationMetadataPayload {
-                        trigger_turn: *trigger_turn,
-                    },
-                }
-            }
+            RolloutItem::InterAgentCommunicationMetadata {
+                message_id,
+                trigger_turn,
+                wake_applied,
+            } => Self::InterAgentCommunicationMetadata {
+                payload: InterAgentCommunicationMetadataPayload {
+                    message_id: message_id.as_deref().map(Cow::Borrowed),
+                    trigger_turn: *trigger_turn,
+                    wake_applied: *wake_applied,
+                },
+            },
             RolloutItem::Compacted(payload) => Self::Compacted {
                 payload: Cow::Borrowed(payload),
             },
@@ -112,7 +116,9 @@ impl From<RolloutItemWire<'_>> for RolloutItem {
             }
             RolloutItemWire::InterAgentCommunicationMetadata { payload } => {
                 Self::InterAgentCommunicationMetadata {
+                    message_id: payload.message_id.map(Cow::into_owned),
                     trigger_turn: payload.trigger_turn,
+                    wake_applied: payload.wake_applied,
                 }
             }
             RolloutItemWire::Compacted { payload } => Self::Compacted(payload.into_owned()),
@@ -128,8 +134,12 @@ impl From<RolloutItemWire<'_>> for RolloutItem {
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
-pub(super) struct InterAgentCommunicationMetadataPayload {
+pub(super) struct InterAgentCommunicationMetadataPayload<'a> {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    message_id: Option<Cow<'a, str>>,
     trigger_turn: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    wake_applied: bool,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]

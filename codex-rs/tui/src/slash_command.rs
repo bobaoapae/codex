@@ -34,6 +34,8 @@ pub enum SlashCommand {
     Archive,
     Delete,
     Resume,
+    /// FORK: inspect and explicitly recover a contaminated current thread.
+    Recover,
     Fork,
     App,
     Init,
@@ -42,6 +44,8 @@ pub enum SlashCommand {
     Plan,
     /// FORK: browse plans saved by Plan mode.
     Plans,
+    /// FORK: browse durable transient jobs.
+    Jobs,
     Goal,
     Agents,
     Side,
@@ -52,6 +56,8 @@ pub enum SlashCommand {
     Diff,
     Mention,
     Status,
+    /// Inspect the current model context without changing the conversation.
+    Context,
     Cd,
     #[strum(to_string = "pwd", serialize = "cwd")]
     Pwd,
@@ -97,6 +103,7 @@ impl SlashCommand {
             SlashCommand::Review => "review my current changes and find issues",
             SlashCommand::Rename => "rename the current thread",
             SlashCommand::Resume => "resume a saved chat",
+            SlashCommand::Recover => "inspect and recover the current chat into a new lineage",
             SlashCommand::Archive => "archive this session and exit",
             SlashCommand::Delete => "permanently delete this session and exit",
             SlashCommand::Clear => "clear the terminal and start a new chat",
@@ -112,6 +119,7 @@ impl SlashCommand {
             SlashCommand::Import => "import setup, this project, and recent chats from Claude Code",
             SlashCommand::Hooks => "view and manage lifecycle hooks",
             SlashCommand::Status => "show current session configuration and token usage",
+            SlashCommand::Context => "inspect the current model context and token budget",
             SlashCommand::Cd => "change the current working directory",
             SlashCommand::Pwd => "show the current working directory",
             SlashCommand::Usage => "view account usage or use a usage limit reset",
@@ -131,6 +139,7 @@ impl SlashCommand {
             SlashCommand::Personality => "choose a communication style for Codex",
             SlashCommand::Plan => "switch to Plan mode",
             SlashCommand::Plans => "browse saved plans and load one into this session",
+            SlashCommand::Jobs => "browse durable transient jobs",
             SlashCommand::Goal => "set or view the goal for a long-running task",
             SlashCommand::Agents => "view and switch between all active agent sessions",
             SlashCommand::MultiAgents => "switch between this session's subagents",
@@ -178,6 +187,7 @@ impl SlashCommand {
                 | SlashCommand::Mcp
                 | SlashCommand::Export
                 | SlashCommand::Raw
+                | SlashCommand::Context
                 | SlashCommand::Cd
                 | SlashCommand::Pwd
                 | SlashCommand::Usage
@@ -200,6 +210,8 @@ impl SlashCommand {
                 | SlashCommand::Diff
                 | SlashCommand::Mention
                 | SlashCommand::Status
+                | SlashCommand::Context
+                | SlashCommand::Jobs
                 | SlashCommand::Pwd
                 | SlashCommand::Usage
                 | SlashCommand::Ide
@@ -227,6 +239,7 @@ impl SlashCommand {
             | SlashCommand::Review
             | SlashCommand::Plan
             | SlashCommand::Plans
+            | SlashCommand::Recover
             | SlashCommand::Cd
             | SlashCommand::Clear
             | SlashCommand::Logout
@@ -251,6 +264,7 @@ impl SlashCommand {
             | SlashCommand::Stop
             | SlashCommand::App
             | SlashCommand::Goal
+            | SlashCommand::Jobs
             | SlashCommand::Mcp
             | SlashCommand::Apps
             | SlashCommand::Plugins
@@ -259,6 +273,7 @@ impl SlashCommand {
             | SlashCommand::AutoReview
             | SlashCommand::Feedback
             | SlashCommand::Ide
+            | SlashCommand::Context
             | SlashCommand::Quit
             | SlashCommand::Exit
             | SlashCommand::Side

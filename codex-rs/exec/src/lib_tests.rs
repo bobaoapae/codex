@@ -483,7 +483,7 @@ async fn thread_start_params_include_review_policy_when_review_policy_is_manual_
         .await
         .expect("build config with manual-only review policy");
 
-    let params = thread_start_params_from_config(&config, &ThreadSource::User);
+    let params = thread_start_params_from_config(&config, &ThreadSource::User, false);
 
     assert_eq!(
         params.approvals_reviewer,
@@ -511,7 +511,7 @@ async fn thread_start_params_include_review_policy_when_auto_review_is_enabled()
         .await
         .expect("build config with guardian review policy");
 
-    let params = thread_start_params_from_config(&config, &ThreadSource::User);
+    let params = thread_start_params_from_config(&config, &ThreadSource::User, false);
 
     assert_eq!(
         params.approvals_reviewer,
@@ -649,23 +649,108 @@ async fn thread_start_params_match_history_to_persistence() {
         .await
         .expect("build config");
 
-    let params = thread_start_params_from_config(&config, &ThreadSource::User);
+    let params = thread_start_params_from_config(&config, &ThreadSource::User, false);
 
     assert_eq!(
         params.thread_source,
         Some(codex_app_server_protocol::ThreadSource::User)
     );
+    assert_eq!(params.thread_class, None);
     assert_eq!(params.history_mode, Some(ThreadHistoryMode::Paginated));
 
     let thread_source = ThreadSource::Feature("automated_review".to_string());
-    let params = thread_start_params_from_config(&config, &thread_source);
+    let params = thread_start_params_from_config(&config, &thread_source, false);
     assert_eq!(params.thread_source, Some(thread_source));
 
     config.ephemeral = true;
-    let params = thread_start_params_from_config(&config, &ThreadSource::User);
+    let params = thread_start_params_from_config(&config, &ThreadSource::User, false);
 
     assert_eq!(params.ephemeral, Some(true));
     assert_eq!(params.history_mode, None);
+}
+
+#[tokio::test]
+async fn transient_thread_start_params_remain_durable_and_are_explicitly_classified() {
+    let codex_home = tempdir().expect("create temp codex home");
+    let cwd = tempdir().expect("create temp cwd");
+    let mut config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(cwd.path().to_path_buf()))
+        .build()
+        .await
+        .expect("build config");
+    // A transient invocation must win even if a caller accidentally passes a
+    // config snapshot that still carries the ephemeral bit.
+    config.ephemeral = true;
+
+    let params = thread_start_params_from_config(&config, &ThreadSource::User, true);
+
+    assert_eq!(params.ephemeral, Some(false));
+    assert_eq!(params.history_mode, Some(ThreadHistoryMode::Paginated));
+    assert_eq!(
+        params.thread_source,
+        Some(codex_app_server_protocol::ThreadSource::User)
+    );
+    assert_eq!(
+        params.thread_class,
+        Some(codex_app_server_protocol::ThreadClass::TransientJob)
+    );
+}
+
+#[test]
+fn transient_invocation_rejects_existing_thread_commands() {
+    let invocations = [
+        (
+            "resume",
+            ExecCommand::Resume(crate::cli::ResumeArgs {
+                session_id: None,
+                last: true,
+                all: false,
+                images: Vec::new(),
+                prompt: None,
+            }),
+        ),
+        (
+            "fork",
+            ExecCommand::Fork(crate::cli::ForkArgs {
+                session_id: "thread-id".to_string(),
+                images: Vec::new(),
+                prompt: None,
+            }),
+        ),
+        (
+            "review",
+            ExecCommand::Review(crate::cli::ReviewArgs {
+                uncommitted: true,
+                base: None,
+                commit: None,
+                commit_title: None,
+                prompt: None,
+            }),
+        ),
+    ];
+
+    for (command_name, command) in invocations {
+        let error = validate_transient_invocation(true, false, Some(&command))
+            .expect_err("transient should reject existing-thread commands");
+        assert!(
+            error.to_string().contains(command_name),
+            "error should name the conflicting command: {error}"
+        );
+    }
+}
+
+#[test]
+fn resume_thread_classes_exclude_transient_jobs() {
+    assert_eq!(
+        resume_thread_classes(),
+        vec![
+            codex_app_server_protocol::ThreadClass::Interactive,
+            codex_app_server_protocol::ThreadClass::SubAgent,
+            codex_app_server_protocol::ThreadClass::Internal,
+            codex_app_server_protocol::ThreadClass::LegacyExec,
+        ]
+    );
 }
 
 #[tokio::test]
@@ -687,7 +772,7 @@ async fn thread_lifecycle_params_preserve_hook_trust_bypass() {
         serde_json::Value::Bool(true),
     )]));
 
-    let start_params = thread_start_params_from_config(&config, &ThreadSource::User);
+    let start_params = thread_start_params_from_config(&config, &ThreadSource::User, false);
     let resume_params = thread_resume_params_from_config(
         &config,
         "thread-id".to_string(),
@@ -723,7 +808,7 @@ async fn thread_lifecycle_params_include_legacy_sandbox_when_no_active_profile()
         .await
         .expect("build config with legacy sandbox override");
 
-    let start_params = thread_start_params_from_config(&config, &ThreadSource::User);
+    let start_params = thread_start_params_from_config(&config, &ThreadSource::User, false);
     let resume_params = thread_resume_params_from_config(
         &config,
         "thread-id".to_string(),

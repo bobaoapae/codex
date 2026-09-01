@@ -463,11 +463,14 @@ impl Session {
             Arc::clone(&active_turn.turn_state)
         };
 
+        let has_pending_mailbox_wake = self.input_queue.has_pending_mailbox_wakes().await;
         let (input, mut start_options) =
             self.input_queue.get_pending_input(&self.active_turn).await;
-        if !input.iter().any(
-            |item| matches!(item, TurnInput::InterAgentCommunication(mail) if mail.trigger_turn),
-        ) {
+        if !has_pending_mailbox_wake
+            && !input.iter().any(
+                |item| matches!(item, TurnInput::InterAgentCommunication(mail) if mail.trigger_turn),
+            )
+        {
             // Queue-only mail wakes durable sleep without selecting a new task's settings.
             start_options.cyber_access_program = self
                 .reference_context_item()

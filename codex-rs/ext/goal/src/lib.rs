@@ -3,6 +3,7 @@
 mod accounting;
 mod analytics;
 mod api;
+mod approved_plan;
 mod events;
 mod extension;
 mod metrics;

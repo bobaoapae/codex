@@ -4,6 +4,8 @@ use std::pin::Pin;
 use codex_protocol::ThreadId;
 
 use crate::AgentGraphStoreResult;
+use crate::ThreadSpawnEdge;
+use crate::ThreadSpawnEdgeDetail;
 use crate::ThreadSpawnEdgeStatus;
 
 /// Future returned by [`AgentGraphStore`] operations.
@@ -17,8 +19,8 @@ pub type AgentGraphStoreFuture<'a, T> =
 pub trait AgentGraphStore: Send + Sync {
     /// Insert or replace the directional parent/child edge for a spawned thread.
     ///
-    /// `child_thread_id` has at most one persisted parent. Re-inserting the same child should
-    /// update both the parent and status to match the supplied values.
+    /// `child_thread_id` has at most one persisted parent. Re-inserting the same child updates its
+    /// parent, but a previously closed edge remains closed and cannot be reopened.
     fn upsert_thread_spawn_edge(
         &self,
         parent_thread_id: ThreadId,
@@ -57,4 +59,20 @@ pub trait AgentGraphStore: Send + Sync {
         root_thread_id: ThreadId,
         status_filter: Option<ThreadSpawnEdgeStatus>,
     ) -> AgentGraphStoreFuture<'_, Vec<ThreadId>>;
+
+    /// Return every edge reachable from `root_thread_id`, breadth-first and deterministically
+    /// ordered. Closed edges are included when `status_filter` is `None`, but remain sticky and
+    /// are never changed by this read-only operation.
+    fn list_thread_spawn_edge_details(
+        &self,
+        root_thread_id: ThreadId,
+        status_filter: Option<ThreadSpawnEdgeStatus>,
+    ) -> AgentGraphStoreFuture<'_, Vec<ThreadSpawnEdgeDetail>>;
+
+    /// Read one direct persisted edge. Missing or disconnected edges return `None`.
+    fn get_thread_spawn_edge(
+        &self,
+        parent_thread_id: ThreadId,
+        child_thread_id: ThreadId,
+    ) -> AgentGraphStoreFuture<'_, Option<ThreadSpawnEdge>>;
 }

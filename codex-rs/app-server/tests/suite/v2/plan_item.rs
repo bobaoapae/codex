@@ -116,6 +116,7 @@ async fn plan_mode_uses_proposed_plan_block_for_plan_item() -> Result<()> {
             request_id,
             params: PlanReadParams {
                 id: summary.id.clone(),
+                revision: None,
             },
         })
         .await?;

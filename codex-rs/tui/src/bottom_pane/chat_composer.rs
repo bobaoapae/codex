@@ -384,6 +384,10 @@ fn parent_owned_command_is_allowed(command: SlashCommand, args: &str) -> bool {
         return true;
     }
 
+    if command == SlashCommand::Context {
+        return args.is_empty() || args.eq_ignore_ascii_case("preview");
+    }
+
     args.is_empty()
         && matches!(
             command,
@@ -413,6 +417,8 @@ fn parent_owned_command_is_allowed(command: SlashCommand, args: &str) -> bool {
                 | SlashCommand::Import
                 | SlashCommand::Hooks
                 | SlashCommand::Status
+                | SlashCommand::Context
+                | SlashCommand::Jobs
                 | SlashCommand::Usage
                 | SlashCommand::Ide
                 | SlashCommand::DebugConfig

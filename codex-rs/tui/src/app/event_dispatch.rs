@@ -271,6 +271,32 @@ impl App {
                 // Leaving alt-screen may blank the inline viewport; force a redraw either way.
                 tui.frame_requester().schedule_frame();
             }
+            AppEvent::OpenRecovery => {
+                self.open_recovery(app_server);
+            }
+            AppEvent::RecoveryPreviewLoaded { request_id, result } => {
+                self.apply_recovery_preview(request_id, result);
+            }
+            AppEvent::CreateThreadRecovery { request_id } => {
+                self.create_recovery(app_server, request_id).await;
+            }
+            AppEvent::CancelThreadRecovery { request_id } => {
+                self.chat_widget.cancel_recovery(request_id);
+            }
+            AppEvent::RecoveryCreated {
+                request_id,
+                source_thread_id,
+                result,
+            } => {
+                self.apply_recovery_created(
+                    tui,
+                    app_server,
+                    request_id,
+                    source_thread_id,
+                    result,
+                )
+                .await;
+            }
             AppEvent::OpenExternalAgentConfigMigration => {
                 match crate::external_agent_config_migration::flow::handle_external_agent_config_migration_prompt(
                     tui,
@@ -2546,6 +2572,59 @@ impl App {
                 self.stop_agents_overview_thread(app_server, thread_id)
                     .await;
             }
+            AppEvent::OpenAgentsFleetActions {
+                root_thread_id,
+                expected_generation,
+            } => {
+                self.open_agents_fleet_actions(root_thread_id, expected_generation);
+            }
+            AppEvent::OpenAgentsFleetCloseConfirmation {
+                root_thread_id,
+                expected_generation,
+            } => {
+                self.open_agents_fleet_close_confirmation(root_thread_id, expected_generation);
+            }
+            AppEvent::RefreshAgentsFleet => {
+                self.refresh_agents_fleet_status(app_server);
+            }
+            AppEvent::AgentsFleetStatusLoaded {
+                request_id,
+                root_thread_id,
+                result,
+            } => {
+                self.apply_agents_fleet_status(request_id, root_thread_id, result);
+            }
+            AppEvent::RequestAgentsFleetSuspend {
+                root_thread_id,
+                expected_generation,
+            } => {
+                self.request_agents_fleet_suspend(app_server, root_thread_id, expected_generation);
+            }
+            AppEvent::RequestAgentsFleetResume {
+                root_thread_id,
+                expected_generation,
+            } => {
+                self.request_agents_fleet_resume(app_server, root_thread_id, expected_generation);
+            }
+            AppEvent::RequestAgentsFleetClose {
+                root_thread_id,
+                expected_generation,
+            } => {
+                self.request_agents_fleet_close(app_server, root_thread_id, expected_generation);
+            }
+            AppEvent::AgentsFleetOperationLoaded {
+                request_id,
+                root_thread_id,
+                expected_generation,
+                result,
+            } => {
+                self.apply_agents_fleet_operation(
+                    request_id,
+                    root_thread_id,
+                    expected_generation,
+                    result,
+                );
+            }
             #[cfg(unix)]
             AppEvent::StartAgentsDaemon => {
                 self.start_agents_daemon();
@@ -2565,21 +2644,89 @@ impl App {
             AppEvent::OpenPlansPicker => {
                 self.open_plans_picker(app_server);
             }
+            AppEvent::OpenContextInspection { include_preview } => {
+                self.open_context_inspection(app_server, include_preview);
+            }
+            AppEvent::ContextInspectionLoaded {
+                request_id,
+                thread_id,
+                include_preview,
+                result,
+            } => {
+                self.apply_context_inspection_result(
+                    request_id,
+                    thread_id,
+                    include_preview,
+                    result,
+                );
+            }
             AppEvent::PlansPickerLoaded { request_id, result } => {
                 self.apply_plans_picker_result(request_id, result);
             }
-            AppEvent::OpenSavedPlanActions { id, title } => {
-                self.chat_widget.show_saved_plan_actions(id, title);
+            AppEvent::OpenSavedPlanActions {
+                id,
+                title,
+                revision,
+                lifecycle,
+            } => {
+                self.chat_widget
+                    .show_saved_plan_actions(id, title, revision, lifecycle);
             }
-            AppEvent::LoadSavedPlan { id, action } => {
-                self.load_saved_plan(app_server, id, action);
+            AppEvent::LoadSavedPlan {
+                id,
+                revision,
+                lifecycle,
+                action,
+            } => {
+                self.load_saved_plan(app_server, id, revision, lifecycle, action);
             }
             AppEvent::SavedPlanLoaded {
+                request_id,
+                expected_revision,
+                action,
+                result,
+            } => {
+                self.apply_saved_plan_loaded(request_id, expected_revision, action, result);
+            }
+            AppEvent::ApproveSavedPlan {
+                id,
+                expected_revision,
+                action,
+            } => {
+                self.approve_saved_plan(app_server, id, expected_revision, action);
+            }
+            AppEvent::PlanApprovalLoaded {
                 request_id,
                 action,
                 result,
             } => {
-                self.apply_saved_plan_loaded(request_id, action, result);
+                self.apply_plan_approval_result(request_id, action, result);
+            }
+            // FORK: `/jobs` — durable transient job list/read/cancel flow.
+            AppEvent::OpenJobsPicker => {
+                self.open_jobs_picker(app_server);
+            }
+            AppEvent::JobsPickerLoaded {
+                request_id,
+                result,
+                has_more,
+            } => {
+                self.apply_jobs_picker_result(request_id, result, has_more);
+            }
+            AppEvent::ReadJob { job_id } => {
+                self.read_job(app_server, job_id);
+            }
+            AppEvent::JobReadLoaded { request_id, result } => {
+                self.apply_job_read_result(request_id, result);
+            }
+            AppEvent::OpenJobCancelConfirmation { job_id } => {
+                self.chat_widget.show_job_cancel_confirmation(job_id);
+            }
+            AppEvent::CancelJob { job_id } => {
+                self.cancel_job(app_server, job_id);
+            }
+            AppEvent::JobCancelLoaded { request_id, result } => {
+                self.apply_job_cancel_result(request_id, result);
             }
             AppEvent::OpenAgentPicker => {
                 self.open_agent_picker(app_server).await;

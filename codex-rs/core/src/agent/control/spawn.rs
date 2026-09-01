@@ -1,3 +1,4 @@
+use super::agent_lifecycle::reconstruct_agent_lifecycle;
 use super::residency::is_v2_resident_session_source;
 use super::*;
 use crate::agent::role::apply_role_to_config;
@@ -18,6 +19,7 @@ use codex_context_fragments::to_annotated_content;
 use codex_extension_api::ExtensionDataInit;
 use codex_protocol::intersect_effective_permission_profiles;
 use codex_protocol::protocol::EnvironmentConfigState;
+use codex_protocol::protocol::WarningEvent;
 use codex_utils_path_uri::PathUri;
 
 const AGENT_NAMES: &str = include_str!("../../../assets/agent/agent_names.txt");
@@ -194,6 +196,11 @@ impl AgentControl {
                         include_history: false,
                     })
                     .await?;
+                let history =
+                    load_agent_model_context(&state, thread_id, stored_thread.history_mode)
+                        .await?
+                        .unwrap_or_default();
+                let (restored_status, generation, _active) = reconstruct_agent_lifecycle(&history);
                 let stored_agent_path = stored_thread
                     .agent_path
                     .as_deref()
@@ -216,6 +223,14 @@ impl AgentControl {
                 )?;
                 metadata.agent_id = Some(thread_id);
                 reservation.commit(metadata);
+                self.state.restore_agent_lifecycle(
+                    thread_id,
+                    restored_status,
+                    generation,
+                    // Metadata restoration never reopens a runtime.  The
+                    // next explicit resume/follow-up reacquires the slot.
+                    false,
+                );
                 Ok::<(), CodexErr>(())
             }
             .await;
@@ -334,6 +349,11 @@ impl AgentControl {
         }
         if self.state.agent_metadata_for_thread(thread_id).is_none() {
             return Err(CodexErr::ThreadNotFound(thread_id));
+        }
+        if self.state.is_agent_closed(thread_id) {
+            return Err(CodexErr::InvalidRequest(format!(
+                "cannot load closed agent {thread_id}; resume it first"
+            )));
         }
         let mut environment_selections = self.state.evicted_environments(thread_id);
 
@@ -592,6 +612,30 @@ impl AgentControl {
         options: SpawnAgentOptions,
     ) -> CodexResult<LiveAgent> {
         let state = self.upgrade()?;
+        let fork_metrics_id =
+            if let (Some(fork_mode), Some(spawn_call_id), Some(parent_thread_id)) = (
+                options.fork_mode.as_ref(),
+                options.fork_parent_spawn_call_id.as_deref(),
+                options.parent_thread_id.or_else(|| {
+                    session_source
+                        .as_ref()
+                        .and_then(SessionSource::parent_thread_id)
+                }),
+            ) {
+                Some(
+                    self.record_fork_spawn_requested(parent_thread_id, spawn_call_id, fork_mode)
+                        .await,
+                )
+            } else {
+                None
+            };
+        if let Some(parent_thread_id) = options.parent_thread_id.or_else(|| {
+            session_source
+                .as_ref()
+                .and_then(SessionSource::parent_thread_id)
+        }) {
+            self.ensure_fleet_data_admission(parent_thread_id).await?;
+        }
         let multi_agent_version = state
             .effective_multi_agent_version_for_spawn(
                 &InitialHistory::New,
@@ -662,6 +706,7 @@ impl AgentControl {
                     config,
                     session_source,
                     &options,
+                    fork_metrics_id.as_deref(),
                     inheritance,
                     multi_agent_version,
                 ))
@@ -698,6 +743,10 @@ impl AgentControl {
         };
         agent_metadata.agent_id = Some(new_thread.thread_id);
         reservation.commit(agent_metadata.clone());
+        if let Some(fork_id) = fork_metrics_id.as_deref() {
+            self.record_fork_child_created(fork_id, new_thread.thread_id)
+                .await;
+        }
         if let Some(residency_slot) = residency_slot {
             residency_slot.commit(new_thread.thread_id);
         }
@@ -790,12 +839,17 @@ impl AgentControl {
         })
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "fork setup keeps state, request options, projection id, and inheritance explicit"
+    )]
     async fn spawn_forked_thread(
         &self,
         state: &Arc<ThreadManagerState>,
         config: Config,
         session_source: SessionSource,
         options: &SpawnAgentOptions,
+        fork_metrics_id: Option<&str>,
         inheritance: SpawnAgentThreadInheritance,
         multi_agent_version: MultiAgentVersion,
     ) -> CodexResult<crate::thread_manager::NewThread> {
@@ -1065,6 +1119,59 @@ impl AgentControl {
                 subagent_usage_hint_message.into(),
             ));
         }
+        if let Some(fork_id) = fork_metrics_id {
+            let (projected_bytes, projected_tokens, context_entries) =
+                super::fork_metrics::project_rollout_context(fork_id, &forked_rollout_items);
+            self.update_fork_projection(
+                fork_id,
+                projected_bytes,
+                projected_tokens,
+                context_entries,
+            )
+            .await;
+            let limit_tokens = parent_thread
+                .session
+                .new_default_turn()
+                .await
+                .model_context_window();
+            let near_compaction = limit_tokens.is_some_and(|limit| {
+                limit > 0 && projected_tokens.saturating_mul(10) >= limit.saturating_mul(9)
+            });
+            if matches!(fork_mode, SpawnAgentForkMode::FullHistory)
+                && near_compaction
+                && self
+                    .claim_fork_compaction_warning(
+                        fork_id,
+                        projected_tokens,
+                        limit_tokens.unwrap_or_default(),
+                    )
+                    .await
+            {
+                let limit_tokens = limit_tokens.unwrap_or_default();
+                let warning = serde_json::json!({
+                    "type": "fullHistoryForkNearCompaction",
+                    "forkId": fork_id,
+                    "projectedTokens": projected_tokens,
+                    "limitTokens": limit_tokens,
+                })
+                .to_string();
+                let warning_turn = parent_thread.session.new_default_turn().await;
+                parent_thread
+                    .session
+                    .send_event(
+                        &warning_turn,
+                        EventMsg::Warning(WarningEvent { message: warning }),
+                    )
+                    .await;
+                tracing::warn!(
+                    event = "fork.full_history.near_compaction",
+                    fork_id,
+                    projected_tokens,
+                    limit_tokens,
+                    "full-history fork is near the compaction threshold"
+                );
+            }
+        }
         let mut thread_extension_init = ExtensionDataInit::new();
         thread_extension_init.insert(selected_capability_roots);
 
@@ -1162,7 +1269,7 @@ impl AgentControl {
         Ok(resumed_thread_id)
     }
 
-    async fn resume_single_agent_from_rollout(
+    pub(super) async fn resume_single_agent_from_rollout(
         &self,
         config: Config,
         thread_id: ThreadId,
@@ -1192,6 +1299,8 @@ impl AgentControl {
             history: Arc::new(history),
             rollout_path: stored_thread.rollout_path,
         });
+        let (restored_status, generation, _restored_active) =
+            reconstruct_agent_lifecycle(initial_history.get_rollout_items());
         let parent_thread_id = stored_thread.parent_thread_id;
         let multi_agent_version = state
             .effective_multi_agent_version_for_spawn(
@@ -1202,8 +1311,27 @@ impl AgentControl {
                 &config,
             )
             .await;
+        let spawn_uses_v2_residency = multi_agent_version == MultiAgentVersion::V2
+            && is_v2_resident_session_source(&session_source);
+        let residency_slot = if spawn_uses_v2_residency {
+            Some(
+                self.reserve_v2_residency_slot(&state, &config, /*protected_thread_id*/ None)
+                    .await?,
+            )
+        } else {
+            None
+        };
         let agent_max_threads = config.effective_agent_max_threads(multi_agent_version);
-        let mut reservation = self.state.reserve_spawn_slot(agent_max_threads)?;
+        let mut reservation = if self
+            .state
+            .agent_metadata_for_thread(thread_id)
+            .is_some_and(|metadata| !metadata.agent_path.as_ref().is_some_and(AgentPath::is_root))
+        {
+            self.state
+                .reserve_existing_spawn_slot(thread_id, agent_max_threads)?
+        } else {
+            self.state.reserve_spawn_slot(agent_max_threads)?
+        };
         let (session_source, agent_metadata) = match session_source {
             SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
                 parent_thread_id,
@@ -1246,6 +1374,17 @@ impl AgentControl {
         let mut agent_metadata = agent_metadata;
         agent_metadata.agent_id = Some(resumed_thread.thread_id);
         reservation.commit(agent_metadata.clone());
+        self.state.restore_agent_lifecycle(
+            resumed_thread.thread_id,
+            restored_status,
+            generation,
+            // Loading a rollout is not itself a new running generation.  A
+            // subsequent follow-up reacquires the logical slot atomically.
+            false,
+        );
+        if let Some(residency_slot) = residency_slot {
+            residency_slot.commit(resumed_thread.thread_id);
+        }
         // Resumed threads are re-registered in-memory and need the same listener
         // attachment path as freshly spawned threads.
         state.notify_thread_created(resumed_thread.thread_id);

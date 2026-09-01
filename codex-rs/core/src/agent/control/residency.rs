@@ -151,6 +151,15 @@ impl V2Residency {
                 .agent_control
                 .state
                 .save_evicted_environments(candidate_thread_id, environments);
+            // Eviction removes only the loaded runtime.  Keep the identity and
+            // rollout resumable, but release its logical spawn slot so a
+            // replacement resident can be admitted immediately.
+            candidate_thread
+                .session
+                .services
+                .agent_control
+                .state
+                .release_active_slot(candidate_thread_id);
             let _ = manager.remove_thread(&candidate_thread_id).await;
             return true;
         }
@@ -236,6 +245,7 @@ async fn is_unloadable(thread: &CodexThread) -> bool {
         AgentStatus::Completed(_) | AgentStatus::Errored(_) | AgentStatus::Interrupted
     ) && thread.session.active_turn.lock().await.is_none()
         && !thread.session.input_queue.has_pending_mailbox_items().await
+        && !crate::agent::mailbox::has_durable_pending(&thread.session).await
 }
 
 #[cfg(test)]

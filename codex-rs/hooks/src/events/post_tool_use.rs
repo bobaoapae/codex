@@ -16,6 +16,7 @@ use crate::engine::ConfiguredHandler;
 use crate::engine::HandlerRunResult;
 use crate::engine::dispatcher;
 use crate::engine::output_parser;
+use crate::events::evidence::PostToolUseEvidence;
 use crate::output_spill::AdditionalContext;
 use crate::schema::PostToolUseCommandInput;
 use crate::schema::SubagentCommandInputFields;
@@ -42,6 +43,7 @@ pub struct PostToolUseOutcome {
     pub should_block: bool,
     pub additional_contexts: Vec<String>,
     pub feedback_message: Option<String>,
+    pub evidence: Vec<PostToolUseEvidence>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -49,6 +51,7 @@ struct PostToolUseHandlerData {
     should_block: bool,
     additional_contexts_for_model: Vec<AdditionalContext>,
     feedback_messages_for_model: Vec<String>,
+    evidence: Vec<PostToolUseEvidence>,
 }
 
 pub(crate) fn preview(
@@ -84,6 +87,7 @@ pub(crate) async fn run(
             should_block: false,
             additional_contexts: Vec::new(),
             feedback_message: None,
+            evidence: Vec::new(),
         };
     }
 
@@ -127,6 +131,10 @@ pub(crate) async fn run(
             .flat_map(|result| result.data.feedback_messages_for_model.clone())
             .collect(),
     );
+    let evidence = results
+        .iter()
+        .flat_map(|result| result.data.evidence.iter().cloned())
+        .collect();
 
     PostToolUseOutcome {
         hook_events: results
@@ -138,6 +146,7 @@ pub(crate) async fn run(
         should_block,
         additional_contexts,
         feedback_message,
+        evidence,
     }
 }
 
@@ -176,6 +185,7 @@ fn parse_completed(
     let mut should_block = false;
     let mut additional_contexts_for_model = Vec::new();
     let mut feedback_messages_for_model = Vec::new();
+    let mut evidence = Vec::new();
 
     match run_result.error.as_deref() {
         Some(error) => {
@@ -191,6 +201,31 @@ fn parse_completed(
                 if trimmed_stdout.is_empty() {
                 } else if let Some(parsed) = output_parser::parse_post_tool_use(&run_result.stdout)
                 {
+                    if parsed.invalid_evidence {
+                        entries.push(HookOutputEntry {
+                            kind: HookOutputEntryKind::Warning,
+                            text:
+                                "PostToolUse hook returned invalid evidence; evidence was ignored"
+                                    .to_string(),
+                        });
+                    } else if let Some(evidence_wire) = parsed.evidence {
+                        if handler.can_emit_evidence() {
+                            match PostToolUseEvidence::from_wire(evidence_wire, handler) {
+                                Ok(contribution) => evidence.push(contribution),
+                                Err(_) => entries.push(HookOutputEntry {
+                                    kind: HookOutputEntryKind::Warning,
+                                    text: "PostToolUse hook returned invalid evidence; evidence was ignored"
+                                        .to_string(),
+                                }),
+                            }
+                        } else {
+                            entries.push(HookOutputEntry {
+                                kind: HookOutputEntryKind::Warning,
+                                text: "PostToolUse hook evidence was ignored for an asynchronous or executor-scoped handler"
+                                    .to_string(),
+                            });
+                        }
+                    }
                     if let Some(system_message) = parsed.universal.system_message {
                         entries.push(HookOutputEntry {
                             kind: HookOutputEntryKind::Warning,
@@ -301,6 +336,7 @@ fn parse_completed(
             should_block,
             additional_contexts_for_model,
             feedback_messages_for_model,
+            evidence,
         },
         completion_order: 0,
     }
@@ -312,6 +348,7 @@ fn serialization_failure_outcome(hook_events: Vec<HookCompletedEvent>) -> PostTo
         should_block: false,
         additional_contexts: Vec::new(),
         feedback_message: None,
+        evidence: Vec::new(),
     }
 }
 
@@ -367,6 +404,7 @@ mod tests {
                 should_block: true,
                 additional_contexts_for_model: Vec::new(),
                 feedback_messages_for_model: vec!["bash output looked sketchy".to_string()],
+                evidence: Vec::new(),
             }
         );
         assert_eq!(parsed.completed.run.status, HookRunStatus::Blocked);
@@ -395,6 +433,7 @@ mod tests {
                     limit: AdditionalContextLimit::from_config(Some(17)),
                 }],
                 feedback_messages_for_model: Vec::new(),
+                evidence: Vec::new(),
             }
         );
         assert_eq!(
@@ -421,6 +460,7 @@ mod tests {
                 should_block: false,
                 additional_contexts_for_model: Vec::new(),
                 feedback_messages_for_model: Vec::new(),
+                evidence: Vec::new(),
             }
         );
         assert_eq!(parsed.completed.run.status, HookRunStatus::Failed);
@@ -462,6 +502,7 @@ mod tests {
                 should_block: true,
                 additional_contexts_for_model: Vec::new(),
                 feedback_messages_for_model: vec!["post hook says pause".to_string()],
+                evidence: Vec::new(),
             }
         );
         assert_eq!(parsed.completed.run.status, HookRunStatus::Blocked);
@@ -485,6 +526,7 @@ mod tests {
                 should_block: false,
                 additional_contexts_for_model: Vec::new(),
                 feedback_messages_for_model: vec!["post-tool hook says stop".to_string()],
+                evidence: Vec::new(),
             }
         );
         assert_eq!(parsed.completed.run.status, HookRunStatus::Stopped);
@@ -511,6 +553,7 @@ mod tests {
                 should_block: false,
                 additional_contexts_for_model: Vec::new(),
                 feedback_messages_for_model: vec!["PostToolUse hook stopped execution".to_string()],
+                evidence: Vec::new(),
             }
         );
         assert_eq!(parsed.completed.run.status, HookRunStatus::Stopped);
@@ -537,6 +580,7 @@ mod tests {
                 should_block: false,
                 additional_contexts_for_model: Vec::new(),
                 feedback_messages_for_model: Vec::new(),
+                evidence: Vec::new(),
             }
         );
         assert_eq!(parsed.completed.run.status, HookRunStatus::Completed);
@@ -634,3 +678,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "post_tool_use_evidence_tests.rs"]
+mod evidence_tests;

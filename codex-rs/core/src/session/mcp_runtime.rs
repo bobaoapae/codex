@@ -125,16 +125,18 @@ impl Session {
             environments: resolved_environments.clone(),
             local_process_cwd,
         };
-        self.publish_mcp_runtime(
-            &desired,
-            mcp_projection,
-            /*ready_selected_capability_roots*/ &[],
-            Some(self.mcp_elicitation_reviewer()),
+        Box::pin(
+            self.publish_mcp_runtime(
+                &desired,
+                mcp_projection,
+                /*ready_selected_capability_roots*/ &[],
+                Some(self.mcp_elicitation_reviewer()),
+            )
+            .instrument(info_span!(
+                "session_init.mcp_manager_init",
+                otel.name = "session_init.mcp_manager_init",
+            )),
         )
-        .instrument(info_span!(
-            "session_init.mcp_manager_init",
-            otel.name = "session_init.mcp_manager_init",
-        ))
         .await;
 
         self.services.mcp_runtime.validate_required_servers().await

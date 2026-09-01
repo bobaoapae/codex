@@ -668,10 +668,13 @@ fn clamp_spawn_agent_reasoning_effort(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_features::Feature;
+    use codex_login::CodexAuth;
+    use codex_protocol::config_types::MultiAgentMode;
     use std::path::PathBuf;
 
     #[test]
-    fn native_claude_fork_is_always_task_only() {
+    fn fork_invariant_claude_children_use_task_only_fork_rules() {
         assert_eq!(
             task_fork_mode_for_wire_api(
                 WireApi::ClaudeCode,
@@ -857,7 +860,7 @@ mod tests {
     /// FORK: naming a locally served model without a role must still route to
     /// the provider that can serve it.
     #[tokio::test]
-    async fn a_claude_model_pulls_the_child_onto_the_claude_provider() {
+    async fn fork_invariant_claude_model_routes_to_claude_provider() {
         let (_home, mut config) = claude_test_config(Vec::new()).await;
         config.model = Some("claude-opus-5".to_string());
         assert_ne!(config.model_provider_id, CLAUDE_CODE_PROVIDER_ID);
@@ -871,7 +874,7 @@ mod tests {
     /// FORK: the same routing for the ChatGPT Web bundle, which must land on
     /// its own provider and not on `claude_code`.
     #[tokio::test]
-    async fn a_chatgpt_web_model_pulls_the_child_onto_the_chatgpt_web_provider() {
+    async fn fork_invariant_chatgpt_web_model_routes_to_chatgpt_web_provider() {
         let (_home, mut config) = claude_test_config(Vec::new()).await;
         config.model = Some("chatgpt-web/thinking".to_string());
         assert_ne!(config.model_provider_id, CHATGPT_WEB_PROVIDER_ID);
@@ -885,7 +888,7 @@ mod tests {
     /// FORK: a ChatGPT Web child is briefed like a Claude child: task-only by
     /// default, capped by its own config table otherwise.
     #[test]
-    fn chatgpt_web_fork_turns_follow_the_local_rules() {
+    fn fork_invariant_chatgpt_web_children_use_task_only_fork_rules() {
         assert_eq!(
             task_fork_mode_for_wire_api(
                 WireApi::ChatGptWeb,
@@ -916,6 +919,41 @@ mod tests {
             )
             .0,
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_invariant_effective_multi_agent_mode_is_ultra_only() {
+        let (_session, regular_turn, _rx) =
+            crate::session::tests::make_session_and_context_with_auth_and_config_and_rx(
+                CodexAuth::from_api_key("Test API Key"),
+                Vec::new(),
+                |config| {
+                    let _ = config.features.enable(Feature::MultiAgentV2);
+                    config.model_reasoning_effort = Some(ReasoningEffort::High);
+                },
+            )
+            .await;
+        assert_eq!(regular_turn.multi_agent_version, MultiAgentVersion::V2);
+        assert_eq!(
+            crate::session::multi_agents::effective_multi_agent_mode(&regular_turn),
+            Some(MultiAgentMode::ExplicitRequestOnly)
+        );
+
+        let (_session, ultra_turn, _rx) =
+            crate::session::tests::make_session_and_context_with_auth_and_config_and_rx(
+                CodexAuth::from_api_key("Test API Key"),
+                Vec::new(),
+                |config| {
+                    let _ = config.features.enable(Feature::MultiAgentV2);
+                    config.model_reasoning_effort = Some(ReasoningEffort::Ultra);
+                },
+            )
+            .await;
+        assert_eq!(ultra_turn.multi_agent_version, MultiAgentVersion::V2);
+        assert_eq!(
+            crate::session::multi_agents::effective_multi_agent_mode(&ultra_turn),
+            Some(MultiAgentMode::Proactive)
         );
     }
 

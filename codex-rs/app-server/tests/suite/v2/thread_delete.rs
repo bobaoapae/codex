@@ -88,7 +88,7 @@ async fn thread_delete_rejects_paginated_writer_owned_by_another_process() -> Re
 }
 
 #[tokio::test]
-async fn thread_delete_deletes_spawned_descendants() -> Result<()> {
+async fn fork_invariant_thread_delete_tombstones_without_purging_rollouts() -> Result<()> {
     let codex_home = TempDir::new()?;
 
     let parent_id = create_delete_test_rollout(codex_home.path(), /*minute*/ 0, "parent")?;
@@ -146,7 +146,10 @@ async fn thread_delete_deletes_spawned_descendants() -> Result<()> {
         .await??;
         deleted_ids.push(deleted_notification.thread_id);
     }
-    assert_eq!(deleted_ids, vec![grandchild_id, child_id, parent_id]);
+    assert_eq!(
+        deleted_ids,
+        vec![grandchild_id, child_id, parent_id.clone()]
+    );
 
     for thread_id in [parent_thread_id, child_thread_id, grandchild_thread_id] {
         let rollout_path = find_thread_path_by_id_str(
@@ -156,16 +159,25 @@ async fn thread_delete_deletes_spawned_descendants() -> Result<()> {
         )
         .await?;
         assert!(
-            rollout_path.is_none(),
-            "expected active rollout for {thread_id} to be deleted"
+            rollout_path.is_some(),
+            "expected canonical rollout for {thread_id} to be retained"
         );
+        assert!(state_db.is_thread_tombstoned(thread_id).await?);
     }
     assert_eq!(
         state_db
             .list_thread_spawn_descendants(parent_thread_id)
             .await?,
-        Vec::<ThreadId>::new()
+        vec![child_thread_id, grandchild_thread_id]
     );
+    let _: ThreadDeleteResponse = mcp
+        .request(|request_id| ClientRequest::ThreadDelete {
+            request_id,
+            params: ThreadDeleteParams {
+                thread_id: parent_id,
+            },
+        })
+        .await?;
     Ok(())
 }
 

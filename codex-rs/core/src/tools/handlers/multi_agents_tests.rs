@@ -1,6 +1,8 @@
 use super::*;
 use crate::StartThreadOptions;
 use crate::ThreadManager;
+use crate::agent_communication::AgentCommunicationContext;
+use crate::agent_communication::AgentCommunicationKind;
 use crate::config::AgentRoleConfig;
 use crate::config::DEFAULT_AGENT_MAX_DEPTH;
 use crate::config::PermissionProfileSnapshot;
@@ -14,13 +16,16 @@ use crate::session::tests::make_session_and_context;
 use crate::session::turn_context::TurnContext;
 use crate::session_prefix::format_inter_agent_completion_message;
 use crate::thread_manager::thread_store_from_config;
+use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolOutput;
 use crate::tools::handlers::multi_agents_v2::FollowupTaskHandler as FollowupTaskHandlerV2;
 use crate::tools::handlers::multi_agents_v2::InterruptAgentHandler;
 use crate::tools::handlers::multi_agents_v2::ListAgentsHandler as ListAgentsHandlerV2;
 use crate::tools::handlers::multi_agents_v2::SendMessageHandler as SendMessageHandlerV2;
 use crate::tools::handlers::multi_agents_v2::SpawnAgentHandler as SpawnAgentHandlerV2;
+use crate::tools::handlers::multi_agents_v2::ToolMessageForm;
 use crate::tools::handlers::multi_agents_v2::WaitAgentHandler as WaitAgentHandlerV2;
+use crate::tools::handlers::multi_agents_v2::require_readable_message_form;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use codex_extension_api::empty_extension_registry;
 use codex_features::Feature;
@@ -29,6 +34,8 @@ use codex_history::RolloutItem;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_model_provider::create_model_provider;
+use codex_model_provider_info::CLAUDE_CODE_PROVIDER_ID;
+use codex_model_provider_info::WireApi;
 use codex_model_provider_info::built_in_model_providers;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
@@ -41,6 +48,7 @@ use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::BaseInstructionsProvenance;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
+use codex_protocol::models::MessagePhase;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
@@ -101,6 +109,113 @@ fn function_payload(args: serde_json::Value) -> ToolPayload {
     ToolPayload::Function {
         arguments: args.to_string(),
     }
+}
+
+async fn v2_wait_fixture() -> (
+    ThreadManager,
+    Arc<crate::session::session::Session>,
+    Arc<TurnContext>,
+) {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    let root = manager
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .await
+        .expect("root thread should start");
+    session.services.agent_control = manager.agent_control();
+    session.thread_id = root.thread_id;
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow feature update");
+    config.multi_agent_v2.min_wait_timeout_ms = 1;
+    config.multi_agent_v2.max_wait_timeout_ms = 1_000;
+    config.multi_agent_v2.default_wait_timeout_ms = 50;
+    set_turn_config(&mut turn, config);
+    (manager, Arc::new(session), Arc::new(turn))
+}
+
+async fn spawn_v2_wait_worker(
+    session: &Arc<crate::session::session::Session>,
+    turn: &Arc<TurnContext>,
+    task_name: &str,
+) -> (ThreadId, AgentPath) {
+    SpawnAgentHandlerV2::default()
+        .handle(invocation(
+            session.clone(),
+            turn.clone(),
+            "spawn_agent",
+            function_payload(json!({
+                "message": format!("boot {task_name}"),
+                "task_name": task_name
+            })),
+        ))
+        .await
+        .expect("spawn worker");
+    let agent_id = session
+        .services
+        .agent_control
+        .resolve_agent_reference(session.thread_id, &turn.session_source, task_name)
+        .await
+        .expect("worker should resolve");
+    let agent_path = session
+        .services
+        .agent_control
+        .get_agent_metadata(agent_id)
+        .expect("worker metadata")
+        .agent_path
+        .expect("worker path");
+    (agent_id, agent_path)
+}
+
+#[tokio::test]
+async fn fork_invariant_local_provider_message_forms_require_plaintext() {
+    let (_, turn) = make_session_and_context().await;
+    let base_config = (*turn.config).clone();
+    for wire_api in [WireApi::ClaudeCode, WireApi::ChatGptWeb] {
+        let mut config = base_config.clone();
+        config.model_provider.wire_api = wire_api;
+
+        assert!(
+            require_readable_message_form(
+                &config,
+                ToolMessageForm::Plaintext,
+                &ToolCallSource::Direct,
+                "send_message",
+            )
+            .is_ok()
+        );
+        assert!(
+            require_readable_message_form(
+                &config,
+                ToolMessageForm::Encrypted,
+                &ToolCallSource::DirectPlaintextMessage,
+                "send_message",
+            )
+            .is_ok()
+        );
+
+        let error = require_readable_message_form(
+            &config,
+            ToolMessageForm::Encrypted,
+            &ToolCallSource::Direct,
+            "send_message",
+        )
+        .expect_err("local direct send should reject opaque encrypted content");
+        assert!(error.to_string().contains("plaintext_message"));
+    }
+
+    let config = base_config;
+    assert!(
+        require_readable_message_form(
+            &config,
+            ToolMessageForm::Encrypted,
+            &ToolCallSource::Direct,
+            "send_message",
+        )
+        .is_ok()
+    );
 }
 
 fn parse_agent_id(id: &str) -> ThreadId {
@@ -209,6 +324,8 @@ struct ListAgentsResult {
 struct ListedAgentResult {
     agent_name: String,
     agent_status: serde_json::Value,
+    status: String,
+    generation: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1235,6 +1352,243 @@ async fn multi_agent_v2_send_message_accepts_root_target_from_child() {
                         && communication.other_recipients.is_empty()
                         && communication.content.is_empty()
                         && communication.encrypted_content.as_deref() == Some("encrypted-done")
+                        && !communication.trigger_turn
+            )
+    }));
+}
+
+#[tokio::test]
+async fn multi_agent_v2_message_checks_local_receiver_and_rejects_mixed_forms() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    let mut root_config = (*turn.config).clone();
+    root_config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow feature update");
+    set_turn_config(&mut turn, root_config.clone());
+    let root = manager
+        .start_thread(StartThreadOptions::new(root_config.clone()))
+        .await
+        .expect("root thread should start");
+    session.services.agent_control = manager.agent_control();
+    session.thread_id = root.thread_id;
+
+    let child_path = AgentPath::try_from("/root/local_worker").expect("agent path");
+    let mut child_config = root_config;
+    let local_provider = built_in_model_providers(/* openai_base_url */ None)
+        .get(CLAUDE_CODE_PROVIDER_ID)
+        .expect("Claude provider should be available")
+        .clone();
+    child_config.model_provider_id = CLAUDE_CODE_PROVIDER_ID.to_string();
+    child_config.model_provider = local_provider;
+    let initial_communication = InterAgentCommunication::new(
+        AgentPath::root(),
+        child_path.clone(),
+        Vec::new(),
+        "initial local worker state".to_string(),
+        /*trigger_turn*/ false,
+    );
+    let child_thread_id = session
+        .services
+        .agent_control
+        .spawn_agent_with_communication(
+            child_config,
+            initial_communication,
+            AgentCommunicationContext::new(AgentCommunicationKind::Spawn, root.thread_id),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: root.thread_id,
+                depth: 1,
+                agent_path: Some(child_path.clone()),
+                agent_nickname: None,
+                agent_role: None,
+            })),
+            crate::agent::control::SpawnAgentOptions::default(),
+        )
+        .await
+        .expect("local worker should be registered without starting a provider turn")
+        .thread_id;
+    let child_snapshot = manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("local worker should exist")
+        .config_snapshot()
+        .await;
+    assert_eq!(child_snapshot.model_provider_id, CLAUDE_CODE_PROVIDER_ID);
+
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let captured_before_rejected_send = manager.captured_ops().len();
+    let Err(error) = SendMessageHandlerV2
+        .handle(invocation(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "send_message",
+            function_payload(json!({
+                "target": "local_worker",
+                "message": "opaque OpenAI payload"
+            })),
+        ))
+        .await
+    else {
+        panic!("OpenAI-to-local encrypted message should fail closed");
+    };
+    assert!(error.to_string().contains("plaintext_message"));
+    assert_eq!(manager.captured_ops().len(), captured_before_rejected_send);
+
+    SendMessageHandlerV2
+        .handle(invocation(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "send_message",
+            function_payload(json!({
+                "target": "local_worker",
+                "plaintext_message": "readable OpenAI payload"
+            })),
+        ))
+        .await
+        .expect("OpenAI-to-local plaintext message should succeed");
+    assert!(manager.captured_ops().iter().any(|(id, op)| {
+        *id == child_thread_id
+            && matches!(
+                op,
+                Op::InterAgentCommunication { communication, .. }
+                    if communication.author == AgentPath::root()
+                        && communication.recipient == child_path
+                        && communication.encrypted_content.is_none()
+                        && communication.content.contains("readable OpenAI payload")
+                        && !communication.trigger_turn
+            )
+    }));
+
+    let Err(error) = SendMessageHandlerV2
+        .handle(invocation(
+            session,
+            turn,
+            "send_message",
+            function_payload(json!({
+                "target": "local_worker",
+                "message": "encrypted form",
+                "plaintext_message": "mixed form"
+            })),
+        ))
+        .await
+    else {
+        panic!("mixed message forms should be rejected");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("either message or plaintext_message")
+    );
+}
+
+#[tokio::test]
+async fn multi_agent_v2_message_reloads_unloaded_openai_receiver_before_guard() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow feature update");
+    set_turn_config(&mut turn, config.clone());
+    let root = manager
+        .start_thread(StartThreadOptions::new(config.clone()))
+        .await
+        .expect("root thread should start");
+    session.services.agent_control = manager.agent_control();
+    session.thread_id = root.thread_id;
+
+    let child_path = AgentPath::try_from("/root/openai_worker").expect("agent path");
+    let initial_communication = InterAgentCommunication::new(
+        AgentPath::root(),
+        child_path.clone(),
+        Vec::new(),
+        "initial worker state".to_string(),
+        /*trigger_turn*/ false,
+    );
+    let child_thread_id = session
+        .services
+        .agent_control
+        .spawn_agent_with_communication(
+            config,
+            initial_communication,
+            AgentCommunicationContext::new(AgentCommunicationKind::Spawn, root.thread_id),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: root.thread_id,
+                depth: 1,
+                agent_path: Some(child_path.clone()),
+                agent_nickname: None,
+                agent_role: None,
+            })),
+            crate::agent::control::SpawnAgentOptions::default(),
+        )
+        .await
+        .expect("OpenAI worker should be registered")
+        .thread_id;
+    let child = manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("OpenAI worker should exist");
+    child
+        .inject_response_items(vec![ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "initial worker response".to_string(),
+            }],
+            phase: Some(MessagePhase::FinalAnswer),
+            internal_chat_message_metadata_passthrough: None,
+        }])
+        .await
+        .expect("worker history should be persisted before unloading");
+    child
+        .shutdown_and_wait()
+        .await
+        .expect("worker should shut down");
+    assert!(
+        manager.remove_thread(&child_thread_id).await.is_some(),
+        "worker should be unloaded while keeping its persisted metadata"
+    );
+    assert!(manager.get_thread(child_thread_id).await.is_err());
+    session
+        .services
+        .agent_control
+        .restore_v2_agent_metadata(&turn.config, root.thread_id)
+        .await;
+    assert!(
+        session
+            .services
+            .agent_control
+            .ensure_agent_known(child_thread_id)
+            .is_ok(),
+        "an unloaded worker must remain known to its parent"
+    );
+
+    SendMessageHandlerV2
+        .handle(invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "send_message",
+            function_payload(json!({
+                "target": "openai_worker",
+                "message": "opaque OpenAI payload"
+            })),
+        ))
+        .await
+        .expect("encrypted OpenAI-to-OpenAI message should survive receiver reload");
+
+    assert!(manager.captured_ops().iter().any(|(id, op)| {
+        *id == child_thread_id
+            && matches!(
+                op,
+                Op::InterAgentCommunication { communication, .. }
+                    if communication.author == AgentPath::root()
+                        && communication.recipient == child_path
+                        && communication.content.is_empty()
+                        && communication.encrypted_content.as_deref()
+                            == Some("opaque OpenAI payload")
                         && !communication.trigger_turn
             )
     }));
@@ -3679,6 +4033,300 @@ async fn multi_agent_v2_wait_agent_does_not_return_completed_content() {
 }
 
 #[tokio::test]
+async fn fork_invariant_wait_agent_deduplicates_relative_and_canonical_targets() {
+    let (manager, session, turn) = v2_wait_fixture().await;
+    let (worker_id, worker_path) = spawn_v2_wait_worker(&session, &turn, "worker").await;
+    session
+        .services
+        .agent_control
+        .record_agent_status_change(worker_id, AgentStatus::Running);
+    let baseline = session.services.agent_control.current_revision();
+    let wait_task = tokio::spawn({
+        let session = session.clone();
+        let turn = turn.clone();
+        let canonical_path = worker_path.to_string();
+        async move {
+            WaitAgentHandlerV2::default()
+                .handle(invocation(
+                    session,
+                    turn,
+                    "wait_agent",
+                    function_payload(json!({
+                        "targets": ["worker", canonical_path],
+                        "afterRevision": baseline,
+                        "timeout_ms": 1_000
+                    })),
+                ))
+                .await
+        }
+    });
+    tokio::task::yield_now().await;
+
+    let worker_thread = manager
+        .get_thread(worker_id)
+        .await
+        .expect("worker thread should be resident");
+    let worker_turn = worker_thread.session.new_default_turn().await;
+    worker_thread
+        .session
+        .send_event(
+            &worker_turn,
+            EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: worker_turn.sub_id.clone(),
+                started_at: None,
+                last_agent_message: Some("done".to_string()),
+                error: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            }),
+        )
+        .await;
+
+    let output = timeout(Duration::from_secs(1), wait_task)
+        .await
+        .expect("wait should wake before one second")
+        .expect("wait task should join")
+        .expect("wait_agent should succeed");
+    let (content, success) = expect_text_output(output);
+    let result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
+        serde_json::from_str(&content).expect("wait result should parse");
+    assert!(!result.timed_out);
+    assert_eq!(
+        result.reason,
+        crate::tools::handlers::multi_agents_v2::wait::WaitAgentWakeReason::Terminal
+    );
+    assert_eq!(result.targets.len(), 1);
+    assert_eq!(result.targets[0].canonical_path, worker_path.to_string());
+    assert_eq!(success, None);
+}
+
+#[tokio::test]
+async fn agent_lifecycle_list_and_wait_share_status_and_generation() {
+    let (manager, session, turn) = v2_wait_fixture().await;
+    let (worker_id, worker_path) = spawn_v2_wait_worker(&session, &turn, "worker").await;
+    session
+        .services
+        .agent_control
+        .record_agent_status_change(worker_id, AgentStatus::Running);
+    let baseline = session.services.agent_control.current_revision();
+
+    let wait_task = tokio::spawn({
+        let session = session.clone();
+        let turn = turn.clone();
+        let target = worker_path.to_string();
+        async move {
+            WaitAgentHandlerV2::default()
+                .handle(invocation(
+                    session,
+                    turn,
+                    "wait_agent",
+                    function_payload(json!({
+                        "targets": [target],
+                        "afterRevision": baseline,
+                        "timeout_ms": 1_000
+                    })),
+                ))
+                .await
+        }
+    });
+    tokio::task::yield_now().await;
+
+    let worker = manager
+        .get_thread(worker_id)
+        .await
+        .expect("worker should be resident");
+    let worker_turn = worker.session.new_default_turn().await;
+    worker
+        .session
+        .send_event(
+            &worker_turn,
+            EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: worker_turn.sub_id.clone(),
+                started_at: None,
+                last_agent_message: Some("done".to_string()),
+                error: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            }),
+        )
+        .await;
+
+    let wait_output = timeout(Duration::from_secs(1), wait_task)
+        .await
+        .expect("terminal lifecycle should wake wait_agent")
+        .expect("wait task should join")
+        .expect("wait_agent should succeed");
+    let (wait_content, _) = expect_text_output(wait_output);
+    let wait_result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
+        serde_json::from_str(&wait_content).expect("wait result should parse");
+    assert!(!wait_result.timed_out);
+    assert_eq!(wait_result.targets.len(), 1);
+    assert_eq!(
+        wait_result.targets[0].canonical_path,
+        worker_path.to_string()
+    );
+    assert_eq!(wait_result.targets[0].generation, 0);
+    assert_eq!(
+        serde_json::to_value(wait_result.targets[0].status).expect("status should serialize"),
+        "completed"
+    );
+
+    let list_output = ListAgentsHandlerV2
+        .handle(invocation(
+            session,
+            turn,
+            "list_agents",
+            function_payload(json!({})),
+        ))
+        .await
+        .expect("list_agents should succeed");
+    let (list_content, _) = expect_text_output(list_output);
+    let list_result: ListAgentsResult =
+        serde_json::from_str(&list_content).expect("list result should parse");
+    let listed = list_result
+        .agents
+        .iter()
+        .find(|agent| agent.agent_name == worker_path.as_str())
+        .expect("completed worker should remain listable");
+    assert_eq!(listed.status, "completed");
+    assert_eq!(listed.generation, 0);
+}
+
+#[tokio::test]
+async fn multi_agent_v2_wait_agent_ignores_unrelated_mail_and_preserves_revision() {
+    let (_manager, session, turn) = v2_wait_fixture().await;
+    let (worker_a_id, worker_a_path) = spawn_v2_wait_worker(&session, &turn, "worker_a").await;
+    let (_worker_b_id, worker_b_path) = spawn_v2_wait_worker(&session, &turn, "worker_b").await;
+    session
+        .services
+        .agent_control
+        .record_agent_status_change(worker_a_id, AgentStatus::Running);
+    let baseline = session.services.agent_control.current_revision();
+    let started_at = std::time::Instant::now();
+    let wait_task = tokio::spawn({
+        let session = session.clone();
+        let turn = turn.clone();
+        async move {
+            WaitAgentHandlerV2::default()
+                .handle(invocation(
+                    session,
+                    turn,
+                    "wait_agent",
+                    function_payload(json!({
+                        "targets": [worker_a_path.to_string()],
+                        "afterRevision": baseline,
+                        "timeout_ms": 50
+                    })),
+                ))
+                .await
+        }
+    });
+    tokio::task::yield_now().await;
+    session
+        .input_queue
+        .enqueue_mailbox_communication(
+            InterAgentCommunication::new(
+                worker_b_path,
+                AgentPath::root(),
+                Vec::new(),
+                "unrelated".to_string(),
+                /*trigger_turn*/ false,
+            ),
+            Default::default(),
+        )
+        .await;
+
+    let output = wait_task
+        .await
+        .expect("wait task should join")
+        .expect("wait_agent should succeed");
+    let elapsed = started_at.elapsed();
+    let (content, success) = expect_text_output(output);
+    let result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
+        serde_json::from_str(&content).expect("wait result should parse");
+    assert!(result.timed_out);
+    assert!(matches!(
+        result.reason,
+        crate::tools::handlers::multi_agents_v2::wait::WaitAgentWakeReason::Timeout
+            | crate::tools::handlers::multi_agents_v2::wait::WaitAgentWakeReason::NeedsAttention
+    ));
+    assert_eq!(result.revision, baseline);
+    assert!(
+        elapsed >= Duration::from_millis(40),
+        "wait returned early: {elapsed:?}"
+    );
+    assert_eq!(success, None);
+}
+
+#[tokio::test]
+async fn fork_invariant_wait_agent_uses_after_revision_for_new_changes() {
+    let (_manager, session, turn) = v2_wait_fixture().await;
+    let (worker_id, worker_path) = spawn_v2_wait_worker(&session, &turn, "worker").await;
+    session
+        .services
+        .agent_control
+        .record_agent_status_change(worker_id, AgentStatus::Running);
+    let old_revision = session
+        .services
+        .agent_control
+        .record_agent_message(&worker_path)
+        .expect("worker message should be tracked");
+    let started_at = std::time::Instant::now();
+    let output = WaitAgentHandlerV2::default()
+        .handle(invocation(
+            session,
+            turn,
+            "wait_agent",
+            function_payload(json!({
+                "targets": [worker_path.to_string()],
+                "afterRevision": old_revision,
+                "timeout_ms": 50
+            })),
+        ))
+        .await
+        .expect("wait_agent should succeed");
+    let elapsed = started_at.elapsed();
+    let (content, success) = expect_text_output(output);
+    let result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
+        serde_json::from_str(&content).expect("wait result should parse");
+    assert!(result.timed_out);
+    assert_eq!(
+        result.reason,
+        crate::tools::handlers::multi_agents_v2::wait::WaitAgentWakeReason::NeedsAttention
+    );
+    assert_eq!(result.revision, old_revision);
+    assert!(
+        elapsed >= Duration::from_millis(40),
+        "wait returned early: {elapsed:?}"
+    );
+    assert_eq!(success, None);
+}
+
+#[tokio::test]
+async fn fork_invariant_wait_agent_rejects_unknown_target_without_waiting() {
+    let (_manager, session, turn) = v2_wait_fixture().await;
+    let started_at = std::time::Instant::now();
+    let result = WaitAgentHandlerV2::default()
+        .handle(invocation(
+            session,
+            turn,
+            "wait_agent",
+            function_payload(json!({
+                "targets": ["/root/missing"],
+                "timeout_ms": 1_000
+            })),
+        ))
+        .await;
+    assert!(started_at.elapsed() < Duration::from_millis(500));
+    let Err(FunctionCallError::RespondToModel(message)) = result else {
+        panic!("missing target should be reported to the model");
+    };
+    assert!(message.contains("live agent path `/root/missing` not found"));
+}
+
+#[tokio::test]
 async fn multi_agent_v2_interrupt_agent_accepts_task_name_target() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
@@ -4119,7 +4767,7 @@ async fn close_agent_submits_shutdown_and_returns_previous_status() {
 }
 
 #[tokio::test]
-async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtrees_closed() {
+async fn close_subtree_reconciles_edges_and_resume_keeps_them_closed() {
     let (_session, turn) = make_session_and_context().await;
     let mut config = turn.config.as_ref().clone();
     config.agent_max_depth = 3;
@@ -4244,6 +4892,19 @@ async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtr
             .await,
         AgentStatus::NotFound
     );
+    for (parent_id, child_id) in [
+        (parent_thread_id, child_thread_id),
+        (child_thread_id, grandchild_thread_id),
+    ] {
+        let edge = state_db
+            .as_ref()
+            .expect("state db should be available")
+            .get_thread_spawn_edge(parent_id, child_id)
+            .await
+            .expect("closed subtree edge should load")
+            .expect("closed subtree edge should be retained");
+        assert_eq!(edge.status, DirectionalThreadSpawnEdgeStatus::Closed);
+    }
 
     let child_resume_output = ResumeAgentHandler
         .handle(invocation(
@@ -4273,7 +4934,7 @@ async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtr
             .permission_profile,
         owner_permission_profile
     );
-    assert_ne!(
+    assert_eq!(
         manager
             .agent_control()
             .get_status(grandchild_thread_id)

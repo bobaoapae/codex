@@ -103,9 +103,14 @@ pub(super) async fn emit_applied(
     submission_id: String,
     snapshot: ThreadSettingsSnapshot,
 ) {
+    let (runtime_build_info, config_layer_revision, runtime_feature_revision) =
+        session.runtime_provenance().await;
     let msg = EventMsg::ThreadSettingsApplied(ThreadSettingsAppliedEvent {
         thread_id: Some(session.thread_id()),
         thread_settings: snapshot,
+        runtime_build_info,
+        config_layer_revision,
+        runtime_feature_revision,
     });
     session
         .send_event_raw_without_materializing_rollout(Event {
@@ -117,8 +122,13 @@ pub(super) async fn emit_applied(
 
 /// Builds a current thread-owned snapshot for fork and compaction persistence.
 pub(super) async fn applied_event(session: &Session) -> EventMsg {
+    let (runtime_build_info, config_layer_revision, runtime_feature_revision) =
+        session.runtime_provenance().await;
     EventMsg::ThreadSettingsApplied(ThreadSettingsAppliedEvent {
         thread_id: Some(session.thread_id()),
         thread_settings: session.thread_settings_snapshot().await,
+        runtime_build_info,
+        config_layer_revision,
+        runtime_feature_revision,
     })
 }

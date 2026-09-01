@@ -236,6 +236,8 @@ pub(super) async fn ensure_listener_task_running(
             "thread {conversation_id} is closing; retry after the thread is closed"
         )));
     };
+    let transient_job_classification =
+        crate::transient_job_lifecycle::classify_thread(&conversation, conversation_id).await;
     let config = conversation.config().await;
     let environments = conversation.environment_selections().await;
     let watch_registration = listener_task_context
@@ -370,7 +372,7 @@ pub(super) async fn ensure_listener_task_running(
                     )
                     .await;
 
-                    apply_bespoke_event_handling(
+                    crate::bespoke_event_handling::apply_bespoke_event_handling_with_classification(
                         event.clone(),
                         conversation_id,
                         conversation.clone(),
@@ -380,6 +382,7 @@ pub(super) async fn ensure_listener_task_running(
                         thread_watch_manager.clone(),
                         thread_list_state_permit.clone(),
                         fallback_model_provider.clone(),
+                        &transient_job_classification,
                     )
                     .await;
                     if matches!(event.msg, EventMsg::ShutdownComplete)

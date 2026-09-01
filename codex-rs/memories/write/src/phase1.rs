@@ -824,7 +824,11 @@ mod tests {
         let response_item = communication.to_model_input_item();
 
         let serialized = job::serialize_filtered_rollout_response_items(&[
-            RolloutItem::InterAgentCommunicationMetadata { trigger_turn: true },
+            RolloutItem::InterAgentCommunicationMetadata {
+                message_id: None,
+                trigger_turn: true,
+                wake_applied: false,
+            },
             RolloutItem::ResponseItem(response_item.clone().into()),
         ])
         .expect("serialize");

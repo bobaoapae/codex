@@ -1,12 +1,27 @@
 use super::*;
+use crate::agent::AgentChangeKind;
 use crate::session::InputQueueActivity;
 use crate::tools::handlers::multi_agents_spec::WaitAgentTimeoutOptions;
 use crate::tools::handlers::multi_agents_spec::create_wait_agent_tool_v2;
+use codex_protocol::AgentPath;
+use codex_protocol::ThreadId;
 use codex_tools::ToolSpec;
+use serde::Deserialize;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::time::Duration;
+use tokio::sync::watch;
 use tokio::time::Instant;
 use tokio::time::timeout_at;
+
+use super::wait_state::ResolvedTarget;
+pub(crate) use super::wait_state::WaitAgentResult;
+use super::wait_state::WaitAgentSnapshot;
+use super::wait_state::WaitAgentTargetStatus;
+pub(crate) use super::wait_state::WaitAgentWakeReason;
+use super::wait_state::WaitOutcome;
+use super::wait_state::is_final;
+use super::wait_state::target_snapshots;
 
 #[derive(Default)]
 pub(crate) struct Handler {
@@ -64,6 +79,19 @@ impl Handler {
             None => default_timeout_ms,
         };
 
+        let control = &session.services.agent_control;
+        control.register_session_root(session.thread_id, turn.parent_thread_id);
+        let target_references = args.targets.unwrap_or_default();
+        let targets = resolve_targets(
+            control,
+            session.thread_id,
+            &turn.session_source,
+            &target_references,
+        )
+        .await?;
+        let after_revision = args.after_revision;
+        let current_revision = control.current_revision();
+        let baseline = after_revision.unwrap_or(current_revision);
         let turn_state = session
             .input_queue
             .turn_state_for_sub_id(&session.active_turn, &turn.sub_id)
@@ -72,6 +100,7 @@ impl Handler {
             .input_queue
             .subscribe_activity(turn_state.as_deref())
             .await;
+        let mut revision_rx = control.subscribe_revision();
 
         session
             .emit_turn_item_started(
@@ -92,21 +121,30 @@ impl Handler {
             .await;
 
         let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
-        let targets = args.targets.unwrap_or_default();
-        let mut outcome = wait_for_activity(&mut activity_rx, pending_activity, deadline).await;
-        // FORK: mail from an agent the caller did not ask about is not the event
-        // it was waiting for. Keep waiting until the deadline instead of
-        // returning and making it call again.
-        while outcome == WaitOutcome::MailboxActivity
-            && !targets.is_empty()
-            && !mailbox_matches_targets(&session, &targets).await
-        {
-            outcome =
-                wait_for_activity(&mut activity_rx, /*pending_activity*/ None, deadline).await;
-        }
+        let outcome = wait_for_outcome(
+            WaitParameters {
+                session: &session,
+                targets: &targets,
+                baseline,
+                include_current_terminal: after_revision.is_none(),
+                accept_existing_mailbox: after_revision.is_none(),
+                timeout_duration: Duration::from_millis(timeout_ms as u64),
+            },
+            pending_activity,
+            &mut activity_rx,
+            &mut revision_rx,
+            deadline,
+        )
+        .await;
+        let target_snapshots = target_snapshots(control, &targets).await;
         let agents = live_agent_snapshots(&session, &turn).await;
-        let result =
-            WaitAgentResult::from_outcome(outcome, requested_timeout_ms, timeout_ms, agents);
+        let result = WaitAgentResult::from_outcome(
+            outcome,
+            requested_timeout_ms,
+            timeout_ms,
+            target_snapshots,
+            agents,
+        );
 
         session
             .emit_turn_item_completed(
@@ -136,20 +174,281 @@ impl CoreToolRuntime for Handler {
     }
 }
 
-/// FORK: whether any waiting mail is from one of the named agents.
-///
-/// Matching is by prefix so `targets: ["/root/explorer"]` also wakes for that
-/// agent's own children, which report through it.
+struct WaitParameters<'a> {
+    session: &'a crate::session::session::Session,
+    targets: &'a [ResolvedTarget],
+    baseline: u64,
+    include_current_terminal: bool,
+    accept_existing_mailbox: bool,
+    timeout_duration: Duration,
+}
+
+async fn resolve_targets(
+    control: &crate::agent::AgentControl,
+    current_thread_id: ThreadId,
+    session_source: &codex_protocol::protocol::SessionSource,
+    references: &[String],
+) -> Result<Vec<ResolvedTarget>, FunctionCallError> {
+    let mut resolved = Vec::with_capacity(references.len());
+    let mut seen = HashSet::new();
+    for reference in references {
+        let path = control
+            .resolve_agent_path(current_thread_id, session_source, reference)
+            .map_err(agent_reference_error)?;
+        let thread_id = control
+            .resolve_agent_reference(current_thread_id, session_source, reference)
+            .await
+            .map_err(agent_reference_error)?;
+        if seen.insert(path.to_string()) {
+            resolved.push(ResolvedTarget { thread_id, path });
+        }
+    }
+    Ok(resolved)
+}
+
+fn agent_reference_error(error: codex_protocol::error::CodexErr) -> FunctionCallError {
+    FunctionCallError::RespondToModel(error.to_string())
+}
+
+async fn wait_for_outcome(
+    parameters: WaitParameters<'_>,
+    pending_activity: Option<InputQueueActivity>,
+    activity_rx: &mut watch::Receiver<InputQueueActivity>,
+    revision_rx: &mut watch::Receiver<u64>,
+    deadline: Instant,
+) -> WaitOutcome {
+    let WaitParameters {
+        session,
+        targets,
+        baseline,
+        include_current_terminal,
+        accept_existing_mailbox,
+        timeout_duration,
+    } = parameters;
+    if matches!(pending_activity, Some(InputQueueActivity::Steer)) {
+        return WaitOutcome::Steered { revision: baseline };
+    }
+    if matches!(pending_activity, Some(InputQueueActivity::Mailbox))
+        && (targets.is_empty() || mailbox_matches_targets(session, targets).await)
+        && (accept_existing_mailbox || matching_message_is_new(session, targets, baseline).await)
+    {
+        return WaitOutcome::Progress {
+            revision: matching_message_revision(session, targets, baseline).await,
+            reason: WaitAgentWakeReason::Message,
+        };
+    }
+    if let Some((revision, kind)) =
+        latest_matching_change(session, targets, baseline, include_current_terminal).await
+    {
+        return WaitOutcome::Progress {
+            revision,
+            reason: wake_reason(kind),
+        };
+    }
+
+    loop {
+        tokio::select! {
+            activity = timeout_at(deadline, activity_rx.changed()) => {
+                match activity {
+                    Ok(Ok(())) => {
+                        let activity = *activity_rx.borrow_and_update();
+                        match activity {
+                            InputQueueActivity::Mailbox => {
+                                if targets.is_empty()
+                                    || mailbox_matches_targets(session, targets).await
+                                {
+                                    let revision =
+                                        newly_arrived_message_revision(session, targets, baseline)
+                                            .await;
+                                    return WaitOutcome::Progress {
+                                        revision,
+                                        reason: WaitAgentWakeReason::Message,
+                                    };
+                                }
+                            }
+                            InputQueueActivity::Steer => {
+                                return WaitOutcome::Steered { revision: baseline };
+                            }
+                        }
+                    }
+                    Ok(Err(_)) | Err(_) => return timeout_outcome(session, targets, baseline, timeout_duration).await,
+                }
+            }
+            revision = timeout_at(deadline, revision_rx.changed()) => {
+                match revision {
+                    Ok(Ok(())) => {
+                        if let Some((revision, kind)) = latest_matching_change(
+                            session,
+                            targets,
+                            baseline,
+                            /*include_current_terminal*/ false,
+                        ).await {
+                            return WaitOutcome::Progress {
+                                revision,
+                                reason: wake_reason(kind),
+                            };
+                        }
+                    }
+                    Ok(Err(_)) | Err(_) => return timeout_outcome(session, targets, baseline, timeout_duration).await,
+                }
+            }
+        }
+    }
+}
+
+async fn timeout_outcome(
+    session: &crate::session::session::Session,
+    targets: &[ResolvedTarget],
+    baseline: u64,
+    timeout_duration: Duration,
+) -> WaitOutcome {
+    let snapshots = target_snapshots(&session.services.agent_control, targets).await;
+    let needs_attention = snapshots.iter().any(|target| {
+        target.waiting_terminal.as_ref().is_some_and(|terminal| {
+            terminal.state == crate::unified_exec::TerminalProcessState::NeedsAttention
+        }) || matches!(
+            target.status,
+            WaitAgentTargetStatus::Running
+                | WaitAgentTargetStatus::WaitingForTool
+                | WaitAgentTargetStatus::WaitingForApproval
+                | WaitAgentTargetStatus::WaitingForUser
+        ) && target
+            .idle_ms
+            .is_none_or(|idle_ms| idle_ms >= timeout_duration.as_millis() as u64)
+    });
+    WaitOutcome::TimedOut {
+        revision: baseline,
+        needs_attention,
+    }
+}
+
+async fn latest_matching_change(
+    session: &crate::session::session::Session,
+    targets: &[ResolvedTarget],
+    baseline: u64,
+    include_current_terminal: bool,
+) -> Option<(u64, AgentChangeKind)> {
+    let control = &session.services.agent_control;
+    let entries: Vec<(ThreadId, AgentPath)> = if targets.is_empty() {
+        control
+            .agent_entries_for_prefix(None)
+            .into_iter()
+            .filter(|(_, path)| !path.is_root())
+            .collect()
+    } else {
+        targets
+            .iter()
+            .flat_map(|target| control.agent_entries_for_prefix(Some(&target.path)))
+            .chain(
+                targets
+                    .iter()
+                    .map(|target| (target.thread_id, target.path.clone())),
+            )
+            .collect()
+    };
+    let mut seen = HashSet::new();
+    let mut latest = None;
+    for (thread_id, _) in entries {
+        if !seen.insert(thread_id) {
+            continue;
+        }
+        if include_current_terminal && is_final(&control.get_status(thread_id).await) {
+            let change = control.last_agent_change(thread_id);
+            if change.is_none_or(|change| change.revision <= baseline) {
+                return Some((baseline, AgentChangeKind::Terminal));
+            }
+        }
+        let Some(change) = control.last_agent_change(thread_id) else {
+            continue;
+        };
+        if change.revision > baseline
+            && latest.is_none_or(|(revision, _)| change.revision > revision)
+        {
+            latest = Some((change.revision, change.kind));
+        }
+    }
+    latest
+}
+
+fn wake_reason(kind: AgentChangeKind) -> WaitAgentWakeReason {
+    match kind {
+        AgentChangeKind::Message => WaitAgentWakeReason::Message,
+        AgentChangeKind::StatusChanged => WaitAgentWakeReason::StatusChanged,
+        AgentChangeKind::NeedsAttention => WaitAgentWakeReason::NeedsAttention,
+        AgentChangeKind::Terminal => WaitAgentWakeReason::Terminal,
+    }
+}
+
+async fn matching_message_revision(
+    session: &crate::session::session::Session,
+    targets: &[ResolvedTarget],
+    baseline: u64,
+) -> u64 {
+    latest_matching_change(
+        session, targets, baseline, /*include_current_terminal*/ false,
+    )
+    .await
+    .map(|(revision, _)| revision)
+    .unwrap_or_else(|| session.services.agent_control.current_revision())
+}
+
+async fn matching_message_is_new(
+    session: &crate::session::session::Session,
+    targets: &[ResolvedTarget],
+    baseline: u64,
+) -> bool {
+    latest_matching_change(
+        session, targets, baseline, /*include_current_terminal*/ false,
+    )
+    .await
+    .is_some_and(|(_, kind)| kind == AgentChangeKind::Message)
+}
+
+async fn newly_arrived_message_revision(
+    session: &crate::session::session::Session,
+    targets: &[ResolvedTarget],
+    baseline: u64,
+) -> u64 {
+    if !matching_message_is_new(session, targets, baseline).await {
+        let authors = session.input_queue.pending_mailbox_authors().await;
+        for author in authors {
+            let Ok(author) = AgentPath::try_from(author.as_str()) else {
+                continue;
+            };
+            if targets.is_empty()
+                || targets
+                    .iter()
+                    .any(|target| path_is_under(&author, &target.path))
+            {
+                session.services.agent_control.record_agent_message(&author);
+            }
+        }
+    }
+    matching_message_revision(session, targets, baseline).await
+}
+
 async fn mailbox_matches_targets(
     session: &crate::session::session::Session,
-    targets: &[String],
+    targets: &[ResolvedTarget],
 ) -> bool {
     let authors = session.input_queue.pending_mailbox_authors().await;
     authors.iter().any(|author| {
+        let Ok(author) = AgentPath::try_from(author.as_str()) else {
+            return false;
+        };
         targets
             .iter()
-            .any(|target| author == target || author.starts_with(&format!("{target}/")))
+            .any(|target| path_is_under(&author, &target.path))
     })
+}
+
+fn path_is_under(path: &AgentPath, prefix: &AgentPath) -> bool {
+    prefix.is_root()
+        || path == prefix
+        || path
+            .as_str()
+            .strip_prefix(prefix.as_str())
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 /// FORK: what every live agent was last observed doing.
@@ -169,6 +468,8 @@ async fn live_agent_snapshots(
         .into_iter()
         .map(|agent| WaitAgentSnapshot {
             agent_name: agent.agent_name,
+            status: agent.status,
+            generation: agent.generation,
             last_activity: agent.last_activity,
             idle_seconds: agent.idle_seconds,
         })
@@ -182,113 +483,11 @@ struct WaitArgs {
     /// FORK: only wake for these agents.
     #[serde(default)]
     targets: Option<Vec<String>>,
+    /// Causal revision after which progress is considered new.
+    #[serde(default, rename = "afterRevision", alias = "after_revision")]
+    after_revision: Option<u64>,
 }
 
-#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
-pub(crate) struct WaitAgentResult {
-    pub(crate) message: String,
-    pub(crate) timed_out: bool,
-    /// FORK: what each live agent was last observed doing.
-    ///
-    /// A bare "wait timed out" told the parent nothing, so it interrupted on a
-    /// hunch. This is the line that distinguishes a child running `cargo test`
-    /// from one that has genuinely stopped.
-    pub(crate) agents: Vec<WaitAgentSnapshot>,
-}
-
-#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
-pub(crate) struct WaitAgentSnapshot {
-    pub(crate) agent_name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) last_activity: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) idle_seconds: Option<u64>,
-}
-
-impl WaitAgentResult {
-    fn from_outcome(
-        outcome: WaitOutcome,
-        requested_timeout_ms: Option<i64>,
-        timeout_ms: i64,
-        agents: Vec<WaitAgentSnapshot>,
-    ) -> Self {
-        let message = match outcome {
-            WaitOutcome::MailboxActivity => "Wait completed.",
-            WaitOutcome::Steered => "Wait interrupted by new input.",
-            WaitOutcome::TimedOut => "Wait timed out.",
-        };
-        let message = match requested_timeout_ms {
-            Some(requested_timeout_ms) if requested_timeout_ms < timeout_ms => format!(
-                "{message}\n\nRequested timeout of {requested_timeout_ms}ms was clamped to the minimum of {timeout_ms}ms."
-            ),
-            Some(_) | None => message.to_string(),
-        };
-        // On a timeout, say what the agents are actually doing rather than
-        // leaving the parent to guess.
-        let message = if outcome == WaitOutcome::TimedOut && !agents.is_empty() {
-            let lines: Vec<String> = agents
-                .iter()
-                .map(|agent| match (&agent.last_activity, agent.idle_seconds) {
-                    (Some(activity), Some(idle)) => {
-                        format!("- {} {activity} {idle}s ago", agent.agent_name)
-                    }
-                    (Some(activity), None) => format!("- {} {activity}", agent.agent_name),
-                    _ => format!("- {} has not reported activity yet", agent.agent_name),
-                })
-                .collect();
-            format!("{message}\n\nLive agents:\n{}", lines.join("\n"))
-        } else {
-            message
-        };
-        Self {
-            message,
-            timed_out: outcome == WaitOutcome::TimedOut,
-            agents,
-        }
-    }
-}
-
-impl ToolOutput for WaitAgentResult {
-    fn log_output(&self) -> String {
-        tool_output_json_text(self, "wait_agent")
-    }
-
-    fn success_for_logging(&self) -> bool {
-        true
-    }
-
-    fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
-        tool_output_response_item(call_id, payload, self, /*success*/ None, "wait_agent")
-    }
-
-    fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue {
-        tool_output_code_mode_result(self, "wait_agent")
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WaitOutcome {
-    MailboxActivity,
-    Steered,
-    TimedOut,
-}
-
-async fn wait_for_activity(
-    activity_rx: &mut tokio::sync::watch::Receiver<InputQueueActivity>,
-    pending_activity: Option<InputQueueActivity>,
-    deadline: Instant,
-) -> WaitOutcome {
-    if let Some(activity) = pending_activity {
-        return match activity {
-            InputQueueActivity::Mailbox => WaitOutcome::MailboxActivity,
-            InputQueueActivity::Steer => WaitOutcome::Steered,
-        };
-    }
-    match timeout_at(deadline, activity_rx.changed()).await {
-        Ok(Ok(())) => match *activity_rx.borrow_and_update() {
-            InputQueueActivity::Mailbox => WaitOutcome::MailboxActivity,
-            InputQueueActivity::Steer => WaitOutcome::Steered,
-        },
-        Ok(Err(_)) | Err(_) => WaitOutcome::TimedOut,
-    }
-}
+#[cfg(test)]
+#[path = "wait_tests.rs"]
+mod tests;

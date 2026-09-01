@@ -1,5 +1,7 @@
 use super::*;
 use crate::config::Constrained;
+use crate::context::ApprovedPlanRef;
+use crate::context::PlanLoaded;
 use crate::session::step_settings::StepSettingsUpdate;
 use crate::session::tests::make_session_and_context_with_rx;
 use crate::session::turn_context::TurnContext;
@@ -13,6 +15,7 @@ use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::Settings;
 use codex_protocol::error::CodexErrorDetails;
+use codex_protocol::error::HistoryRecoveryReason;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -20,6 +23,7 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::TurnAbortReason;
+use codex_protocol::turn_input::ApprovedPlanContext;
 use codex_protocol::turn_input::TurnInput as SubmittedTurnInput;
 use codex_protocol::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -246,6 +250,75 @@ async fn recovery_rejects_active_turn_without_injecting_or_applying_settings() {
 }
 
 #[tokio::test]
+async fn history_recovery_required_blocks_start_steer_and_recovery_before_request() {
+    for mode in [
+        TurnInputMode::StartIfIdle,
+        TurnInputMode::StartOrSteer,
+        TurnInputMode::Steer {
+            expected_turn_id: "turn-that-must-not-start".to_string(),
+        },
+    ] {
+        let (session, _turn_context, _rx) = make_session_and_context_with_rx().await;
+        session
+            .mark_history_recovery_required(
+                HistoryRecoveryReason::UndecryptableEncryptedFunctionOutput,
+            )
+            .await;
+
+        let request = match &mode {
+            TurnInputMode::StartIfIdle | TurnInputMode::StartOrSteer => {
+                TurnInputRequest::user_input(vec![UserInput::Text {
+                    text: "must not be sent".to_string(),
+                    text_elements: Vec::new(),
+                }])
+            }
+            TurnInputMode::Steer { .. } => TurnInputRequest::user_input(vec![UserInput::Text {
+                text: "must not be steered".to_string(),
+                text_elements: Vec::new(),
+            }]),
+        };
+        let error = handle(&session, request, mode, "blocked-submission".to_string())
+            .await
+            .expect_err("poisoned history must be rejected before admission");
+        assert!(matches!(
+            error.details(),
+            CodexErrorDetails::HistoryRecoveryRequired {
+                reason: HistoryRecoveryReason::UndecryptableEncryptedFunctionOutput
+            }
+        ));
+        assert!(session.active_turn.lock().await.is_none());
+        assert!(
+            session
+                .input_queue
+                .get_pending_input(&session.active_turn)
+                .await
+                .0
+                .is_empty()
+        );
+    }
+
+    let (session, _turn_context, _rx) = make_session_and_context_with_rx().await;
+    session
+        .mark_history_recovery_required(HistoryRecoveryReason::UndecryptableEncryptedFunctionOutput)
+        .await;
+    let error = handle_recovery(
+        &session,
+        ThreadSettingsOverrides::default(),
+        TurnStartOptions::default(),
+        "blocked-recovery".to_string(),
+    )
+    .await
+    .expect_err("recovery must not retry a poisoned history");
+    assert!(matches!(
+        error.details(),
+        CodexErrorDetails::HistoryRecoveryRequired {
+            reason: HistoryRecoveryReason::UndecryptableEncryptedFunctionOutput
+        }
+    ));
+    assert!(session.active_turn.lock().await.is_none());
+}
+
+#[tokio::test]
 async fn start_only_rejects_current_plan_before_validating_settings() {
     let (session, _turn_context, _rx) = make_session_and_context_with_rx().await;
     let default_mode = session.collaboration_mode().await;
@@ -399,7 +472,7 @@ async fn prepared_user_updates_merge_with_settings_at_turn_start() {
 }
 
 #[tokio::test]
-async fn automatic_admission_uses_current_candidate_after_plan_preview() {
+async fn fork_invariant_automatic_admission_uses_current_candidate_after_plan_preview() {
     let (session, _turn_context, _rx) = make_session_and_context_with_rx().await;
     let default_mode = session.collaboration_mode().await;
     let mut plan_mode = default_mode.clone();
@@ -452,7 +525,8 @@ async fn automatic_admission_uses_current_candidate_after_plan_preview() {
 }
 
 #[tokio::test]
-async fn automatic_admission_rechecks_plan_mode_without_committing_sparse_settings() {
+async fn fork_invariant_automatic_admission_rechecks_plan_mode_without_committing_sparse_settings()
+{
     struct ConfigRecorder(Arc<std::sync::Mutex<Vec<(AskForApproval, ApprovalsReviewer)>>>);
 
     impl codex_extension_api::ConfigContributor<crate::config::Config> for ConfigRecorder {
@@ -670,7 +744,7 @@ async fn admission_revalidates_constraints_before_committing(kind: TurnStartKind
 }
 
 #[tokio::test]
-async fn start_only_accepts_user_input_in_plan_mode() {
+async fn fork_invariant_start_only_accepts_user_input_in_plan_mode() {
     let (session, _turn_context, _rx) = make_session_and_context_with_rx().await;
     let mut collaboration_mode = session.collaboration_mode().await;
     collaboration_mode.mode = ModeKind::Plan;
@@ -706,7 +780,7 @@ async fn start_only_accepts_user_input_in_plan_mode() {
 }
 
 #[tokio::test]
-async fn start_only_rejects_empty_user_input_in_plan_mode() {
+async fn fork_invariant_start_only_rejects_empty_user_input_in_plan_mode() {
     let (session, _turn_context, _rx) = make_session_and_context_with_rx().await;
     let mut collaboration_mode = session.collaboration_mode().await;
     collaboration_mode.mode = ModeKind::Plan;
@@ -936,4 +1010,175 @@ async fn rejects_non_regular_turns() {
 
         session.abort_all_tasks(TurnAbortReason::Interrupted).await;
     }
+}
+
+fn approved_user_request(text: &str, id: &str, revision: u32, body: &str) -> TurnInputRequest {
+    TurnInputRequest::user_input(vec![UserInput::Text {
+        text: text.to_string(),
+        text_elements: Vec::new(),
+    }])
+    .with_approved_plan(id, revision, body)
+}
+
+#[test]
+fn approved_plan_input_is_immediately_before_user_input() {
+    let plan = PlanLoaded::new(ApprovedPlanRef::new("plan-order", 1), "approved body")
+        .expect("approved plan should fit");
+    let mut task_input = Vec::new();
+    append_approved_plan_input(&mut task_input, &plan);
+    task_input.push(pending_turn_input(SubmittedTurnInput::UserInput {
+        content: vec![UserInput::Text {
+            text: "user input".to_string(),
+            text_elements: Vec::new(),
+        }],
+        client_id: None,
+    }));
+
+    assert_eq!(task_input.len(), 2);
+    assert!(matches!(
+        &task_input[0],
+        TurnInput::ResponseItem(envelope) if PlanLoaded::is_response_item(&envelope.item)
+    ));
+    assert!(matches!(&task_input[1], TurnInput::UserInput { .. }));
+}
+
+#[tokio::test]
+async fn approved_plan_start_or_steer_requires_idle_without_steering() {
+    let (session, turn_context, _rx) = make_session_and_context_with_rx().await;
+    session
+        .spawn_task(
+            Arc::clone(&turn_context),
+            Vec::new(),
+            NeverEndingTask {
+                kind: TaskKind::Regular,
+                listen_to_cancellation_token: true,
+            },
+        )
+        .await;
+
+    let submission = handle(
+        &session,
+        approved_user_request("must wait", "plan-active", 1, "approved body"),
+        TurnInputMode::StartOrSteer,
+        "approved-start".to_string(),
+    )
+    .await
+    .expect("approved plan request should return a typed result");
+
+    assert_eq!(
+        submission,
+        TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::NotIdle,
+        }
+    );
+    assert_eq!(session.approved_plan_ref(), None);
+    assert_eq!(
+        session
+            .input_queue
+            .get_pending_input(&session.active_turn)
+            .await
+            .0,
+        Vec::<TurnInput>::new()
+    );
+
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
+#[tokio::test]
+async fn approved_plan_is_validated_before_reserving_idle_turn() {
+    let (session, _turn_context, _rx) = make_session_and_context_with_rx().await;
+    let result = handle(
+        &session,
+        approved_user_request("user input", "plan-large", 1, &"approved ".repeat(80_000)),
+        TurnInputMode::StartIfIdle,
+        "approved-invalid".to_string(),
+    )
+    .await;
+
+    let error = result.expect_err("oversized approved plan must be rejected");
+    assert!(error.to_string().contains("maximum is 10000"));
+    assert_eq!(session.approved_plan_ref(), None);
+    assert!(session.active_turn.lock().await.is_none());
+    assert_eq!(
+        session
+            .input_queue
+            .get_pending_input(&session.active_turn)
+            .await
+            .0,
+        Vec::<TurnInput>::new()
+    );
+}
+
+#[tokio::test]
+async fn approved_plan_admission_is_idempotent_and_rejects_body_conflicts() {
+    let plan = PlanLoaded::new(ApprovedPlanRef::new("plan-idempotent", 4), "approved body")
+        .expect("approved plan should fit");
+    let (session, _turn_context, _rx) = make_session_and_context_with_rx().await;
+    session.set_approved_plan(Some(plan));
+
+    let same = prepare_approved_plan(
+        &session,
+        Some(ApprovedPlanContext {
+            id: "plan-idempotent".to_string(),
+            revision: 4,
+            body: "approved body".to_string(),
+        }),
+    )
+    .expect("same approved plan should validate");
+    assert_eq!(same, None);
+
+    let conflict = prepare_approved_plan(
+        &session,
+        Some(ApprovedPlanContext {
+            id: "plan-idempotent".to_string(),
+            revision: 4,
+            body: "different body".to_string(),
+        }),
+    )
+    .expect_err("same reference with another body must fail");
+    assert!(
+        conflict
+            .to_string()
+            .contains("body does not match its existing reference")
+    );
+
+    let replacement = prepare_approved_plan(
+        &session,
+        Some(ApprovedPlanContext {
+            id: "plan-idempotent".to_string(),
+            revision: 5,
+            body: "new approved body".to_string(),
+        }),
+    )
+    .expect("new revision should be admitted for an idle start")
+    .expect("new revision should replace the active snapshot");
+    assert_eq!(
+        replacement.approved_plan(),
+        &ApprovedPlanRef::new("plan-idempotent", 5)
+    );
+}
+
+#[tokio::test]
+async fn approved_plan_start_publishes_active_reference_after_admission() {
+    let (session, _turn_context, _rx) = make_session_and_context_with_rx().await;
+    let submission = handle(
+        &session,
+        approved_user_request("start with plan", "plan-start", 2, "approved body"),
+        TurnInputMode::StartOrSteer,
+        "approved-start".to_string(),
+    )
+    .await
+    .expect("approved plan start should be accepted");
+
+    assert_eq!(
+        submission,
+        TurnInputSubmission::Started {
+            turn_id: "approved-start".to_string(),
+        }
+    );
+    assert_eq!(
+        session.approved_plan_ref(),
+        Some(ApprovedPlanRef::new("plan-start", 2))
+    );
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
 }

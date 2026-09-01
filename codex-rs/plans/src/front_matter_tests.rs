@@ -6,11 +6,16 @@ fn sample() -> PlanFrontMatter {
         title: "Final plan".to_string(),
         thread_id: Some("019c2d47-4935-7423-a190-05691f566092".to_string()),
         turn_id: Some("turn-1".to_string()),
+        item_id: Some("item-1".to_string()),
+        rollout_id: Some("rollout-1".to_string()),
         cwd: Some("/home/user/project".to_string()),
         model: Some("gpt-5.2".to_string()),
         created_at: "2026-08-27T10:00:00Z".to_string(),
         updated_at: "2026-08-27T11:00:00Z".to_string(),
         revision: 2,
+        approved_at: Some("2026-08-27T12:00:00Z".to_string()),
+        build_revision: Some("build-1".to_string()),
+        config_revision: Some("config-1".to_string()),
     }
 }
 

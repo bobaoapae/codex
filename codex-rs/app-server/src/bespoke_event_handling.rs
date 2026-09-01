@@ -12,6 +12,8 @@ use crate::thread_state::TurnSummary;
 use crate::thread_state::resolve_server_request_on_thread_listener;
 use crate::thread_status::ThreadWatchActiveGuard;
 use crate::thread_status::ThreadWatchManager;
+use crate::transient_job_lifecycle::EventHandling as TransientJobEventHandling;
+use crate::transient_job_lifecycle::ThreadClassification;
 use codex_app_server_protocol::AccountRateLimitsUpdatedNotification;
 use codex_app_server_protocol::AdditionalPermissionProfile as V2AdditionalPermissionProfile;
 use codex_app_server_protocol::AuthRecoveryNotification;
@@ -95,6 +97,7 @@ use codex_core::ThreadManager;
 use codex_features::Feature;
 use codex_guardian_v2::StrictReviewReason;
 use codex_protocol::ThreadId;
+use codex_protocol::error::history_recovery_reason_from_error_message;
 use codex_protocol::items::CollabAgentTool as CoreCollabAgentTool;
 use codex_protocol::items::TurnItem as CoreTurnItem;
 use codex_protocol::models::AdditionalPermissionProfile as CoreAdditionalPermissionProfile;
@@ -144,6 +147,7 @@ struct CommandExecutionCompletionItem {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) async fn apply_bespoke_event_handling(
     event: Event,
     conversation_id: ThreadId,
@@ -155,10 +159,50 @@ pub(crate) async fn apply_bespoke_event_handling(
     thread_list_state_permit: Arc<tokio::sync::Semaphore>,
     fallback_model_provider: String,
 ) {
+    let classification =
+        crate::transient_job_lifecycle::classify_thread(&conversation, conversation_id).await;
+    apply_bespoke_event_handling_with_classification(
+        event,
+        conversation_id,
+        conversation,
+        thread_manager,
+        outgoing,
+        thread_state,
+        thread_watch_manager,
+        thread_list_state_permit,
+        fallback_model_provider,
+        &classification,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn apply_bespoke_event_handling_with_classification(
+    event: Event,
+    conversation_id: ThreadId,
+    conversation: Arc<CodexThread>,
+    thread_manager: Arc<ThreadManager>,
+    outgoing: ThreadScopedOutgoingMessageSender,
+    thread_state: Arc<tokio::sync::Mutex<ThreadState>>,
+    thread_watch_manager: ThreadWatchManager,
+    thread_list_state_permit: Arc<tokio::sync::Semaphore>,
+    fallback_model_provider: String,
+    classification: &ThreadClassification,
+) {
     let Event {
         id: event_turn_id,
         msg,
     } = event;
+    let transient_job_handling = crate::transient_job_lifecycle::handle_classified_event(
+        &conversation,
+        &event_turn_id,
+        &msg,
+        classification,
+    )
+    .await;
+    if matches!(transient_job_handling, TransientJobEventHandling::Suppress) {
+        return;
+    }
     match msg {
         EventMsg::TurnStarted(payload) => {
             // While not technically necessary as it was already done on TurnComplete, be extra cautios and abort any pending server requests.
@@ -985,12 +1029,13 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .await;
         }
         EventMsg::Error(ev) => {
+            let message = ev.message.clone();
+            let codex_error_info = ev.codex_error_info.clone();
+            let is_history_recovery =
+                history_recovery_reason_from_error_message(&message).is_some();
             thread_watch_manager
                 .note_system_error(&conversation_id.to_string())
                 .await;
-
-            let message = ev.message.clone();
-            let codex_error_info = ev.codex_error_info.clone();
             // If this error belongs to an in-flight `thread/rollback` request, fail that request
             // (and clear pending state) so subsequent rollbacks are unblocked.
             //
@@ -1015,7 +1060,11 @@ pub(crate) async fn apply_bespoke_event_handling(
             let turn_error = TurnError {
                 misalignment: ev.misalignment.map(Into::into),
                 message: ev.message,
-                codex_error_info: ev.codex_error_info.map(V2CodexErrorInfo::from),
+                codex_error_info: if is_history_recovery {
+                    Some(V2CodexErrorInfo::HistoryRecoveryRequired)
+                } else {
+                    codex_error_info.map(V2CodexErrorInfo::from)
+                },
                 additional_details: None,
             };
             handle_error_notification(

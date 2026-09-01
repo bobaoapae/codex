@@ -33,8 +33,21 @@ pub struct Cli {
     pub skip_git_repo_check: bool,
 
     /// Run without persisting session files to disk.
-    #[arg(long = "ephemeral", global = true, default_value_t = false)]
+    #[arg(
+        long = "ephemeral",
+        global = true,
+        default_value_t = false,
+        conflicts_with = "transient"
+    )]
     pub ephemeral: bool,
+
+    /// Persist this invocation as a non-interactive transient job.
+    ///
+    /// Transient jobs use the normal durable rollout path, but are classified
+    /// separately from interactive sessions by the app-server. They cannot
+    /// resume, fork, or review an existing thread.
+    #[arg(long = "transient", global = true, default_value_t = false)]
+    pub transient: bool,
 
     /// Do not load `$CODEX_HOME/config.toml`; auth still uses `CODEX_HOME`.
     #[arg(long = "ignore-user-config", global = true, default_value_t = false)]

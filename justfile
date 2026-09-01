@@ -91,6 +91,32 @@ test *args:
 test *args:
     $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast @($args | Select-Object -Skip 1)
 
+# Run the fork's named behavioral invariants without source-marker or custom
+# result-parser gates.
+[unix]
+fork-invariants:
+    RUST_MIN_STACK={{ rust_min_stack }} NEXTEST_PROFILE=local cargo nextest run --no-fail-fast -p codex-features -E 'test(/fork_invariant_/)'
+    RUST_MIN_STACK={{ rust_min_stack }} NEXTEST_PROFILE=local cargo nextest run --no-fail-fast -p codex-core -E 'test(/fork_invariant_/)'
+    RUST_MIN_STACK={{ rust_min_stack }} NEXTEST_PROFILE=local cargo nextest run --no-fail-fast -p codex-app-server-protocol -E 'test(/fork_invariant_/)'
+    RUST_MIN_STACK={{ rust_min_stack }} NEXTEST_PROFILE=local cargo nextest run --no-fail-fast -p codex-app-server -E 'test(/fork_invariant_/)'
+    RUST_MIN_STACK={{ rust_min_stack }} NEXTEST_PROFILE=local cargo nextest run --no-fail-fast -p codex-exec -E 'test(/fork_invariant_/)'
+    RUST_MIN_STACK={{ rust_min_stack }} NEXTEST_PROFILE=local cargo nextest run --no-fail-fast -p codex-goal-extension -E 'test(/fork_invariant_/)'
+    RUST_MIN_STACK={{ rust_min_stack }} NEXTEST_PROFILE=local cargo nextest run --no-fail-fast -p codex-plans -E 'test(/fork_invariant_/)'
+    RUST_MIN_STACK={{ rust_min_stack }} NEXTEST_PROFILE=local cargo nextest run --no-fail-fast -p codex-rollout -E 'test(/fork_invariant_/)'
+    RUST_MIN_STACK={{ rust_min_stack }} NEXTEST_PROFILE=local cargo nextest run --no-fail-fast -p codex-state -E 'test(/fork_invariant_/)'
+
+[windows]
+fork-invariants:
+    $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast -p codex-features -E 'test(/fork_invariant_/)'
+    $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast -p codex-core -E 'test(/fork_invariant_/)'
+    $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast -p codex-app-server-protocol -E 'test(/fork_invariant_/)'
+    $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast -p codex-app-server -E 'test(/fork_invariant_/)'
+    $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast -p codex-exec -E 'test(/fork_invariant_/)'
+    $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast -p codex-goal-extension -E 'test(/fork_invariant_/)'
+    $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast -p codex-plans -E 'test(/fork_invariant_/)'
+    $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast -p codex-rollout -E 'test(/fork_invariant_/)'
+    $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast -p codex-state -E 'test(/fork_invariant_/)'
+
 # Run from the repository root so scripts that resolve paths from `cwd` see
 # the same layout they use in GitHub Actions.
 [no-cd]
@@ -179,7 +205,7 @@ write-config-schema:
 
 # Regenerate vendored app-server protocol schema artifacts.
 write-app-server-schema *args:
-    cargo run -p codex-app-server-protocol --bin write_schema_fixtures -- {args}
+    python "{{ justfile_directory() }}/codex-rs/app-server-protocol/scripts/write_schema_fixtures.py" {{ args }}
 
 [no-cd]
 write-hooks-schema:

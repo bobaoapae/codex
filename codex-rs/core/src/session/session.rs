@@ -7,6 +7,7 @@ use super::step_settings::StepSettingsUpdate;
 use super::*;
 use crate::agents_md_manager::AgentsMdManager;
 use crate::config::ConstraintError;
+use crate::context::PlanLoaded;
 use crate::environment_selection::ThreadEnvironments;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::hook_mcp_executor::CoreHookMcpExecutor;
@@ -28,6 +29,7 @@ use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::protocol::EnvironmentConfig;
 use codex_protocol::protocol::HookCompletedEvent;
 use codex_protocol::protocol::MultiAgentVersion;
+use codex_protocol::protocol::RuntimeBuildInfo;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnEnvironmentSelections;
@@ -79,6 +81,9 @@ pub(crate) struct Session {
     /// only in the transcript — and compaction rewrites the transcript. Keeping
     /// it here is what lets the compacted history carry it forward.
     pub(crate) last_plan: std::sync::Mutex<Option<codex_protocol::plan_tool::UpdatePlanArgs>>,
+    /// FORK: the active immutable approved plan snapshot, separate from the
+    /// mutable `update_plan` checklist.
+    pub(crate) approved_plan: std::sync::Mutex<Option<PlanLoaded>>,
     /// FORK: Desktop threads (`create_thread`/`fork_thread`) opened by this
     /// session, for the soft limit that warns when they pile up.
     pub(crate) desktop_threads_created: AtomicU64,
@@ -88,6 +93,11 @@ pub(crate) struct Session {
     /// taking the session state lock there would be both wasteful and a
     /// deadlock hazard.
     pub(crate) is_subagent: bool,
+    /// Receipt IDs reserved by this session's derived-history projection.
+    ///
+    /// The set is seeded from hydrated history and prevents repeated legacy or
+    /// lifecycle observations from appending the same receipt twice.
+    pub(super) derived_receipt_ids: std::sync::Mutex<HashSet<String>>,
 }
 
 #[derive(Clone)]
@@ -598,6 +608,30 @@ async fn warm_plugins_and_skills_for_session_init(
 }
 
 impl Session {
+    /// Return provenance for events that establish or refresh thread settings.
+    ///
+    /// The configuration revisions are derived from the live layer stack each
+    /// time so a user-layer refresh is reflected in the next persisted
+    /// checkpoint. Runtime build identity is initialized by the final binary
+    /// and is safe to include in every checkpoint.
+    pub(crate) async fn runtime_provenance(
+        &self,
+    ) -> (Option<RuntimeBuildInfo>, Option<String>, Option<String>) {
+        let runtime_build_info = Some(RuntimeBuildInfo::current());
+        let state = self.state.lock().await;
+        let config_layer_stack = &state
+            .session_configuration
+            .original_config_do_not_use
+            .config_layer_stack;
+        (
+            runtime_build_info,
+            Some(config_layer_stack.revision()),
+            Some(config_layer_stack.runtime_feature_revision()),
+        )
+    }
+}
+
+impl Session {
     /// Returns the concrete identity for this thread.
     pub(crate) fn thread_id(&self) -> ThreadId {
         self.thread_id
@@ -1000,13 +1034,14 @@ impl Session {
         // Join all independent futures.
         let (thread_persistence_result, state_db_ctx, (auth, mcp_projection)) =
             tokio::join!(thread_persistence_fut, state_db_fut, auth_and_mcp_fut);
+        agent_control.install_workflow_store(state_db_ctx.as_ref());
 
         let mut live_thread_init =
             LiveThreadInitGuard::new(thread_persistence_result.map_err(|e| {
                 error!("failed to initialize thread persistence: {e:#}");
                 e
             })?);
-        let session_result: anyhow::Result<Arc<Self>> = async {
+        let session_result: anyhow::Result<Arc<Self>> = Box::pin(async {
             let rollout_path = if let Some(live_thread) = live_thread_init.as_ref() {
                 live_thread.local_rollout_path().await?
             } else {
@@ -1520,8 +1555,12 @@ impl Session {
                 forked_from_ordinal_exclusive,
                 next_internal_sub_id: AtomicU64::new(0),
                 last_plan: std::sync::Mutex::new(None),
+                approved_plan: std::sync::Mutex::new(None),
                 desktop_threads_created: AtomicU64::new(0),
                 is_subagent: session_source_is_non_root_agent,
+                derived_receipt_ids: std::sync::Mutex::new(
+                    crate::evidence::receipt_ids_from_history(&initial_history),
+                ),
             });
             if let Some(network_policy_decider_session) = network_policy_decider_session {
                 let mut guard = network_policy_decider_session.write().await;
@@ -1614,6 +1653,15 @@ impl Session {
 
             // record_initial_history can emit events. We record only after the SessionConfiguredEvent is emitted.
             Box::pin(sess.record_initial_history(initial_history)).await;
+            match crate::agent::mailbox::rehydrate(&sess).await {
+                Ok(true) => {
+                    sess.maybe_start_turn_for_pending_work().await;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    warn!("failed to rehydrate durable mailbox: {error}");
+                }
+            }
             if restore_child_window {
                 sess.state.lock().await.restore_auto_compact_window(
                     /*window_number*/ 0,
@@ -1630,7 +1678,7 @@ impl Session {
                 state.queue_pending_session_start_source(session_start_source);
             }
             Ok(sess)
-        }
+        })
         .await;
         match session_result {
             Ok(sess) => {

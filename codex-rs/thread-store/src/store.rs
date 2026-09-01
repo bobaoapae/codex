@@ -4,6 +4,8 @@ use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 
+use crate::AppendReceiptOutcome;
+use crate::AppendReceiptParams;
 use crate::AppendThreadItemsParams;
 use crate::ArchiveThreadParams;
 use crate::ArchiveThreadsParams;
@@ -29,6 +31,12 @@ use crate::PreparedFork;
 use crate::ProjectMoveOutcome;
 use crate::ReadThreadByRolloutPathParams;
 use crate::ReadThreadParams;
+use crate::RecoveryCreateParams;
+use crate::RecoveryCreateResult;
+use crate::RecoveryPreview;
+use crate::RecoveryPreviewParams;
+use crate::RecoveryQuiescenceAttestation;
+use crate::RecoveryQuiescenceParams;
 use crate::RenameThreadSectionParams;
 use crate::ResumeThreadParams;
 use crate::RevertThreadParams;
@@ -47,6 +55,8 @@ use crate::ThreadPage;
 use crate::ThreadSearchPage;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
+use crate::TombstoneThreadParams;
+use crate::TombstoneThreadsParams;
 use crate::TurnPage;
 use crate::UpdateProjectParams;
 use crate::UpdateThreadMetadataParams;
@@ -114,6 +124,21 @@ pub trait ThreadStore: Any + Send + Sync {
     /// replay history and before updating any implementation-owned projections.
     fn append_items(&self, params: AppendThreadItemsParams) -> ThreadStoreFuture<'_, ()>;
 
+    /// Compare and append one host-owned receipt under the implementation's
+    /// lifecycle and writer locks. Equivalent existing receipts must be
+    /// returned without another canonical rollout append; divergent records
+    /// must fail with [`ThreadStoreError::Conflict`].
+    fn append_receipt(
+        &self,
+        _params: AppendReceiptParams,
+    ) -> ThreadStoreFuture<'_, AppendReceiptOutcome> {
+        Box::pin(async {
+            Err(ThreadStoreError::Unsupported {
+                operation: "append_receipt",
+            })
+        })
+    }
+
     /// Materializes the thread if persistence is lazy, then persists all queued items.
     ///
     /// Standard persistence must complete before returning. Turn-start persistence may complete
@@ -165,6 +190,51 @@ pub trait ThreadStore: Any + Send + Sync {
         Box::pin(async {
             Err(ThreadStoreError::Unsupported {
                 operation: "prepare_fork",
+            })
+        })
+    }
+
+    /// Inspects a provider-attested poisoned rollout without modifying the source.
+    ///
+    /// Implementations must validate the supplied candidates against their durable history. They
+    /// must not infer provider encryption capabilities or retry ranges from opaque rollout data.
+    fn preview_recovery(
+        &self,
+        _params: RecoveryPreviewParams,
+    ) -> ThreadStoreFuture<'_, RecoveryPreview> {
+        Box::pin(async {
+            Err(ThreadStoreError::Unsupported {
+                operation: "thread/recovery/preview",
+            })
+        })
+    }
+
+    /// Flushes a loaded local writer and returns a bounded idle-turn attestation for recovery.
+    ///
+    /// Implementations must fail when the writer is not locally controlled or the caller cannot
+    /// prove that no turn is active.
+    fn attest_recovery_quiescence(
+        &self,
+        _params: RecoveryQuiescenceParams,
+    ) -> ThreadStoreFuture<'_, RecoveryQuiescenceAttestation> {
+        Box::pin(async {
+            Err(ThreadStoreError::Unsupported {
+                operation: "thread/recovery/quiesce",
+            })
+        })
+    }
+
+    /// Prepares a fresh child identity and sanitized history from a validated recovery token.
+    ///
+    /// The source rollout remains immutable. Implementations should retain any source lifecycle
+    /// reservation in the returned value until the caller either starts or drops the child.
+    fn create_recovery(
+        &self,
+        _params: RecoveryCreateParams,
+    ) -> ThreadStoreFuture<'_, RecoveryCreateResult> {
+        Box::pin(async {
+            Err(ThreadStoreError::Unsupported {
+                operation: "thread/recovery/create",
             })
         })
     }
@@ -440,6 +510,26 @@ pub trait ThreadStore: Any + Send + Sync {
                     Ok(()) | Err(ThreadStoreError::ThreadNotFound { .. }) => {}
                     Err(err) => return Err(err),
                 }
+            }
+            Ok(())
+        })
+    }
+
+    /// Mark a thread invisible while retaining its rollout and all durable references.
+    fn tombstone_thread(&self, _params: TombstoneThreadParams) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async move {
+            Err(ThreadStoreError::Unsupported {
+                operation: "thread/tombstone",
+            })
+        })
+    }
+
+    /// Mark threads invisible in the supplied order without deleting history.
+    fn tombstone_threads(&self, params: TombstoneThreadsParams) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async move {
+            for thread_id in params.thread_ids {
+                self.tombstone_thread(TombstoneThreadParams { thread_id })
+                    .await?;
             }
             Ok(())
         })

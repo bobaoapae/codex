@@ -1,4 +1,4 @@
-//! Daemon-wide overview of loaded root sessions and their subagents.
+//! Shared-agent navigation; remote `/agents` status is sourced from the durable fleet API.
 
 use super::agents_overview_view::AgentsOverviewGroup;
 use super::agents_overview_view::AgentsOverviewRow;
@@ -38,6 +38,7 @@ pub(super) struct AgentsOverviewState {
         Arc<std::sync::Mutex<super::agents_overview_view::AgentsOverviewViewState>>,
     pub(super) input_states: HashMap<ThreadId, ThreadInputState>,
     pub(super) dispatched_requests: HashMap<ThreadId, Vec<ServerRequest>>,
+    pub(super) fleet: super::agents_fleet::AgentsFleetState,
 }
 
 impl App {
@@ -91,15 +92,32 @@ impl App {
             return;
         }
 
+        let Some(root_thread_id) = self.primary_thread_id else {
+            self.chat_widget.show_selection_view(SelectionViewParams {
+                title: Some("No fleet root selected".to_string()),
+                subtitle: Some(
+                    "Open a session before opening the shared agent-fleet dashboard.".to_string(),
+                ),
+                footer_hint: Some(standard_popup_hint_line_for_keymap(&self.keymap.list)),
+                items: vec![SelectionItem {
+                    name: "Return to this session".to_string(),
+                    dismiss_on_select: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+            return;
+        };
+
         self.agents_overview.request_id = None;
         self.agents_overview.refresh_pending = false;
-        let view = self.agents_overview_view(Vec::new(), /*selected_thread_id*/ None);
-        self.agents_overview.visible_thread_ids = view.thread_ids();
-        self.chat_widget.show_bottom_pane_view(Box::new(view));
-        self.refresh_agents_overview_threads(app_server);
+        self.open_agents_fleet_overview(app_server, root_thread_id);
     }
 
     pub(super) fn refresh_agents_overview_threads(&mut self, app_server: &AppServerSession) {
+        if self.agents_overview.fleet.root_thread_id.is_some() {
+            return;
+        }
         if self
             .chat_widget
             .selected_index_for_present_view(AGENTS_OVERVIEW_VIEW_ID)

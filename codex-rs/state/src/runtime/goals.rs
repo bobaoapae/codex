@@ -1,5 +1,6 @@
 use super::*;
 use crate::model::ThreadGoalRow;
+use codex_protocol::protocol::validate_thread_goal_objective;
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -24,6 +25,20 @@ pub struct GoalUpdate {
     pub expected_goal_id: Option<String>,
 }
 
+/// Result of atomically claiming the goal slot for an approved plan.
+///
+/// A claim creates a fresh active goal when the slot is empty, replaces only a
+/// complete goal, and reports every other existing goal as a conflict without
+/// mutating it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovedPlanGoalClaim {
+    Claimed {
+        goal: crate::ThreadGoal,
+        previous_goal: Option<crate::ThreadGoal>,
+    },
+    Conflict(crate::ThreadGoal),
+}
+
 pub enum GoalAccountingOutcome {
     Unchanged(Option<crate::ThreadGoal>),
     Updated(crate::ThreadGoal),
@@ -38,6 +53,176 @@ pub enum GoalAccountingMode {
 }
 
 impl GoalStore {
+    /// Atomically claim the goal slot for an approved plan.
+    ///
+    /// The objective is already validated and contains only the bounded plan
+    /// title/reference chosen by the caller.  Empty slots and complete goals
+    /// can be claimed; active, paused, blocked, usage-limited, and
+    /// budget-limited goals are returned unchanged as conflicts.
+    pub async fn claim_approved_plan_goal(
+        &self,
+        thread_id: ThreadId,
+        objective: &str,
+    ) -> anyhow::Result<ApprovedPlanGoalClaim> {
+        validate_thread_goal_objective(objective).map_err(anyhow::Error::msg)?;
+        if objective.contains('\0') {
+            anyhow::bail!("goal objective must not contain NUL");
+        }
+        let now_ms = datetime_to_epoch_millis(Utc::now());
+        let goal_id = Uuid::new_v4().to_string();
+        let mut transaction = self.pool.begin().await?;
+        let existing = sqlx::query(
+            r#"
+SELECT
+    thread_id,
+    goal_id,
+    objective,
+    status,
+    token_budget,
+    tokens_used,
+    time_used_seconds,
+    created_at_ms,
+    updated_at_ms
+FROM thread_goals
+WHERE thread_id = ?
+            "#,
+        )
+        .bind(thread_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await?
+        .map(|row| thread_goal_from_row(&row))
+        .transpose()?;
+        let inserted = sqlx::query(
+            r#"
+INSERT INTO thread_goals (
+    thread_id,
+    goal_id,
+    objective,
+    status,
+    token_budget,
+    tokens_used,
+    time_used_seconds,
+    created_at_ms,
+    updated_at_ms
+) VALUES (?, ?, ?, 'active', NULL, 0, 0, ?, ?)
+ON CONFLICT(thread_id) DO UPDATE SET
+    goal_id = excluded.goal_id,
+    objective = excluded.objective,
+    status = excluded.status,
+    token_budget = excluded.token_budget,
+    tokens_used = excluded.tokens_used,
+    time_used_seconds = excluded.time_used_seconds,
+    created_at_ms = excluded.created_at_ms,
+    updated_at_ms = excluded.updated_at_ms
+WHERE thread_goals.status = 'complete'
+RETURNING
+    thread_id,
+    goal_id,
+    objective,
+    status,
+    token_budget,
+    tokens_used,
+    time_used_seconds,
+    created_at_ms,
+    updated_at_ms
+            "#,
+        )
+        .bind(thread_id.to_string())
+        .bind(goal_id)
+        .bind(objective)
+        .bind(now_ms)
+        .bind(now_ms)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .map(|row| thread_goal_from_row(&row))
+        .transpose()?;
+        let outcome = if let Some(goal) = inserted {
+            ApprovedPlanGoalClaim::Claimed {
+                goal,
+                previous_goal: existing,
+            }
+        } else {
+            let current = sqlx::query(
+                r#"
+SELECT
+    thread_id,
+    goal_id,
+    objective,
+    status,
+    token_budget,
+    tokens_used,
+    time_used_seconds,
+    created_at_ms,
+    updated_at_ms
+FROM thread_goals
+WHERE thread_id = ?
+                "#,
+            )
+            .bind(thread_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await?
+            .map(|row| thread_goal_from_row(&row))
+            .transpose()?;
+            let Some(current) = current else {
+                anyhow::bail!("goal claim lost its thread goal slot");
+            };
+            ApprovedPlanGoalClaim::Conflict(current)
+        };
+        transaction.commit().await?;
+        Ok(outcome)
+    }
+
+    /// Delete a goal only when its ID still matches the caller's claim.
+    pub async fn delete_thread_goal_if_id(
+        &self,
+        thread_id: ThreadId,
+        expected_goal_id: &str,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query("DELETE FROM thread_goals WHERE thread_id = ? AND goal_id = ?")
+            .bind(thread_id.to_string())
+            .bind(expected_goal_id)
+            .execute(self.pool.as_ref())
+            .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Restore a previous goal only when the claimed goal is still current.
+    pub async fn restore_thread_goal_if_id(
+        &self,
+        thread_id: ThreadId,
+        expected_goal_id: &str,
+        previous_goal: &crate::ThreadGoal,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            r#"
+UPDATE thread_goals
+SET
+    goal_id = ?,
+    objective = ?,
+    status = ?,
+    token_budget = ?,
+    tokens_used = ?,
+    time_used_seconds = ?,
+    created_at_ms = ?,
+    updated_at_ms = ?
+WHERE thread_id = ? AND goal_id = ?
+            "#,
+        )
+        .bind(&previous_goal.goal_id)
+        .bind(&previous_goal.objective)
+        .bind(previous_goal.status.as_str())
+        .bind(previous_goal.token_budget)
+        .bind(previous_goal.tokens_used)
+        .bind(previous_goal.time_used_seconds)
+        .bind(datetime_to_epoch_millis(previous_goal.created_at))
+        .bind(datetime_to_epoch_millis(previous_goal.updated_at))
+        .bind(thread_id.to_string())
+        .bind(expected_goal_id)
+        .execute(self.pool.as_ref())
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     pub async fn get_thread_goal(
         &self,
         thread_id: ThreadId,

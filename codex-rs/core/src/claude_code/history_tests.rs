@@ -132,7 +132,7 @@ fn delegated_agent_message_is_rendered_as_the_current_user_instruction() {
 }
 
 #[test]
-fn encrypted_agent_message_is_not_rendered_for_local_claude() {
+fn fork_invariant_local_claude_drops_encrypted_agent_messages() {
     let encrypted = ResponseItem::AgentMessage {
         id: None,
         author: "/root".to_string(),

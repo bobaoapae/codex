@@ -14,6 +14,24 @@
       ],
       "type": "string"
     },
+    "ApprovedPlanRef": {
+      "description": "A stable reference to one immutable approved plan snapshot.",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "revision": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "revision"
+      ],
+      "type": "object"
+    },
     "AskForApproval": {
       "oneOf": [
         {
@@ -256,6 +274,46 @@
         "location"
       ],
       "type": "object"
+    },
+    "ThreadClass": {
+      "description": "Classification used by the workflow projections and thread filters.",
+      "oneOf": [
+        {
+          "description": "A user-facing interactive conversation.",
+          "enum": [
+            "interactive"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A child agent in a delegated agent tree.",
+          "enum": [
+            "subAgent"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A durable, explicitly requested, non-interactive job.",
+          "enum": [
+            "transientJob"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A run used internally by the runtime.",
+          "enum": [
+            "internal"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A historical `exec` run whose original class is retained.",
+          "enum": [
+            "legacyExec"
+          ],
+          "type": "string"
+        }
+      ]
     },
     "ThreadHistoryMode": {
       "enum": [

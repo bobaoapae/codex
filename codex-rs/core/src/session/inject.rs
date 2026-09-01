@@ -1,12 +1,50 @@
 use super::TurnInput as PendingTurnInput;
 use super::session::Session;
 use super::turn_context::TurnContext;
+use crate::context::ApprovedPlanRef;
+use crate::context::ContextualUserFragment;
+use crate::context::PlanLoaded;
+use crate::session::thread_settings;
 use codex_features::Feature;
 use codex_history::CodexHarnessMetadata;
 use codex_history::ResponseItemEnvelope;
+use codex_protocol::error::CodexErr;
 use codex_protocol::models::ResponseItem;
 
 impl Session {
+    /// Inject an approved Plan-mode snapshot without opening a new user turn.
+    ///
+    /// The settings persistence permit orders this operation with compaction
+    /// checkpoints, so a compaction cannot observe the state change without
+    /// the corresponding model-visible fragment.
+    pub(crate) async fn inject_approved_plan(
+        &self,
+        plan_id: String,
+        revision: u32,
+        body: String,
+    ) -> Result<(), CodexErr> {
+        let plan = PlanLoaded::new(ApprovedPlanRef::new(plan_id, revision), body)
+            .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?;
+        let _persistence_guard = thread_settings::acquire_persistence_lock(self).await;
+        if let Some(existing) = self.approved_plan() {
+            if existing == plan {
+                return Ok(());
+            }
+            if existing.approved_plan() == plan.approved_plan() {
+                return Err(CodexErr::InvalidRequest(
+                    "approved plan snapshot body does not match its existing reference".to_string(),
+                ));
+            }
+        }
+        self.inject_no_new_turn(
+            vec![ContextualUserFragment::into(plan.clone())],
+            /*current_turn_context*/ None,
+        )
+        .await;
+        self.set_approved_plan(Some(plan));
+        Ok(())
+    }
+
     /// Returns the input if there is no active turn to inject into.
     #[expect(
         clippy::await_holding_invalid_type,

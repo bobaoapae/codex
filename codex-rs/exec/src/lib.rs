@@ -32,6 +32,7 @@ use codex_app_server_protocol::ReviewTarget as ApiReviewTarget;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::Thread as AppServerThread;
+use codex_app_server_protocol::ThreadClass;
 use codex_app_server_protocol::ThreadForkParams;
 use codex_app_server_protocol::ThreadForkResponse;
 use codex_app_server_protocol::ThreadHistoryMode;
@@ -223,6 +224,7 @@ struct ExecRunArgs {
     prompt: Option<String>,
     skip_git_repo_check: bool,
     stderr_with_ansi: bool,
+    transient: bool,
     thread_source: ThreadSource,
 }
 
@@ -243,11 +245,30 @@ fn exec_stderr_env_filter() -> EnvFilter {
         .unwrap_or_else(|_| EnvFilter::new("error"))
 }
 
-pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
-    if let Err(err) = set_default_originator("codex_exec".to_string()) {
-        tracing::warn!(?err, "Failed to set codex exec originator override {err:?}");
+fn validate_transient_invocation(
+    transient: bool,
+    ephemeral: bool,
+    command: Option<&ExecCommand>,
+) -> anyhow::Result<()> {
+    if transient && ephemeral {
+        anyhow::bail!("`--transient` cannot be combined with `--ephemeral`");
     }
 
+    if transient && let Some(command) = command {
+        let command_name = match command {
+            ExecCommand::Resume(_) => "resume",
+            ExecCommand::Fork(_) => "fork",
+            ExecCommand::Review(_) => "review",
+        };
+        anyhow::bail!(
+            "`--transient` can only start a new session; it cannot be combined with `codex exec {command_name}`"
+        );
+    }
+
+    Ok(())
+}
+
+pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
     let Cli {
         command,
         strict_config,
@@ -255,6 +276,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         thread_source,
         skip_git_repo_check,
         ephemeral,
+        transient,
         ignore_user_config,
         ignore_rules,
         color,
@@ -264,6 +286,12 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         output_schema: output_schema_path,
         mut config_overrides,
     } = cli;
+
+    validate_transient_invocation(transient, ephemeral, command.as_ref())?;
+
+    if let Err(err) = set_default_originator("codex_exec".to_string()) {
+        tracing::warn!(?err, "Failed to set codex exec originator override {err:?}");
+    }
     let mut shared = shared.into_inner();
     shared.take_auto_review_config_overrides(&mut config_overrides);
     let SharedCliOptions {
@@ -430,7 +458,14 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         compact_prompt: None,
         show_raw_agent_reasoning: oss.then_some(true),
         tools_web_search_request: None,
-        ephemeral: ephemeral.then_some(true),
+        // `--transient` is durable by definition. Explicitly override a
+        // possible config value so this mode cannot accidentally take the
+        // ephemeral/non-persisted path.
+        ephemeral: if transient {
+            Some(false)
+        } else {
+            ephemeral.then_some(true)
+        },
         bypass_hook_trust: bypass_hook_trust.then_some(true),
         additional_writable_roots: add_dir,
     };
@@ -445,12 +480,17 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
             .cloud_config_bundle(cloud_config_bundle.clone())
             .build()
     };
-    let config = build_exec_config(
+    let mut config = build_exec_config(
         overrides,
         dangerously_bypass_approvals_and_sandbox,
         build_config,
     )
     .await?;
+    if transient {
+        // Keep the runtime config aligned with the durable transient contract
+        // even if a future config layer starts exposing persistence defaults.
+        config.ephemeral = false;
+    }
     let resume_approvals_reviewer_override = cli_kv_overrides
         .iter()
         .any(|(key, _)| key == "approvals_reviewer")
@@ -576,6 +616,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         prompt,
         skip_git_repo_check,
         stderr_with_ansi,
+        transient,
         thread_source: thread_source.map(Into::into).unwrap_or(ThreadSource::User),
     })
     .instrument(exec_span)
@@ -675,6 +716,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         prompt,
         skip_git_repo_check,
         stderr_with_ansi,
+        transient,
         thread_source,
     } = args;
 
@@ -841,9 +883,15 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                     .map_err(anyhow::Error::msg)?;
             (session_configured.thread_id, session_configured)
         } else {
-            let response = start_thread(&client, &mut request_ids, &config, &thread_source)
-                .await
-                .map_err(anyhow::Error::msg)?;
+            let response = start_thread(
+                &client,
+                &mut request_ids,
+                &config,
+                &thread_source,
+                transient,
+            )
+            .await
+            .map_err(anyhow::Error::msg)?;
             let session_configured =
                 session_configured_from_thread_start_response(&response, &config)
                     .map_err(anyhow::Error::msg)?;
@@ -915,9 +963,15 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         .map_err(anyhow::Error::msg)?;
         (session_configured.thread_id, session_configured)
     } else {
-        let response = start_thread(&client, &mut request_ids, &config, &thread_source)
-            .await
-            .map_err(anyhow::Error::msg)?;
+        let response = start_thread(
+            &client,
+            &mut request_ids,
+            &config,
+            &thread_source,
+            transient,
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
         let session_configured = session_configured_from_thread_start_response(&response, &config)
             .map_err(anyhow::Error::msg)?;
         (session_configured.thread_id, session_configured)
@@ -973,6 +1027,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                     request_id: request_ids.next(),
                     params: TurnStartParams {
                         thread_id: primary_thread_id_for_span.clone(),
+                        approved_plan: None,
                         turn_trigger: None,
                         client_user_message_id: None,
                         input: items.into_iter().map(Into::into).collect(),
@@ -1150,8 +1205,9 @@ async fn start_thread(
     request_ids: &mut RequestIdSequencer,
     config: &Config,
     thread_source: &ThreadSource,
+    transient: bool,
 ) -> Result<ThreadStartResponse, String> {
-    let mut params = thread_start_params_from_config(config, thread_source);
+    let mut params = thread_start_params_from_config(config, thread_source, transient);
     loop {
         match client
             .request_typed(ClientRequest::ThreadStart {
@@ -1177,6 +1233,7 @@ async fn start_thread(
 fn thread_start_params_from_config(
     config: &Config,
     thread_source: &ThreadSource,
+    transient: bool,
 ) -> ThreadStartParams {
     let permissions = permissions_selection_from_config(config);
     let sandbox = permissions.is_none().then(|| {
@@ -1185,6 +1242,7 @@ fn thread_start_params_from_config(
             config.cwd.as_path(),
         )
     });
+    let ephemeral = if transient { false } else { config.ephemeral };
     ThreadStartParams {
         model: config.model.clone(),
         model_provider: Some(config.model_provider_id.clone()),
@@ -1195,9 +1253,10 @@ fn thread_start_params_from_config(
         sandbox: sandbox.flatten(),
         permissions,
         config: thread_config_overrides_from_config(config),
-        ephemeral: Some(config.ephemeral),
-        history_mode: (!config.ephemeral).then_some(ThreadHistoryMode::Paginated),
+        ephemeral: Some(ephemeral),
+        history_mode: (!ephemeral).then_some(ThreadHistoryMode::Paginated),
         thread_source: Some(thread_source.clone()),
+        thread_class: transient.then_some(ThreadClass::TransientJob),
         ..ThreadStartParams::default()
     }
 }
@@ -1614,6 +1673,9 @@ async fn resolve_resume_thread_id(
                         cwd: None,
                         use_state_db_only,
                         search_term: None,
+                        thread_classes: Some(resume_thread_classes()),
+                        root_thread_id: None,
+                        terminal_outcomes: None,
                     },
                 },
                 "thread/list",
@@ -1699,6 +1761,9 @@ async fn resolve_resume_thread_id(
                     cwd: None,
                     use_state_db_only: false,
                     search_term: Some(session_id.to_string()),
+                    thread_classes: None,
+                    root_thread_id: None,
+                    terminal_outcomes: None,
                 },
             },
             "thread/list",
@@ -1730,6 +1795,15 @@ fn resume_lookup_model_providers(
     } else {
         None
     }
+}
+
+fn resume_thread_classes() -> Vec<ThreadClass> {
+    vec![
+        ThreadClass::Interactive,
+        ThreadClass::SubAgent,
+        ThreadClass::Internal,
+        ThreadClass::LegacyExec,
+    ]
 }
 
 fn canceled_mcp_server_elicitation_response() -> Result<Value, String> {

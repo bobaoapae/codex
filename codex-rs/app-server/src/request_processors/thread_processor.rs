@@ -2,11 +2,16 @@ use super::persisted_resume_settings::PersistedResumeSettings;
 use super::persisted_resume_settings::latest_persisted_resume_settings;
 use super::thread_enrichment::enrich_loaded_threads;
 use super::thread_fork_goal::inherit_thread_goal_snapshot;
+use super::thread_goal_processor::ResolvedApprovedPlan;
+use super::thread_goal_processor::resolve_approved_plan;
 use super::thread_input::can_accept_direct_input;
 use super::thread_input::ensure_direct_input_allowed;
 use super::*;
 use crate::error_code::method_not_found;
+use codex_app_server_protocol::IndexState;
 use codex_app_server_protocol::SelectedCapabilityRoot;
+use codex_app_server_protocol::TerminalOutcome;
+use codex_app_server_protocol::ThreadClass;
 use codex_app_server_protocol::ThreadHistoryMode as ApiThreadHistoryMode;
 use codex_app_server_protocol::ThreadRevertParams;
 use codex_app_server_protocol::ThreadRevertResponse;
@@ -22,7 +27,21 @@ use codex_protocol::config_types::MultiAgentMode;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_state::WorkflowRunCreate;
+use codex_state::WorkflowStore;
+use codex_state::WorkflowThreadClass;
 use codex_thread_store::PersistContext;
+use codex_thread_store::StoredThreadSearchResult;
+
+#[path = "thread_search_index.rs"]
+mod thread_search_index;
+use thread_search_index::IndexStatus;
+use thread_search_index::ThreadFilterOptions;
+use thread_search_index::ThreadSearchQuery;
+use thread_search_index::classify_threads;
+use thread_search_index::index_status;
+use thread_search_index::search_index;
+use thread_search_index::thread_matches_filters;
 
 pub(super) const THREAD_LIST_DEFAULT_LIMIT: usize = 25;
 pub(super) const THREAD_LIST_MAX_LIMIT: usize = 100;
@@ -61,6 +80,100 @@ async fn stage_pending_project_metadata(
     Ok(Some(thread_id))
 }
 
+async fn stage_pending_project_metadata_for_thread(
+    thread_store: &dyn ThreadStore,
+    thread_id: ThreadId,
+    project_id: &str,
+    operation: &'static str,
+) -> Result<(), JSONRPCErrorError> {
+    thread_store
+        .stage_pending_thread_metadata(
+            thread_id,
+            StoreThreadMetadataPatch {
+                project_id: Some(Some(project_id.to_string())),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|error| match error {
+            ThreadStoreError::Unsupported { .. } => {
+                method_not_found(format!("{operation} is unavailable without sqlite state"))
+            }
+            ThreadStoreError::InvalidRequest { message } => invalid_request(message),
+            error => internal_error(format!("failed to stage {operation} metadata: {error}")),
+        })
+}
+
+async fn prepare_transient_workflow_run(
+    workflow: &WorkflowStore,
+    thread_id: ThreadId,
+    provider: Option<String>,
+    model: Option<String>,
+    cwd: Option<String>,
+) -> Result<(), JSONRPCErrorError> {
+    let run_id = thread_id.to_string();
+    if let Some(run) = workflow
+        .get_run(&run_id)
+        .await
+        .map_err(|error| internal_error(format!("failed to read transient job state: {error}")))?
+    {
+        if run.thread_class != WorkflowThreadClass::TransientJob || run.thread_id != run_id {
+            return Err(invalid_request(format!(
+                "thread {thread_id} is already associated with a non-transient workflow run"
+            )));
+        }
+        return Ok(());
+    }
+
+    workflow
+        .create_run(&WorkflowRunCreate {
+            run_id: run_id.clone(),
+            thread_id: run_id,
+            root_thread_id: None,
+            parent_run_id: None,
+            thread_class: WorkflowThreadClass::TransientJob,
+            status: "pending".to_string(),
+            idempotency_key: None,
+            provider,
+            model,
+            cwd,
+            metadata: Some(serde_json::json!({
+                "source": "thread/start",
+                "threadClass": "transientJob",
+            })),
+        })
+        .await
+        .map(|_| ())
+        .map_err(|error| internal_error(format!("failed to persist transient job state: {error}")))
+}
+
+async fn terminalize_transient_workflow_run(
+    workflow: &WorkflowStore,
+    thread_id: ThreadId,
+    status: &str,
+) {
+    let run_id = thread_id.to_string();
+    let Ok(Some(run)) = workflow.get_run(&run_id).await else {
+        return;
+    };
+    if matches!(
+        run.status.as_str(),
+        "succeeded" | "failed" | "blocked" | "inconclusive" | "cancelled" | "aborted"
+    ) {
+        return;
+    }
+    if let Err(error) = workflow
+        .transition_run_cas(&run.run_id, run.version, &run.status, status, Some(status))
+        .await
+    {
+        warn!(
+            thread_id = %thread_id,
+            target_status = status,
+            "failed to terminalize transient job startup: {error}"
+        );
+    }
+}
+
 async fn remove_pending_project_metadata(
     thread_store: &dyn ThreadStore,
     thread_id: Option<ThreadId>,
@@ -83,6 +196,9 @@ struct ThreadListFilters {
     search_term: Option<String>,
     use_state_db_only: bool,
     relation_filter: Option<StoreThreadRelationFilter>,
+    thread_classes: Option<Vec<ThreadClass>>,
+    root_thread_id: Option<String>,
+    terminal_outcomes: Option<Vec<TerminalOutcome>>,
 }
 
 struct ThreadRevertRuntimeSnapshot {
@@ -448,6 +564,11 @@ pub(crate) struct ThreadRequestProcessor {
     pub(super) initial_config_warnings: Arc<Vec<ConfigWarningNotification>>,
 }
 
+enum ThreadStartMode {
+    Client,
+    Job { reserved_thread_id: ThreadId },
+}
+
 /// Outcome of trying to satisfy a resume request from an already loaded thread.
 enum RunningThreadResumeResult {
     /// The request was delegated to the loaded thread.
@@ -521,6 +642,33 @@ impl ThreadRequestProcessor {
         )
         .await
         .map(|()| None)
+    }
+
+    /// Start a durable thread for a workflow-owned job without emitting a
+    /// second JSON-RPC response. The caller owns the reserved identity and
+    /// receives the live thread handle so it can submit the first turn.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn start_thread_for_job(
+        &self,
+        request_id: ConnectionRequestId,
+        params: ThreadStartParams,
+        app_server_client_name: Option<String>,
+        app_server_client_version: Option<String>,
+        client_mcp_extensions: ClientMcpExtensions,
+        request_context: RequestContext,
+        reserved_thread_id: ThreadId,
+    ) -> Result<Arc<CodexThread>, JSONRPCErrorError> {
+        self.thread_start_inner_with_mode(
+            request_id,
+            params,
+            app_server_client_name,
+            app_server_client_version,
+            client_mcp_extensions,
+            request_context,
+            ThreadStartMode::Job { reserved_thread_id },
+        )
+        .await?
+        .ok_or_else(|| internal_error("job thread startup did not return a thread"))
     }
 
     pub(crate) async fn thread_unsubscribe(
@@ -1113,9 +1261,34 @@ impl ThreadRequestProcessor {
         client_mcp_extensions: ClientMcpExtensions,
         request_context: RequestContext,
     ) -> Result<(), JSONRPCErrorError> {
+        self.thread_start_inner_with_mode(
+            request_id,
+            params,
+            app_server_client_name,
+            app_server_client_version,
+            client_mcp_extensions,
+            request_context,
+            ThreadStartMode::Client,
+        )
+        .await?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn thread_start_inner_with_mode(
+        &self,
+        request_id: ConnectionRequestId,
+        params: ThreadStartParams,
+        app_server_client_name: Option<String>,
+        app_server_client_version: Option<String>,
+        client_mcp_extensions: ClientMcpExtensions,
+        request_context: RequestContext,
+        mode: ThreadStartMode,
+    ) -> Result<Option<Arc<CodexThread>>, JSONRPCErrorError> {
         let ThreadStartParams {
             model,
             model_provider,
+            approved_plan,
             allow_provider_model_fallback,
             service_tier,
             cwd,
@@ -1138,9 +1311,28 @@ impl ThreadRequestProcessor {
             history_mode,
             session_start_source,
             thread_source,
+            thread_class,
             project_id,
             environments,
         } = params;
+        let approved_plan = match approved_plan {
+            Some(reference) => {
+                self.thread_goal_processor.ensure_approved_plan_support()?;
+                Some(resolve_approved_plan(&self.config, &reference).await?)
+            }
+            None => None,
+        };
+        let is_transient_job = matches!(thread_class, Some(ThreadClass::TransientJob));
+        if is_transient_job && ephemeral == Some(true) {
+            return Err(invalid_request(
+                "transient jobs cannot use ephemeral thread persistence",
+            ));
+        }
+        if is_transient_job && self.state_db.is_none() {
+            return Err(method_not_found(
+                "transient jobs require sqlite state persistence",
+            ));
+        }
         if matches!(
             history_mode,
             Some(codex_app_server_protocol::ThreadHistoryMode::Paginated)
@@ -1176,6 +1368,13 @@ impl ThreadRequestProcessor {
         let runtime_workspace_roots = runtime_workspace_roots.map(resolve_runtime_workspace_roots);
         let environments =
             resolve_turn_environment_selections(self.thread_manager.as_ref(), environments)?;
+        let workflow_provider = model_provider
+            .clone()
+            .or_else(|| Some(self.config.model_provider_id.clone()));
+        let workflow_model = model.clone().or_else(|| self.config.model.clone());
+        let workflow_cwd = cwd
+            .clone()
+            .or_else(|| Some(self.config.cwd.to_string_lossy().into_owned()));
         let mut typesafe_overrides = self.build_thread_config_overrides(
             model,
             model_provider,
@@ -1190,7 +1389,11 @@ impl ThreadRequestProcessor {
             developer_instructions,
             personality,
         );
-        typesafe_overrides.ephemeral = ephemeral;
+        typesafe_overrides.ephemeral = if is_transient_job {
+            Some(false)
+        } else {
+            ephemeral
+        };
         let listener_task_context = ListenerTaskContext {
             thread_manager: Arc::clone(&self.thread_manager),
             thread_state_manager: self.thread_state_manager.clone(),
@@ -1209,11 +1412,44 @@ impl ThreadRequestProcessor {
         let initial_config_warnings = Arc::clone(&self.initial_config_warnings);
         let outgoing = Arc::clone(&listener_task_context.outgoing);
         let error_request_id = request_id.clone();
+        let reserved_thread_id = match &mode {
+            ThreadStartMode::Client => None,
+            ThreadStartMode::Job { reserved_thread_id } => Some(*reserved_thread_id),
+        };
+        let reserved_thread_id = if is_transient_job && reserved_thread_id.is_none() {
+            Some(self.thread_manager.reserve_thread_id())
+        } else {
+            reserved_thread_id
+        };
+        let transient_workflow = if is_transient_job {
+            let workflow = self
+                .state_db
+                .as_ref()
+                .map(|state_db| state_db.workflow_store().clone())
+                .ok_or_else(|| method_not_found("transient jobs require sqlite state"))?;
+            let thread_id = reserved_thread_id
+                .ok_or_else(|| internal_error("transient job thread id was not reserved"))?;
+            prepare_transient_workflow_run(
+                &workflow,
+                thread_id,
+                workflow_provider,
+                workflow_model,
+                workflow_cwd,
+            )
+            .await?;
+            Some(workflow)
+        } else {
+            None
+        };
+        let transient_thread_id = reserved_thread_id;
+        let send_response = matches!(mode, ThreadStartMode::Client);
+        let thread_goal_processor = self.thread_goal_processor.clone();
         let thread_start_task = async move {
-            if let Err(error) = Self::thread_start_task(
+            let result = Self::thread_start_task(
                 listener_task_context,
                 thread_store,
                 config_manager,
+                thread_goal_processor,
                 request_id,
                 app_server_client_name,
                 app_server_client_version,
@@ -1230,17 +1466,37 @@ impl ThreadRequestProcessor {
                 service_name,
                 allow_provider_model_fallback,
                 experimental_raw_events,
+                approved_plan,
                 request_trace,
                 initial_config_warnings,
+                reserved_thread_id,
+                send_response,
             )
-            .await
+            .await;
+            if result.is_err()
+                && let (Some(workflow), Some(thread_id)) =
+                    (transient_workflow.as_ref(), transient_thread_id)
             {
-                outgoing.send_error(error_request_id, error).await;
+                terminalize_transient_workflow_run(workflow, thread_id, "failed").await;
             }
+            result
         };
-        self.background_tasks
-            .spawn(thread_start_task.instrument(request_context.span()));
-        Ok(())
+        if send_response {
+            self.background_tasks.spawn(
+                async move {
+                    if let Err(error) = thread_start_task.await {
+                        outgoing.send_error(error_request_id, error).await;
+                    }
+                }
+                .instrument(request_context.span()),
+            );
+            Ok(None)
+        } else {
+            thread_start_task
+                .instrument(request_context.span())
+                .await
+                .map(Some)
+        }
     }
 
     pub(crate) async fn drain_background_tasks(&self) {
@@ -1293,6 +1549,7 @@ impl ThreadRequestProcessor {
         listener_task_context: ListenerTaskContext,
         thread_store: Arc<dyn ThreadStore>,
         config_manager: ConfigManager,
+        thread_goal_processor: ThreadGoalRequestProcessor,
         request_id: ConnectionRequestId,
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
@@ -1309,15 +1566,28 @@ impl ThreadRequestProcessor {
         service_name: Option<String>,
         allow_provider_model_fallback: bool,
         experimental_raw_events: bool,
+        approved_plan: Option<ResolvedApprovedPlan>,
         request_trace: Option<W3cTraceContext>,
         initial_config_warnings: Arc<Vec<ConfigWarningNotification>>,
-    ) -> Result<(), JSONRPCErrorError> {
+        reserved_thread_id: Option<ThreadId>,
+        send_response: bool,
+    ) -> Result<Arc<CodexThread>, JSONRPCErrorError> {
         let thread_start_started_at = std::time::Instant::now();
         let requested_cwd = typesafe_overrides.cwd.clone();
         let mut config = config_manager
             .load_with_overrides(config_overrides.clone(), typesafe_overrides.clone())
             .await
             .map_err(|err| config_load_error(&err))?;
+        if approved_plan.is_some() && !config.features.enabled(Feature::Goals) {
+            return Err(invalid_request(
+                "approved plans require the goals feature in the effective thread configuration",
+            ));
+        }
+        if approved_plan.is_some() && config.ephemeral {
+            return Err(invalid_request(
+                "approved plans require a durable thread with sqlite state",
+            ));
+        }
         // Project-local config can launch host processes, so only the effective
         // permissions after managed constraints can imply project trust.
         let effective_permission_profile = config.permissions.effective_permission_profile();
@@ -1427,6 +1697,17 @@ impl ThreadRequestProcessor {
         let mut start_options = StartThreadOptions::new(config);
         let reserved_thread_id = if start_options.config.ephemeral {
             None
+        } else if let Some(reserved_thread_id) = reserved_thread_id {
+            if let Some(project_id) = project_id.as_deref() {
+                stage_pending_project_metadata_for_thread(
+                    thread_store.as_ref(),
+                    reserved_thread_id,
+                    project_id,
+                    "thread/start",
+                )
+                .await?;
+            }
+            Some(reserved_thread_id)
         } else {
             stage_pending_project_metadata(
                 listener_task_context.thread_manager.as_ref(),
@@ -1504,14 +1785,14 @@ impl ThreadRequestProcessor {
                 otel.name = "app_server.thread_start.config_snapshot",
             ))
             .await;
-        let mut thread = build_thread_from_snapshot(
+        let mut api_thread = build_thread_from_snapshot(
             thread_id,
             session_configured.session_id.to_string(),
             thread.multi_agent_version(),
             &config_snapshot,
             session_configured.rollout_path.clone(),
         );
-        thread.project_id = project_id.clone();
+        api_thread.project_id = project_id.clone();
 
         // Auto-attach a thread listener when starting a thread.
         log_listener_attach_result(
@@ -1534,17 +1815,17 @@ impl ThreadRequestProcessor {
 
         listener_task_context
             .thread_watch_manager
-            .upsert_thread_silently(&thread.id)
+            .upsert_thread_silently(&api_thread.id)
             .instrument(tracing::info_span!(
                 "app_server.thread_start.upsert_thread",
                 otel.name = "app_server.thread_start.upsert_thread",
             ))
             .await;
 
-        thread.status = resolve_thread_status(
+        api_thread.status = resolve_thread_status(
             listener_task_context
                 .thread_watch_manager
-                .loaded_status_for_thread(&thread.id)
+                .loaded_status_for_thread(&api_thread.id)
                 .instrument(tracing::info_span!(
                     "app_server.thread_start.resolve_status",
                     otel.name = "app_server.thread_start.resolve_status",
@@ -1553,6 +1834,62 @@ impl ThreadRequestProcessor {
             /*has_in_progress_turn*/ false,
         );
 
+        if let Some(plan) = approved_plan.as_ref() {
+            let claim = thread_goal_processor
+                .claim_approved_plan_goal(thread_id, plan)
+                .await?;
+            if let Err(error) = thread
+                .inject_approved_plan(plan.id.clone(), plan.revision, plan.body.clone())
+                .await
+            {
+                let error = match error.details() {
+                    CodexErrorDetails::InvalidRequest(message) => invalid_request(message.clone()),
+                    _ => internal_error(format!(
+                        "failed to load approved plan into thread {thread_id}: {error}"
+                    )),
+                };
+                if let Err(rollback_error) = thread_goal_processor
+                    .rollback_approved_plan_goal(&claim)
+                    .await
+                {
+                    warn!(
+                        "failed to roll back approved plan goal after injection failure for {thread_id}: {}",
+                        rollback_error.message
+                    );
+                }
+                return Err(error);
+            }
+            if let Err(error) = thread.flush_rollout().await {
+                if let Err(rollback_error) = thread_goal_processor
+                    .rollback_approved_plan_goal(&claim)
+                    .await
+                {
+                    warn!(
+                        "failed to roll back approved plan goal after flush failure for {thread_id}: {}",
+                        rollback_error.message
+                    );
+                }
+                return Err(internal_error(format!(
+                    "failed to flush approved plan into thread {thread_id}: {error}"
+                )));
+            }
+            if let Err(error) = thread_goal_processor
+                .commit_approved_plan_goal(thread.as_ref(), &claim)
+                .await
+            {
+                if let Err(rollback_error) = thread_goal_processor
+                    .rollback_approved_plan_goal(&claim)
+                    .await
+                {
+                    warn!(
+                        "failed to roll back approved plan goal after persistence failure for {thread_id}: {}",
+                        rollback_error.message
+                    );
+                }
+                return Err(error);
+            }
+        }
+
         let sandbox = config_snapshot.sandbox_policy().into();
         let cwd = config_snapshot.cwd().clone();
         let active_permission_profile =
@@ -1560,7 +1897,7 @@ impl ThreadRequestProcessor {
         let thread_originator = config_snapshot.originator.clone();
 
         let response = ThreadStartResponse {
-            thread: thread.clone(),
+            thread: api_thread.clone(),
             model: config_snapshot.model,
             model_provider: config_snapshot.model_provider_id,
             service_tier: config_snapshot.service_tier,
@@ -1574,30 +1911,32 @@ impl ThreadRequestProcessor {
             reasoning_effort: config_snapshot.reasoning_effort,
             multi_agent_mode: MultiAgentMode::ExplicitRequestOnly,
         };
-        let notif = thread_started_notification(thread);
-        listener_task_context
-            .outgoing
-            .send_response_with_thread_originator(request_id, response, thread_originator)
-            .instrument(tracing::info_span!(
-                "app_server.thread_start.send_response",
-                otel.name = "app_server.thread_start.send_response",
-            ))
-            .await;
+        if send_response {
+            let notif = thread_started_notification(api_thread);
+            listener_task_context
+                .outgoing
+                .send_response_with_thread_originator(request_id, response, thread_originator)
+                .instrument(tracing::info_span!(
+                    "app_server.thread_start.send_response",
+                    otel.name = "app_server.thread_start.send_response",
+                ))
+                .await;
 
-        listener_task_context
-            .outgoing
-            .send_server_notification(ServerNotification::ThreadStarted(notif))
-            .instrument(tracing::info_span!(
-                "app_server.thread_start.notify_started",
-                otel.name = "app_server.thread_start.notify_started",
-            ))
-            .await;
+            listener_task_context
+                .outgoing
+                .send_server_notification(ServerNotification::ThreadStarted(notif))
+                .instrument(tracing::info_span!(
+                    "app_server.thread_start.notify_started",
+                    otel.name = "app_server.thread_start.notify_started",
+                ))
+                .await;
+        }
         session_telemetry.record_startup_phase(
             "thread_start_total",
             thread_start_started_at.elapsed(),
             Some("ready"),
         );
-        Ok(())
+        Ok(thread)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2513,6 +2852,9 @@ impl ThreadRequestProcessor {
             search_term,
             parent_thread_id,
             ancestor_thread_id,
+            thread_classes,
+            root_thread_id,
+            terminal_outcomes,
         } = params;
         if project_id.is_some() && !self.thread_store.supports_projects() {
             return Err(unsupported_thread_store_operation("projects"));
@@ -2584,6 +2926,9 @@ impl ThreadRequestProcessor {
                     search_term,
                     use_state_db_only,
                     relation_filter,
+                    thread_classes,
+                    root_thread_id,
+                    terminal_outcomes,
                 },
             )
             .await?;
@@ -2609,10 +2954,14 @@ impl ThreadRequestProcessor {
             |thread| thread,
         )
         .await;
+        let index_status =
+            index_status(self.state_db.as_ref().map(|state_db| state_db.workflow())).await;
         Ok(ThreadListResponse {
             data,
             next_cursor,
             backwards_cursor,
+            index_state: index_status.state,
+            partial: index_status.partial,
         })
     }
 
@@ -2625,9 +2974,16 @@ impl ThreadRequestProcessor {
             limit,
             sort_key,
             sort_direction,
+            model_providers,
+            cwd,
+            project_id,
+            root_thread_id,
+            ancestor_thread_id,
             source_kinds,
             archived,
             search_term,
+            thread_classes,
+            terminal_outcomes,
         } = params;
         let search_term = search_term.trim().to_string();
         let search_term = (!search_term.is_empty())
@@ -2643,64 +2999,62 @@ impl ThreadRequestProcessor {
             ThreadSearchSortKey::RecencyAt => StoreThreadSortKey::RecencyAt,
         };
         let store_sort_direction = sort_direction.unwrap_or(SortDirection::Desc);
-        let (allowed_sources, source_kind_filter) = compute_source_filters(source_kinds);
-        let mut cursor_obj = cursor;
-        let mut last_cursor = cursor_obj.clone();
-        let mut remaining = requested_page_size;
-        let mut search_results = Vec::with_capacity(requested_page_size);
-        let mut next_cursor = None;
-
-        while remaining > 0 {
-            let page = self
-                .thread_store
-                .search_threads(StoreSearchThreadsParams {
-                    page_size: remaining.min(THREAD_LIST_MAX_LIMIT),
-                    cursor: cursor_obj.clone(),
-                    sort_key: store_sort_key,
-                    sort_direction: match store_sort_direction {
-                        SortDirection::Asc => StoreSortDirection::Asc,
-                        SortDirection::Desc => StoreSortDirection::Desc,
-                    },
-                    allowed_sources: allowed_sources.clone(),
-                    archived: archived.unwrap_or(false),
-                    search_term: search_term.clone(),
-                })
+        let cwd_filters = normalize_thread_list_cwd_filters(cwd)?;
+        let archived = archived.unwrap_or(false);
+        let query = ThreadSearchQuery {
+            search_term: search_term.clone(),
+            sort_key: sort_key.unwrap_or(ThreadSearchSortKey::CreatedAt),
+            sort_direction: store_sort_direction,
+            model_providers,
+            cwd_filters,
+            project_id,
+            root_thread_id,
+            ancestor_thread_id,
+            source_kinds,
+            archived,
+            thread_classes,
+            terminal_outcomes,
+        };
+        let mut index_status =
+            index_status(self.state_db.as_ref().map(|state_db| state_db.workflow())).await;
+        let mut partial = index_status.partial;
+        let (search_results, next_cursor) = if matches!(index_status.state, IndexState::Ready) {
+            if let Some(state_db) = self.state_db.as_ref() {
+                match search_index(
+                    state_db.workflow(),
+                    self.thread_store.as_ref(),
+                    query.clone(),
+                    requested_page_size,
+                    cursor.clone(),
+                )
                 .await
-                .map_err(thread_store_list_error)?;
-
-            for result in page.items {
-                let source = with_thread_spawn_agent_metadata(
-                    result.thread.source.clone(),
-                    result.thread.agent_nickname.clone(),
-                    result.thread.agent_role.clone(),
-                );
-                if source_kind_filter
-                    .as_ref()
-                    .is_none_or(|filter| source_kind_matches(&source, filter))
                 {
-                    search_results.push(result);
-                    if search_results.len() >= requested_page_size {
-                        break;
+                    Ok(page) => {
+                        partial |= page.partial;
+                        (page.items, page.next_cursor)
+                    }
+                    Err(thread_search_index::ThreadIndexError::InvalidCursor(message)) => {
+                        return Err(invalid_request(message));
+                    }
+                    Err(thread_search_index::ThreadIndexError::Backend(error)) => {
+                        warn!(error = %error, "thread/search FTS index failed; using bounded fallback");
+                        index_status = IndexStatus {
+                            state: IndexState::Recoverable,
+                            partial: true,
+                        };
+                        partial = true;
+                        self.fallback_thread_search(&query, requested_page_size, cursor.clone())
+                            .await?
                     }
                 }
+            } else {
+                self.fallback_thread_search(&query, requested_page_size, cursor.clone())
+                    .await?
             }
-
-            remaining = requested_page_size.saturating_sub(search_results.len());
-            next_cursor = page.next_cursor;
-            if remaining == 0 {
-                break;
-            }
-
-            let Some(cursor_val) = next_cursor.clone() else {
-                break;
-            };
-            if last_cursor.as_ref() == Some(&cursor_val) {
-                next_cursor = None;
-                break;
-            }
-            last_cursor = Some(cursor_val.clone());
-            cursor_obj = Some(cursor_val);
-        }
+        } else {
+            self.fallback_thread_search(&query, requested_page_size, cursor.clone())
+                .await?
+        };
 
         let backwards_cursor = search_results.first().and_then(|result| {
             thread_backwards_cursor_for_sort_key(
@@ -2735,7 +3089,136 @@ impl ThreadRequestProcessor {
             data,
             next_cursor,
             backwards_cursor,
+            index_state: index_status.state,
+            partial,
         })
+    }
+
+    async fn fallback_thread_search(
+        &self,
+        query: &ThreadSearchQuery,
+        requested_page_size: usize,
+        cursor: Option<String>,
+    ) -> Result<(Vec<StoredThreadSearchResult>, Option<String>), JSONRPCErrorError> {
+        let (allowed_sources, source_kind_filter) =
+            if query.thread_classes.is_some() && query.source_kinds.is_none() {
+                (Vec::new(), None)
+            } else {
+                compute_source_filters(query.source_kinds.clone())
+            };
+        let relation_ids =
+            thread_search_index::relation_ids_for_query(self.thread_store.as_ref(), query)
+                .await
+                .map_err(|error| {
+                    invalid_request(format!("invalid thread relation filter: {error}"))
+                })?;
+        let mut cursor_obj = thread_search_index::decode_fallback_cursor(cursor.as_deref(), query)
+            .map_err(|error| match error {
+                thread_search_index::ThreadIndexError::InvalidCursor(message) => {
+                    invalid_request(message)
+                }
+                thread_search_index::ThreadIndexError::Backend(error) => {
+                    internal_error(format!("failed to decode fallback search cursor: {error}"))
+                }
+            })?;
+        let mut last_cursor = cursor_obj.clone();
+        let mut remaining = requested_page_size;
+        let mut search_results = Vec::with_capacity(requested_page_size);
+        let mut next_cursor = None;
+
+        while remaining > 0 {
+            let page = self
+                .thread_store
+                .search_threads(StoreSearchThreadsParams {
+                    page_size: remaining.min(THREAD_LIST_MAX_LIMIT),
+                    cursor: cursor_obj.clone(),
+                    sort_key: match query.sort_key {
+                        ThreadSearchSortKey::CreatedAt => StoreThreadSortKey::CreatedAt,
+                        ThreadSearchSortKey::UpdatedAt => StoreThreadSortKey::UpdatedAt,
+                        ThreadSearchSortKey::RecencyAt => StoreThreadSortKey::RecencyAt,
+                    },
+                    sort_direction: match query.sort_direction {
+                        SortDirection::Asc => StoreSortDirection::Asc,
+                        SortDirection::Desc => StoreSortDirection::Desc,
+                    },
+                    allowed_sources: allowed_sources.clone(),
+                    archived: query.archived,
+                    search_term: query.search_term.clone(),
+                })
+                .await
+                .map_err(thread_store_list_error)?;
+            let page_threads = page
+                .items
+                .iter()
+                .map(|result| result.thread.clone())
+                .collect::<Vec<_>>();
+            let classifications = classify_threads(
+                self.state_db.as_ref().map(|state_db| state_db.workflow()),
+                &page_threads,
+            )
+            .await;
+
+            for result in page.items {
+                let source = with_thread_spawn_agent_metadata(
+                    result.thread.source.clone(),
+                    result.thread.agent_nickname.clone(),
+                    result.thread.agent_role.clone(),
+                );
+                let Some(classification) =
+                    classifications.get(&result.thread.thread_id.to_string())
+                else {
+                    continue;
+                };
+                if source_kind_filter
+                    .as_ref()
+                    .is_none_or(|filter| source_kind_matches(&source, filter))
+                    && thread_matches_filters(
+                        &result.thread,
+                        classification,
+                        ThreadFilterOptions {
+                            model_providers: query.model_providers.as_deref(),
+                            cwd_filters: query.cwd_filters.as_deref(),
+                            archived: Some(query.archived),
+                            project_id: query.project_id.as_ref(),
+                            root_thread_id: query.root_thread_id.as_deref(),
+                            source_kinds: None,
+                            thread_classes: query.thread_classes.as_deref(),
+                            terminal_outcomes: query.terminal_outcomes.as_deref(),
+                            relation_ids: relation_ids.as_ref(),
+                        },
+                    )
+                {
+                    search_results.push(result);
+                    if search_results.len() >= requested_page_size {
+                        break;
+                    }
+                }
+            }
+
+            remaining = requested_page_size.saturating_sub(search_results.len());
+            next_cursor = page
+                .next_cursor
+                .map(|cursor| thread_search_index::encode_fallback_cursor(cursor, query));
+            if remaining == 0 {
+                break;
+            }
+            let Some(cursor_val) = next_cursor
+                .as_deref()
+                .and_then(|encoded| {
+                    thread_search_index::decode_fallback_cursor(Some(encoded), query).ok()
+                })
+                .flatten()
+            else {
+                break;
+            };
+            if last_cursor.as_ref() == Some(&cursor_val) {
+                next_cursor = None;
+                break;
+            }
+            last_cursor = Some(cursor_val.clone());
+            cursor_obj = Some(cursor_val);
+        }
+        Ok((search_results, next_cursor))
     }
 
     async fn thread_loaded_list_response_inner(
@@ -5265,6 +5748,9 @@ impl ThreadRequestProcessor {
             search_term,
             use_state_db_only,
             relation_filter,
+            thread_classes,
+            root_thread_id,
+            terminal_outcomes,
         } = filters;
         let mut cursor_obj = cursor;
         let mut last_cursor = cursor_obj.clone();
@@ -5280,11 +5766,17 @@ impl ThreadRequestProcessor {
                     Some(providers)
                 }
             }
-            None if relation_filter.is_some() => None,
+            None if relation_filter.is_some()
+                || thread_classes.is_some()
+                || root_thread_id.is_some()
+                || terminal_outcomes.is_some() =>
+            {
+                None
+            }
             None => Some(vec![self.config.model_provider_id.clone()]),
         };
         let (allowed_sources_vec, source_kind_filter) =
-            if relation_filter.is_some() && source_kinds.is_none() {
+            if (relation_filter.is_some() || thread_classes.is_some()) && source_kinds.is_none() {
                 (Vec::new(), None)
             } else {
                 compute_source_filters(source_kinds)
@@ -5293,6 +5785,19 @@ impl ThreadRequestProcessor {
         let store_sort_direction = match sort_direction {
             SortDirection::Asc => StoreSortDirection::Asc,
             SortDirection::Desc => StoreSortDirection::Desc,
+        };
+        let root_relation_ids = if let Some(root_thread_id) = root_thread_id.as_deref() {
+            Some(
+                thread_search_index::relation_ids_for_root(
+                    self.thread_store.as_ref(),
+                    root_thread_id,
+                    archived,
+                )
+                .await
+                .map_err(|error| invalid_request(format!("invalid root thread filter: {error}")))?,
+            )
+        } else {
+            None
         };
 
         while remaining > 0 {
@@ -5317,6 +5822,11 @@ impl ThreadRequestProcessor {
                 .await
                 .map_err(thread_store_list_error)?;
 
+            let classifications = classify_threads(
+                self.state_db.as_ref().map(|state_db| state_db.workflow()),
+                &page.items,
+            )
+            .await;
             let mut filtered = Vec::with_capacity(page.items.len());
             for it in page.items {
                 let source = with_thread_spawn_agent_metadata(
@@ -5324,14 +5834,27 @@ impl ThreadRequestProcessor {
                     it.agent_nickname.clone(),
                     it.agent_role.clone(),
                 );
+                let Some(classification) = classifications.get(&it.thread_id.to_string()) else {
+                    continue;
+                };
                 if source_kind_filter
                     .as_ref()
                     .is_none_or(|filter| source_kind_matches(&source, filter))
-                    && cwd_filters.as_ref().is_none_or(|expected_cwds| {
-                        expected_cwds.iter().any(|expected_cwd| {
-                            path_utils::paths_match_after_normalization(&it.cwd, expected_cwd)
-                        })
-                    })
+                    && thread_matches_filters(
+                        &it,
+                        classification,
+                        ThreadFilterOptions {
+                            model_providers: model_provider_filter.as_deref(),
+                            cwd_filters: cwd_filters.as_deref(),
+                            archived: Some(archived),
+                            project_id: project_id.as_ref(),
+                            root_thread_id: root_thread_id.as_deref(),
+                            source_kinds: None,
+                            thread_classes: thread_classes.as_deref(),
+                            terminal_outcomes: terminal_outcomes.as_deref(),
+                            relation_ids: root_relation_ids.as_ref(),
+                        },
+                    )
                 {
                     filtered.push(it);
                     if filtered.len() >= remaining {

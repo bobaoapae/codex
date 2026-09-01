@@ -372,7 +372,19 @@ async fn worker_compresses_archived_fork_chain_only_with_shared_mode() -> anyhow
         let original_source = fs::read(&source_path)?;
         let original_child = fs::read(&child_path)?;
 
-        worker::run(home.path().to_path_buf(), mode).await?;
+        match mode {
+            RolloutCompressionMode::Standalone => {
+                worker::run(home.path().to_path_buf(), mode).await?
+            }
+            RolloutCompressionMode::IncludeShared => {
+                worker::run_with_capabilities(
+                    home.path().to_path_buf(),
+                    mode,
+                    RolloutCompressionCapabilities::all_readers(),
+                )
+                .await?
+            }
+        }
 
         for (path, original) in [
             (&source_path, original_source),
@@ -735,6 +747,157 @@ async fn find_thread_path_by_id_ignores_compression_temp_matches() -> anyhow::Re
     Ok(())
 }
 
+#[test]
+fn replacement_validation_rejects_a_different_valid_zstd_rollout() -> anyhow::Result<()> {
+    let home = TempDir::new()?;
+    let uuid = Uuid::from_u128(30);
+    let thread_id = ThreadId::from_string(&uuid.to_string())?;
+    let source_path = rollout_path(home.path(), "2025-01-03T12-00-00", uuid);
+    write_rollout(&source_path, thread_id, "source bytes")?;
+    let candidate_path = compressed_rollout_path(&source_path);
+    let candidate_plain = source_path.with_file_name("candidate.jsonl");
+    write_rollout(&candidate_plain, thread_id, "different bytes")?;
+    let input = File::open(&candidate_plain)?;
+    let output = File::create(&candidate_path)?;
+    let mut encoder = zstd::stream::write::Encoder::new(output, 3)?;
+    std::io::copy(&mut std::io::BufReader::new(input), &mut encoder)?;
+    encoder.finish()?;
+
+    let error = validate_rollout_replacement(&source_path, &candidate_path)
+        .expect_err("different valid zstd payload must be rejected");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("logical bytes differ"));
+    Ok(())
+}
+
+#[test]
+fn replacement_validation_reports_final_offset_and_metadata() -> anyhow::Result<()> {
+    let home = TempDir::new()?;
+    let uuid = Uuid::from_u128(31);
+    let thread_id = ThreadId::from_string(&uuid.to_string())?;
+    let source_path = rollout_path(home.path(), "2025-01-03T12-00-00", uuid);
+    write_rollout(&source_path, thread_id, "same logical bytes")?;
+    let candidate_path = compressed_rollout_path(&source_path);
+    compress_copy(&source_path, &candidate_path)?;
+
+    let summary = validate_rollout_replacement(&source_path, &candidate_path)?;
+    assert_eq!(summary.source_bytes, fs::metadata(&source_path)?.len());
+    assert_eq!(summary.source_bytes, summary.candidate_bytes);
+    assert_eq!(summary.session_id, thread_id);
+    assert_eq!(summary.first_ordinal, None);
+    assert_eq!(summary.last_ordinal, None);
+    assert_eq!(
+        summary.first_timestamp.as_deref(),
+        Some("2025-01-03T12:00:00Z")
+    );
+    assert_eq!(
+        summary.last_timestamp.as_deref(),
+        Some("2025-01-03T12:00:01Z")
+    );
+    assert_eq!(summary.line_count, 2);
+
+    let tampered_plain = source_path.with_file_name("tampered.jsonl");
+    let mut tampered = fs::read(&source_path)?;
+    tampered.extend_from_slice(b"{}\n");
+    fs::write(&tampered_plain, tampered)?;
+    let tampered_path = source_path.with_file_name("tampered.jsonl.zst");
+    compress_copy(&tampered_plain, &tampered_path)?;
+    let error = validate_rollout_replacement(&source_path, &tampered_path)
+        .expect_err("a trailing logical record must fail final offset validation");
+    assert!(error.to_string().contains("trailing records"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn interrupted_compression_journal_keeps_plain_source_as_winner() -> anyhow::Result<()> {
+    let home = TempDir::new()?;
+    let uuid = Uuid::from_u128(32);
+    let thread_id = ThreadId::from_string(&uuid.to_string())?;
+    let source_path = archived_rollout_path(home.path(), "2025-01-03T12-00-00", uuid);
+    write_rollout(&source_path, thread_id, "plain wins")?;
+    let compressed_path = compressed_rollout_path(&source_path);
+    compress_copy(&source_path, &compressed_path)?;
+    let summary = validate_rollout_replacement(&source_path, &compressed_path)?;
+    let journal_path = compression_journal::journal_path(&source_path);
+    compression_journal::write(&journal_path, &summary)?;
+
+    worker::run(
+        home.path().to_path_buf(),
+        RolloutCompressionMode::Standalone,
+    )
+    .await?;
+
+    assert!(source_path.exists());
+    assert!(!compressed_path.exists());
+    assert!(!journal_path.exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn interrupted_published_compression_journal_keeps_valid_zstd() -> anyhow::Result<()> {
+    let home = TempDir::new()?;
+    let uuid = Uuid::from_u128(33);
+    let thread_id = ThreadId::from_string(&uuid.to_string())?;
+    let source_path = archived_rollout_path(home.path(), "2025-01-03T12-00-00", uuid);
+    write_rollout(&source_path, thread_id, "compressed wins")?;
+    set_old_mtime(&source_path)?;
+    let compressed_path = compressed_rollout_path(&source_path);
+    compress_copy(&source_path, &compressed_path)?;
+    let summary = validate_rollout_replacement(&source_path, &compressed_path)?;
+    let journal_path = compression_journal::journal_path(&source_path);
+    compression_journal::write(&journal_path, &summary)?;
+    fs::remove_file(&source_path)?;
+
+    worker::run(
+        home.path().to_path_buf(),
+        RolloutCompressionMode::Standalone,
+    )
+    .await?;
+
+    assert!(!source_path.exists());
+    assert!(compressed_path.exists());
+    assert!(!journal_path.exists());
+    let mut restored = Vec::new();
+    crate::open_rollout_seekable_reader(&source_path)?.read_to_end(&mut restored)?;
+    assert!(!restored.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn fork_invariant_include_shared_fails_closed_without_reader_capabilities()
+-> anyhow::Result<()> {
+    let home = TempDir::new()?;
+    let thread_id = ThreadId::from_string(&Uuid::from_u128(34).to_string())?;
+    let source_uuid = Uuid::from_u128(35);
+    let source_id = ThreadId::from_string(&source_uuid.to_string())?;
+    let source_path = rollout_path(home.path(), "2025-01-03T12-00-00", source_uuid);
+    write_rollout(&source_path, thread_id, "shared source")?;
+    set_old_mtime(&source_path)?;
+    let child_path = archived_rollout_path(home.path(), "2025-01-03T12-00-01", Uuid::from_u128(36));
+    write_rollout(&child_path, thread_id, "shared child")?;
+    set_history_base(
+        &child_path,
+        HistoryPosition {
+            thread_id: source_id,
+            end_ordinal_exclusive: 2,
+            end_byte_offset: fs::metadata(&source_path)?.len(),
+        },
+    )?;
+    set_old_mtime(&child_path)?;
+
+    worker::run(
+        home.path().to_path_buf(),
+        RolloutCompressionMode::IncludeShared,
+    )
+    .await?;
+
+    assert!(source_path.exists());
+    assert!(child_path.exists());
+    assert!(!compressed_rollout_path(&source_path).exists());
+    assert!(!compressed_rollout_path(&child_path).exists());
+    Ok(())
+}
+
 fn rollout_path(home: &std::path::Path, ts: &str, uuid: Uuid) -> std::path::PathBuf {
     home.join("sessions/2025/01/03")
         .join(format!("rollout-{ts}-{uuid}.jsonl"))
@@ -774,6 +937,7 @@ fn write_rollout(path: &std::path::Path, thread_id: ThreadId, message: &str) -> 
             subagent_history_start_ordinal: None,
             multi_agent_version: None,
             context_window: None,
+            ..SessionMeta::default()
         },
         git: None,
     };
@@ -825,6 +989,15 @@ fn compress_now(path: &std::path::Path) -> anyhow::Result<()> {
     std::io::copy(&mut input, &mut encoder)?;
     encoder.finish()?;
     fs::remove_file(path)?;
+    Ok(())
+}
+
+fn compress_copy(source: &std::path::Path, destination: &std::path::Path) -> anyhow::Result<()> {
+    let input = fs::File::open(source)?;
+    let output = fs::File::create(destination)?;
+    let mut encoder = zstd::stream::write::Encoder::new(output, 3)?;
+    std::io::copy(&mut std::io::BufReader::new(input), &mut encoder)?;
+    encoder.finish()?;
     Ok(())
 }
 

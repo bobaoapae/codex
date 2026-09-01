@@ -4,9 +4,15 @@ use ts_rs::TS;
 
 use super::ExtensionItem;
 use super::image_generation::ImageGenerationItem;
+use super::receipt::MAX_TAGS;
+use super::receipt::ReceiptAttachedItem;
+use super::receipt::ReceiptReference;
+use super::receipt::ReceiptStatus;
+use super::receipt::is_forbidden_metadata_key;
 use super::sleep::SleepItem;
 use super::web_search::WebSearchAction;
 use super::web_search::WebSearchItem;
+use std::collections::BTreeMap;
 
 fn completed_image_generation_item() -> ExtensionItem {
     ExtensionItem::ImageGeneration(ImageGenerationItem {
@@ -197,4 +203,138 @@ fn malformed_known_extension_payload_is_rejected() {
     });
 
     assert!(serde_json::from_value::<ExtensionItem>(value).is_err());
+}
+
+fn receipt_item() -> ReceiptAttachedItem {
+    let mut item = ReceiptAttachedItem::new(
+        "receipt-1",
+        1,
+        "physical.smoke",
+        "Android cold start",
+        ReceiptStatus::Pass,
+        "2026-08-31T12:00:00Z",
+        "tester",
+    )
+    .expect("valid receipt");
+    item.thread_id = Some("thread-1".to_string());
+    item.turn_id = Some("turn-1".to_string());
+    item.job_id = Some("job-1".to_string());
+    item.plan_snapshot_id = Some("plan-1".to_string());
+    item.updated_at = Some("2026-08-31T12:00:01Z".to_string());
+    item.finished_at = Some("2026-08-31T12:00:02Z".to_string());
+    item.provenance = Some(json!({"runner": "device-lab", "future": {"version": 2}}));
+    item.tags = BTreeMap::from([
+        ("device".to_string(), "pixel-8".to_string()),
+        ("owner".to_string(), "qa".to_string()),
+    ]);
+    item.refs = vec![ReceiptReference {
+        kind: "artifact".to_string(),
+        id: "artifact-1".to_string(),
+    }];
+    item.metadata = Some(json!({"futureField": {"value": 7}}));
+    item.validate().expect("receipt remains valid");
+    item
+}
+
+#[test]
+fn receipt_attached_preserves_generic_fields_and_unknown_values() {
+    let item = ExtensionItem::ReceiptAttached(receipt_item());
+    assert_eq!(item.id(), "receipt-1");
+    let value = serde_json::to_value(&item).expect("serialize receipt item");
+    assert_eq!(value["kind"], "receipt.attached");
+    assert_eq!(value["receiptKind"], "physical.smoke");
+    assert_eq!(value["schemaVersion"], 1);
+    assert_eq!(value["metadata"]["futureField"]["value"], 7);
+    assert_eq!(
+        serde_json::from_value::<ExtensionItem>(value).expect("deserialize receipt item"),
+        item
+    );
+}
+
+#[test]
+fn receipt_attached_accepts_unknown_schema_version_and_kind() {
+    let mut value = serde_json::to_value(receipt_item()).expect("serialize receipt");
+    value
+        .as_object_mut()
+        .expect("receipt object")
+        .remove("receiptKind");
+    value["kind"] = json!("future.provider.result");
+    value["schemaVersion"] = json!(u64::MAX);
+    let decoded = serde_json::from_value::<ReceiptAttachedItem>(value).expect("future receipt");
+    assert_eq!(decoded.schema_version, u64::MAX);
+    assert_eq!(decoded.kind, "future.provider.result");
+}
+
+#[test]
+fn receipt_attached_rejects_unbounded_or_raw_metadata() {
+    let mut too_many_tags = receipt_item();
+    too_many_tags.tags = (0..=MAX_TAGS)
+        .map(|index| (format!("tag-{index}"), "value".to_string()))
+        .collect();
+    assert!(too_many_tags.validate().is_err());
+
+    let mut raw = receipt_item();
+    raw.metadata = Some(json!({"stdout": "must not be copied"}));
+    assert!(raw.validate().is_err());
+
+    let mut oversized = receipt_item();
+    oversized.metadata = Some(json!({"future": "x".repeat(65 * 1024)}));
+    assert!(oversized.validate().is_err());
+}
+
+#[test]
+fn forbidden_metadata_key_helper_covers_canonical_union() {
+    let forbidden = [
+        "stdout",
+        "stderr",
+        "aggregatedOutput",
+        "arguments",
+        "args",
+        "ciphertext",
+        "encryptedContent",
+        "payload",
+        "raw",
+        "rawPayload",
+        "toolInput",
+        "toolOutput",
+        "toolResponse",
+        "path",
+        "paths",
+        "cwd",
+        "workdir",
+        "command",
+        "argv",
+        "env",
+        "environment",
+        "output",
+        "rawOutput",
+    ];
+    for key in forbidden {
+        assert!(
+            is_forbidden_metadata_key(key),
+            "key should be forbidden: {key}"
+        );
+        let mut receipt = receipt_item();
+        receipt.metadata = Some(json!({key: "not persisted"}));
+        assert!(receipt.validate().is_err(), "key should be rejected: {key}");
+    }
+
+    for key in ["futureResult", "rawData", "pathology", "environmental"] {
+        assert!(
+            !is_forbidden_metadata_key(key),
+            "key should remain safe: {key}"
+        );
+        let mut receipt = receipt_item();
+        receipt.metadata = Some(json!({key: true}));
+        receipt
+            .validate()
+            .expect("unknown metadata key should be safe");
+    }
+
+    for key in ["AGGREGATED_OUTPUT", "tool-output", "work_dir", "ENV"] {
+        assert!(
+            is_forbidden_metadata_key(key),
+            "separator normalization: {key}"
+        );
+    }
 }

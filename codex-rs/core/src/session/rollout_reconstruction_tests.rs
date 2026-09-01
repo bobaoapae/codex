@@ -11,12 +11,17 @@ use codex_history::ResponseItemEnvelope;
 use codex_history::ResumedHistory;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
+use codex_protocol::error::HISTORY_RECOVERY_REQUIRED_ERROR_MESSAGE;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::CodexErrorInfo;
+use codex_protocol::protocol::ErrorEvent;
+use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::SessionContextWindow;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
+use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::WorldStateItem;
 use codex_protocol::security_risk::SecurityRiskScore;
 use core_test_support::responses::strip_metadata_from_items;
@@ -55,6 +60,39 @@ fn assistant_message(text: &str) -> ResponseItem {
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     }
+}
+
+#[tokio::test]
+async fn record_initial_history_marks_history_recovery_required_on_cold_resume() {
+    let (session, _turn_context) = make_session_and_context().await;
+    let rollout_items = vec![RolloutItem::EventMsg(EventMsg::TurnComplete(
+        TurnCompleteEvent {
+            turn_id: "poisoned-turn".to_string(),
+            last_agent_message: None,
+            error: Some(ErrorEvent {
+                message: HISTORY_RECOVERY_REQUIRED_ERROR_MESSAGE.to_string(),
+                codex_error_info: Some(CodexErrorInfo::Other),
+                misalignment: None,
+            }),
+            started_at: None,
+            completed_at: None,
+            duration_ms: None,
+            time_to_first_token_ms: None,
+        },
+    ))];
+
+    session
+        .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+            conversation_id: ThreadId::default(),
+            history: Arc::new(rollout_items),
+            rollout_path: Some(PathBuf::from("/tmp/poisoned-resume.jsonl")),
+        }))
+        .await;
+
+    assert_eq!(
+        session.history_recovery_reason().await,
+        Some(codex_protocol::error::HistoryRecoveryReason::UndecryptableEncryptedFunctionOutput)
+    );
 }
 
 fn annotated(items: Vec<ResponseItem>) -> Vec<ResponseItemEnvelope> {

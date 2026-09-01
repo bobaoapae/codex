@@ -77,9 +77,16 @@ pub(crate) fn spawn_search(
                         limit: Some(MAX_SEARCH_RESULTS),
                         sort_key: Some(ThreadSearchSortKey::RecencyAt),
                         sort_direction: Some(SortDirection::Desc),
+                        model_providers: Some(Vec::new()),
+                        cwd: None,
+                        project_id: None,
+                        root_thread_id: None,
+                        ancestor_thread_id: None,
                         source_kinds: Some(Vec::new()),
                         archived: Some(false),
                         search_term: query.trim().to_string(),
+                        thread_classes: None,
+                        terminal_outcomes: None,
                     },
                 })
             ),
@@ -104,6 +111,9 @@ pub(crate) fn spawn_search(
                         search_term: None,
                         parent_thread_id: None,
                         ancestor_thread_id: None,
+                        thread_classes: None,
+                        root_thread_id: None,
+                        terminal_outcomes: None,
                     },
                 })
             )

@@ -304,6 +304,9 @@ async fn thread_delete_with_non_local_thread_store_does_not_create_local_persist
                 search_term: None,
                 parent_thread_id: None,
                 ancestor_thread_id: None,
+                thread_classes: None,
+                root_thread_id: None,
+                terminal_outcomes: None,
             },
         })
         .await?
@@ -353,7 +356,7 @@ async fn thread_delete_with_non_local_thread_store_does_not_create_local_persist
     let calls = thread_store.calls().await;
     assert_eq!(calls.create_thread, 2);
     assert_eq!(calls.list_threads, 1);
-    assert_eq!(calls.delete_thread, 2);
+    assert_eq!(calls.tombstone_thread, 2);
     assert!(
         calls.append_items > 0,
         "turn/start should append rollout items through the injected store"

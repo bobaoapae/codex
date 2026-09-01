@@ -857,6 +857,7 @@ mod tests {
     use codex_utils_absolute_path::test_support::PathBufExt;
     use codex_utils_absolute_path::test_support::test_path_buf;
     use pretty_assertions::assert_eq;
+    use std::collections::HashMap;
 
     use super::ConfiguredHandler;
     use super::ConfiguredHandlerKind;
@@ -1024,6 +1025,74 @@ mod tests {
             }
         );
         assert!(entries[0].current_hash.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn mcp_tool_input_sensitive_values_change_trust_identity() {
+        let source_path = source_path();
+        let input = |header: &str, token: &str| {
+            serde_json::from_value(serde_json::json!({
+                "headers": {"Authorization": header},
+                "env": {"TOKEN": token},
+                "file_path": "${tool_input.file_path}",
+            }))
+            .expect("MCP hook input should be an object")
+        };
+
+        let discover = |input, hook_states: &std::collections::HashMap<String, HookStateToml>| {
+            let mut handlers = Vec::new();
+            let mut entries = Vec::new();
+            let mut warnings = Vec::new();
+            let mut display_order = 0;
+            append_matcher_groups(
+                &mut handlers,
+                &mut entries,
+                &mut warnings,
+                &mut display_order,
+                &mut unmanaged_hook_handler_source(&source_path, hook_states, false),
+                HookEventName::PostToolUse,
+                vec![MatcherGroup {
+                    matcher: Some("Write|Edit".to_string()),
+                    hooks: vec![HookHandlerConfig::McpTool {
+                        server: "security".to_string(),
+                        tool: "scan".to_string(),
+                        input,
+                        timeout_sec: Some(30),
+                        status_message: Some("Scanning file".to_string()),
+                    }],
+                }],
+            );
+            (handlers, entries, warnings)
+        };
+
+        let (_, trusted_entries, warnings) =
+            discover(input("first-header", "first-token"), &HashMap::new());
+        assert!(warnings.is_empty());
+        let trusted_hash = trusted_entries[0].current_hash.clone();
+        let state_key = crate::hook_key(
+            &source_path.display().to_string(),
+            HookEventName::PostToolUse,
+            0,
+            0,
+        );
+        let hook_states = HashMap::from([(
+            state_key,
+            HookStateToml {
+                enabled: Some(true),
+                trusted_hash: Some(trusted_hash.clone()),
+            },
+        )]);
+
+        for changed_input in [
+            input("changed-header", "first-token"),
+            input("first-header", "changed-token"),
+        ] {
+            let (handlers, entries, warnings) = discover(changed_input, &hook_states);
+            assert!(warnings.is_empty());
+            assert!(handlers.is_empty());
+            assert_ne!(entries[0].current_hash, trusted_hash);
+            assert_eq!(entries[0].trust_status, HookTrustStatus::Modified);
+        }
     }
 
     #[test]

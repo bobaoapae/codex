@@ -622,13 +622,13 @@ async fn steer_interrupts_wait_agent_and_is_sent_in_follow_up_request() {
         vec![INITIAL_PROMPT.to_string(), STEER_PROMPT.to_string()]
     );
     let wait_output = function_call_output_text(&second, WAIT_CALL_ID).expect("wait_agent output");
-    assert_eq!(
-        serde_json::from_str::<Value>(wait_output).expect("parse wait_agent output"),
-        json!({
-            "message": "Wait interrupted by new input.",
-            "timed_out": false,
-        })
-    );
+    let wait_output = serde_json::from_str::<Value>(wait_output).expect("parse wait_agent output");
+    assert_eq!(wait_output["message"], "Wait interrupted by new input.");
+    assert_eq!(wait_output["timed_out"], false);
+    assert_eq!(wait_output["reason"], "statusChanged");
+    assert_eq!(wait_output["targets"], json!([]));
+    assert_eq!(wait_output["agents"], json!([]));
+    assert!(wait_output["revision"].is_number());
 
     server.shutdown().await;
 }

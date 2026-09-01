@@ -77,12 +77,16 @@ pub static INTERACTIVE_SESSION_SOURCES: LazyLock<Vec<SessionSource>> = LazyLock:
 });
 
 pub use codex_protocol::protocol::SessionMeta;
+pub use compression::RolloutCompressionCapabilities;
 pub use compression::RolloutCompressionMode;
 pub use compression::RolloutLineReader;
+pub use compression::RolloutValidationSummary;
 pub use compression::existing_rollout_path;
 pub use compression::open_rollout_line_reader;
 pub use compression::plain_rollout_path;
 pub use compression::spawn_rollout_compression_worker;
+pub use compression::spawn_rollout_compression_worker_with_capabilities;
+pub use compression::validate_rollout_replacement;
 pub use seekable_reader::open_rollout_seekable_reader;
 pub use seekable_reader::rollout_contains_prefix;
 

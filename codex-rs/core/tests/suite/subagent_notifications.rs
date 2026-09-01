@@ -2272,8 +2272,12 @@ async fn multi_agent_v2_spawn_sends_agent_message_to_child(
         .expect("spawn send event");
     assert!(send.contains(&format!("sender_thread_id={root_thread_id}")));
     assert!(send.contains(&format!("receiver_thread_id={child_thread_id}")));
-    let logged_message = if plaintext { "[plaintext]" } else { message };
+    let logged_message = "[redacted]";
     assert!(send.contains(&format!("content=\"{logged_message}\"")));
+    assert!(
+        !send.contains(message),
+        "multi-agent message content must not be present in logs"
+    );
 
     let communication_id = log_field(send, "communication_id").expect("communication ID");
     logs.lines()

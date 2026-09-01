@@ -195,7 +195,7 @@ async fn handle_spawn_agent(
         .session_source
         .get_agent_path()
         .unwrap_or_else(AgentPath::root);
-    require_readable_message_form(&config, message_form, "spawn_agent")?;
+    require_readable_message_form(&config, message_form, &source, "spawn_agent")?;
     let communication = communication_from_tool_message(
         author,
         new_agent_path.clone(),

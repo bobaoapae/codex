@@ -52,6 +52,40 @@ fn map_api_error_preserves_retry_delay() {
 }
 
 #[test]
+fn map_api_error_classifies_only_the_exact_history_recovery_message() {
+    let error = map_api_error(ApiError::Stream(
+        ENCRYPTED_FUNCTION_OUTPUT_CONTENT_ERROR_MESSAGE.to_string(),
+    ));
+    assert_eq!(
+        error.history_recovery_reason(),
+        Some(HistoryRecoveryReason::UndecryptableEncryptedFunctionOutput)
+    );
+    assert!(!error.is_retryable());
+    assert_eq!(error.retry_delay(), None);
+
+    let near_miss = map_api_error(ApiError::Stream(format!(
+        "{ENCRYPTED_FUNCTION_OUTPUT_CONTENT_ERROR_MESSAGE} extra"
+    )));
+    assert_eq!(near_miss.history_recovery_reason(), None);
+    assert!(near_miss.is_retryable());
+}
+
+#[test]
+fn map_retryable_history_recovery_message_discards_retry_delay() {
+    let error = map_api_error(ApiError::Retryable {
+        message: ENCRYPTED_FUNCTION_OUTPUT_CONTENT_ERROR_MESSAGE.to_string(),
+        delay: Some(std::time::Duration::from_secs(17)),
+    });
+
+    assert_eq!(
+        error.history_recovery_reason(),
+        Some(HistoryRecoveryReason::UndecryptableEncryptedFunctionOutput)
+    );
+    assert!(!error.is_retryable());
+    assert_eq!(error.retry_delay(), None);
+}
+
+#[test]
 fn map_api_error_maps_server_overloaded_from_503_body() {
     let body = serde_json::json!({
         "error": {

@@ -1,12 +1,18 @@
 use super::*;
+use crate::context::ApprovedPlanRef;
+use crate::context::CarriedPlan;
 use crate::context::ContextualUserFragment;
 use crate::context::InternalContextSource;
 use crate::context::InternalModelContextFragment;
+use crate::context::PlanLoaded;
 use crate::context::SubagentNotification;
 use codex_protocol::items::HookPromptFragment;
 use codex_protocol::items::build_hook_prompt_message;
 use codex_protocol::models::ContentItemKind;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::plan_tool::PlanItemArg;
+use codex_protocol::plan_tool::StepStatus;
+use codex_protocol::plan_tool::UpdatePlanArgs;
 use pretty_assertions::assert_eq;
 
 #[test]
@@ -141,6 +147,35 @@ fn ignores_regular_user_text() {
     assert!(!is_contextual_user_fragment(&ContentItem::InputText {
         text: "hello".to_string(),
     }));
+}
+
+#[test]
+fn detects_plan_fragments_but_not_arbitrary_plan_text() {
+    let approved = PlanLoaded::new(ApprovedPlanRef::new("plan-1", 2), "body")
+        .expect("approved plan should fit")
+        .render();
+    let checklist = UpdatePlanArgs {
+        explanation: None,
+        plan: vec![PlanItemArg {
+            step: "step".to_string(),
+            status: StepStatus::Pending,
+        }],
+    };
+    let carried_fragment = CarriedPlan::new(&checklist).expect("checklist should render");
+    let carried = carried_fragment.render();
+
+    for text in [approved, carried.clone()] {
+        assert!(is_contextual_user_fragment(&ContentItem::InputText {
+            text
+        }));
+    }
+    assert!(!is_contextual_user_fragment(&ContentItem::InputText {
+        text: "ordinary user text".to_string(),
+    }));
+    assert_eq!(
+        serde_json::to_value(CarriedPlan::from_text(&carried)).expect("serialize parsed checklist"),
+        serde_json::to_value(Some(checklist)).expect("serialize checklist")
+    );
 }
 
 #[test]

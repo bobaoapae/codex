@@ -98,7 +98,9 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
                     event.item,
                     TurnItem::FunctionCallOutput(_)
                         | TurnItem::Plan(_)
-                        | TurnItem::Extension(ExtensionItem::Sleep(_))
+                        | TurnItem::Extension(
+                            ExtensionItem::Sleep(_) | ExtensionItem::ReceiptAttached(_),
+                        )
                 )
                 || matches!(
                     &event.item,
@@ -200,3 +202,7 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
         | EventMsg::CollabResumeBegin(_) => false,
     }
 }
+
+#[cfg(test)]
+#[path = "policy_tests.rs"]
+mod tests;

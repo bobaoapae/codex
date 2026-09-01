@@ -1,4 +1,7 @@
 //! `thread/delete` request handling.
+//!
+//! The public delete operation is a logical tombstone. Canonical rollout,
+//! receipt, artifact, goal, and history data stay durable.
 
 use super::thread_processor::unsupported_thread_store_operation;
 use super::*;
@@ -48,22 +51,11 @@ impl ThreadRequestProcessor {
         delete_order.push(thread_id);
 
         self.thread_store
-            .delete_threads(StoreDeleteThreadsParams {
+            .tombstone_threads(StoreTombstoneThreadsParams {
                 thread_ids: delete_order.clone(),
             })
             .await
-            .map_err(thread_store_delete_error)?;
-
-        if let Some(state_db) = self.state_db.as_ref() {
-            state_db
-                .delete_threads_strict(thread_ids.as_slice())
-                .await
-                .map_err(|err| {
-                    internal_error(format!(
-                        "failed to delete app-server state for {thread_id}: {err}"
-                    ))
-                })?;
-        }
+            .map_err(thread_store_tombstone_error)?;
 
         deleted_thread_ids.extend(
             delete_order
@@ -111,10 +103,21 @@ impl ThreadRequestProcessor {
                     return Ok(());
                 }
                 let Some(state_db) = self.state_db.as_ref() else {
-                    return Err(thread_store_delete_error(
+                    return Err(thread_store_tombstone_error(
                         ThreadStoreError::ThreadNotFound { thread_id },
                     ));
                 };
+                if state_db
+                    .is_thread_tombstoned(thread_id)
+                    .await
+                    .map_err(|err| {
+                        internal_error(format!(
+                            "failed to read tombstone state for {thread_id}: {err}"
+                        ))
+                    })?
+                {
+                    return Ok(());
+                }
                 if state_db
                     .get_thread(thread_id)
                     .await
@@ -127,12 +130,12 @@ impl ThreadRequestProcessor {
                 {
                     Ok(())
                 } else {
-                    Err(thread_store_delete_error(
+                    Err(thread_store_tombstone_error(
                         ThreadStoreError::ThreadNotFound { thread_id },
                     ))
                 }
             }
-            Err(err) => Err(thread_store_delete_error(err)),
+            Err(err) => Err(thread_store_tombstone_error(err)),
         }
     }
 
@@ -144,7 +147,7 @@ impl ThreadRequestProcessor {
     }
 }
 
-fn thread_store_delete_error(err: ThreadStoreError) -> JSONRPCErrorError {
+fn thread_store_tombstone_error(err: ThreadStoreError) -> JSONRPCErrorError {
     match err {
         ThreadStoreError::ThreadNotFound { thread_id } => {
             invalid_request(format!("thread not found: {thread_id}"))

@@ -536,6 +536,7 @@ fn sandbox_outcome_from_tool_error(err: &ToolError) -> Option<&'static str> {
             _ => None,
         },
         ToolError::Rejected(_) => None,
+        ToolError::BuildAdmissionBusy(_) => None,
     }
 }
 

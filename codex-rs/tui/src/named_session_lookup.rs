@@ -288,6 +288,9 @@ impl<'a> NamedSessionCandidates<'a> {
                     cwd: None,
                     use_state_db_only: self.mode == SessionNameLookupMode::StateDbOnly,
                     search_term: self.search_term.map(str::to_string),
+                    thread_classes: None,
+                    root_thread_id: None,
+                    terminal_outcomes: None,
                 })
                 .await?;
             self.cursor = response.next_cursor;

@@ -812,6 +812,13 @@ impl NetworkApprovalService {
                 pending_owner.complete(PendingApprovalDecision::Deny);
                 return NetworkDecision::deny(REASON_NOT_ALLOWED);
             }
+            Err(ToolError::BuildAdmissionBusy(busy)) => {
+                if let Some(owner_call) = owner_call.as_ref() {
+                    self.record_call_outcome(&owner_call.registration_id, busy.to_string());
+                }
+                pending_owner.complete(PendingApprovalDecision::Deny);
+                return NetworkDecision::deny(REASON_NOT_ALLOWED);
+            }
         };
 
         let _session_policy_commit_guard = if matches!(

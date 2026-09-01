@@ -436,6 +436,8 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
         additional_permissions_preapproved: false,
         justification: None,
         prefix_rule: None,
+        mutation_authorization: None,
+        root_override_reason: None,
     };
 
     let transcript = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default()));
@@ -517,7 +519,7 @@ fn pruning_falls_back_to_lru_when_no_exited() {
 
     let candidate = UnifiedExecProcessManager::process_id_to_prune_from_meta(&meta);
 
-    assert_eq!(candidate, Some(1));
+    assert_eq!(candidate, None);
 }
 
 #[test]
@@ -538,8 +540,9 @@ fn pruning_protects_recent_processes_even_if_exited() {
 
     let candidate = UnifiedExecProcessManager::process_id_to_prune_from_meta(&meta);
 
-    // (10) is exited but among the last 8; we should drop the LRU outside that set.
-    assert_eq!(candidate, Some(1));
+    // (10) is exited but among the last 8. A live process must never be
+    // evicted implicitly just because the soft cap was reached.
+    assert_eq!(candidate, None);
 }
 
 #[cfg(unix)]
@@ -599,7 +602,9 @@ async fn pruning_does_not_evict_live_process_while_exited_process_is_finalizing(
                     /*additional_permissions*/ None,
                     /*internal_permissions*/ None,
                 ),
+                mutation_authorization: None,
                 network_approval: None,
+                _build_admission: None,
                 session: std::sync::Weak::new(),
                 last_used: if is_exited {
                     now - Duration::from_secs(1)
@@ -615,5 +620,80 @@ async fn pruning_does_not_evict_live_process_while_exited_process_is_finalizing(
     assert_eq!(
         (pruned.map(|entry| entry.process_id), store.processes.len()),
         (None, MAX_UNIFIED_EXEC_PROCESSES)
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn reaper_removes_proven_exit_but_keeps_a_terminal_snapshot() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let manager = UnifiedExecProcessManager::new(10_000);
+    let process_id = 1234;
+    let process = Arc::new(
+        crate::unified_exec::process_tests::remote_process(
+            codex_exec_server::WriteStatus::Accepted,
+            /*terminate_error*/ None,
+            codex_sandboxing::SandboxType::None,
+        )
+        .await,
+    );
+    process
+        .terminate_confirmed()
+        .await
+        .expect("fake process should exit");
+    manager.observability.register(
+        Arc::downgrade(&session),
+        session.session_id().to_string(),
+        process_id,
+        "call-reaper".to_string(),
+        "echo safe",
+        Some(10),
+    );
+    manager.observability.mark_final_receipt(process_id);
+    let cwd = turn.cwd.clone().into();
+    manager.process_store.lock().await.processes.insert(
+        process_id,
+        ProcessEntry {
+            process,
+            plugin_metrics_sidecar: None,
+            call_id: "call-reaper".to_string(),
+            process_id,
+            cwd,
+            initial_exec_command_active: Arc::new(AtomicBool::new(false)),
+            hook_command: "echo safe".to_string(),
+            tty: false,
+            environment_id: codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
+            permissions: super::super::TerminalPermissions::for_launch(
+                turn.environments.primary().expect("turn environment"),
+                &turn,
+                super::super::TerminalSandboxSource::Native,
+                crate::sandboxing::SandboxPermissions::UseDefault,
+                /*additional_permissions*/ None,
+                /*internal_permissions*/ None,
+            ),
+            mutation_authorization: None,
+            network_approval: None,
+            _build_admission: None,
+            session: Arc::downgrade(&session),
+            last_used: Instant::now(),
+        },
+    );
+
+    manager.reap_exited_processes().await;
+
+    assert!(
+        !manager
+            .process_store
+            .lock()
+            .await
+            .processes
+            .contains_key(&process_id)
+    );
+    assert_eq!(
+        manager
+            .terminal_snapshot(process_id)
+            .expect("reaped terminal snapshot")
+            .state,
+        TerminalProcessState::Exited
     );
 }

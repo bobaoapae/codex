@@ -25,14 +25,14 @@ use crate::DeleteThreadsParams;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
 
-struct ThreadRollouts {
+pub(super) struct ThreadRollouts {
     thread_id: codex_protocol::ThreadId,
     rollout_ids: HashSet<codex_protocol::ThreadId>,
     paths: Vec<PathBuf>,
 }
 
 impl ThreadRollouts {
-    fn from_index(
+    pub(super) fn from_index(
         reference_index: &RolloutReferenceIndex,
         thread_id: codex_protocol::ThreadId,
     ) -> Self {
@@ -49,6 +49,10 @@ impl ThreadRollouts {
             rollout_ids,
             paths,
         }
+    }
+
+    pub(super) fn has_rollout(&self) -> bool {
+        !self.paths.is_empty()
     }
 
     fn add_path(&mut self, path: PathBuf) {
@@ -114,7 +118,7 @@ pub(super) async fn delete_threads(
     Ok(())
 }
 
-fn ensure_no_external_references(
+pub(super) fn ensure_no_external_references(
     reference_index: &RolloutReferenceIndex,
     thread_rollouts: &[ThreadRollouts],
 ) -> ThreadStoreResult<()> {
@@ -147,7 +151,7 @@ fn ensure_no_external_references(
     Ok(())
 }
 
-async fn scan_reference_index(
+pub(super) async fn scan_reference_index(
     store: &LocalThreadStore,
 ) -> ThreadStoreResult<RolloutReferenceIndex> {
     RolloutReferenceIndex::scan(store.config.codex_home.as_path())

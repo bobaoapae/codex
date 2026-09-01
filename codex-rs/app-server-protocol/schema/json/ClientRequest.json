@@ -87,6 +87,24 @@
       ],
       "type": "string"
     },
+    "ApprovedPlanRef": {
+      "description": "A stable reference to one immutable approved plan snapshot.",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "revision": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "revision"
+      ],
+      "type": "object"
+    },
     "AppsInstalledParams": {
       "description": "Read the committed installed connector runtime snapshot.",
       "properties": {
@@ -832,6 +850,33 @@
           "type": "object"
         }
       ]
+    },
+    "EvidenceReference": {
+      "description": "A bounded reference to a canonical rollout item or artifact.",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "kind"
+      ],
+      "type": "object"
+    },
+    "EvidenceStatus": {
+      "description": "Stable status vocabulary for host-attached evidence.",
+      "enum": [
+        "pass",
+        "fail",
+        "blocked",
+        "inconclusive",
+        "informational"
+      ],
+      "type": "string"
     },
     "ExperimentalFeatureEnablementSetParams": {
       "properties": {
@@ -1627,6 +1672,67 @@
       },
       "type": "object"
     },
+    "JobStatus": {
+      "description": "Current lifecycle state of a durable job.",
+      "oneOf": [
+        {
+          "description": "The run has been accepted but has not started execution.",
+          "enum": [
+            "pending"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The run is currently executing.",
+          "enum": [
+            "running"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The run finished successfully.",
+          "enum": [
+            "succeeded"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The run finished with an execution error.",
+          "enum": [
+            "failed"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The run cannot make progress without an explicit intervention.",
+          "enum": [
+            "blocked"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The run's terminal state could not be determined.",
+          "enum": [
+            "inconclusive"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The run was explicitly cancelled.",
+          "enum": [
+            "cancelled"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The run was aborted before a normal terminal result was recorded.",
+          "enum": [
+            "aborted"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "LegacyAppPathString": {
       "type": "string"
     },
@@ -2271,36 +2377,6 @@
         "pragmatic"
       ],
       "type": "string"
-    },
-    "PlanListParams": {
-      "properties": {
-        "cursor": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "limit": {
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        }
-      },
-      "type": "object"
-    },
-    "PlanReadParams": {
-      "properties": {
-        "id": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "id"
-      ],
-      "type": "object"
     },
     "PluginInstallParams": {
       "properties": {
@@ -4041,6 +4117,18 @@
       ],
       "type": "object"
     },
+    "TerminalOutcome": {
+      "description": "Terminal outcome recorded for a completed or stopped job.",
+      "enum": [
+        "succeeded",
+        "failed",
+        "blocked",
+        "inconclusive",
+        "cancelled",
+        "aborted"
+      ],
+      "type": "string"
+    },
     "TextElement": {
       "properties": {
         "byteRange": {
@@ -4089,6 +4177,46 @@
         "threadId"
       ],
       "type": "object"
+    },
+    "ThreadClass": {
+      "description": "Classification used by the workflow projections and thread filters.",
+      "oneOf": [
+        {
+          "description": "A user-facing interactive conversation.",
+          "enum": [
+            "interactive"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A child agent in a delegated agent tree.",
+          "enum": [
+            "subAgent"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A durable, explicitly requested, non-interactive job.",
+          "enum": [
+            "transientJob"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A run used internally by the runtime.",
+          "enum": [
+            "internal"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A historical `exec` run whose original class is retained.",
+          "enum": [
+            "legacyExec"
+          ],
+          "type": "string"
+        }
+      ]
     },
     "ThreadCompactStartParams": {
       "properties": {
@@ -4389,33 +4517,12 @@
             "null"
           ]
         },
-        "cwd": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/ThreadListCwdFilter"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Optional cwd filter or filters; when set, only threads whose session cwd exactly matches one of these paths are returned."
-        },
         "limit": {
           "description": "Optional page size; defaults to a reasonable server-side value.",
           "format": "uint32",
           "minimum": 0.0,
           "type": [
             "integer",
-            "null"
-          ]
-        },
-        "modelProviders": {
-          "description": "Optional provider filter; when set, only sessions recorded under these providers are returned. When present but empty, includes all providers.",
-          "items": {
-            "type": "string"
-          },
-          "type": [
-            "array",
             "null"
           ]
         },
@@ -5723,6 +5830,14 @@
         "mode"
       ],
       "type": "object"
+    },
+    "WorkspaceLeaseMode": {
+      "description": "Access requested for a workspace lease.",
+      "enum": [
+        "read",
+        "write"
+      ],
+      "type": "string"
     }
   },
   "description": "Request from the client to the server.",
@@ -6423,56 +6538,6 @@
         "params"
       ],
       "title": "Thread/injectItemsRequest",
-      "type": "object"
-    },
-    {
-      "description": "Fork extension: list the plans persisted by Plan mode, newest first.",
-      "properties": {
-        "id": {
-          "$ref": "#/definitions/RequestId"
-        },
-        "method": {
-          "enum": [
-            "plan/list"
-          ],
-          "title": "Plan/listRequestMethod",
-          "type": "string"
-        },
-        "params": {
-          "$ref": "#/definitions/PlanListParams"
-        }
-      },
-      "required": [
-        "id",
-        "method",
-        "params"
-      ],
-      "title": "Plan/listRequest",
-      "type": "object"
-    },
-    {
-      "description": "Fork extension: read one saved plan, including its Markdown body.",
-      "properties": {
-        "id": {
-          "$ref": "#/definitions/RequestId"
-        },
-        "method": {
-          "enum": [
-            "plan/read"
-          ],
-          "title": "Plan/readRequestMethod",
-          "type": "string"
-        },
-        "params": {
-          "$ref": "#/definitions/PlanReadParams"
-        }
-      },
-      "required": [
-        "id",
-        "method",
-        "params"
-      ],
-      "title": "Plan/readRequest",
       "type": "object"
     },
     {

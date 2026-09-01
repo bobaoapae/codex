@@ -18,6 +18,7 @@ use chrono::DateTime;
 use codex_app_server_protocol::project_rollout_line;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::InternalSessionSource;
+use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadHistoryMode;
@@ -41,9 +42,14 @@ use super::thread_history::RolloutProjectionStep;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
 
+mod apply;
+mod apply_report;
+mod apply_support;
 mod canonicalizer;
 mod legacy_event;
 mod line_parser;
+mod preview;
+mod preview_types;
 mod publish;
 mod rollback;
 mod rollback_plan;
@@ -70,8 +76,36 @@ use rollback_plan::RollbackPlanner;
 use telemetry::RolloutMigrationTelemetry;
 use telemetry::RolloutMigrationTrigger;
 
+pub use preview_types::FROZEN_PREVIEW_SCHEMA_VERSION;
+pub use preview_types::FrozenPreview;
+pub use preview_types::RolloutMigrationPreviewCounts;
+pub use preview_types::RolloutMigrationPreviewEntry;
+pub use preview_types::RolloutMigrationPreviewOptions;
+pub use preview_types::RolloutMigrationPreviewReport;
+pub use preview_types::RolloutMigrationPreviewRepresentation;
+pub use preview_types::RolloutMigrationPreviewStatus;
+pub use preview_types::RolloutMigrationPreviewThreadClass;
+pub use preview_types::RolloutMigrationPreviewWatermark;
+
 const PROJECTION_BATCH_BYTES: u64 = 256 * 1024;
 const MAX_ROLLOUT_LINE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Bounded metadata marker used only by the CLI's internal migration receipt rollout.
+///
+/// The source remains an `Internal` session so interactive listings continue to hide it, while
+/// the originator and thread-source marker make it distinguishable from Guardian and memory
+/// consolidation rollouts during later migration previews.
+pub(crate) const MIGRATION_RECEIPT_ORIGINATOR: &str = "codex-cli-migration";
+pub(crate) const MIGRATION_RECEIPT_THREAD_SOURCE: &str = "rollout_migration";
+
+pub(crate) fn is_migration_receipt_session_meta(metadata: &SessionMeta) -> bool {
+    metadata.source.is_internal()
+        && metadata.originator == MIGRATION_RECEIPT_ORIGINATOR
+        && matches!(
+            metadata.thread_source.as_ref(),
+            Some(ThreadSource::Feature(feature)) if feature == MIGRATION_RECEIPT_THREAD_SOURCE
+        )
+}
 
 enum CanonicalizationAttempt {
     Complete {
@@ -84,6 +118,7 @@ enum CanonicalizationAttempt {
 enum RolloutMigrationPaths {
     Discover,
     Known(Vec<PathBuf>),
+    Frozen(FrozenPreview),
 }
 
 struct CanonicalizationSource<'a> {
@@ -101,7 +136,7 @@ pub enum RolloutMigrationMode {
     /// Report eligible files without modifying local storage.
     #[default]
     DryRun,
-    /// Publish paginated rollouts and materialize their SQLite history.
+    /// Publish paginated rollouts and materialize their SQLite history from a frozen preview.
     Apply,
 }
 
@@ -167,6 +202,29 @@ pub struct RolloutMigrationOutcome {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct RolloutMigrationReport {
     pub outcomes: Vec<RolloutMigrationOutcome>,
+    /// Bounded metadata for an applied backfill. The canonical receipt is
+    /// emitted by the caller; this field only gives it a stable summary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub apply_receipt: Option<RolloutMigrationApplyReceipt>,
+}
+
+/// Receipt-shaped summary returned by a resumable apply pass.
+///
+/// For frozen applies, `subject` is `rollout-migration:<provenance digest>` so receipt
+/// idempotency remains bound to the exact approved source set.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RolloutMigrationApplyReceipt {
+    pub schema_version: u32,
+    pub kind: String,
+    pub subject: String,
+    pub status: String,
+    pub watermark: Option<RolloutMigrationPreviewWatermark>,
+    pub generation_id: Option<i64>,
+    pub completed: usize,
+    pub skipped_permanent: usize,
+    pub recoverable: usize,
+    pub failed: usize,
 }
 
 /// Incremental progress emitted while rollout migration scans discovered paths.
@@ -258,17 +316,33 @@ impl RolloutMigrationRateLimiter {
 }
 
 impl LocalThreadStore {
+    /// Inspect discovered rollout files without writing canonical history, state, or journals.
+    pub async fn preview_rollout_migration(
+        &self,
+        options: RolloutMigrationPreviewOptions,
+    ) -> ThreadStoreResult<RolloutMigrationPreviewReport> {
+        preview::run(self, options).await
+    }
+
     /// Check whether startup needs to migrate legacy rollouts, then migrate in the background
     /// when it does.
     pub async fn migrate_rollouts_on_startup(&self) -> ThreadStoreResult<()> {
         startup::migrate_rollouts_on_startup(self).await
     }
 
-    /// Inspect or migrate eligible legacy rollout files beneath active and archived sessions.
+    /// Inspect eligible legacy rollout files beneath active and archived sessions.
+    ///
+    /// Apply mode is intentionally rejected here; callers must provide a [`FrozenPreview`] via
+    /// [`Self::migrate_rollouts_from_preview`].
     pub async fn migrate_rollouts(
         &self,
         options: RolloutMigrationOptions,
     ) -> ThreadStoreResult<RolloutMigrationReport> {
+        if options.mode == RolloutMigrationMode::Apply {
+            return Err(ThreadStoreError::InvalidRequest {
+                message: "rollout apply requires a frozen preview".to_string(),
+            });
+        }
         self.migrate_rollouts_with_progress_for_trigger(
             options,
             |_| {},
@@ -278,9 +352,43 @@ impl LocalThreadStore {
         .await
     }
 
-    /// Inspect or migrate rollouts while reporting each discovered path after it is processed.
+    /// Inspect rollouts while reporting each discovered path after it is processed.
+    ///
+    /// Apply mode is intentionally rejected here; callers must provide a [`FrozenPreview`] via
+    /// [`Self::migrate_rollouts_from_preview_with_progress`].
     pub async fn migrate_rollouts_with_progress(
         &self,
+        options: RolloutMigrationOptions,
+        on_progress: impl FnMut(RolloutMigrationProgress),
+    ) -> ThreadStoreResult<RolloutMigrationReport> {
+        if options.mode == RolloutMigrationMode::Apply {
+            return Err(ThreadStoreError::InvalidRequest {
+                message: "rollout apply requires a frozen preview".to_string(),
+            });
+        }
+        self.migrate_rollouts_with_progress_for_trigger(
+            options,
+            on_progress,
+            RolloutMigrationTrigger::Manual,
+            RolloutMigrationPaths::Discover,
+        )
+        .await
+    }
+
+    /// Apply exactly the physical rollout set captured by a frozen preview.
+    pub async fn migrate_rollouts_from_preview(
+        &self,
+        preview: FrozenPreview,
+        options: RolloutMigrationOptions,
+    ) -> ThreadStoreResult<RolloutMigrationReport> {
+        self.migrate_rollouts_from_preview_with_progress(preview, options, |_| {})
+            .await
+    }
+
+    /// Apply a frozen preview while reporting each source after it is processed.
+    pub async fn migrate_rollouts_from_preview_with_progress(
+        &self,
+        preview: FrozenPreview,
         options: RolloutMigrationOptions,
         on_progress: impl FnMut(RolloutMigrationProgress),
     ) -> ThreadStoreResult<RolloutMigrationReport> {
@@ -288,7 +396,7 @@ impl LocalThreadStore {
             options,
             on_progress,
             RolloutMigrationTrigger::Manual,
-            RolloutMigrationPaths::Discover,
+            RolloutMigrationPaths::Frozen(preview),
         )
         .await
     }
@@ -300,9 +408,38 @@ impl LocalThreadStore {
         trigger: RolloutMigrationTrigger,
         paths: RolloutMigrationPaths,
     ) -> ThreadStoreResult<RolloutMigrationReport> {
+        if options.mode == RolloutMigrationMode::Apply
+            && matches!(&paths, RolloutMigrationPaths::Discover)
+        {
+            return Err(ThreadStoreError::InvalidRequest {
+                message: "rollout apply requires a frozen preview".to_string(),
+            });
+        }
+        let use_resumable_apply = if options.mode != RolloutMigrationMode::Apply {
+            false
+        } else if matches!(&paths, RolloutMigrationPaths::Frozen(_)) {
+            true
+        } else if matches!(trigger, RolloutMigrationTrigger::Manual) {
+            self.state_db.is_some()
+        } else if let Some(state_db) = self.state_db.as_ref() {
+            state_db
+                .workflow()
+                .get_backfill_coordinator_state()
+                .await
+                .map_err(migration_error)?
+                .status
+                != codex_state::WorkflowBackfillStatus::Complete
+        } else {
+            false
+        };
         let telemetry = RolloutMigrationTelemetry::new(trigger, &options);
         let result = self
-            .migrate_rollouts_with_progress_inner(options, &mut on_progress, paths)
+            .migrate_rollouts_with_progress_inner(
+                options,
+                &mut on_progress,
+                paths,
+                use_resumable_apply,
+            )
             .await;
         telemetry.finish(&result);
         result
@@ -313,8 +450,31 @@ impl LocalThreadStore {
         options: RolloutMigrationOptions,
         on_progress: &mut impl FnMut(RolloutMigrationProgress),
         paths: RolloutMigrationPaths,
+        use_resumable_apply: bool,
     ) -> ThreadStoreResult<RolloutMigrationReport> {
         let mut limiter = RolloutMigrationRateLimiter::new(options.max_mib_per_second)?;
+        if use_resumable_apply {
+            let paths = match paths {
+                RolloutMigrationPaths::Frozen(preview) => RolloutMigrationPaths::Frozen(preview),
+                RolloutMigrationPaths::Known(paths) => RolloutMigrationPaths::Frozen(
+                    preview::run_for_paths(
+                        self,
+                        RolloutMigrationPreviewOptions {
+                            thread_ids: options.thread_ids.clone(),
+                            max_mib_per_second: options.max_mib_per_second,
+                        },
+                        paths,
+                    )
+                    .await?,
+                ),
+                RolloutMigrationPaths::Discover => {
+                    return Err(ThreadStoreError::InvalidRequest {
+                        message: "rollout apply requires a frozen preview".to_string(),
+                    });
+                }
+            };
+            return apply::run(self, options, on_progress, &mut limiter, paths).await;
+        }
         let _maintenance_guard = match options.mode {
             RolloutMigrationMode::DryRun => None,
             RolloutMigrationMode::Apply => Some(
@@ -331,6 +491,11 @@ impl LocalThreadStore {
                 find_all_rollout_paths(&self.config.codex_home).await?
             }
             RolloutMigrationPaths::Known(paths) => paths,
+            RolloutMigrationPaths::Frozen(_) => {
+                return Err(ThreadStoreError::InvalidRequest {
+                    message: "frozen rollout preview requires apply mode".to_string(),
+                });
+            }
         };
         if options.mode == RolloutMigrationMode::Apply {
             let pending_thread_ids = pending_migration_thread_ids(&self.config.codex_home).await?;
@@ -374,16 +539,43 @@ impl LocalThreadStore {
 
     async fn migrate_rollout_path(
         &self,
+        path: PathBuf,
+        options: &RolloutMigrationOptions,
+        legacy_names: &HashMap<ThreadId, String>,
+        limiter: &mut RolloutMigrationRateLimiter,
+    ) -> ThreadStoreResult<Option<RolloutMigrationOutcome>> {
+        self.migrate_rollout_path_with_recovery(path, options, legacy_names, limiter, true)
+            .await
+    }
+
+    async fn migrate_rollout_path_exact(
+        &self,
+        path: PathBuf,
+        options: &RolloutMigrationOptions,
+        legacy_names: &HashMap<ThreadId, String>,
+        limiter: &mut RolloutMigrationRateLimiter,
+    ) -> ThreadStoreResult<Option<RolloutMigrationOutcome>> {
+        self.migrate_rollout_path_with_recovery(path, options, legacy_names, limiter, false)
+            .await
+    }
+
+    async fn migrate_rollout_path_with_recovery(
+        &self,
         mut path: PathBuf,
         options: &RolloutMigrationOptions,
         legacy_names: &HashMap<ThreadId, String>,
         limiter: &mut RolloutMigrationRateLimiter,
+        allow_path_recovery: bool,
     ) -> ThreadStoreResult<Option<RolloutMigrationOutcome>> {
         let mut retried_moved_path = false;
         let metadata = loop {
             let error = match codex_rollout::read_session_meta_line(&path).await {
                 Ok(metadata) => break metadata,
-                Err(error) if !retried_moved_path && error.kind() == io::ErrorKind::NotFound => {
+                Err(error)
+                    if allow_path_recovery
+                        && !retried_moved_path
+                        && error.kind() == io::ErrorKind::NotFound =>
+                {
                     // A different Codex process can archive or compress this rollout after path
                     // discovery but before we take its writer lock. Retry the same rollout under
                     // its current root/suffix before treating the missing snapshot path as failed.
@@ -452,6 +644,9 @@ impl LocalThreadStore {
         };
         let thread_id = metadata.meta.id;
         if !matches_selection(&options.thread_ids, Some(thread_id)) {
+            return Ok(None);
+        }
+        if is_migration_receipt_session_meta(&metadata.meta) {
             return Ok(None);
         }
         let is_memory_consolidation = matches!(
@@ -556,9 +751,10 @@ impl LocalThreadStore {
         };
         // SessionMeta gives us the writer-lock id, so archiving can win between that read and
         // lock acquisition. Once the lock is ours, follow the same rollout to its current path.
-        if !tokio::fs::try_exists(&path)
-            .await
-            .map_err(migration_error)?
+        if allow_path_recovery
+            && !tokio::fs::try_exists(&path)
+                .await
+                .map_err(migration_error)?
             && let Some(current_path) =
                 find_current_rollout_path(&self.config.codex_home, &path).await?
         {

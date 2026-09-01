@@ -21,6 +21,7 @@ use super::HandlerSourcePath;
 use super::command_runner::run_command;
 use super::mcp_runner::run_mcp_tool;
 use crate::events::common::matches_matcher;
+use crate::events::evidence;
 
 #[derive(Debug)]
 pub(crate) struct ParsedHandler<T> {
@@ -172,6 +173,14 @@ pub(crate) async fn execute_handlers_with_metadata<T: 'static>(
                 let result =
                     execute_handler(&task_engine, &handler, &input_json, &cwd, metadata.as_ref())
                         .await;
+                if handler.event_name == HookEventName::PostToolUse
+                    && evidence::has_evidence(&result.stdout)
+                {
+                    tracing::warn!(
+                        source_path = %handler.source_path,
+                        "executor-scoped PostToolUse evidence was ignored"
+                    );
+                }
                 if let Some(error) = result.error {
                     tracing::warn!(
                         source_path = %handler.source_path,

@@ -18,10 +18,6 @@ sortKey?: ThreadSortKey | null, /**
  * Optional sort direction; defaults to descending (newest first).
  */
 sortDirection?: SortDirection | null, /**
- * Optional provider filter; when set, only sessions recorded under these
- * providers are returned. When present but empty, includes all providers.
- */
-modelProviders?: Array<string> | null, /**
  * Optional source filter; when set, only sessions from these source kinds
  * are returned. When omitted or empty, defaults to interactive sources.
  */
@@ -34,10 +30,6 @@ archived?: boolean | null, /**
  * or provide a section ID to return only threads in that section.
  */
 sectionId?: string | null, /**
- * Optional cwd filter or filters; when set, only threads whose session cwd
- * exactly matches one of these paths are returned.
- */
-cwd?: string | Array<string> | null, /**
  * If true, return from the state DB without scanning JSONL rollouts to
  * repair thread metadata. Omitted or false preserves scan-and-repair
  * behavior.
