@@ -1329,7 +1329,7 @@ impl UnifiedExecProcessManager {
         cwd: PathUri,
         environment_id: String,
         permissions: super::TerminalPermissions,
-        mutation_authorization: Option<ExecMutationAuthorization>,
+        mut mutation_authorization: Option<ExecMutationAuthorization>,
         plugin_attribution: Option<PluginCommandAttribution>,
         started_at: Instant,
         process_id: i32,
@@ -1354,8 +1354,8 @@ impl UnifiedExecProcessManager {
             environment_id,
             permissions,
             _lease_hold: mutation_authorization
-                .as_ref()
-                .and_then(|authorization| authorization.lease_hold.clone()),
+                .as_mut()
+                .and_then(|authorization| authorization.lease_hold.take()),
             mutation_authorization,
             network_approval,
             _build_admission: process.build_admission(),
@@ -1467,6 +1467,19 @@ impl UnifiedExecProcessManager {
                 }
 
                 if !alive {
+                    // FORK: the terminal entry outlives the process on purpose -
+                    // the model can still read its output - but the write lease
+                    // must not. Releasing only on eviction left a finished
+                    // command holding the whole checkout while the renewer
+                    // extended it indefinitely, starving every sibling.
+                    {
+                        let mut store = process_store.lock().await;
+                        if let Some(entry) = store.processes.get_mut(&process_id)
+                            && Arc::ptr_eq(&entry.process, &process)
+                        {
+                            entry._lease_hold = None;
+                        }
+                    }
                     let should_reap = {
                         let store = process_store.lock().await;
                         store.processes.get(&process_id).is_some_and(|entry| {
