@@ -344,7 +344,10 @@ pub(crate) async fn authorize_mcp_mutation(
     }
     let service = match session.ownership_service().await {
         Ok(service) => service,
-        Err(OwnershipError::Unavailable) if actor.authority() == OwnershipAuthority::Root => {
+        Err(error)
+            if actor.authority() == OwnershipAuthority::Root
+                && super::ownership_state_is_absent(&error) =>
+        {
             return Ok(None);
         }
         Err(error) => return Err(format_ownership_error(error)),

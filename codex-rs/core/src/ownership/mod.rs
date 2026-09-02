@@ -23,6 +23,7 @@ pub(crate) use provider::authorize_mcp_mutation;
 pub use service::OwnershipError;
 pub use service::WorkspaceOwnershipService;
 pub(crate) use service_helpers::describe_ownership_error;
+pub(crate) use service_helpers::ownership_state_is_absent;
 pub use service_types::MutationAuthorizationRequest;
 pub use service_types::MutationGuard;
 pub use service_types::MutationOperation;

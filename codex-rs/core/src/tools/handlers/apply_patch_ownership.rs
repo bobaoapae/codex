@@ -50,13 +50,7 @@ pub(crate) async fn authorize_apply_patch(
         Ok(service) => service,
         Err(error)
             if actor.authority() == OwnershipAuthority::Root
-                && matches!(
-                    error,
-                    OwnershipError::Unavailable
-                        | OwnershipError::Path(
-                            OwnershipPathError::NoRoots | OwnershipPathError::OutsideRoots { .. }
-                        )
-                ) =>
+                && crate::ownership::ownership_state_is_absent(&error) =>
         {
             return Ok(None);
         }

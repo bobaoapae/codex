@@ -155,6 +155,28 @@ pub(super) fn map_state_error(error: anyhow::Error) -> OwnershipError {
     }
 }
 
+/// FORK: ownership-state errors that mean "there is nothing here to coordinate",
+/// as opposed to "coordination failed".
+///
+/// A session with no durable workflow state, or with no authorized workspace
+/// root at all, has no lease layer to consult. The root keeps its pre-lease
+/// behavior in that case; a subagent still fails closed, because a subagent
+/// with no provable scope is exactly what the lease layer exists to stop.
+///
+/// The three mutating admissions disagreed on this: apply_patch accepted a
+/// missing root, exec and MCP did not, so a session without workspace roots
+/// could patch files but could not run a command.
+pub(crate) fn ownership_state_is_absent(error: &OwnershipError) -> bool {
+    matches!(
+        error,
+        OwnershipError::Unavailable
+            | OwnershipError::Path(
+                crate::ownership::OwnershipPathError::NoRoots
+                    | crate::ownership::OwnershipPathError::OutsideRoots { .. }
+            )
+    )
+}
+
 /// FORK: the single place an ownership failure is turned into agent-facing text.
 ///
 /// There were two copies of this, both of which said only that a lease was

@@ -13,6 +13,7 @@ use crate::ownership::OwnershipAuthority;
 use crate::ownership::OwnershipError;
 use crate::ownership::OwnershipOverrideAuthorization;
 use crate::ownership::ensure_subagent_write_leases;
+use crate::ownership::ownership_state_is_absent;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::session::turn_context::TurnEnvironment;
@@ -109,9 +110,10 @@ pub(crate) async fn authorize_exec_command(
 
     let service = match session.ownership_service().await {
         Ok(service) => service,
-        Err(OwnershipError::Unavailable)
+        Err(error)
             if actor.authority() == OwnershipAuthority::Root
-                && !matches!(&intent, MutationIntent::DestructiveGit { .. }) =>
+                && !matches!(&intent, MutationIntent::DestructiveGit { .. })
+                && ownership_state_is_absent(&error) =>
         {
             return Ok(None);
         }
