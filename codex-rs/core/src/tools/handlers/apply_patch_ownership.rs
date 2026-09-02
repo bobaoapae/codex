@@ -1,6 +1,8 @@
 //! Ownership admission for apply_patch before and during filesystem mutation.
 
 use crate::function_tool::FunctionCallError;
+use crate::ownership::EnsureLeaseRequest;
+use crate::ownership::LeaseHold;
 use crate::ownership::MutationAuthorizationRequest;
 use crate::ownership::MutationGuard;
 use crate::ownership::MutationOperation;
@@ -11,6 +13,8 @@ use crate::ownership::OwnershipError;
 use crate::ownership::OwnershipOverrideAuthorization;
 use crate::ownership::OwnershipPathError;
 use crate::ownership::WorkspaceOwnershipService;
+use crate::ownership::describe_ownership_error;
+use crate::ownership::ensure_subagent_write_leases;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use codex_apply_patch::ApplyPatchAction;
@@ -19,10 +23,13 @@ use codex_utils_path_uri::PathUri;
 use sha2::Digest;
 use sha2::Sha256;
 use std::sync::Arc;
+use std::time::Duration;
 
 pub(crate) struct ApplyPatchOwnership {
     pub(crate) service: Arc<WorkspaceOwnershipService>,
     pub(crate) guard: MutationGuard,
+    /// FORK: custody of a lease acquired for this patch, released with it.
+    pub(crate) _lease_hold: Option<LeaseHold>,
 }
 
 /// Admit an apply_patch operation through the root-scoped ownership service.
@@ -35,6 +42,10 @@ pub(crate) async fn authorize_apply_patch(
     file_paths: &[PathUri],
 ) -> Result<Option<ApplyPatchOwnership>, FunctionCallError> {
     let actor = ownership_actor(session, turn);
+    let ownership_policy = session.get_config().await.workspace_ownership.clone();
+    if !ownership_policy.enforce {
+        return Ok(None);
+    }
     let service = match session.ownership_service().await {
         Ok(service) => service,
         Err(error)
@@ -77,19 +88,42 @@ pub(crate) async fn authorize_apply_patch(
     let operation = MutationOperation {
         digest: operation_digest(action, &normalized_paths),
     };
+    let paths = paths
+        .into_iter()
+        .map(AbsolutePathBuf::into_path_buf)
+        .collect::<Vec<_>>();
+    // apply_patch names its exact targets, so the lease it takes is exactly
+    // those files rather than the whole checkout.
+    let ensured = ensure_subagent_write_leases(EnsureLeaseRequest {
+        service: &service,
+        coordinator: &session.services.lease_coordinator,
+        actor,
+        paths: &paths,
+        environment_id: codex_exec_server::LOCAL_ENVIRONMENT_ID,
+        ttl: Duration::from_millis(ownership_policy.auto_ttl_ms as u64),
+        wait: Duration::from_millis(ownership_policy.exec_wait_ms as u64),
+        auto_acquire: ownership_policy.auto_acquire,
+        cancel: None,
+    })
+    .await
+    .map_err(ownership_error)?;
+    if ensured.is_exempt() {
+        return Ok(None);
+    }
     let guard = service
         .authorize_mutation(MutationAuthorizationRequest {
             actor,
-            paths: paths
-                .into_iter()
-                .map(AbsolutePathBuf::into_path_buf)
-                .collect(),
+            paths,
             operation,
             override_authorization: OwnershipOverrideAuthorization::NotRequested,
         })
         .await
         .map_err(ownership_error)?;
-    Ok(Some(ApplyPatchOwnership { service, guard }))
+    Ok(Some(ApplyPatchOwnership {
+        service,
+        guard,
+        _lease_hold: ensured.hold(),
+    }))
 }
 
 fn ownership_actor(session: &Session, turn: &TurnContext) -> OwnershipActor {
@@ -124,5 +158,8 @@ fn update_digest_part(digest: &mut Sha256, value: &[u8]) {
 }
 
 fn ownership_error(error: OwnershipError) -> FunctionCallError {
-    FunctionCallError::RespondToModel(format!("apply_patch ownership check failed: {error}"))
+    FunctionCallError::RespondToModel(format!(
+        "apply_patch ownership check failed: {}",
+        describe_ownership_error(error)
+    ))
 }

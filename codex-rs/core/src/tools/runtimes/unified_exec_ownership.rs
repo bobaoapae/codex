@@ -5,12 +5,14 @@
 //! process is spawned. A running process keeps the returned authorization; stdin continuation does
 //! not perform a second caller-based authorization.
 
+use crate::ownership::EnsureLeaseRequest;
 use crate::ownership::MutationAuthorizationRequest;
 use crate::ownership::MutationOperation;
 use crate::ownership::OwnershipActor;
 use crate::ownership::OwnershipAuthority;
 use crate::ownership::OwnershipError;
 use crate::ownership::OwnershipOverrideAuthorization;
+use crate::ownership::ensure_subagent_write_leases;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::session::turn_context::TurnEnvironment;
@@ -23,6 +25,8 @@ use sha2::Digest;
 use sha2::Sha256;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 /// Admit a command through the root-scoped ownership service before the orchestrator can spawn it.
 pub(crate) async fn authorize_exec_command(
@@ -33,6 +37,7 @@ pub(crate) async fn authorize_exec_command(
     tty: bool,
     environment: &TurnEnvironment,
     override_authorization: OwnershipOverrideAuthorization,
+    cancel: Option<&CancellationToken>,
 ) -> Result<Option<ExecMutationAuthorization>, String> {
     let intent = codex_shell_command::classify_command(command);
     if matches!(&intent, MutationIntent::ReadOnly) && !tty {
@@ -53,8 +58,9 @@ pub(crate) async fn authorize_exec_command(
         .to_abs_path()
         .map_err(|error| format!("workspace mutation cwd is not local: {error}"))?;
     let config = session.get_config().await;
+    let ownership_policy = config.workspace_ownership.clone();
     let checkout_paths = config
-        .effective_workspace_roots()
+        .lease_scoped_workspace_roots()
         .into_iter()
         .map(AbsolutePathBuf::into_path_buf)
         .collect::<Vec<_>>();
@@ -94,6 +100,12 @@ pub(crate) async fn authorize_exec_command(
     {
         return Err("destructive Git requires an explicit one-shot root override".to_string());
     }
+    // The kill-switch sits *after* the destructive-Git denials on purpose: those
+    // do not depend on a lease, and switching lease coordination off must not
+    // quietly re-open them.
+    if !ownership_policy.enforce {
+        return Ok(None);
+    }
 
     let service = match session.ownership_service().await {
         Ok(service) => service,
@@ -105,6 +117,23 @@ pub(crate) async fn authorize_exec_command(
         }
         Err(error) => return Err(format!("workspace ownership check failed: {error}")),
     };
+    // Obtain the lease this command needs before asking whether it holds one.
+    let ensured = ensure_subagent_write_leases(EnsureLeaseRequest {
+        service: &service,
+        coordinator: &session.services.lease_coordinator,
+        actor,
+        paths: &paths,
+        environment_id: &environment.selection.environment_id,
+        ttl: Duration::from_millis(ownership_policy.auto_ttl_ms as u64),
+        wait: Duration::from_millis(ownership_policy.exec_wait_ms as u64),
+        auto_acquire: ownership_policy.auto_acquire,
+        cancel,
+    })
+    .await
+    .map_err(format_ownership_error)?;
+    if ensured.is_exempt() {
+        return Ok(None);
+    }
     let operation = MutationOperation {
         digest: operation_digest(command, &native_cwd, &paths),
     };
@@ -123,7 +152,26 @@ pub(crate) async fn authorize_exec_command(
             .await
             .map_err(format_ownership_error)?;
     }
-    Ok(Some(ExecMutationAuthorization { service, guard }))
+    // A root override takes leases owned by the root itself; without custody
+    // they would stay active for their whole TTL and collide with the next
+    // grant on the same path.
+    let mut lease_hold = ensured.hold();
+    if actor.authority() == OwnershipAuthority::Root && !guard.leases().is_empty() {
+        let coordinator = &session.services.lease_coordinator;
+        coordinator
+            .track(
+                &service,
+                guard.leases(),
+                Duration::from_millis(ownership_policy.auto_ttl_ms as u64),
+            )
+            .await;
+        lease_hold = Some(coordinator.hold());
+    }
+    Ok(Some(ExecMutationAuthorization {
+        service,
+        guard,
+        lease_hold,
+    }))
 }
 
 /// Revalidate a guard after tool approval and sandbox selection, immediately before spawn.
@@ -211,17 +259,7 @@ fn update_digest_part(digest: &mut Sha256, value: &[u8]) {
 }
 
 fn format_ownership_error(error: OwnershipError) -> String {
-    match error {
-        OwnershipError::LeaseRequired { path } => {
-            format!("write lease required for {}", path.display())
-        }
-        OwnershipError::Conflict { .. } => {
-            "workspace ownership conflicts with another agent".to_string()
-        }
-        OwnershipError::ReadOnlyRole => "the agent role is read-only".to_string(),
-        OwnershipError::Unavailable => "workspace ownership state is unavailable".to_string(),
-        other => other.to_string(),
-    }
+    crate::ownership::describe_ownership_error(error)
 }
 
 #[cfg(test)]

@@ -63,6 +63,10 @@ owner = "codex-core"
 tests = [
     "fork_invariant_destructive_git_requires_explicit_override",
     "fork_invariant_read_only_provider_denies_mutating_tools",
+    # The lease kill-switch sits after these denials, not before them: they
+    # never depended on a lease, and a shared dirty tree is where they matter.
+    "fork_invariant_destructive_git_survives_disabled_lease_enforcement",
+    "fork_invariant_unmanaged_provider_still_denies_destructive_git",
 ]
 
 [[invariant]]

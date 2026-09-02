@@ -159,6 +159,16 @@ pub(super) fn validate_release_request(request: &WorkflowLeaseReleaseRequest) ->
     validate_nonnegative_i64(request.generation, "path lease generation")
 }
 
+pub(super) fn validate_extend_request(request: &WorkflowLeaseExtendRequest) -> Result<()> {
+    validate_lease_id(&request.lease_id)?;
+    validate_lease_token(&request.token)?;
+    validate_nonnegative_i64(request.generation, "path lease generation")?;
+    if !(1..=MAX_LEASE_DURATION_MS).contains(&request.extend_duration_ms) {
+        bail!("path lease extension must be between 1 and {MAX_LEASE_DURATION_MS} milliseconds");
+    }
+    Ok(())
+}
+
 pub(super) fn validate_override_create(
     request: &WorkflowLeaseOverrideCreate,
 ) -> Result<Vec<WorkflowLeasePath>> {

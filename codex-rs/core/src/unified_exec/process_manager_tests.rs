@@ -605,6 +605,7 @@ async fn pruning_does_not_evict_live_process_while_exited_process_is_finalizing(
                 mutation_authorization: None,
                 network_approval: None,
                 _build_admission: None,
+                _lease_hold: None,
                 session: std::sync::Weak::new(),
                 last_used: if is_exited {
                     now - Duration::from_secs(1)
@@ -674,6 +675,7 @@ async fn reaper_removes_proven_exit_but_keeps_a_terminal_snapshot() {
             mutation_authorization: None,
             network_approval: None,
             _build_admission: None,
+            _lease_hold: None,
             session: Arc::downgrade(&session),
             last_used: Instant::now(),
         },

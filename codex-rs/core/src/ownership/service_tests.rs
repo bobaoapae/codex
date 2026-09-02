@@ -50,8 +50,13 @@ async fn make_service() -> (TempDir, WorkspaceOwnershipService, PathBuf, ThreadI
         std::fs::create_dir(root.join("second")).expect("second target");
         symlink(root.join("first"), root.join("link")).expect("initial symlink");
     }
+    // The database lives beside the workspace, not above it: every ancestor of
+    // an authorized root is fingerprinted, so a SQLite write in a parent
+    // directory reads as the tree changing under the guard.
+    let state = home.path().join("state");
+    std::fs::create_dir_all(&state).expect("state directory");
     let store = WorkflowStore::open(&SqliteConfig::new_for_testing(
-        AbsolutePathBuf::from_absolute_path(home.path()).expect("absolute home"),
+        AbsolutePathBuf::from_absolute_path(&state).expect("absolute state home"),
     ))
     .await
     .expect("workflow store");
@@ -452,4 +457,226 @@ async fn mutation_guard_revalidates_symlink_changes() {
     std::fs::remove_file(&link).expect("remove initial link");
     symlink(root.join("second"), &link).expect("replace link");
     assert!(guard.revalidate().is_err());
+}
+
+/// FORK: the regression that stalled every root command after a child ran.
+///
+/// Lease rows are never deleted, so a released or expired child claim used to
+/// stay in the conflict scan forever and could only be cleared with a one-shot
+/// override per operation digest.
+#[tokio::test]
+async fn released_child_lease_no_longer_blocks_root() {
+    let (_home, service, root, root_run_id) = make_service().await;
+    let child = OwnershipActor::subagent(
+        ThreadId::new(),
+        capabilities_for_canonical_role("executor_luna"),
+    );
+    let leases = service
+        .grant_agent_ownership(grant_request(root_run_id, child, vec![root.join("src")]))
+        .await
+        .expect("grant the child a write lease");
+
+    let blocked = service
+        .authorize_mutation(mutation_request(
+            OwnershipActor::root(root_run_id),
+            root.join("src").join("file.rs"),
+            OwnershipOverrideAuthorization::NotRequested,
+        ))
+        .await
+        .expect_err("an active child write lease blocks the root");
+    assert!(matches!(blocked, OwnershipError::Conflict { .. }));
+
+    service
+        .release_agent_ownership(OwnershipReleaseRequest {
+            requester: child,
+            lease_id: leases[0].lease_id.clone(),
+            token: leases[0].token.clone(),
+            generation: leases[0].generation,
+        })
+        .await
+        .expect("the child releases its own lease");
+
+    service
+        .authorize_mutation(mutation_request(
+            OwnershipActor::root(root_run_id),
+            root.join("src").join("file.rs"),
+            OwnershipOverrideAuthorization::NotRequested,
+        ))
+        .await
+        .expect("a released child lease must not block the root");
+}
+
+#[tokio::test]
+async fn child_read_lease_does_not_block_root_write() {
+    let (_home, service, root, root_run_id) = make_service().await;
+    let child = OwnershipActor::subagent(
+        ThreadId::new(),
+        capabilities_for_canonical_role("executor_luna"),
+    );
+    service
+        .grant_agent_ownership(OwnershipGrantRequest {
+            mode: WorkflowLeaseMode::Read,
+            ..grant_request(root_run_id, child, vec![root.join("src")])
+        })
+        .await
+        .expect("grant the child a read lease");
+
+    service
+        .authorize_mutation(mutation_request(
+            OwnershipActor::root(root_run_id),
+            root.join("src").join("file.rs"),
+            OwnershipOverrideAuthorization::NotRequested,
+        ))
+        .await
+        .expect("a child read lease must not block the root");
+}
+
+/// FORK: the subtlest part of narrowing the root's blocking rule.
+///
+/// Once a write lease blocks, the override's conflict-owner set has to include
+/// the overlapping *read* holders too: the store's own scan is mode-agnostic
+/// for a write acquisition, so a proof that omits them is rejected as a
+/// mismatch exactly when it is consumed.
+#[tokio::test]
+async fn root_override_covers_overlapping_read_and_write_holders() {
+    let (_home, service, root, root_run_id) = make_service().await;
+    let writer = OwnershipActor::subagent(
+        ThreadId::new(),
+        capabilities_for_canonical_role("executor_luna"),
+    );
+    let reader = OwnershipActor::subagent(
+        ThreadId::new(),
+        capabilities_for_canonical_role("executor_luna"),
+    );
+    // Disjoint children, both inside the root's requested scope.
+    service
+        .grant_agent_ownership(grant_request(root_run_id, writer, vec![root.join("src")]))
+        .await
+        .expect("grant the writer a write lease");
+    service
+        .grant_agent_ownership(OwnershipGrantRequest {
+            mode: WorkflowLeaseMode::Read,
+            ..grant_request(root_run_id, reader, vec![root.join("shared")])
+        })
+        .await
+        .expect("grant the reader a read lease elsewhere in the tree");
+
+    let sink: Arc<dyn OwnershipReceiptSink> = Arc::new(RecordingReceiptSink::default());
+    let guard = service
+        .authorize_mutation(mutation_request(
+            OwnershipActor::root(root_run_id),
+            root.clone(),
+            OwnershipOverrideAuthorization::Request(OwnershipOverrideRequest {
+                reason: "root must reclaim the checkout".to_string(),
+                receipt_sink: sink,
+            }),
+        ))
+        .await
+        .expect("the override consumes cleanly with both holders in its set");
+    assert!(!guard.leases().is_empty());
+}
+
+#[tokio::test]
+async fn subagent_acquires_and_renews_its_own_lease() {
+    let (_home, service, root, _root_run_id) = make_service().await;
+    let editor = OwnershipActor::subagent(
+        ThreadId::new(),
+        capabilities_for_canonical_role("executor_luna"),
+    );
+    let normalized = service
+        .authorized_roots()
+        .normalize(root.join("src"))
+        .expect("path normalizes");
+    let state_path = super::service_helpers::state_path(&normalized).expect("state path");
+
+    let leases = service
+        .acquire_subagent_leases(
+            editor,
+            std::slice::from_ref(&state_path),
+            Some("local"),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("a capable subagent acquires its own lease");
+    // "local" is the implicit environment and must be stored as NULL: an
+    // exact-equality mismatch there would let two agents write one path.
+    assert_eq!(leases[0].environment_id, None);
+
+    service
+        .authorize_mutation(mutation_request(
+            editor,
+            root.join("src").join("file.rs"),
+            OwnershipOverrideAuthorization::NotRequested,
+        ))
+        .await
+        .expect("the self-acquired lease admits the mutation");
+
+    let renewed = service
+        .renew_agent_ownership(&[codex_state::WorkflowLeaseExtendRequest {
+            lease_id: leases[0].lease_id.clone(),
+            token: leases[0].token.clone(),
+            generation: leases[0].generation,
+            extend_duration_ms: 3_600_000,
+        }])
+        .await
+        .expect("renewal extends the lease under its exact fence");
+    assert!(renewed[0].expires_at_ms > leases[0].expires_at_ms);
+
+    let stale = service
+        .renew_agent_ownership(&[codex_state::WorkflowLeaseExtendRequest {
+            lease_id: leases[0].lease_id.clone(),
+            token: "not-the-token".to_string(),
+            generation: leases[0].generation,
+            extend_duration_ms: 3_600_000,
+        }])
+        .await
+        .expect_err("a lost fence cannot renew");
+    assert!(matches!(stale, OwnershipError::State { .. }));
+}
+
+#[tokio::test]
+async fn read_only_role_cannot_acquire_its_own_lease() {
+    let (_home, service, root, _root_run_id) = make_service().await;
+    let reader =
+        OwnershipActor::subagent(ThreadId::new(), capabilities_for_canonical_role("explorer"));
+    let normalized = service
+        .authorized_roots()
+        .normalize(root.join("src"))
+        .expect("path normalizes");
+    let state_path = super::service_helpers::state_path(&normalized).expect("state path");
+    let error = service
+        .acquire_subagent_leases(reader, &[state_path], None, Duration::from_secs(60))
+        .await
+        .expect_err("self-acquisition is not a wider door for read-only roles");
+    assert!(matches!(error, OwnershipError::ReadOnlyRole));
+}
+
+#[tokio::test]
+async fn releasing_by_owner_clears_every_lease_an_evicted_agent_held() {
+    let (_home, service, root, root_run_id) = make_service().await;
+    let evicted = OwnershipActor::subagent(
+        ThreadId::new(),
+        capabilities_for_canonical_role("executor_luna"),
+    );
+    service
+        .grant_agent_ownership(grant_request(
+            root_run_id,
+            evicted,
+            vec![root.join("src"), root.join("shared")],
+        ))
+        .await
+        .expect("grant the agent two leases");
+
+    let released = service
+        .release_leases_for_owner(evicted.run_id())
+        .await
+        .expect("release everything the evicted agent held");
+    assert_eq!(released.len(), 2);
+    assert!(
+        service
+            .active_leases()
+            .await
+            .expect("active leases")
+            .is_empty()
+    );
 }

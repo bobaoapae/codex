@@ -160,6 +160,14 @@ impl V2Residency {
                 .agent_control
                 .state
                 .release_active_slot(candidate_thread_id);
+            // The evicted runtime took its lease fences with it; the rows have
+            // to be handed back here or its siblings wait out the TTL.
+            candidate_thread
+                .session
+                .services
+                .agent_control
+                .release_agent_leases(candidate_thread_id)
+                .await;
             let _ = manager.remove_thread(&candidate_thread_id).await;
             return true;
         }

@@ -42,7 +42,7 @@ pub(crate) fn create_grant_agent_ownership_tool() -> ToolSpec {
     ]);
     ToolSpec::Function(ResponsesApiTool {
         name: "grant_agent_ownership".to_string(),
-        description: "Root-only: grant an agent a bounded workspace path lease. This records ownership coordination only; it does not grant mutation without a later lease check, sandbox, approval, and execpolicy admission.".to_string(),
+        description: "Root-only, manual arbitration: leases are normally taken and released by the runtime, so use this only for a path you have already diagnosed as stuck. Grants an agent a bounded workspace path lease. This records ownership coordination only; it does not grant mutation without a later lease check, sandbox, approval, and execpolicy admission.".to_string(),
         strict: false,
         defer_loading: None,
         parameters: JsonSchema::object(
@@ -73,7 +73,7 @@ pub(crate) fn create_release_agent_ownership_tool() -> ToolSpec {
     ]);
     ToolSpec::Function(ResponsesApiTool {
         name: "release_agent_ownership".to_string(),
-        description: "Root-only: release one workspace ownership lease with its exact fencing token and generation.".to_string(),
+        description: "Root-only, manual arbitration: the runtime releases its own leases at the end of the holder's turn, so use this only to reclaim a path you have already diagnosed as stuck. Releases one workspace ownership lease with its exact fencing token and generation.".to_string(),
         strict: false,
         defer_loading: None,
         parameters: JsonSchema::object(
@@ -114,7 +114,7 @@ pub(crate) fn create_override_agent_ownership_tool() -> ToolSpec {
     ]);
     ToolSpec::Function(ResponsesApiTool {
         name: "override_agent_ownership".to_string(),
-        description: "Root-only: prepare a one-shot ownership override for an exact denied operation. This appends a redacted canonical receipt and returns an unconsumed proof; it never performs the mutation.".to_string(),
+        description: "Root-only, manual arbitration: conflicting agents wait and retry on their own, so use this only for a path you have already diagnosed as stuck. Prepares a one-shot ownership override for an exact denied operation. This appends a redacted canonical receipt and returns an unconsumed proof; it never performs the mutation.".to_string(),
         strict: false,
         defer_loading: None,
         parameters: JsonSchema::object(

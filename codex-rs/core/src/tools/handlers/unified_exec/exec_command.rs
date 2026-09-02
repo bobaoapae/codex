@@ -417,6 +417,7 @@ impl ExecCommandHandler {
                 tty,
                 turn_environment,
                 OwnershipOverrideAuthorization::NotRequested,
+                Some(&context.cancellation_token),
             )
             .await
             {

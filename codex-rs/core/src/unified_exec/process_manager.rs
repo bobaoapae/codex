@@ -1353,6 +1353,9 @@ impl UnifiedExecProcessManager {
             tty,
             environment_id,
             permissions,
+            _lease_hold: mutation_authorization
+                .as_ref()
+                .and_then(|authorization| authorization.lease_hold.clone()),
             mutation_authorization,
             network_approval,
             _build_admission: process.build_admission(),

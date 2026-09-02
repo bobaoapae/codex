@@ -1,5 +1,7 @@
 //! Fail-closed workspace path normalization primitives.
 
+mod ensure;
+mod lease_coordinator;
 mod path;
 mod provider;
 mod service;
@@ -7,6 +9,11 @@ mod service_admission;
 mod service_helpers;
 mod service_types;
 
+pub(crate) use ensure::EnsureLeaseRequest;
+pub(crate) use ensure::EnsuredLeases;
+pub(crate) use ensure::ensure_subagent_write_leases;
+pub(crate) use lease_coordinator::LeaseCoordinator;
+pub(crate) use lease_coordinator::LeaseHold;
 pub use path::AuthorizedWorkspaceRoots;
 pub use path::NormalizedLeasePath;
 pub use path::OwnershipPathError;
@@ -15,6 +22,7 @@ pub(crate) use provider::authorize_claude_provider;
 pub(crate) use provider::authorize_mcp_mutation;
 pub use service::OwnershipError;
 pub use service::WorkspaceOwnershipService;
+pub(crate) use service_helpers::describe_ownership_error;
 pub use service_types::MutationAuthorizationRequest;
 pub use service_types::MutationGuard;
 pub use service_types::MutationOperation;
@@ -35,3 +43,7 @@ mod tests;
 #[cfg(test)]
 #[path = "service_tests.rs"]
 mod service_tests;
+
+#[cfg(test)]
+#[path = "ensure_tests.rs"]
+mod ensure_tests;

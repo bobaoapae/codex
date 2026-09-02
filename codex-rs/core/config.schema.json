@@ -1317,6 +1317,9 @@
             "workspace_owner_usage_nudge": {
               "type": "boolean"
             },
+            "workspace_ownership": {
+              "$ref": "#/definitions/FeatureToml_for_WorkspaceOwnershipConfigToml"
+            },
             "write_stdin_approval": {
               "type": "boolean"
             }
@@ -1599,6 +1602,16 @@
         },
         {
           "$ref": "#/definitions/TokenBudgetConfigToml"
+        }
+      ]
+    },
+    "FeatureToml_for_WorkspaceOwnershipConfigToml": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "$ref": "#/definitions/WorkspaceOwnershipConfigToml"
         }
       ]
     },
@@ -6044,6 +6057,41 @@
         }
       ]
     },
+    "WorkspaceOwnershipConfigToml": {
+      "additionalProperties": false,
+      "description": "FORK: runtime coordination knobs for workspace path leases.\n\nLease coordination is a runtime responsibility (acquire, renew, release, wait); these knobs exist so a bad interaction can be switched off without a rebuild. `enabled = false` is the kill-switch: admission falls back to the pre-lease behavior while the destructive-Git and read-only-role denials stay in force.",
+      "properties": {
+        "auto_acquire": {
+          "description": "Whether the runtime acquires a subagent's write lease on demand.",
+          "type": "boolean"
+        },
+        "auto_ttl_ms": {
+          "description": "Lifetime of a runtime-acquired lease. The renewal interval is a third of it.",
+          "format": "int64",
+          "maximum": 86400000.0,
+          "minimum": 1000.0,
+          "type": "integer"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "exec_wait_ms": {
+          "description": "How long an exec admission may wait for a sibling to release a path.",
+          "format": "int64",
+          "maximum": 600000.0,
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "provider_wait_ms": {
+          "description": "How long a Claude sampling request may wait before degrading to read-only.",
+          "format": "int64",
+          "maximum": 600000.0,
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "WorkspaceRootsToml": {
       "type": "object"
     }
@@ -6674,6 +6722,9 @@
         },
         "workspace_owner_usage_nudge": {
           "type": "boolean"
+        },
+        "workspace_ownership": {
+          "$ref": "#/definitions/FeatureToml_for_WorkspaceOwnershipConfigToml"
         },
         "write_stdin_approval": {
           "type": "boolean"

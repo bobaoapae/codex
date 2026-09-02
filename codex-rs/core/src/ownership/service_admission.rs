@@ -40,6 +40,12 @@ impl WorkspaceOwnershipService {
                 let selected =
                     select_actor_leases(&leases, &state_paths, &request.actor.run_id().to_string());
                 for (path, normalized) in state_paths.iter().zip(&normalized_paths) {
+                    // A lease-exempt scratch root is private to this thread, so
+                    // requiring a lease over it only makes a mixed path set
+                    // (one repo file, one rendered chart) fail as a whole.
+                    if self.authorized_roots.is_lease_exempt(normalized) {
+                        continue;
+                    }
                     if !selected.iter().any(|lease| {
                         lease.mode == WorkflowLeaseMode::Write
                             && state_path_covers(&lease.path, path)
@@ -58,17 +64,7 @@ impl WorkspaceOwnershipService {
             }
             OwnershipAuthority::Root => {
                 self.require_root(request.actor)?;
-                let conflicts = self
-                    .active_leases()
-                    .await?
-                    .into_iter()
-                    .filter(|lease| lease.owner_run_id != self.root_run_id.to_string())
-                    .filter(|lease| {
-                        state_paths
-                            .iter()
-                            .any(|path| state_path_overlaps(&lease.path, path))
-                    })
-                    .collect::<Vec<_>>();
+                let conflicts = self.blocking_child_leases(&state_paths).await?;
                 let leases = match request.override_authorization {
                     OwnershipOverrideAuthorization::NotRequested => {
                         if !conflicts.is_empty() {
@@ -147,14 +143,10 @@ impl WorkspaceOwnershipService {
             }
         }
         if guard.actor_run_id() == self.root_run_id && guard.leases().is_empty() {
-            let conflicts = leases
+            let conflicts = self
+                .blocking_child_leases(&state_paths)
+                .await?
                 .into_iter()
-                .filter(|lease| lease.owner_run_id != self.root_run_id.to_string())
-                .filter(|lease| {
-                    state_paths
-                        .iter()
-                        .any(|path| state_path_overlaps(&lease.path, path))
-                })
                 .map(|lease| WorkflowLeaseConflict {
                     lease_id: lease.lease_id,
                     owner_run_id: lease.owner_run_id,
@@ -187,6 +179,9 @@ impl WorkspaceOwnershipService {
         let (normalized_paths, state_paths) = self.normalize_paths(paths)?;
         let owner_run_id = guard.actor_run_id().to_string();
         for (normalized, requested) in normalized_paths.iter().zip(state_paths) {
+            if self.authorized_roots.is_lease_exempt(normalized) {
+                continue;
+            }
             let covered = guard.leases().iter().any(|lease| {
                 lease.mode == WorkflowLeaseMode::Write
                     && lease.state == WorkflowLeaseState::Active
@@ -216,17 +211,7 @@ impl WorkspaceOwnershipService {
         let (_, state_paths) = self.normalize_paths(&paths)?;
         validate_operation_digest(&operation.digest)?;
         validate_override_reason(&reason)?;
-        let conflicts = self
-            .active_leases()
-            .await?
-            .into_iter()
-            .filter(|lease| lease.owner_run_id != self.root_run_id.to_string())
-            .filter(|lease| {
-                state_paths
-                    .iter()
-                    .any(|path| state_path_overlaps(&lease.path, path))
-            })
-            .collect::<Vec<_>>();
+        let conflicts = self.blocking_child_leases(&state_paths).await?;
         if conflicts.is_empty() {
             return Err(OwnershipError::OverrideNotNeeded);
         }
@@ -349,7 +334,11 @@ impl WorkspaceOwnershipService {
             .map_err(map_state_error)
     }
 
-    async fn active_leases(&self) -> Result<Vec<WorkflowPathLease>, OwnershipError> {
+    /// Every lease row recorded for this root, in any state.
+    ///
+    /// Rows are never deleted, so this includes released, expired and
+    /// recoverable claims. Only diagnostics and full listings want it.
+    pub(super) async fn all_leases(&self) -> Result<Vec<WorkflowPathLease>, OwnershipError> {
         self.workflow
             .expire_path_leases(chrono::Utc::now().timestamp_millis())
             .await
@@ -358,6 +347,52 @@ impl WorkspaceOwnershipService {
             .list_path_leases(&self.root_run_id.to_string())
             .await
             .map_err(map_state_error)
+    }
+
+    /// FORK: only the leases that still hold a claim.
+    ///
+    /// This used to return every row, so a child lease that had been released
+    /// or had expired blocked the root on that path forever and could only be
+    /// cleared with a one-shot override per operation digest.
+    pub(super) async fn active_leases(&self) -> Result<Vec<WorkflowPathLease>, OwnershipError> {
+        Ok(self
+            .all_leases()
+            .await?
+            .into_iter()
+            .filter(|lease| lease.state == WorkflowLeaseState::Active)
+            .collect())
+    }
+
+    /// FORK: the conflict set that blocks a root mutation over `state_paths`.
+    ///
+    /// A read lease held by a child does not block the root, but once anything
+    /// blocks, every overlapping active lease belongs to the set: the store's
+    /// own conflict scan is mode-agnostic for a write acquisition, and an
+    /// override proof whose owner set omits a read holder is rejected as a
+    /// mismatch when it is consumed.
+    async fn blocking_child_leases(
+        &self,
+        state_paths: &[WorkflowLeasePath],
+    ) -> Result<Vec<WorkflowPathLease>, OwnershipError> {
+        let overlapping = self
+            .active_leases()
+            .await?
+            .into_iter()
+            .filter(|lease| lease.owner_run_id != self.root_run_id.to_string())
+            .filter(|lease| {
+                state_paths
+                    .iter()
+                    .any(|path| state_path_overlaps(&lease.path, path))
+            })
+            .collect::<Vec<_>>();
+        if overlapping
+            .iter()
+            .any(|lease| lease.mode == WorkflowLeaseMode::Write)
+        {
+            Ok(overlapping)
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     async fn find_prepared_override(

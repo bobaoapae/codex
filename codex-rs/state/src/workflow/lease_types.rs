@@ -144,6 +144,19 @@ pub struct WorkflowLeaseReleaseRequest {
     pub generation: i64,
 }
 
+/// Fencing data required to extend an active lease's expiry.
+///
+/// Renewal has to be an extend rather than a re-acquire: `collect_conflicts`
+/// does not exclude the requester's own active leases, so re-acquiring the same
+/// path would conflict with the lease being renewed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowLeaseExtendRequest {
+    pub lease_id: String,
+    pub token: String,
+    pub generation: i64,
+    pub extend_duration_ms: i64,
+}
+
 /// One active conflict found while acquiring a path set.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

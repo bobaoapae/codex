@@ -214,3 +214,40 @@ fn revalidation_detects_existing_ancestor_replacement() {
         Err(OwnershipPathError::Changed { .. })
     ));
 }
+
+/// FORK: a sibling writing in the same directory is not tampering.
+///
+/// The workspace root is an ancestor of every leased path, so fingerprinting a
+/// directory's mtime meant one agent creating a file invalidated every other
+/// agent's admitted mutation — "workspace path changed before mutation" —
+/// which is precisely the concurrency the lease layer exists to allow.
+#[test]
+fn revalidation_survives_a_sibling_write_in_the_same_directory() {
+    let (_temp_dir, root) = workspace();
+    let target = root.join("mine.txt");
+    fs::write(&target, "mine").expect("target file should be created");
+    let authorized = roots(&root);
+    let lease = normalized(&authorized, &target);
+
+    fs::write(root.join("theirs.txt"), "theirs").expect("sibling file should be created");
+    fs::create_dir(root.join("theirs")).expect("sibling directory should be created");
+    assert_eq!(lease.revalidate_before_mutation(), Ok(()));
+
+    // The leased file itself is still guarded by its own content fingerprint.
+    fs::write(&target, "someone else's edit").expect("target should be rewritten");
+    assert!(matches!(
+        lease.revalidate_before_mutation(),
+        Err(OwnershipPathError::Changed { .. })
+    ));
+}
+
+/// FORK: a not-yet-created target must survive its directory being written to.
+#[test]
+fn revalidation_of_a_missing_leaf_survives_a_sibling_write() {
+    let (_temp_dir, root) = workspace();
+    let authorized = roots(&root);
+    let lease = normalized(&authorized, &root.join("not-yet.txt"));
+
+    fs::write(root.join("someone-else.txt"), "theirs").expect("sibling file should be created");
+    assert_eq!(lease.revalidate_before_mutation(), Ok(()));
+}

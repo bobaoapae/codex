@@ -155,6 +155,7 @@ pub use workflow::WorkflowLeaseAcquireRequest;
 pub use workflow::WorkflowLeaseAuthority;
 pub use workflow::WorkflowLeaseConflict;
 pub use workflow::WorkflowLeaseError;
+pub use workflow::WorkflowLeaseExtendRequest;
 pub use workflow::WorkflowLeaseMode;
 pub use workflow::WorkflowLeaseOverride;
 pub use workflow::WorkflowLeaseOverrideCreate;

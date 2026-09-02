@@ -302,6 +302,20 @@ impl AgentControl {
         Ok(self.ownership_service.get().cloned().unwrap_or(service))
     }
 
+    /// FORK: hand back every lease an agent still holds as it goes away.
+    ///
+    /// Shutdown and residency eviction destroy the in-memory fences that the
+    /// lease coordinator would have released, so without this the rows stay
+    /// active and block the agent's siblings until their TTL runs out.
+    pub(crate) async fn release_agent_leases(&self, agent_id: ThreadId) {
+        let Some(service) = self.ownership_service.get().cloned() else {
+            return;
+        };
+        if let Err(error) = service.release_leases_for_owner(agent_id).await {
+            tracing::debug!("could not release workspace leases for {agent_id}: {error}");
+        }
+    }
+
     pub(crate) async fn grant_agent_ownership(
         &self,
         authorized_roots: AuthorizedWorkspaceRoots,

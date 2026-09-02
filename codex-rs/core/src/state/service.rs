@@ -82,6 +82,9 @@ pub(crate) struct SessionServices {
     pub(crate) selected_capability_roots: Vec<SelectedCapabilityRoot>,
     pub(crate) mcp_thread_init: ExtensionDataInit,
     pub(crate) agent_control: AgentControl,
+    /// FORK: custody of the workspace path leases this session acquires for
+    /// itself, so they are renewed while it works and released when it stops.
+    pub(crate) lease_coordinator: crate::ownership::LeaseCoordinator,
     pub(crate) network_proxy: ArcSwapOption<StartedNetworkProxy>,
     pub(crate) network_proxy_audit_metadata: NetworkProxyAuditMetadata,
     pub(crate) managed_network_requirements_configured: bool,

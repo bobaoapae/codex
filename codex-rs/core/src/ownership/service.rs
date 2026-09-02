@@ -11,6 +11,9 @@ use codex_state::WorkflowLeaseReleaseRequest;
 use codex_state::WorkflowPathLease;
 use codex_state::WorkflowStore;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Notify;
 
 /// Errors returned by the ownership admission service.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -58,6 +61,15 @@ pub enum OwnershipError {
     /// A bounded ownership request was malformed.
     #[error("ownership request is invalid: {message}")]
     InvalidRequest { message: String },
+    /// FORK: a sibling still held the path after the bounded wait elapsed.
+    #[error(
+        "waited {waited_ms}ms for another agent to release {path}; it is still held by {owners}"
+    )]
+    LeaseWaitTimeout {
+        path: PathBuf,
+        waited_ms: u64,
+        owners: String,
+    },
 }
 
 /// Root-scoped service that binds filesystem paths to durable workflow leases.
@@ -66,6 +78,12 @@ pub struct WorkspaceOwnershipService {
     pub(super) workflow: WorkflowStore,
     pub(super) root_run_id: ThreadId,
     pub(super) authorized_roots: AuthorizedWorkspaceRoots,
+    /// FORK: woken whenever this tree observes a lease release or expiry.
+    ///
+    /// The service is a per-tree singleton, so a sibling waiting on a path is
+    /// woken the moment the holder lets go instead of polling until its budget
+    /// runs out.
+    pub(super) lease_activity: Arc<Notify>,
 }
 
 impl WorkspaceOwnershipService {
@@ -78,7 +96,117 @@ impl WorkspaceOwnershipService {
             workflow,
             root_run_id,
             authorized_roots,
+            lease_activity: Arc::new(Notify::new()),
         }
+    }
+
+    /// FORK: the tree-wide signal a waiter subscribes to before re-checking.
+    pub(crate) fn lease_activity(&self) -> Arc<Notify> {
+        Arc::clone(&self.lease_activity)
+    }
+
+    /// FORK: wake every waiter after a release, expiry, or forced eviction.
+    pub(crate) fn notify_lease_activity(&self) {
+        self.lease_activity.notify_waiters();
+    }
+
+    /// FORK: acquire write leases for a subagent on its own behalf.
+    ///
+    /// Ownership used to be grantable only by the root through a tool no model
+    /// ever called, so a capable executor could not obtain the lease its own
+    /// first write required. The role capability check is unchanged: this is a
+    /// different way to reach the same admission, not a wider one.
+    pub(crate) async fn acquire_subagent_leases(
+        &self,
+        actor: OwnershipActor,
+        paths: &[WorkflowLeasePath],
+        environment_id: Option<&str>,
+        lease_duration: Duration,
+    ) -> Result<Vec<WorkflowPathLease>, OwnershipError> {
+        if actor.authority() != OwnershipAuthority::Subagent {
+            return Err(OwnershipError::InvalidRequest {
+                message: "only a subagent acquires its own workspace lease".to_string(),
+            });
+        }
+        if !actor.capabilities().may_request_workspace_lease() {
+            return Err(OwnershipError::ReadOnlyRole);
+        }
+        if paths.is_empty() {
+            return Err(OwnershipError::InvalidRequest {
+                message: "at least one path is required".to_string(),
+            });
+        }
+        let request = WorkflowLeaseAcquireRequest {
+            root_run_id: self.root_run_id.to_string(),
+            owner_run_id: actor.run_id().to_string(),
+            environment_id: normalize_environment_id(environment_id),
+            paths: paths.to_vec(),
+            mode: codex_state::WorkflowLeaseMode::Write,
+            lease_duration_ms: duration_millis(lease_duration)?,
+            authority: WorkflowLeaseAuthority::Owner,
+        };
+        self.workflow
+            .acquire_path_leases(&request)
+            .await
+            .map_err(map_state_error)
+    }
+
+    /// FORK: extend runtime-held leases under their exact fences.
+    ///
+    /// Renewal has to extend rather than re-acquire: the store's conflict scan
+    /// does not exclude the requester's own active leases, so re-acquiring the
+    /// same path conflicts with the lease being renewed.
+    pub(crate) async fn renew_agent_ownership(
+        &self,
+        requests: &[codex_state::WorkflowLeaseExtendRequest],
+    ) -> Result<Vec<WorkflowPathLease>, OwnershipError> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.workflow
+            .extend_path_leases(requests)
+            .await
+            .map_err(map_state_error)
+    }
+
+    /// FORK: release one lease the runtime acquired for itself.
+    ///
+    /// The coordinator tracks only runtime-acquired fences, so this needs no
+    /// actor check; a manual root grant is released through
+    /// [`Self::release_agent_ownership`] as before.
+    pub(crate) async fn release_runtime_lease(
+        &self,
+        request: WorkflowLeaseReleaseRequest,
+    ) -> Result<WorkflowPathLease, OwnershipError> {
+        let released = self
+            .workflow
+            .release_path_lease(&request)
+            .await
+            .map_err(map_state_error)?;
+        self.notify_lease_activity();
+        Ok(released)
+    }
+
+    /// FORK: drop every active lease an agent still holds when it goes away.
+    ///
+    /// Shutdown and residency eviction destroy the in-memory fences, so the
+    /// rows would otherwise block its siblings until the TTL ran out.
+    pub(crate) async fn release_leases_for_owner(
+        &self,
+        owner_run_id: ThreadId,
+    ) -> Result<Vec<WorkflowPathLease>, OwnershipError> {
+        let released = self
+            .workflow
+            .release_active_path_leases_for_owner(
+                &self.root_run_id.to_string(),
+                &owner_run_id.to_string(),
+            )
+            .await
+            .map_err(map_state_error)?;
+        if !released.is_empty() {
+            self.notify_lease_activity();
+        }
+        Ok(released)
     }
 
     pub fn root_run_id(&self) -> ThreadId {

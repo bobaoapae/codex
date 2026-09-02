@@ -473,6 +473,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
                             receipt_sink: ctx.session.clone(),
                         },
                     ),
+                    Some(&ctx.cancellation_token),
                 )
                 .await
                 .map_err(ToolError::Rejected)?;

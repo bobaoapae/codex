@@ -1,6 +1,7 @@
 //! Transactional path leases and root-authorized one-shot overrides.
 
 use anyhow::Result;
+use anyhow::bail;
 use uuid::Uuid;
 
 use super::WorkflowStore;
@@ -178,6 +179,93 @@ impl WorkflowStore {
         let lease = lease_from_row(&row)?;
         tx.commit().await?;
         Ok(lease)
+    }
+
+    /// Extend the expiry of active leases under one fenced, all-or-nothing
+    /// transaction. Any stale fence, missing row, or non-active lease rolls the
+    /// whole batch back so a renewer never keeps a partially valid claim.
+    pub async fn extend_path_leases(
+        &self,
+        requests: &[WorkflowLeaseExtendRequest],
+    ) -> Result<Vec<WorkflowPathLease>> {
+        if requests.is_empty() {
+            bail!("path lease extension must name at least one lease");
+        }
+        if requests.len() > MAX_LEASE_PATHS {
+            bail!("path lease extension exceeds {MAX_LEASE_PATHS} leases");
+        }
+        for request in requests {
+            validate_extend_request(request)?;
+        }
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let now = now_ms();
+        expire_active_leases(&mut tx, now).await?;
+        let mut extended = Vec::with_capacity(requests.len());
+        for request in requests {
+            let expires_at_ms = now
+                .checked_add(request.extend_duration_ms)
+                .ok_or_else(|| anyhow::anyhow!("path lease expiry timestamp overflow"))?;
+            let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "UPDATE workflow_path_leases
+                 SET expires_at_ms = MAX(COALESCE(expires_at_ms, 0), ?)
+                 WHERE lease_id = ? AND lease_token = ? AND generation = ?
+                   AND state = 'active'
+                 RETURNING {LEASE_COLUMNS}"
+            )))
+            .bind(expires_at_ms)
+            .bind(&request.lease_id)
+            .bind(&request.token)
+            .bind(request.generation)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some(row) = row else {
+                tx.rollback().await?;
+                return Err(anyhow::Error::new(WorkflowLeaseError::Stale {
+                    lease_id: request.lease_id.clone(),
+                }));
+            };
+            extended.push(lease_from_row(&row)?);
+        }
+        tx.commit().await?;
+        Ok(extended)
+    }
+
+    /// Release every active lease held by one owner in a root's tree without a
+    /// fencing token. This exists for shutdown and eviction, where the
+    /// in-memory fences of the departing owner are already gone; it can never
+    /// touch another owner's rows.
+    pub async fn release_active_path_leases_for_owner(
+        &self,
+        root_run_id: &str,
+        owner_run_id: &str,
+    ) -> Result<Vec<WorkflowPathLease>> {
+        validate_lease_id(root_run_id)?;
+        validate_lease_id(owner_run_id)?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let released_at_ms = now_ms();
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE workflow_path_leases
+             SET state = 'released', released_at_ms = ?
+             WHERE root_run_id = ? AND owner_run_id = ? AND state = 'active'
+             RETURNING {LEASE_COLUMNS}"
+        )))
+        .bind(released_at_ms)
+        .bind(root_run_id)
+        .bind(owner_run_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut leases = rows
+            .iter()
+            .map(lease_from_row)
+            .collect::<Result<Vec<_>>>()?;
+        leases.sort_by(|left, right| {
+            left.path
+                .comparison_key
+                .cmp(&right.path.comparison_key)
+                .then_with(|| left.lease_id.cmp(&right.lease_id))
+        });
+        tx.commit().await?;
+        Ok(leases)
     }
 
     /// Mark expired active leases recoverable and fence their prior claims.

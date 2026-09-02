@@ -152,6 +152,9 @@ pub(crate) struct ExecCommandRequest {
 pub(crate) struct ExecMutationAuthorization {
     pub(crate) service: Arc<WorkspaceOwnershipService>,
     pub(crate) guard: MutationGuard,
+    /// FORK: custody of a lease the runtime acquired for this command, kept for
+    /// as long as the process it admitted can still write.
+    pub(crate) lease_hold: Option<crate::ownership::LeaseHold>,
 }
 
 impl std::fmt::Debug for ExecMutationAuthorization {
@@ -247,6 +250,9 @@ struct ProcessEntry {
     mutation_authorization: Option<ExecMutationAuthorization>,
     network_approval: Option<DeferredNetworkApproval>,
     _build_admission: Option<Arc<BuildAdmissionGuard>>,
+    /// FORK: a background process outlives the turn that started it, so it has
+    /// to keep the write lease alive past that turn's own custody.
+    _lease_hold: Option<crate::ownership::LeaseHold>,
     session: Weak<Session>,
     last_used: tokio::time::Instant,
 }

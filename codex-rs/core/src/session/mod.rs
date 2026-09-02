@@ -1237,7 +1237,8 @@ impl Session {
         &self,
     ) -> Result<std::sync::Arc<WorkspaceOwnershipService>, OwnershipError> {
         let config = self.get_config().await;
-        let authorized_roots = AuthorizedWorkspaceRoots::new(config.effective_workspace_roots())?;
+        let authorized_roots = AuthorizedWorkspaceRoots::new(config.effective_workspace_roots())?
+            .with_lease_exempt_roots(config.lease_exempt_workspace_roots());
         self.services
             .agent_control
             .ownership_service(authorized_roots)

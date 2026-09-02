@@ -84,6 +84,17 @@ pub(super) fn state_path_overlaps(left: &WorkflowLeasePath, right: &WorkflowLeas
     state_path_covers(left, right) || state_path_covers(right, left)
 }
 
+/// FORK: collapse the implicit local environment onto the stored `NULL`.
+///
+/// The store compares `environment_id` for exact equality, so a lease recorded
+/// as `Some("local")` and one recorded as `None` never conflict even though
+/// they name the same machine — two writers on one path, by spelling.
+pub(super) fn normalize_environment_id(environment_id: Option<&str>) -> Option<String> {
+    environment_id
+        .filter(|environment_id| *environment_id != LOCAL_ENVIRONMENT_ID)
+        .map(str::to_string)
+}
+
 pub(super) fn lease_environment_matches(
     lease_environment: Option<&str>,
     expected_environment: &str,
@@ -141,6 +152,48 @@ pub(super) fn map_state_error(error: anyhow::Error) -> OwnershipError {
     }
     OwnershipError::State {
         message: error.to_string(),
+    }
+}
+
+/// FORK: the single place an ownership failure is turned into agent-facing text.
+///
+/// There were two copies of this, both of which said only that a lease was
+/// required or that something conflicted — leaving the model to conclude it had
+/// to ask its parent for a grant, which is exactly what stalled every executor.
+/// The wording now says who holds the path and that waiting is the fix.
+pub(crate) fn describe_ownership_error(error: OwnershipError) -> String {
+    match error {
+        OwnershipError::LeaseRequired { path } => format!(
+            "another agent is writing {}; the write lease is taken automatically, so retry shortly or work on other files",
+            path.display()
+        ),
+        OwnershipError::LeaseWaitTimeout {
+            path,
+            waited_ms,
+            owners,
+        } => format!(
+            "waited {waited_ms}ms for {owners} to finish writing {}; leases are released automatically at the end of the holder's turn, so retry shortly or work on other files",
+            path.display()
+        ),
+        OwnershipError::Conflict { conflicts, .. } => {
+            let mut owners = conflicts
+                .iter()
+                .map(|conflict| conflict.owner_run_id.clone())
+                .collect::<Vec<_>>();
+            owners.sort();
+            owners.dedup();
+            let owners = if owners.is_empty() {
+                "another agent".to_string()
+            } else {
+                owners.join(", ")
+            };
+            format!(
+                "these paths are held by {owners}; the lease is released automatically at the end of the holder's turn, so retry shortly or work on other files"
+            )
+        }
+        OwnershipError::ReadOnlyRole => "the agent role is read-only".to_string(),
+        OwnershipError::Unavailable => "workspace ownership state is unavailable".to_string(),
+        other => other.to_string(),
     }
 }
 

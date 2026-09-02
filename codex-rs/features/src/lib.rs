@@ -37,6 +37,7 @@ pub use feature_configs::SleepToolConfigToml;
 pub use feature_configs::SleepToolMode;
 pub use feature_configs::TokenBudgetConfigToml;
 pub use feature_configs::ToolRegistryConfigToml;
+pub use feature_configs::WorkspaceOwnershipConfigToml;
 use legacy::LegacyFeatureToggles;
 pub use legacy::legacy_feature_keys;
 
@@ -110,6 +111,10 @@ pub enum Feature {
     /// subagents. Falls back to the one-shot stdin path when the installed CLI
     /// does not answer `initialize`.
     ClaudeCodeControlProtocol,
+    /// FORK: enforce workspace path leases between agents. Off means admission
+    /// falls back to the pre-lease behavior; the destructive-Git and
+    /// read-only-role denials do not depend on it and stay in force.
+    WorkspaceOwnership,
     /// Send per-content-entry classifications in internal Responses metadata.
     ContentItemKinds,
     /// Record model-attempted tool calls in internal Responses metadata.
@@ -760,6 +765,9 @@ pub struct FeaturesToml {
     pub guardianv2: Option<FeatureToml<GuardianV2ConfigToml>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multi_agent_v2: Option<FeatureToml<MultiAgentV2ConfigToml>>,
+    /// FORK: runtime coordination knobs for workspace path leases.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_ownership: Option<FeatureToml<WorkspaceOwnershipConfigToml>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_budget: Option<FeatureToml<TokenBudgetConfigToml>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -805,6 +813,13 @@ impl FeaturesToml {
         }
         if let Some(enabled) = self.multi_agent_v2.as_ref().and_then(FeatureToml::enabled) {
             entries.insert(Feature::MultiAgentV2.key().to_string(), enabled);
+        }
+        if let Some(enabled) = self
+            .workspace_ownership
+            .as_ref()
+            .and_then(FeatureToml::enabled)
+        {
+            entries.insert(Feature::WorkspaceOwnership.key().to_string(), enabled);
         }
         if let Some(enabled) = self.token_budget.as_ref().and_then(FeatureToml::enabled) {
             entries.insert(Feature::TokenBudget.key().to_string(), enabled);
@@ -968,6 +983,13 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::ClaudeCodeControlProtocol,
         key: "claude_code_control_protocol",
+        stage: Stage::Stable,
+        default_enabled: true,
+    },
+    // FORK: on by default; the runtime, not the model, does the coordinating.
+    FeatureSpec {
+        id: Feature::WorkspaceOwnership,
+        key: "workspace_ownership",
         stage: Stage::Stable,
         default_enabled: true,
     },

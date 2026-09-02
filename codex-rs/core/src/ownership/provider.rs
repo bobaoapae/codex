@@ -3,6 +3,8 @@
 #[path = "provider_paths.rs"]
 mod provider_paths;
 
+use super::EnsureLeaseRequest;
+use super::LeaseHold;
 use super::MutationAuthorizationRequest;
 use super::MutationGuard;
 use super::MutationOperation;
@@ -11,6 +13,8 @@ use super::OwnershipAuthority;
 use super::OwnershipError;
 use super::OwnershipOverrideAuthorization;
 use super::WorkspaceOwnershipService;
+use super::describe_ownership_error;
+use super::ensure_subagent_write_leases;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::session::turn_context::TurnEnvironment;
@@ -24,6 +28,7 @@ use sha2::Sha256;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Scope retained by a provider while it executes a mutating tool.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,6 +46,8 @@ pub(crate) struct ProviderMutationGuard {
     pub(crate) guard: MutationGuard,
     pub(crate) scope: ProviderMutationScope,
     pub(crate) environment_id: String,
+    /// FORK: custody of a lease the runtime acquired for this provider turn.
+    pub(crate) _lease_hold: Option<LeaseHold>,
 }
 
 impl std::fmt::Debug for ProviderMutationGuard {
@@ -71,11 +78,17 @@ impl ProviderMutationGuard {
             .map(|path| self.service.authorized_roots().normalize(path))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| format_ownership_error(OwnershipError::Path(error)))?;
+        let roots = self.service.authorized_roots();
         Ok(normalized.iter().all(|path| {
-            self.guard
-                .paths()
-                .iter()
-                .any(|scope| scope.is_ancestor_or_equal(path))
+            // A lease-exempt root is authorized but never leased, so no guard
+            // scope covers it; without this a Claude edit into the thread's own
+            // scratch directory would be refused as out of scope.
+            roots.is_lease_exempt(path)
+                || self
+                    .guard
+                    .paths()
+                    .iter()
+                    .any(|scope| scope.is_ancestor_or_equal(path))
         }))
     }
 }
@@ -84,13 +97,31 @@ impl ProviderMutationGuard {
 #[derive(Clone, Debug)]
 pub(crate) enum ClaudeProviderAccess {
     Root,
-    ReadOnly,
+    /// FORK: no write lease is in force for this request.
+    ///
+    /// `notice` explains a *temporary* degradation — a sibling holds the paths —
+    /// so the agent reports instead of failing, and the next sampling request
+    /// tries again. A role that simply cannot write carries no notice.
+    ReadOnly {
+        notice: Option<String>,
+    },
+    /// FORK: lease coordination is switched off by config. Tools run, but the
+    /// checks that never depended on a lease still apply.
+    Unmanaged,
     Mutable(ProviderMutationGuard),
 }
 
 impl ClaudeProviderAccess {
     pub(crate) fn is_read_only(&self) -> bool {
-        matches!(self, Self::ReadOnly)
+        matches!(self, Self::ReadOnly { .. })
+    }
+
+    /// FORK: what to tell the agent about a degraded turn, if anything.
+    pub(crate) fn ownership_notice(&self) -> Option<&str> {
+        match self {
+            Self::ReadOnly { notice } => notice.as_deref(),
+            Self::Root | Self::Unmanaged | Self::Mutable(_) => None,
+        }
     }
 
     /// Whether the Claude CLI must route tool calls through the Codex host.
@@ -101,7 +132,7 @@ impl ClaudeProviderAccess {
     /// destructive-Git checks. Root access intentionally keeps its existing
     /// policy mapping; root is not a leased subagent.
     pub(crate) fn requires_tool_authorization(&self) -> bool {
-        matches!(self, Self::Mutable(_))
+        matches!(self, Self::Mutable(_) | Self::Unmanaged)
     }
 
     pub(crate) async fn authorize_claude_tool(
@@ -111,10 +142,15 @@ impl ClaudeProviderAccess {
         cwd: &AbsolutePathBuf,
     ) -> Result<(), String> {
         let Self::Mutable(guard) = self else {
-            return if self.is_read_only() && is_mutating_claude_tool(tool_name) {
-                Err("this Claude agent role is read-only".to_string())
-            } else {
-                Ok(())
+            return match self {
+                Self::ReadOnly { notice } if is_mutating_claude_tool(tool_name) => {
+                    Err(match notice {
+                        Some(_) => "write access is paused for this request".to_string(),
+                        None => "this Claude agent role is read-only".to_string(),
+                    })
+                }
+                Self::Unmanaged => authorize_unmanaged_claude_tool(tool_name, input),
+                _ => Ok(()),
             };
         };
         guard.revalidate().await?;
@@ -179,6 +215,12 @@ impl ClaudeProviderAccess {
 }
 
 /// Prepare local Claude provider access before its process is launched.
+///
+/// FORK: this runs on *every* sampling request, so it must not be able to kill
+/// the turn. A missing lease degrades the request to read-only and says so;
+/// because the next request re-runs this, the agent recovers write access on
+/// its own as soon as the sibling holding the paths lets go. Only a remote
+/// executor is still an error, because ownership cannot be proven there at all.
 pub(crate) async fn authorize_claude_provider(
     session: &Session,
     turn: &TurnContext,
@@ -191,13 +233,17 @@ pub(crate) async fn authorize_claude_provider(
     if actor.authority() == OwnershipAuthority::Root {
         return Ok(ClaudeProviderAccess::Root);
     }
-    if !actor.capabilities().may_request_workspace_lease() {
-        return Ok(ClaudeProviderAccess::ReadOnly);
+    let policy = session.get_config().await.workspace_ownership.clone();
+    if !policy.enforce {
+        return Ok(ClaudeProviderAccess::Unmanaged);
     }
-    let service = session
-        .ownership_service()
-        .await
-        .map_err(|error| format!("Claude ownership check failed: {error}"))?;
+    if !actor.capabilities().may_request_workspace_lease() {
+        return Ok(ClaudeProviderAccess::ReadOnly { notice: None });
+    }
+    let service = match session.ownership_service().await {
+        Ok(service) => service,
+        Err(error) => return Ok(degraded_access(describe_ownership_error(error))),
+    };
     let environment_id = environment.selection.environment_id.clone();
     let (paths, scope) = if let Some(worktree_root) =
         detected_linked_worktree(environment, environment.cwd()).await
@@ -207,16 +253,44 @@ pub(crate) async fn authorize_claude_provider(
             ProviderMutationScope::IsolatedWorktree,
         )
     } else {
-        (
-            checkout_paths(&service, turn)?,
-            ProviderMutationScope::FullCheckout,
-        )
+        match checkout_paths(&service, turn) {
+            Ok(paths) => (paths, ProviderMutationScope::FullCheckout),
+            // Every writable root is lease-exempt scratch: there is nothing to
+            // coordinate, so do not withhold write access over it.
+            Err(CheckoutScope::AllExempt) => return Ok(ClaudeProviderAccess::Unmanaged),
+            Err(CheckoutScope::NoRoots) => {
+                return Ok(degraded_access(format!(
+                    "{} has no authorized workspace roots",
+                    turn.session_source
+                )));
+            }
+        }
     };
+
+    let ensured = match ensure_subagent_write_leases(EnsureLeaseRequest {
+        service: &service,
+        coordinator: &session.services.lease_coordinator,
+        actor,
+        paths: &paths,
+        environment_id: &environment_id,
+        ttl: Duration::from_millis(policy.auto_ttl_ms as u64),
+        wait: Duration::from_millis(policy.provider_wait_ms as u64),
+        auto_acquire: policy.auto_acquire,
+        cancel: None,
+    })
+    .await
+    {
+        Ok(ensured) => ensured,
+        Err(error) => return Ok(degraded_access(describe_ownership_error(error))),
+    };
+    if ensured.is_exempt() {
+        return Ok(ClaudeProviderAccess::Unmanaged);
+    }
 
     let operation = MutationOperation {
         digest: operation_digest(b"claude.provider", &paths, &environment_id),
     };
-    let guard = service
+    let guard = match service
         .authorize_mutation(MutationAuthorizationRequest {
             actor,
             paths: paths.clone(),
@@ -224,17 +298,32 @@ pub(crate) async fn authorize_claude_provider(
             override_authorization: OwnershipOverrideAuthorization::NotRequested,
         })
         .await
-        .map_err(format_ownership_error)?;
-    service
+    {
+        Ok(guard) => guard,
+        Err(error) => return Ok(degraded_access(describe_ownership_error(error))),
+    };
+    if let Err(error) = service
         .require_full_environment_lease(&guard, &paths, &environment_id)
         .await
-        .map_err(format_ownership_error)?;
+    {
+        return Ok(degraded_access(describe_ownership_error(error)));
+    }
     Ok(ClaudeProviderAccess::Mutable(ProviderMutationGuard {
         service,
         guard,
         scope,
         environment_id,
+        _lease_hold: ensured.hold(),
     }))
+}
+
+/// FORK: a read-only turn the next sampling request will try to upgrade.
+fn degraded_access(reason: String) -> ClaudeProviderAccess {
+    ClaudeProviderAccess::ReadOnly {
+        notice: Some(format!(
+            "Write access is paused for this reply: {reason}. Codex retries automatically on the next request, so keep working read-only and say what you would change."
+        )),
+    }
 }
 
 /// Admit a mutating MCP call. Read-only annotations are handled by the caller and do not enter
@@ -249,6 +338,10 @@ pub(crate) async fn authorize_mcp_mutation(
         return Err("local ownership cannot authorize a remote MCP executor".to_string());
     }
     let actor = ownership_actor(session, turn);
+    let policy = session.get_config().await.workspace_ownership.clone();
+    if !policy.enforce {
+        return Ok(None);
+    }
     let service = match session.ownership_service().await {
         Ok(service) => service,
         Err(OwnershipError::Unavailable) if actor.authority() == OwnershipAuthority::Root => {
@@ -266,7 +359,17 @@ pub(crate) async fn authorize_mcp_mutation(
         .collect::<Vec<_>>();
     let full_scope = known_paths.is_empty();
     let paths = if full_scope {
-        checkout_paths(&service, turn)?
+        match checkout_paths(&service, turn) {
+            Ok(paths) => paths,
+            // Nothing writable here needs coordinating.
+            Err(CheckoutScope::AllExempt) => return Ok(None),
+            Err(CheckoutScope::NoRoots) => {
+                return Err(format!(
+                    "{} has no authorized workspace roots",
+                    turn.session_source
+                ));
+            }
+        }
     } else {
         known_paths.clone()
     };
@@ -275,6 +378,18 @@ pub(crate) async fn authorize_mcp_mutation(
         && let Some(worktree_root) = detected_linked_worktree(environment, environment.cwd()).await
     {
         let scope_paths = vec![worktree_root.into_path_buf()];
+        let ensured = ensure_mcp_leases(
+            session,
+            &service,
+            actor,
+            &scope_paths,
+            &environment_id,
+            &policy,
+        )
+        .await?;
+        if ensured.is_exempt() {
+            return Ok(None);
+        }
         let guard = service
             .authorize_mutation(MutationAuthorizationRequest {
                 actor,
@@ -295,11 +410,17 @@ pub(crate) async fn authorize_mcp_mutation(
             service,
             scope: ProviderMutationScope::IsolatedWorktree,
             environment_id,
+            _lease_hold: ensured.hold(),
         };
         if !known_paths.is_empty() && !provider_guard.covers_paths(&known_paths)? {
             return Err("MCP path is outside the isolated worktree".to_string());
         }
         return Ok(Some(provider_guard));
+    }
+    let ensured =
+        ensure_mcp_leases(session, &service, actor, &paths, &environment_id, &policy).await?;
+    if ensured.is_exempt() {
+        return Ok(None);
     }
     let guard = service
         .authorize_mutation(MutationAuthorizationRequest {
@@ -323,7 +444,31 @@ pub(crate) async fn authorize_mcp_mutation(
         guard,
         scope: ProviderMutationScope::FullCheckout,
         environment_id,
+        _lease_hold: ensured.hold(),
     }))
+}
+
+async fn ensure_mcp_leases(
+    session: &Session,
+    service: &Arc<WorkspaceOwnershipService>,
+    actor: OwnershipActor,
+    paths: &[PathBuf],
+    environment_id: &str,
+    policy: &crate::config::WorkspaceOwnershipConfig,
+) -> Result<super::EnsuredLeases, String> {
+    ensure_subagent_write_leases(EnsureLeaseRequest {
+        service,
+        coordinator: &session.services.lease_coordinator,
+        actor,
+        paths,
+        environment_id,
+        ttl: Duration::from_millis(policy.auto_ttl_ms as u64),
+        wait: Duration::from_millis(policy.exec_wait_ms as u64),
+        auto_acquire: policy.auto_acquire,
+        cancel: None,
+    })
+    .await
+    .map_err(format_ownership_error)
 }
 
 pub(crate) fn ownership_actor(session: &Session, turn: &TurnContext) -> OwnershipActor {
@@ -337,22 +482,63 @@ pub(crate) fn ownership_actor(session: &Session, turn: &TurnContext) -> Ownershi
     }
 }
 
+/// Why a provider could not be scoped to a leasable checkout.
+enum CheckoutScope {
+    /// The session has no authorized workspace roots at all.
+    NoRoots,
+    /// Every authorized root is lease-exempt scratch.
+    AllExempt,
+}
+
 fn checkout_paths(
     service: &WorkspaceOwnershipService,
-    turn: &TurnContext,
-) -> Result<Vec<PathBuf>, String> {
-    let paths = service
-        .authorized_roots()
-        .roots()
-        .map(Path::to_path_buf)
-        .collect::<Vec<_>>();
-    if paths.is_empty() {
-        return Err(format!(
-            "{} has no authorized workspace roots",
-            turn.session_source
-        ));
+    _turn: &TurnContext,
+) -> Result<Vec<PathBuf>, CheckoutScope> {
+    let roots = service.authorized_roots();
+    let all = roots.roots().map(Path::to_path_buf).collect::<Vec<_>>();
+    if all.is_empty() {
+        return Err(CheckoutScope::NoRoots);
     }
-    Ok(paths)
+    // The scratch directory is authorized but never leased, so asking for a
+    // lease over it would make every provider turn depend on a claim nobody
+    // ever grants.
+    let leasable = all
+        .into_iter()
+        .filter(|path| {
+            roots
+                .normalize(path)
+                .map(|normalized| !roots.is_lease_exempt(&normalized))
+                .unwrap_or(true)
+        })
+        .collect::<Vec<_>>();
+    if leasable.is_empty() {
+        return Err(CheckoutScope::AllExempt);
+    }
+    Ok(leasable)
+}
+
+/// FORK: what still applies to a Claude tool call when leases are switched off.
+///
+/// The destructive-Git denial never depended on a lease, and a shared, dirty
+/// working tree is exactly where it matters most.
+fn authorize_unmanaged_claude_tool(
+    tool_name: &str,
+    input: &serde_json::Value,
+) -> Result<(), String> {
+    if tool_name != "Bash" {
+        return Ok(());
+    }
+    let command = input
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "Claude Bash request has no literal command".to_string())?;
+    let words = vec!["bash".to_string(), "-lc".to_string(), command.to_string()];
+    match codex_shell_command::classify_command(&words) {
+        codex_shell_command::MutationIntent::DestructiveGit { .. } => {
+            Err("subagents cannot execute destructive Git commands".to_string())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Detect a trusted linked-worktree root for narrowing provider scope.
@@ -413,17 +599,7 @@ fn is_mutating_claude_tool(name: &str) -> bool {
 }
 
 fn format_ownership_error(error: OwnershipError) -> String {
-    match error {
-        OwnershipError::LeaseRequired { path } => {
-            format!("write lease required for {}", path.display())
-        }
-        OwnershipError::Conflict { .. } => {
-            "workspace ownership conflicts with another agent".to_string()
-        }
-        OwnershipError::ReadOnlyRole => "the agent role is read-only".to_string(),
-        OwnershipError::Unavailable => "workspace ownership state is unavailable".to_string(),
-        other => other.to_string(),
-    }
+    describe_ownership_error(error)
 }
 
 #[cfg(test)]

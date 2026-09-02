@@ -42,6 +42,12 @@ pub enum OwnershipPathError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthorizedWorkspaceRoots {
     roots: Vec<AuthorizedRoot>,
+    /// FORK: authorized roots that never require a path lease.
+    ///
+    /// They stay in `roots` so paths inside them still normalize; they are only
+    /// excluded from lease admission. See
+    /// `Config::lease_exempt_workspace_roots`.
+    lease_exempt: Vec<Vec<String>>,
 }
 
 /// A normalized lease path and the root that authorizes it.
@@ -143,7 +149,46 @@ impl AuthorizedWorkspaceRoots {
                 guards: root.guards,
             })
             .collect();
-        Ok(Self { roots })
+        Ok(Self {
+            roots,
+            lease_exempt: Vec::new(),
+        })
+    }
+
+    /// FORK: mark roots that are authorized but never need a path lease.
+    ///
+    /// A root that does not exist yet is retained by its normalized components:
+    /// the scratch directory is created lazily and must still be exempt before
+    /// its first write.
+    pub fn with_lease_exempt_roots<I, P>(mut self, roots: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        for root in roots {
+            let Ok(resolved) = resolve_path(root.as_ref()) else {
+                continue;
+            };
+            if !self.lease_exempt.contains(&resolved.components) {
+                self.lease_exempt.push(resolved.components);
+            }
+            if self.lease_exempt.len() >= MAX_AUTHORIZED_ROOTS {
+                break;
+            }
+        }
+        self
+    }
+
+    /// FORK: whether a normalized path lies under a lease-exempt root.
+    pub fn is_lease_exempt(&self, path: &NormalizedLeasePath) -> bool {
+        self.lease_exempt
+            .iter()
+            .any(|exempt| components_prefix(exempt, &path.components))
+    }
+
+    /// FORK: whether any lease-exempt root was configured.
+    pub fn has_lease_exempt_roots(&self) -> bool {
+        !self.lease_exempt.is_empty()
     }
 
     /// Normalize an absolute path and select the most-specific authorized root.
@@ -409,16 +454,29 @@ fn link_target_key(path: &Path, metadata: &fs::Metadata) -> Option<String> {
 
 impl MetadataFingerprint {
     fn from_metadata(metadata: &fs::Metadata) -> Self {
-        let modified = metadata.modified().ok().and_then(|time| {
-            time.duration_since(UNIX_EPOCH)
-                .ok()
-                .map(|duration| (duration.as_secs(), duration.subsec_nanos()))
-        });
+        // FORK: a plain directory's size and mtime change whenever *any* entry
+        // is created or removed inside it, which is ordinary concurrent work,
+        // not tampering. Fingerprinting them made every admitted mutation fail
+        // with "workspace path changed before mutation" as soon as a second
+        // agent wrote anything in the same directory - and the workspace root
+        // is an ancestor of everything. Identity still comes from the
+        // canonicalized resolved path, the link target and the entry type;
+        // files, symlinks included, keep the full fingerprint.
+        let plain_directory = metadata.is_dir() && !metadata.file_type().is_symlink();
+        let modified = (!plain_directory)
+            .then(|| {
+                metadata.modified().ok().and_then(|time| {
+                    time.duration_since(UNIX_EPOCH)
+                        .ok()
+                        .map(|duration| (duration.as_secs(), duration.subsec_nanos()))
+                })
+            })
+            .flatten();
         Self {
             file: metadata.is_file(),
             directory: metadata.is_dir(),
             symlink: metadata.file_type().is_symlink(),
-            len: metadata.len(),
+            len: if plain_directory { 0 } else { metadata.len() },
             readonly: metadata.permissions().readonly(),
             modified,
         }

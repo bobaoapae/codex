@@ -27,6 +27,9 @@ pub(super) async fn prepare(
         workspace.sandbox = codex_protocol::protocol::SandboxPolicy::new_read_only_policy();
         workspace.writable_roots.clear();
     }
+    // A degraded request says why, so the agent reports instead of retrying a
+    // write it cannot make. The next request re-runs this and may recover.
+    workspace.ownership_notice = provider_access.ownership_notice().map(str::to_string);
     workspace.permission_mode = super::super::permission_mode_for_access(
         &workspace.sandbox,
         turn.config.permissions.approval_policy.value(),

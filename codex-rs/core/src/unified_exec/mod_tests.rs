@@ -153,6 +153,7 @@ async fn exec_command_with_tty(
             mutation_authorization: None,
             network_approval: None,
             _build_admission: None,
+            _lease_hold: None,
             session: Arc::downgrade(session),
             last_used: started_at,
         };
@@ -629,6 +630,7 @@ async fn terminating_initial_exec_command_rechecks_initial_response_state() -> a
             mutation_authorization: None,
             network_approval: None,
             _build_admission: None,
+            _lease_hold: None,
             session: Arc::downgrade(&session),
             last_used: Instant::now(),
         },
@@ -714,6 +716,7 @@ async fn terminating_during_stdin_poll_returns_exited_response() -> anyhow::Resu
             mutation_authorization: None,
             network_approval: None,
             _build_admission: None,
+            _lease_hold: None,
             session: Arc::downgrade(&session),
             last_used,
         },

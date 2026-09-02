@@ -299,6 +299,7 @@ fn ownership_error(operation: &str, error: OwnershipError) -> JSONRPCErrorError 
         OwnershipError::State { .. } => "stateError",
         OwnershipError::InvalidRequest { .. } => "invalidRequest",
         OwnershipError::LeaseRequired { .. } => "leaseRequired",
+        OwnershipError::LeaseWaitTimeout { .. } => "leaseConflict",
     };
     let mut mapped = invalid_request(format!("workspace lease {operation} failed: {error}"));
     mapped.data = Some(json!({

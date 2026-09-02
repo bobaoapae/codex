@@ -430,3 +430,155 @@ async fn path_lease_migration_preserves_legacy_rows() {
     assert_eq!(lease.override_receipt_id.as_deref(), Some("legacy-receipt"));
     store.close().await;
 }
+
+#[tokio::test]
+async fn extending_a_lease_is_fenced_and_all_or_nothing() {
+    let home = unique_temp_dir();
+    let store = WorkflowStore::open(&sqlite_config(&home))
+        .await
+        .expect("open workflow store");
+    let root = "root-extend";
+    let leases = store
+        .acquire_path_leases(&acquire(
+            root,
+            "worker",
+            WorkflowLeaseMode::Write,
+            vec![
+                path("c:/repo/a", "c:/repo/a"),
+                path("c:/repo/b", "c:/repo/b"),
+            ],
+        ))
+        .await
+        .expect("acquire two write leases");
+    assert_eq!(leases.len(), 2);
+    let extend = |lease: &WorkflowPathLease, generation: i64| WorkflowLeaseExtendRequest {
+        lease_id: lease.lease_id.clone(),
+        token: lease.token.clone(),
+        generation,
+        extend_duration_ms: 3_600_000,
+    };
+
+    let extended = store
+        .extend_path_leases(&[extend(&leases[0], 1), extend(&leases[1], 1)])
+        .await
+        .expect("extend both leases under their exact fences");
+    for (before, after) in leases.iter().zip(&extended) {
+        assert!(after.expires_at_ms > before.expires_at_ms);
+        assert_eq!(after.generation, before.generation);
+        assert_eq!(after.state, WorkflowLeaseState::Active);
+    }
+
+    // A stale fence anywhere rolls the whole batch back, so a renewer never
+    // keeps a partially valid claim.
+    let stale = store
+        .extend_path_leases(&[extend(&leases[0], 1), extend(&leases[1], 7)])
+        .await
+        .expect_err("a mismatched generation is stale");
+    assert!(matches!(
+        stale.downcast_ref::<WorkflowLeaseError>(),
+        Some(WorkflowLeaseError::Stale { lease_id }) if *lease_id == leases[1].lease_id
+    ));
+    let unchanged = store
+        .get_path_lease(&leases[0].lease_id)
+        .await
+        .expect("read the first lease")
+        .expect("the first lease still exists");
+    assert_eq!(unchanged.expires_at_ms, extended[0].expires_at_ms);
+}
+
+#[tokio::test]
+async fn extending_an_expired_lease_is_stale() {
+    let home = unique_temp_dir();
+    let store = WorkflowStore::open(&sqlite_config(&home))
+        .await
+        .expect("open workflow store");
+    let root = "root-extend-expired";
+    let mut request = acquire(
+        root,
+        "worker",
+        WorkflowLeaseMode::Write,
+        vec![path("c:/repo/a", "c:/repo/a")],
+    );
+    request.lease_duration_ms = 1;
+    let leases = store
+        .acquire_path_leases(&request)
+        .await
+        .expect("acquire a lease that expires immediately");
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let error = store
+        .extend_path_leases(&[WorkflowLeaseExtendRequest {
+            lease_id: leases[0].lease_id.clone(),
+            token: leases[0].token.clone(),
+            generation: leases[0].generation,
+            extend_duration_ms: 60_000,
+        }])
+        .await
+        .expect_err("an expired lease cannot be extended");
+    assert!(matches!(
+        error.downcast_ref::<WorkflowLeaseError>(),
+        Some(WorkflowLeaseError::Stale { .. })
+    ));
+}
+
+#[tokio::test]
+async fn release_by_owner_only_touches_that_owner_and_unblocks_the_path() {
+    let home = unique_temp_dir();
+    let store = WorkflowStore::open(&sqlite_config(&home))
+        .await
+        .expect("open workflow store");
+    let root = "root-release-owner";
+    let departing = store
+        .acquire_path_leases(&acquire(
+            root,
+            "evicted",
+            WorkflowLeaseMode::Write,
+            vec![path("c:/repo/src", "c:/repo/src")],
+        ))
+        .await
+        .expect("acquire the departing agent's lease");
+    let staying = store
+        .acquire_path_leases(&acquire(
+            root,
+            "staying",
+            WorkflowLeaseMode::Write,
+            vec![path("c:/repo/docs", "c:/repo/docs")],
+        ))
+        .await
+        .expect("acquire an unrelated sibling's lease");
+
+    let released = store
+        .release_active_path_leases_for_owner(root, "evicted")
+        .await
+        .expect("release every active lease of the departing owner");
+    assert_eq!(released.len(), 1);
+    assert_eq!(released[0].lease_id, departing[0].lease_id);
+    assert_eq!(released[0].state, WorkflowLeaseState::Released);
+    assert_eq!(
+        store
+            .get_path_lease(&staying[0].lease_id)
+            .await
+            .expect("read the sibling lease")
+            .expect("the sibling lease still exists")
+            .state,
+        WorkflowLeaseState::Active
+    );
+
+    // The released row is still in the table; it must no longer conflict.
+    store
+        .acquire_path_leases(&acquire(
+            root,
+            "successor",
+            WorkflowLeaseMode::Write,
+            vec![path("c:/repo/src", "c:/repo/src")],
+        ))
+        .await
+        .expect("a released lease no longer blocks the path");
+
+    assert!(
+        store
+            .release_active_path_leases_for_owner(root, "evicted")
+            .await
+            .expect("releasing twice is a no-op")
+            .is_empty()
+    );
+}

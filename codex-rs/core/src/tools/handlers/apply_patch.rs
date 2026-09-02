@@ -605,11 +605,18 @@ async fn execute_verified_patch(
         permissions_preapproved: effective_additional_permissions.permissions_preapproved,
     };
     let mut orchestrator = ToolOrchestrator::new();
-    let mut runtime = match ownership {
-        Some(ApplyPatchOwnership { service, guard }) => {
-            ApplyPatchRuntime::with_ownership(service, guard)
-        }
-        None => ApplyPatchRuntime::new(),
+    // The lease hold stays in scope for the whole run: dropping it here would
+    // hand the paths back while the patch is still being written.
+    let (mut runtime, _lease_hold) = match ownership {
+        Some(ApplyPatchOwnership {
+            service,
+            guard,
+            _lease_hold,
+        }) => (
+            ApplyPatchRuntime::with_ownership(service, guard),
+            _lease_hold,
+        ),
+        None => (ApplyPatchRuntime::new(), None),
     };
     let result = orchestrator
         .run(&mut runtime, &request, &tool_ctx)

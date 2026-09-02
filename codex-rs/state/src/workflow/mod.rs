@@ -63,6 +63,7 @@ pub use lease_types::WorkflowLeaseAcquireRequest;
 pub use lease_types::WorkflowLeaseAuthority;
 pub use lease_types::WorkflowLeaseConflict;
 pub use lease_types::WorkflowLeaseError;
+pub use lease_types::WorkflowLeaseExtendRequest;
 pub use lease_types::WorkflowLeaseMode;
 pub use lease_types::WorkflowLeaseOverride;
 pub use lease_types::WorkflowLeaseOverrideCreate;

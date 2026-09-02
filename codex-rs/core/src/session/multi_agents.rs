@@ -133,6 +133,27 @@ Task IDs stay at most two levels deep. If a third level seems necessary, the tas
 
 Do not ask what the plan, the request, or the code already answers. Ask only when two readings would lead to materially different work."#;
 
+/// FORK: what the root needs to know about workspace ownership.
+///
+/// Measured problem: on the night the lease enforcement shipped, five executors
+/// ended their turn asking the root to "grant the required write lease" and the
+/// root made zero `grant_agent_ownership` calls — nothing told either side that
+/// leases are the runtime's job. This section says so, for both.
+const FORK_MULTI_AGENT_V2_ROOT_OWNERSHIP_HINT_TEXT: &str = r#"## Workspace ownership
+
+Write leases are taken, renewed and released by the runtime. You never grant one to make an agent work, and an agent that mentions a lease is not blocked on you.
+
+When two agents want the same files, the second one waits and retries on its own. If a child reports a lease conflict, give it different files or let it retry; do not hand-manage ownership and do not ask the user about it.
+
+`grant_agent_ownership`, `release_agent_ownership` and `override_agent_ownership` exist for manual arbitration only — a stuck path you have already diagnosed. They are not part of normal work."#;
+
+/// FORK: the same fact, from the side that was ending its turn over it.
+const FORK_MULTI_AGENT_V2_SUBAGENT_OWNERSHIP_HINT_TEXT: &str = r#"## Workspace ownership
+
+Write access is acquired for you automatically when you edit or run something. You never have to ask anyone for a lease, and you must never end your turn to request one.
+
+If a path is held by another agent, the attempt waits briefly and retries. If it still fails, work on other files and say which paths were busy in your report. A read-only reply that names what you would change is a result; an abandoned turn is not."#;
+
 pub(crate) fn resolve_usage_hints(
     config: &MultiAgentV2Config,
     catalog: Option<&MultiAgentRoleMessages>,
@@ -179,9 +200,11 @@ pub(crate) fn resolve_usage_hints(
     if config.delivery_discipline_hint {
         root_suffix.push(FORK_MULTI_AGENT_V2_DELIVERY_HINT_TEXT.to_string());
     }
+    root_suffix.push(FORK_MULTI_AGENT_V2_ROOT_OWNERSHIP_HINT_TEXT.to_string());
     root_suffix.extend(config.root_agent_usage_hint_suffix.clone());
 
     let mut subagent_suffix = vec![FORK_MULTI_AGENT_V2_REPORTING_HINT_TEXT.to_string()];
+    subagent_suffix.push(FORK_MULTI_AGENT_V2_SUBAGENT_OWNERSHIP_HINT_TEXT.to_string());
     subagent_suffix.extend(config.subagent_usage_hint_suffix.clone());
 
     ResolvedMultiAgentV2UsageHints {

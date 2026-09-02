@@ -13015,3 +13015,67 @@ tunnel = "cloudflared"
         codex_config::config_toml::ChatGptWebTools::None
     );
 }
+
+/// FORK: the scratch root the Desktop hands each thread is not a shared
+/// resource, and asking for a lease over it made every command depend on a
+/// claim nobody grants. It stays authorized, it just stops being leased.
+#[tokio::test]
+async fn visualization_scratch_roots_are_authorized_but_never_leased() -> std::io::Result<()> {
+    let codex_home = tempdir()?;
+    let mut config = Config::load_from_base_config_with_overrides(
+        ConfigToml::default(),
+        ConfigOverrides::default(),
+        codex_home.abs(),
+    )
+    .await?;
+
+    let repo = config.cwd.clone();
+    let scratch = config
+        .codex_home
+        .join("visualizations")
+        .join("01999999-0000-7000-8000-000000000000");
+    config.workspace_roots = vec![repo.clone(), scratch.clone()];
+
+    assert!(
+        config.effective_workspace_roots().contains(&scratch),
+        "the scratch root must stay authorized, or paths inside it normalize as OutsideRoots"
+    );
+    assert_eq!(config.lease_scoped_workspace_roots(), vec![repo]);
+    assert_eq!(config.lease_exempt_workspace_roots(), vec![scratch]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn workspace_ownership_defaults_are_enforced_with_a_renew_interval() -> std::io::Result<()> {
+    let codex_home = tempdir()?;
+    let config = Config::load_from_base_config_with_overrides(
+        ConfigToml::default(),
+        ConfigOverrides::default(),
+        codex_home.abs(),
+    )
+    .await?;
+    let ownership = &config.workspace_ownership;
+    assert!(ownership.enforce);
+    assert!(ownership.auto_acquire);
+    // Renew well inside the TTL: one missed tick must not expire a lease.
+    assert!(ownership.renew_interval_ms() * 2 < ownership.auto_ttl_ms);
+    Ok(())
+}
+
+#[tokio::test]
+async fn workspace_ownership_kill_switch_reads_from_the_feature_table() -> std::io::Result<()> {
+    let codex_home = tempdir()?;
+    let config_toml: ConfigToml =
+        toml::from_str("[features.workspace_ownership]\nenabled = false\nexec_wait_ms = 1500\n")
+            .expect("workspace ownership knobs should parse from config.toml");
+    let config = Config::load_from_base_config_with_overrides(
+        config_toml,
+        ConfigOverrides::default(),
+        codex_home.abs(),
+    )
+    .await?;
+
+    assert!(!config.workspace_ownership.enforce);
+    assert_eq!(config.workspace_ownership.exec_wait_ms, 1500);
+    Ok(())
+}
