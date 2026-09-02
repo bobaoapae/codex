@@ -143,7 +143,20 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.0.0"
+# FORK: upstream leaves this at 0.0.0 on main and stamps the real version only
+# when `rust-release-prepare` cuts a tag. A locally built binary therefore
+# reports 0.0.0 over the app-server handshake, and the Desktop reads that as
+# "too old to fork a thread": its guard rejects `null`, `0.0.0`, and anything
+# below 0.146.0-alpha.7 (0.146.0-alpha.8 for the ephemeral fork behind the side
+# chat), so the side chat fails with "Forking is not available for threads using
+# paginated history yet."
+#
+# Pinned to the version of the `@openai/codex` npm wrapper that vendors this
+# binary, so the two never disagree. Our upstream base (88f776588f, 30/08) is
+# newer than the rust-v0.146.1 tag (05/08), so this understates rather than
+# overstates what the build contains. Re-check after a sync that moves the
+# wrapper.
+version = "0.146.1"
 # Track the edition for all workspace crates in one place. Individual
 # crates can still override this value, but keeping it here means new
 # crates created with `cargo new -w ...` automatically inherit the 2024
