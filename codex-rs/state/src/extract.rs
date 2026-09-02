@@ -26,8 +26,9 @@ pub fn apply_rollout_item(
         | RolloutItem::InterAgentCommunicationMetadata { .. } => {}
         RolloutItem::Compacted(_) => {}
         RolloutItem::WorldState(_) => {}
-        RolloutItem::SecurityRiskScore(_) => {}
+        RolloutItem::RetainedContext(_) | RolloutItem::SecurityRiskScore(_) => {}
         RolloutItem::RealtimeItem(_) => {}
+        RolloutItem::TokenUsageRecord(_) => {}
     }
     if metadata.model_provider.is_empty() {
         metadata.model_provider = default_provider.to_string();
@@ -55,7 +56,9 @@ pub fn rollout_item_affects_thread_metadata(item: &RolloutItem) -> bool {
         | RolloutItem::InterAgentCommunicationMetadata { .. }
         | RolloutItem::Compacted(_)
         | RolloutItem::RealtimeItem(_)
+        | RolloutItem::RetainedContext(_)
         | RolloutItem::SecurityRiskScore(_)
+        | RolloutItem::TokenUsageRecord(_)
         | RolloutItem::WorldState(_) => false,
     }
 }
@@ -427,6 +430,7 @@ mod tests {
             &mut metadata,
             &RolloutItem::TurnContext(TurnContextItem {
                 turn_id: Some("turn-1".to_string()),
+                root_turn_id: None,
                 cwd: serde_json::from_value(serde_json::json!(
                     std::env::current_dir()
                         .expect("current directory")
@@ -475,6 +479,7 @@ mod tests {
             &mut metadata,
             &RolloutItem::TurnContext(TurnContextItem {
                 turn_id: Some("turn-1".to_string()),
+                root_turn_id: None,
                 cwd: serde_json::from_value(serde_json::json!(
                     std::env::current_dir()
                         .expect("current directory")
@@ -523,6 +528,7 @@ mod tests {
             &mut metadata,
             &RolloutItem::TurnContext(TurnContextItem {
                 turn_id: Some("turn-1".to_string()),
+                root_turn_id: None,
                 cwd: serde_json::from_value(serde_json::json!(&fallback_cwd))
                     .expect("absolute fallback cwd"),
                 workspace_roots: None,
@@ -560,6 +566,7 @@ mod tests {
             &mut metadata,
             &RolloutItem::TurnContext(TurnContextItem {
                 turn_id: Some("turn-1".to_string()),
+                root_turn_id: None,
                 cwd: serde_json::from_value(serde_json::json!(
                     std::env::current_dir()
                         .expect("current directory")

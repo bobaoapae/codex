@@ -80,7 +80,6 @@ pub(crate) use process::UnifiedExecProcess;
 pub(crate) use stdin_approval::TerminalPermissions;
 pub(crate) use stdin_approval::TerminalSandboxSource;
 pub(crate) use terminal_observability::DEFAULT_INACTIVITY_THRESHOLD_MS;
-pub(crate) use terminal_observability::MAX_COMMAND_SUMMARY_BYTES;
 pub(crate) use terminal_observability::SystemTerminalClock;
 pub(crate) use terminal_observability::TerminalClock;
 pub(crate) use terminal_observability::TerminalObservabilityStore;

@@ -246,7 +246,9 @@ pub(crate) fn extract_item_candidates(
         | RolloutItem::TurnContext(_)
         | RolloutItem::WorldState(_)
         | RolloutItem::SecurityRiskScore(_)
-        | RolloutItem::RealtimeItem(_) => {}
+        | RolloutItem::RealtimeItem(_)
+        | RolloutItem::RetainedContext(_)
+        | RolloutItem::TokenUsageRecord(_) => {}
     }
     candidates
 }

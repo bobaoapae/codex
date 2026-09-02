@@ -184,6 +184,8 @@ pub(super) fn prompt_item_count_through_rollout_boundary(
             | RolloutItem::WorldState(_)
             | RolloutItem::SecurityRiskScore(_)
             | RolloutItem::RealtimeItem(_)
+            | RolloutItem::RetainedContext(_)
+            | RolloutItem::TokenUsageRecord(_)
             | RolloutItem::EventMsg(_) => 0,
         })
         .sum()

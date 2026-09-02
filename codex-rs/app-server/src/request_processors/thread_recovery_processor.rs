@@ -532,6 +532,7 @@ impl ThreadRecoveryRequestProcessor {
             codex_home: source_config.codex_home.to_path_buf(),
             skills_watcher: Arc::clone(&self.skills_watcher),
             turn_cost_worker: self.turn_cost_worker.clone(),
+            thread_unload_delay: source_config.thread_unload_delay,
         };
         let listener_result = ensure_conversation_listener(
             listener_context,

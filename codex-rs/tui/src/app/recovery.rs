@@ -145,6 +145,7 @@ impl App {
         let config = self.config.clone();
         let resumed = app_server
             .resume_thread(
+                &self.local_settings,
                 config.clone(),
                 recovered_thread_id,
                 ResumeModelSettings::RestoreFromThread,

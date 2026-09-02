@@ -8,6 +8,9 @@ mod ssh_config_dependencies;
 use std::fmt;
 use std::sync::Arc;
 
+use serde::Deserialize;
+use serde::Serialize;
+
 /// Cancellation hook used by Windows sandbox capture backends.
 #[derive(Clone)]
 pub struct WindowsSandboxCancellationToken {
@@ -38,7 +41,8 @@ impl fmt::Debug for WindowsSandboxCancellationToken {
 pub use codex_protocol::config_types::WindowsSandboxProxySettingsMode;
 
 /// Network settings installed by an administrator during managed Windows sandbox setup.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct WindowsSandboxProvisioningSettings {
     /// Loopback proxy ports permitted for the offline sandbox identity.
     pub proxy_ports: Vec<u16>,
@@ -65,6 +69,8 @@ mod dpapi;
 #[cfg(target_os = "windows")]
 mod env;
 #[cfg(target_os = "windows")]
+mod framed_io;
+#[cfg(target_os = "windows")]
 mod helper_materialization;
 #[cfg(target_os = "windows")]
 mod hide_users;
@@ -76,6 +82,10 @@ mod logging;
 mod path_normalization;
 #[cfg(target_os = "windows")]
 mod process;
+#[cfg(target_os = "windows")]
+mod provisioning_client;
+#[cfg(target_os = "windows")]
+mod provisioning_protocol;
 #[cfg(target_os = "windows")]
 mod resolved_permissions;
 #[cfg(target_os = "windows")]
@@ -197,6 +207,8 @@ pub use identity::require_logon_sandbox_creds;
 #[cfg(target_os = "windows")]
 pub use identity::sandbox_setup_is_complete;
 #[cfg(target_os = "windows")]
+pub use identity::sandbox_setup_is_complete_with_settings;
+#[cfg(target_os = "windows")]
 pub use ipc_framed::ErrorPayload;
 #[cfg(target_os = "windows")]
 pub use ipc_framed::ErrorStage;
@@ -252,6 +264,28 @@ pub use process::create_process_as_user;
 pub use process::read_handle_loop;
 #[cfg(target_os = "windows")]
 pub use process::spawn_process_with_pipes;
+#[cfg(target_os = "windows")]
+pub use provisioning_client::WindowsSandboxProvisioningOutcome;
+#[cfg(target_os = "windows")]
+pub use provisioning_client::provision_windows_sandbox_via_service;
+#[cfg(target_os = "windows")]
+pub use provisioning_protocol::FramedProvisioningMessage;
+#[cfg(target_os = "windows")]
+pub use provisioning_protocol::PROVISIONING_PROTOCOL_VERSION;
+#[cfg(target_os = "windows")]
+pub use provisioning_protocol::ProvisioningMessage;
+#[cfg(target_os = "windows")]
+pub use provisioning_protocol::SANDBOX_PROVISIONING_PIPE_NAME;
+#[cfg(target_os = "windows")]
+pub use provisioning_protocol::SandboxProvisioningRequest;
+#[cfg(target_os = "windows")]
+pub use provisioning_protocol::SandboxProvisioningResponse;
+#[cfg(target_os = "windows")]
+pub use provisioning_protocol::WindowsSandboxProxyListeners;
+#[cfg(target_os = "windows")]
+pub use provisioning_protocol::read_provisioning_frame;
+#[cfg(target_os = "windows")]
+pub use provisioning_protocol::write_provisioning_frame;
 #[cfg(target_os = "windows")]
 pub use resolved_permissions::ResolvedWindowsSandboxPermissions;
 #[cfg(target_os = "windows")]
@@ -338,7 +372,13 @@ pub use windows_impl::run_windows_sandbox_capture_with_filesystem_overrides;
 #[cfg(target_os = "windows")]
 pub use windows_impl::run_windows_sandbox_legacy_preflight;
 #[cfg(target_os = "windows")]
+pub use winutil::SANDBOX_USERS_GROUP;
+#[cfg(target_os = "windows")]
+pub use winutil::ensure_sandbox_users_group;
+#[cfg(target_os = "windows")]
 pub use winutil::quote_windows_arg;
+#[cfg(target_os = "windows")]
+pub use winutil::resolve_sid;
 #[cfg(target_os = "windows")]
 pub use winutil::string_from_sid_bytes;
 #[cfg(target_os = "windows")]

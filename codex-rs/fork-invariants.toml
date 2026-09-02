@@ -110,11 +110,6 @@ owner = "codex-state"
 tests = ["fork_invariant_tombstone_preserves_durable_thread_row"]
 
 [[invariant]]
-id = "rollout.include_shared_capability"
-owner = "codex-rollout"
-tests = ["fork_invariant_include_shared_fails_closed_without_reader_capabilities"]
-
-[[invariant]]
 id = "exec.transient_vs_ephemeral"
 owner = "codex-exec"
 tests = [

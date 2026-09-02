@@ -14,6 +14,8 @@ use uuid::Uuid;
 #[derive(Debug)]
 pub(crate) struct RolloutReconstruction {
     pub(crate) history: Vec<ResponseItemEnvelope>,
+    pub(crate) retained_context: codex_history::RetainedContext,
+    pub(crate) guardian_history: Option<codex_history::GuardianHistoryCheckpoint>,
     pub(crate) previous_turn_settings: Option<PreviousTurnSettings>,
     pub(crate) last_plan: Option<codex_protocol::plan_tool::UpdatePlanArgs>,
     pub(crate) approved_plan: Option<PlanLoaded>,
@@ -50,6 +52,13 @@ enum TurnReferenceContextItem {
     Latest(Box<TurnContextItem>),
 }
 
+#[derive(Debug, Clone, Copy)]
+// The selected checkpoint and its replay tail must belong to the same surviving segment.
+struct ReplayCheckpoint<'a> {
+    compacted: &'a CompactedItem,
+    suffix: &'a [RolloutItem],
+}
+
 #[derive(Debug, Default)]
 struct ActiveReplaySegment<'a> {
     turn_id: Option<String>,
@@ -58,7 +67,7 @@ struct ActiveReplaySegment<'a> {
     last_plan: Option<codex_protocol::plan_tool::UpdatePlanArgs>,
     reference_context_item: TurnReferenceContextItem,
     world_state_replay: Vec<&'a RolloutItem>,
-    base_replacement_history: Option<&'a [ResponseItemEnvelope]>,
+    base_compaction: Option<ReplayCheckpoint<'a>>,
     window: Option<ReconstructedWindow>,
 }
 
@@ -69,7 +78,7 @@ fn turn_ids_are_compatible(active_turn_id: Option<&str>, item_turn_id: Option<&s
 
 fn finalize_active_segment<'a>(
     active_segment: ActiveReplaySegment<'a>,
-    base_replacement_history: &mut Option<&'a [ResponseItemEnvelope]>,
+    base_compaction: &mut Option<ReplayCheckpoint<'a>>,
     previous_turn_settings: &mut Option<PreviousTurnSettings>,
     last_plan: &mut Option<codex_protocol::plan_tool::UpdatePlanArgs>,
     reference_context_item: &mut TurnReferenceContextItem,
@@ -107,10 +116,10 @@ fn finalize_active_segment<'a>(
 
     // A surviving replacement-history checkpoint is a complete history base. Once we
     // know the newest surviving one, older rollout items do not affect rebuilt history.
-    if base_replacement_history.is_none()
-        && let Some(segment_base_replacement_history) = active_segment.base_replacement_history
+    if base_compaction.is_none()
+        && let Some(segment_base_compaction) = active_segment.base_compaction
     {
-        *base_replacement_history = Some(segment_base_replacement_history);
+        *base_compaction = Some(segment_base_compaction);
     }
 
     if window.is_none() {
@@ -187,7 +196,7 @@ pub(crate) fn reconstruct_history_from_rollout_items_with_policy(
             _ => None,
         })
     };
-    let mut base_replacement_history: Option<&[ResponseItemEnvelope]> = None;
+    let mut base_compaction = None;
     let mut previous_turn_settings = None;
     let mut last_plan = None;
     let mut reference_context_item = TurnReferenceContextItem::NeverSet;
@@ -196,9 +205,6 @@ pub(crate) fn reconstruct_history_from_rollout_items_with_policy(
     // Rollback is "drop the newest N user turns". While scanning in reverse, that becomes
     // "skip the next N user-turn segments we finalize".
     let mut pending_rollback_turns = 0usize;
-    // Borrowed suffix of rollout items newer than the newest surviving replacement-history
-    // checkpoint. If no such checkpoint exists, this remains the full rollout.
-    let mut rollout_suffix = rollout_items;
     // Reverse replay accumulates rollout items into the newest in-progress turn segment until
     // we hit its matching `TurnStarted`, at which point the segment can be finalized.
     let mut active_segment: Option<ActiveReplaySegment<'_>> = None;
@@ -230,11 +236,13 @@ pub(crate) fn reconstruct_history_from_rollout_items_with_policy(
                 ) {
                     active_segment.reference_context_item = TurnReferenceContextItem::Cleared;
                 }
-                if active_segment.base_replacement_history.is_none()
-                    && let Some(replacement_history) = &compacted.replacement_history
+                if active_segment.base_compaction.is_none()
+                    && compacted.replacement_history.is_some()
                 {
-                    active_segment.base_replacement_history = Some(replacement_history);
-                    rollout_suffix = &rollout_items[index + 1..];
+                    active_segment.base_compaction = Some(ReplayCheckpoint {
+                        compacted,
+                        suffix: &rollout_items[index + 1..],
+                    });
                 }
             }
             RolloutItem::EventMsg(EventMsg::ThreadRolledBack(rollback)) => {
@@ -318,7 +326,7 @@ pub(crate) fn reconstruct_history_from_rollout_items_with_policy(
                 {
                     finalize_active_segment(
                         active_segment,
-                        &mut base_replacement_history,
+                        &mut base_compaction,
                         &mut previous_turn_settings,
                         &mut last_plan,
                         &mut reference_context_item,
@@ -341,11 +349,13 @@ pub(crate) fn reconstruct_history_from_rollout_items_with_policy(
             RolloutItem::EventMsg(_)
             | RolloutItem::SessionMeta(_)
             | RolloutItem::RealtimeItem(_)
+            | RolloutItem::RetainedContext(_)
             | RolloutItem::SecurityRiskScore(_)
+            | RolloutItem::TokenUsageRecord(_)
             | RolloutItem::InterAgentCommunicationMetadata { .. } => {}
         }
 
-        if base_replacement_history.is_some()
+        if base_compaction.is_some()
             && previous_turn_settings.is_some()
             && !matches!(reference_context_item, TurnReferenceContextItem::NeverSet)
         {
@@ -359,7 +369,7 @@ pub(crate) fn reconstruct_history_from_rollout_items_with_policy(
     if let Some(active_segment) = active_segment.take() {
         finalize_active_segment(
             active_segment,
-            &mut base_replacement_history,
+            &mut base_compaction,
             &mut previous_turn_settings,
             &mut last_plan,
             &mut reference_context_item,
@@ -379,12 +389,24 @@ pub(crate) fn reconstruct_history_from_rollout_items_with_policy(
 
     let mut history = ContextManager::new();
     let mut saw_legacy_compaction_without_replacement_history = false;
-    if let Some(base_replacement_history) = base_replacement_history {
-        history.replace_annotated(base_replacement_history.to_vec());
+    if let Some(checkpoint) = base_compaction
+        && let Some(items) = &checkpoint.compacted.replacement_history
+    {
+        history.replace_annotated(items.clone());
+        history.restore_guardian_history(checkpoint.compacted.guardian_history.as_ref());
+        if let Some(retained) = &checkpoint.compacted.retained_context {
+            history.restore_retained_context(retained);
+        }
     }
-    // Materialize exact history semantics from the replay-derived suffix.
+    // Materialize exact history semantics from the replay-derived suffix. The eventual lazy
+    // design should keep this same replay shape, but drive it from a resumable reverse source
+    // instead of an eagerly loaded `&[RolloutItem]`.
+    let rollout_suffix = base_compaction.map_or(rollout_items, |checkpoint| checkpoint.suffix);
     for item in rollout_suffix {
         match item {
+            RolloutItem::RetainedContext(event) => {
+                history.record_retained_context(event);
+            }
             RolloutItem::ResponseItem(response_item) => {
                 history
                     .record_annotated_items(std::slice::from_ref(response_item), truncation_policy);
@@ -395,11 +417,10 @@ pub(crate) fn reconstruct_history_from_rollout_items_with_policy(
             }
             RolloutItem::InterAgentCommunicationMetadata { .. } => {}
             RolloutItem::Compacted(compacted) => {
-                if let Some(replacement_history) = &compacted.replacement_history {
-                    // This should actually never happen, because the reverse loop above (to build rollout_suffix)
-                    // should stop before any compaction that has Some replacement_history
-                    history.replace_annotated(replacement_history.clone());
-                } else {
+                // Reverse replay already chose the newest surviving checkpoint. Any newer
+                // replacement checkpoint belongs to a rolled-back turn; replay its original
+                // items so the rollback can still find the removed user boundary.
+                if compacted.replacement_history.is_none() {
                     saw_legacy_compaction_without_replacement_history = true;
                     // Legacy rollouts without `replacement_history` should rebuild the
                     // historical TurnContext at the correct insertion point from persisted
@@ -416,7 +437,9 @@ pub(crate) fn reconstruct_history_from_rollout_items_with_policy(
                         &user_messages,
                         &compacted.message,
                     );
+                    let retained_context = history.retained_context().clone();
                     history.replace_annotated(rebuilt);
+                    history.restore_retained_context(&retained_context);
                 }
             }
             RolloutItem::EventMsg(EventMsg::ThreadRolledBack(rollback)) => {
@@ -427,6 +450,7 @@ pub(crate) fn reconstruct_history_from_rollout_items_with_policy(
             | RolloutItem::RealtimeItem(_)
             | RolloutItem::WorldState(_)
             | RolloutItem::SecurityRiskScore(_)
+            | RolloutItem::TokenUsageRecord(_)
             | RolloutItem::SessionMeta(_) => {}
         }
     }
@@ -469,6 +493,8 @@ pub(crate) fn reconstruct_history_from_rollout_items_with_policy(
             | RolloutItem::InterAgentCommunicationMetadata { .. }
             | RolloutItem::TurnContext(_)
             | RolloutItem::RealtimeItem(_)
+            | RolloutItem::TokenUsageRecord(_)
+            | RolloutItem::RetainedContext(_)
             | RolloutItem::SecurityRiskScore(_)
             | RolloutItem::EventMsg(_) => {
                 unreachable!("only world-state replay items are collected")
@@ -483,6 +509,8 @@ pub(crate) fn reconstruct_history_from_rollout_items_with_policy(
         id: None,
     });
     RolloutReconstruction {
+        retained_context: history.retained_context().clone(),
+        guardian_history: history.guardian_history_checkpoint(),
         history: history.into_annotated_items(),
         previous_turn_settings,
         last_plan,

@@ -187,6 +187,8 @@ pub(crate) enum RateLimitRefreshOrigin {
     ResetPicker { request_id: u64 },
     /// Refresh requested after a reset credit was successfully consumed.
     ResetConsume { request_id: u64 },
+    /// Refresh backend recovery after an inference limit error.
+    Recovery,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -282,15 +284,21 @@ impl std::fmt::Debug for ThreadRecoveryPreviewResult {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct AgentsOverviewThreadRefresh {
+    pub(crate) threads: std::collections::HashMap<ThreadId, Option<Thread>>,
+    pub(crate) recent_seed_complete: bool,
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, IntoStaticStr)]
 pub(crate) enum AppEvent {
-    /// Open the daemon-wide overview of loaded root sessions.
+    /// Open the daemon-wide overview of recent and locally retained root sessions.
     OpenAgentsOverview,
     /// Update the daemon-wide overview after a background thread listing finishes.
     AgentsOverviewThreadsLoaded {
         request_id: Uuid,
-        result: Result<Vec<Thread>, String>,
+        result: Result<AgentsOverviewThreadRefresh, String>,
     },
     /// Switch to a root session selected from the shared dashboard.
     SelectAgentsOverviewThread {
@@ -482,7 +490,7 @@ pub(crate) enum AppEvent {
 
     /// Result of the fresh startup thread that is attached after the input UI is live.
     StartupThreadStarted {
-        result: Result<AppServerStartedThread, String>,
+        result: color_eyre::Result<AppServerStartedThread>,
     },
 
     /// Register a dynamically created background thread before its first turn starts.
@@ -759,6 +767,7 @@ pub(crate) enum AppEvent {
 
     /// Result of refreshing rate limits.
     RateLimitsLoaded {
+        request_id: u64,
         origin: RateLimitRefreshOrigin,
         hard_stop_generation: u64,
         result: Result<GetAccountRateLimitsResponse, String>,
@@ -836,6 +845,7 @@ pub(crate) enum AppEvent {
 
     /// Result of notifying the workspace owner.
     AddCreditsNudgeEmailFinished {
+        request_id: Uuid,
         result: Result<AddCreditsNudgeEmailStatus, String>,
     },
 

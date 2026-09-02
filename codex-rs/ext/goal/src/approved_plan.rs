@@ -102,9 +102,6 @@ impl GoalService {
             }
         };
 
-        if let Some(runtime) = runtime.as_ref() {
-            runtime.invalidate_turn_lineage().await;
-        }
         fill_empty_thread_preview_if_possible(state_db, thread_id, &goal).await;
         let previous_goal = previous_state_goal.as_ref().map(PreviousGoalSnapshot::from);
         Ok(GoalSetOutcome {

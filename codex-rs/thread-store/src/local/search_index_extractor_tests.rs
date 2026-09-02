@@ -118,6 +118,7 @@ fn response_item_and_item_completed_are_deduplicated_with_turn_complete_preceden
             phase: Some(MessagePhase::FinalAnswer),
             memory_citation: None,
             delivery: None,
+            questions: None,
         }),
         started_at_ms: None,
         completed_at_ms: 3,
@@ -158,11 +159,15 @@ fn compacted_message_and_plan_text_are_safe_representations() {
                 internal_chat_message_metadata_passthrough: None,
             },
         )]),
+        guardian_history: None,
+        retained_context: None,
         mcp_resource_origins: None,
         window_number: None,
         first_window_id: None,
         previous_window_id: None,
         window_id: None,
+        compaction_response_id: None,
+        latest_token_usage_record: None,
     });
     let plan = RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
         thread_id: Default::default(),

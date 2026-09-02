@@ -13,15 +13,12 @@ use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
-use super::RolloutCompressionMode;
 use super::RolloutFile;
-use super::compression_capabilities::RolloutCompressionCapabilities;
 use super::compression_cleanup;
 use super::compression_writer::CompressionMeasurement;
 use super::compression_writer::CompressionOutcome;
 use super::compression_writer::compress_rollout_if_cold;
 use super::metrics;
-use crate::RolloutReferenceIndex;
 
 const RUN_MARKER_STALE_AFTER: Duration = Duration::from_secs(6 * 60 * 60);
 const WORKER_MAX_RUNTIME: Duration = Duration::from_secs(5 * 60 * 60);
@@ -91,11 +88,7 @@ impl Drop for CompressionRunMarker {
     }
 }
 
-pub(super) fn spawn(
-    codex_home: PathBuf,
-    mode: RolloutCompressionMode,
-    capabilities: RolloutCompressionCapabilities,
-) {
+pub(super) fn spawn(codex_home: PathBuf) {
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         metrics::run("skipped_no_runtime");
         warn!(
@@ -105,7 +98,7 @@ pub(super) fn spawn(
         return;
     };
     handle.spawn(async move {
-        if let Err(error) = run_with_capabilities(codex_home.clone(), mode, capabilities).await {
+        if let Err(error) = run(codex_home.clone()).await {
             warn!(
                 "rollout compression worker failed for {}: {error}",
                 codex_home.display()
@@ -114,18 +107,7 @@ pub(super) fn spawn(
     });
 }
 
-#[cfg(test)]
-pub(super) async fn run(codex_home: PathBuf, mode: RolloutCompressionMode) -> io::Result<()> {
-    run_with_capabilities(codex_home, mode, RolloutCompressionCapabilities::default()).await
-}
-
-pub(super) async fn run_with_capabilities(
-    codex_home: PathBuf,
-    mode: RolloutCompressionMode,
-    capabilities: RolloutCompressionCapabilities,
-) -> io::Result<()> {
-    let capability_blocked =
-        mode == RolloutCompressionMode::IncludeShared && !capabilities.all_readers_support_shared();
+pub(super) async fn run(codex_home: PathBuf) -> io::Result<()> {
     let Some(_maintenance_guard) =
         crate::try_acquire_rollout_maintenance_lock(codex_home.as_path())?
     else {
@@ -156,17 +138,6 @@ pub(super) async fn run_with_capabilities(
     let started_at = Instant::now();
     let result = async {
         compression_cleanup::cleanup_stale_temps(codex_home.as_path()).await?;
-        if capability_blocked {
-            metrics::run("skipped_capability_gate");
-            debug!("{}", capabilities.shared_compression_diagnostic());
-            return Ok(CompressionStats::default());
-        }
-        let Some(reference_index) =
-            RolloutReferenceIndex::scan_until(codex_home.as_path(), started_at, WORKER_MAX_RUNTIME)
-                .await?
-        else {
-            return Ok(CompressionStats::default());
-        };
         let mut stats = CompressionStats::default();
         for root in [
             codex_home.join(crate::ARCHIVED_SESSIONS_SUBDIR),
@@ -175,14 +146,7 @@ pub(super) async fn run_with_capabilities(
             if started_at.elapsed() >= WORKER_MAX_RUNTIME {
                 break;
             }
-            compress_rollouts_in_root(
-                root.as_path(),
-                started_at,
-                &reference_index,
-                mode,
-                &mut stats,
-            )
-            .await?;
+            compress_rollouts_in_root(root.as_path(), started_at, &mut stats).await?;
         }
         Ok::<_, io::Error>(stats)
     }
@@ -201,9 +165,7 @@ pub(super) async fn run_with_capabilities(
     );
     metrics::run("completed");
     metrics::run_duration("completed", started_at.elapsed());
-    if !capability_blocked {
-        marker.persist();
-    }
+    marker.persist();
     Ok(())
 }
 
@@ -224,8 +186,6 @@ fn create_run_marker_file(path: &Path) -> io::Result<()> {
 async fn compress_rollouts_in_root(
     root: &Path,
     started_at: Instant,
-    reference_index: &RolloutReferenceIndex,
-    mode: RolloutCompressionMode,
     stats: &mut CompressionStats,
 ) -> io::Result<()> {
     if !tokio::fs::try_exists(root).await.unwrap_or(false) {
@@ -284,26 +244,14 @@ async fn compress_rollouts_in_root(
                 continue;
             }
             let path = rollout_file.into_path();
-            let Some(rollout_id) = crate::rollout_id_from_path(path.as_path()) else {
+            if crate::rollout_id_from_path(path.as_path()).is_none() {
                 stats.skipped = stats.skipped.saturating_add(1);
                 metrics::file("skipped_unreadable_meta");
-                continue;
-            };
-            let Ok(meta) = crate::read_session_meta_line(path.as_path()).await else {
-                stats.skipped = stats.skipped.saturating_add(1);
-                metrics::file("skipped_unreadable_meta");
-                continue;
-            };
-            if mode == RolloutCompressionMode::Standalone
-                && reference_index.reference_count(rollout_id) > 0
-            {
-                stats.skipped = stats.skipped.saturating_add(1);
-                metrics::file("skipped_referenced");
                 continue;
             }
-            if mode == RolloutCompressionMode::Standalone && meta.meta.history_base.is_some() {
+            if crate::read_session_meta_line(path.as_path()).await.is_err() {
                 stats.skipped = stats.skipped.saturating_add(1);
-                metrics::file("skipped_fork_pointer");
+                metrics::file("skipped_unreadable_meta");
                 continue;
             }
             stats.scanned = stats.scanned.saturating_add(1);

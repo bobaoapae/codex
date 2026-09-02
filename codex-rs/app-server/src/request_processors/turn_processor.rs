@@ -65,6 +65,7 @@ fn validate_response_item_image_urls(items: &[ResponseItem]) -> Result<(), JSONR
         | ResponseItem::WebSearchCall { .. }
         | ResponseItem::ImageGenerationCall { .. }
         | ResponseItem::Compaction { .. }
+        | ResponseItem::ConfigurationUpdate { .. }
         | ResponseItem::CompactionTrigger { .. }
         | ResponseItem::ContextCompaction { .. }
         | ResponseItem::AdditionalTools { .. }
@@ -240,6 +241,9 @@ impl TurnRequestProcessor {
             Op::TurnSettings {
                 turn_id: params.turn_id,
                 update: TurnSettingsUpdate {
+                    approvals_reviewer: params
+                        .approvals_reviewer
+                        .map(codex_app_server_protocol::ApprovalsReviewer::to_core),
                     model: params.model,
                     // Match thread/settings/update: public null does not clear effort.
                     effort: params.effort.map(Some),
@@ -707,10 +711,6 @@ impl TurnRequestProcessor {
                 },
             )
             .await?;
-        if let TurnInput::UserInput { content, .. } = &input {
-            self.seal_realtime_transcript_before_user_input(thread_id, content)
-                .await?;
-        }
 
         let mut turn_input_request = TurnInputRequest::new(input)
             .with_thread_settings(thread_settings)
@@ -1156,9 +1156,6 @@ impl TurnRequestProcessor {
             .collect();
         let additional_context = map_additional_context(params.additional_context);
 
-        self.seal_realtime_transcript_before_user_input(thread_id, &mapped_items)
-            .await?;
-
         let submission = thread
             .steer_turn(
                 TurnInputRequest::new(TurnInput::UserInput {
@@ -1257,37 +1254,6 @@ impl TurnRequestProcessor {
             }
         };
         Ok(TurnSteerResponse { turn_id })
-    }
-
-    async fn seal_realtime_transcript_before_user_input(
-        &self,
-        thread_id: ThreadId,
-        input: &[CoreInputItem],
-    ) -> Result<(), JSONRPCErrorError> {
-        let thread_state = self.thread_state_manager.thread_state(thread_id).await;
-        if !thread_state
-            .lock()
-            .await
-            .realtime_history
-            .should_seal_user_input(input)
-        {
-            return Ok(());
-        }
-        let listener = self
-            .thread_state_manager
-            .current_listener_command_tx(thread_id)
-            .ok_or_else(|| internal_error("thread listener is not running"))?;
-        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
-        listener
-            .send(ThreadListenerCommand::SealRealtimeUserInput {
-                input: input.to_vec(),
-                completion_tx,
-            })
-            .map_err(|_| internal_error("thread listener is not running"))?;
-        completion_rx
-            .await
-            .map_err(|_| internal_error("thread listener stopped before sealing realtime input"))?
-            .map_err(internal_error)
     }
 
     async fn prepare_realtime_conversation_thread(
@@ -1404,7 +1370,10 @@ impl TurnRequestProcessor {
                         ConversationStartTransport::Webrtc { sdp }
                     }
                     ThreadRealtimeStartTransport::ExistingCall { call_id } => {
-                        ConversationStartTransport::ExistingCall { call_id }
+                        ConversationStartTransport::ExistingCall {
+                            call_id,
+                            sideband_base_url: None,
+                        }
                     }
                 }),
                 version: params.version,
@@ -1637,6 +1606,8 @@ impl TurnRequestProcessor {
         };
 
         if let Some(mut thread) = stored_thread {
+            let config_snapshot = review_thread.config_snapshot().await;
+            apply_live_model_settings(&mut thread, &config_snapshot);
             thread.session_id = review_thread.session_configured().session_id.to_string();
             self.thread_watch_manager
                 .upsert_thread_silently(&thread.id)
@@ -1794,6 +1765,7 @@ impl TurnRequestProcessor {
             thread_list_state_permit: self.thread_list_state_permit.clone(),
             fallback_model_provider: self.config.model_provider_id.clone(),
             codex_home: self.config.codex_home.to_path_buf(),
+            thread_unload_delay: self.config.thread_unload_delay,
             skills_watcher: Arc::clone(&self.skills_watcher),
             turn_cost_worker: self.turn_cost_worker.clone(),
         }

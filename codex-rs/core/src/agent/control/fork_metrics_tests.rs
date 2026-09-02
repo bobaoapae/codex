@@ -88,6 +88,7 @@ async fn first_event_and_response_exclude_inherited_history_and_aggregate_cache_
                 phase: None,
                 memory_citation: None,
                 delivery: None,
+                questions: None,
             }),
         )
         .await;

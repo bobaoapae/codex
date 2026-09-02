@@ -10,8 +10,6 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-#[path = "compression_capabilities.rs"]
-mod compression_capabilities;
 #[path = "compression_cleanup.rs"]
 mod compression_cleanup;
 #[path = "compression_journal.rs"]
@@ -21,7 +19,6 @@ mod compression_validation;
 #[path = "compression_writer.rs"]
 mod compression_writer;
 
-pub use compression_capabilities::RolloutCompressionCapabilities;
 pub use compression_validation::RolloutValidationSummary;
 pub use compression_validation::validate_rollout_replacement;
 
@@ -36,35 +33,13 @@ const OPEN_ROLLOUT_LINE_READER_RETRY_DELAY: Duration = Duration::from_millis(50)
 const TEMP_SUFFIX: &str = ".tmp";
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Whether cold files belonging to shared rollout lineages may be compressed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RolloutCompressionMode {
-    /// Preserve compatibility with readers that require shared lineages to remain plain JSONL.
-    Standalone,
-    /// Requires every reader of this Codex home to support compressed shared lineages.
-    IncludeShared,
-}
-
 /// Starts a best-effort background job that compresses cold local rollout files.
 ///
 /// The worker is fire-and-forget: failures are logged, startup is not blocked,
 /// and a run marker under `codex_home` prevents overlapping or too-frequent
 /// compression runs from the same local store.
-pub fn spawn_rollout_compression_worker(codex_home: PathBuf, mode: RolloutCompressionMode) {
-    spawn_rollout_compression_worker_with_capabilities(
-        codex_home,
-        mode,
-        RolloutCompressionCapabilities::default(),
-    );
-}
-
-/// Start compression with an explicit local reader capability declaration.
-pub fn spawn_rollout_compression_worker_with_capabilities(
-    codex_home: PathBuf,
-    mode: RolloutCompressionMode,
-    capabilities: RolloutCompressionCapabilities,
-) {
-    worker::spawn(codex_home, mode, capabilities)
+pub fn spawn_rollout_compression_worker(codex_home: PathBuf) {
+    worker::spawn(codex_home)
 }
 
 /// Returns the modified time for the existing plain or compressed rollout file.

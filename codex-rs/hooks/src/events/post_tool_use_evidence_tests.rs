@@ -270,6 +270,7 @@ fn handler(r#async: bool) -> ConfiguredHandler {
         additional_context_limit: Default::default(),
         source_path: test_path_buf("/tmp/hooks.json").abs().into(),
         source: HookSource::User,
+        builtin: false,
         display_order: 0,
         kind: ConfiguredHandlerKind::Command {
             command: "python3 post_tool_use_hook.py".to_string(),

@@ -21,6 +21,7 @@ use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSource;
+use codex_protocol::protocol::TokenUsageRecord;
 use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::protocol::WorldStateItem;
 use codex_protocol::realtime::RealtimeItem;
@@ -53,6 +54,10 @@ pub struct CodexHarnessMetadata {
     /// Measured in tokens, with any tool-specific allowance already included.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_token_limit_override: Option<usize>,
+
+    /// Whether a response configuration update was created by the Codex harness itself.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub harness_authored_configuration: bool,
 }
 
 impl ResponseItemEnvelope {
@@ -118,8 +123,10 @@ pub enum RolloutItem {
     },
     Compacted(CompactedItem),
     TurnContext(TurnContextItem),
+    TokenUsageRecord(TokenUsageRecord),
     WorldState(WorldStateItem),
     SecurityRiskScore(SecurityRiskScore),
+    RetainedContext(RetainedContextEvent),
     EventMsg(EventMsg),
     /// Sparse, model-invisible facts used to reconstruct realtime presentation.
     RealtimeItem(RealtimeItem),
@@ -157,17 +164,35 @@ impl JsonSchema for RolloutItem {
     }
 }
 
+mod guardian_history;
+mod retained_context;
+
+pub use retained_context::RetainedContext;
+pub use retained_context::RetainedContextEvent;
+pub use retained_context::VerifiedAnswer;
+pub use retained_context::VerifiedQuestionAnswer;
 mod rollout_payload;
+
+pub use guardian_history::GuardianHistoryCheckpoint;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CompactedItem {
     pub message: String,
     pub replacement_history: Option<Vec<ResponseItemEnvelope>>,
+    pub guardian_history: Option<GuardianHistoryCheckpoint>,
+    pub retained_context: Option<RetainedContext>,
     pub mcp_resource_origins: Option<McpResourceOriginCheckpoint>,
     pub window_number: Option<u64>,
     pub first_window_id: Option<String>,
     pub previous_window_id: Option<String>,
     pub window_id: Option<String>,
+    /// Responses API ID for the model-backed compaction request, when one exists.
+    pub compaction_response_id: Option<String>,
+    /// Snapshot of the latest reachable token usage record when this compaction was written.
+    ///
+    /// `thread/resume` can restore token usage totals from this field without scanning arbitrarily
+    /// far past the compaction.
+    pub latest_token_usage_record: Option<TokenUsageRecord>,
 }
 
 impl Serialize for CompactedItem {
@@ -434,7 +459,9 @@ fn multi_agent_version_from_items(
             | RolloutItem::InterAgentCommunication(_)
             | RolloutItem::InterAgentCommunicationMetadata { .. }
             | RolloutItem::Compacted(_)
+            | RolloutItem::TokenUsageRecord(_)
             | RolloutItem::WorldState(_)
+            | RolloutItem::RetainedContext(_)
             | RolloutItem::SecurityRiskScore(_)
             | RolloutItem::RealtimeItem(_)
             | RolloutItem::EventMsg(_) => None,

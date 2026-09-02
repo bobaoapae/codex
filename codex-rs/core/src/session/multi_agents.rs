@@ -78,7 +78,11 @@ pub(super) fn usage_hint_text(
         .as_ref()
         .and_then(|messages| messages.multi_agent.as_ref())
         .and_then(|messages| messages.role.as_ref());
-    let snapshot = resolve_usage_hints(&turn_context.config.multi_agent_v2, catalog);
+    let snapshot = resolve_usage_hints(
+        &turn_context.config.multi_agent_v2,
+        catalog,
+        !turn_context.config.update_plan_enabled && turn_context.config.model_catalog.is_none(),
+    );
     match session_source {
         SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. }) => snapshot.subagent,
         SessionSource::Cli
@@ -157,6 +161,7 @@ If a path is held by another agent, the attempt waits briefly and retries. If it
 pub(crate) fn resolve_usage_hints(
     config: &MultiAgentV2Config,
     catalog: Option<&MultiAgentRoleMessages>,
+    omit_update_plan_instructions: bool,
 ) -> ResolvedMultiAgentV2UsageHints {
     let resolve_role = |configured: Option<&str>, catalog: Option<&str>, bundled: &str| {
         // Configured roles take precedence; empty configured or catalog roles suppress fallback.
@@ -169,6 +174,11 @@ pub(crate) fn resolve_usage_hints(
         if base.is_empty() {
             return None;
         }
+        let base = if omit_update_plan_instructions {
+            crate::context::without_update_plan_instructions(base)
+        } else {
+            base.to_string()
+        };
 
         let max_concurrency = config.max_concurrent_threads_per_session;
         let wait_agent_guidance = if config.wait_agent_enabled {
@@ -334,7 +344,9 @@ mod fork_hint_tests {
         config.root_agent_usage_hint_text = Some("Only this.".to_string());
         config.subagent_usage_hint_text = Some("And this.".to_string());
 
-        let hints = resolve_usage_hints(&config, /*catalog*/ None);
+        let hints = resolve_usage_hints(
+            &config, /*catalog*/ None, /*omit_update_plan*/ false,
+        );
         let root = body(hints.root);
         let subagent = body(hints.subagent);
 
@@ -348,7 +360,11 @@ mod fork_hint_tests {
     /// reading them would only spend context on advice it cannot act on.
     #[test]
     fn patience_hint_is_root_only() {
-        let hints = resolve_usage_hints(&config(), /*catalog*/ None);
+        let hints = resolve_usage_hints(
+            &config(),
+            /*catalog*/ None,
+            /*omit_update_plan*/ false,
+        );
         let root = body(hints.root);
         let subagent = body(hints.subagent);
 
@@ -364,7 +380,12 @@ mod fork_hint_tests {
         let mut config = config();
         config.delivery_discipline_hint = false;
 
-        let root = body(resolve_usage_hints(&config, /*catalog*/ None).root);
+        let root = body(
+            resolve_usage_hints(
+                &config, /*catalog*/ None, /*omit_update_plan*/ false,
+            )
+            .root,
+        );
 
         assert!(!root.contains("## Delivery discipline"), "{root}");
         // Turning it off must not take the rest with it.
@@ -379,7 +400,9 @@ mod fork_hint_tests {
         config.root_agent_usage_hint_suffix = Some("House rule.".to_string());
         config.subagent_usage_hint_suffix = Some("Worker rule.".to_string());
 
-        let hints = resolve_usage_hints(&config, /*catalog*/ None);
+        let hints = resolve_usage_hints(
+            &config, /*catalog*/ None, /*omit_update_plan*/ false,
+        );
         assert!(body(hints.root).ends_with("House rule."));
         assert!(body(hints.subagent).ends_with("Worker rule."));
     }
@@ -392,9 +415,11 @@ mod fork_hint_tests {
         config.root_agent_usage_hint_text = Some(String::new());
 
         assert!(
-            resolve_usage_hints(&config, /*catalog*/ None)
-                .root
-                .is_none()
+            resolve_usage_hints(
+                &config, /*catalog*/ None, /*omit_update_plan*/ false
+            )
+            .root
+            .is_none()
         );
     }
 
@@ -405,7 +430,12 @@ mod fork_hint_tests {
         let mut config = config();
         config.root_agent_usage_hint_text = Some("Only this.".to_string());
 
-        let root = body(resolve_usage_hints(&config, /*catalog*/ None).root);
+        let root = body(
+            resolve_usage_hints(
+                &config, /*catalog*/ None, /*omit_update_plan*/ false,
+            )
+            .root,
+        );
 
         assert_eq!(without_fork_hint_sections(&root), "Only this.");
         // A hint that never carried them is returned unchanged.

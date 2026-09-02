@@ -251,7 +251,9 @@ fn history_mailbox_state(history: &[RolloutItem], message_id: &str) -> Canonical
             | RolloutItem::WorldState(_)
             | RolloutItem::SecurityRiskScore(_)
             | RolloutItem::EventMsg(_)
-            | RolloutItem::RealtimeItem(_) => {}
+            | RolloutItem::RealtimeItem(_)
+            | RolloutItem::RetainedContext(_)
+            | RolloutItem::TokenUsageRecord(_) => {}
         }
     }
     state
@@ -323,13 +325,13 @@ pub(crate) async fn claim_next_for_session(
         return Ok(None);
     };
     match decode_payload(claim.message.payload.clone(), &claim.message.message_id) {
-        Ok((communication, start_options)) => Ok(Some(ClaimedDelivery::Decoded(
-            ClaimedCommunication {
+        Ok((communication, start_options)) => {
+            Ok(Some(ClaimedDelivery::Decoded(ClaimedCommunication {
                 claim,
                 communication,
                 start_options,
-            },
-        ))),
+            })))
+        }
         Err(error) => Ok(Some(ClaimedDelivery::Undecodable { claim, error })),
     }
 }

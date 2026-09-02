@@ -23,7 +23,12 @@ use codex_cloud_tasks::Cli as CloudTasksCli;
 use codex_exec::Cli as ExecCli;
 use codex_exec::Command as ExecCommand;
 use codex_exec::ReviewArgs;
+use codex_exec_server::ExecServerRuntimePaths;
+use codex_exec_server::ExecServerTelemetry;
+use codex_exec_server::RemoteEnvironmentConfig;
 use codex_execpolicy::ExecPolicyCheckCommand;
+use codex_http_client::HttpClientFactory;
+use codex_http_client::OutboundProxyPolicy;
 use codex_responses_api_proxy::Args as ResponsesApiProxyArgs;
 use codex_rollout_trace::REDUCED_STATE_FILE_NAME;
 use codex_rollout_trace::replay_bundle;
@@ -1914,7 +1919,7 @@ fn profile_v2_for_subcommand<'a>(
 }
 
 async fn run_exec_server_command(
-    cmd: ExecServerCommand,
+    mut cmd: ExecServerCommand,
     arg0_paths: &Arg0DispatchPaths,
     root_config_overrides: &CliConfigOverrides,
     strict_config: bool,
@@ -1923,13 +1928,12 @@ async fn run_exec_server_command(
         .codex_self_exe
         .clone()
         .ok_or_else(|| anyhow::anyhow!("Codex executable path is not configured"))?;
-    let runtime_paths = codex_exec_server::ExecServerRuntimePaths::new(
-        codex_self_exe,
-        arg0_paths.codex_linux_sandbox_exe.clone(),
-    )?;
-    if let Some(base_url) = cmd.remote {
+    let runtime_paths =
+        ExecServerRuntimePaths::new(codex_self_exe, arg0_paths.codex_linux_sandbox_exe.clone())?;
+    if let Some(base_url) = cmd.remote.take() {
         let environment_id = cmd
             .environment_id
+            .take()
             .ok_or_else(|| anyhow::anyhow!("--environment-id is required when --remote is set"))?;
         let config = load_exec_server_config(
             root_config_overrides,
@@ -1938,55 +1942,15 @@ async fn run_exec_server_command(
         )
         .await?;
         let (_otel, telemetry) = exec_server_telemetry::init(Some(&config));
-        let auth_provider =
-            load_exec_server_remote_auth_provider(&config, &base_url, cmd.use_agent_identity_auth)
-                .await?;
-        let mut remote_config = codex_exec_server::RemoteEnvironmentConfig::new(
+        run_remote_exec_server(
+            cmd,
             base_url,
             environment_id,
-            auth_provider,
-            config.http_client_factory(),
-        )?;
-        if let Some(name) = cmd.name {
-            remote_config.name = name;
-        }
-        remote_config.request_dispatch_mode = cmd.request_dispatch_mode;
-        let remote_config = remote_config.with_telemetry(telemetry);
-        let parent_lifetime = if cmd.exit_on_stdin_close {
-            exec_server_telemetry::ParentLifetime::StdinPipe
-        } else {
-            exec_server_telemetry::ParentLifetime::Independent
-        };
-        let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
-        exec_server_telemetry::run_until_shutdown(
-            async move {
-                let shutdown = async move {
-                    let _ = shutdown_receiver.await;
-                };
-                match cmd.command {
-                    Some(ExecServerSubcommand::Forward { connect }) => {
-                        codex_exec_server::run_remote_environment_forward_until_shutdown(
-                            remote_config,
-                            connect,
-                            shutdown,
-                        )
-                        .await
-                    }
-                    None => {
-                        codex_exec_server::run_remote_environment_until_shutdown(
-                            remote_config,
-                            runtime_paths,
-                            shutdown,
-                        )
-                        .await
-                    }
-                }
-            },
-            parent_lifetime,
-            exec_server_telemetry::ShutdownBehavior::Graceful(shutdown_sender),
+            &config,
+            runtime_paths,
+            telemetry,
         )
-        .await?;
-        Ok(())
+        .await
     } else {
         let config_result = load_exec_server_config(
             root_config_overrides,
@@ -2002,32 +1966,84 @@ async fn run_exec_server_command(
         let (_otel, telemetry) = exec_server_telemetry::init(config.as_ref());
         let http_client_factory = config
             .as_ref()
-            .map(codex_core::config::Config::http_client_factory)
-            .unwrap_or_else(|| {
-                codex_http_client::HttpClientFactory::new(
-                    codex_http_client::OutboundProxyPolicy::ReqwestDefault,
-                )
-            });
+            .map(Config::http_client_factory)
+            .unwrap_or_else(|| HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault));
         let listen_url = cmd
             .listen
             .unwrap_or_else(|| codex_exec_server::DEFAULT_LISTEN_URL.to_string());
-        exec_server_telemetry::run_until_shutdown(
-            async move {
-                codex_exec_server::run_main_with_telemetry(
-                    &listen_url,
-                    runtime_paths,
-                    telemetry,
-                    http_client_factory,
-                    cmd.request_dispatch_mode,
-                )
-                .await
-            },
+        let run = exec_server_telemetry::run_until_shutdown(
+            codex_exec_server::run_main_with_telemetry(
+                &listen_url,
+                runtime_paths,
+                telemetry,
+                http_client_factory,
+                cmd.request_dispatch_mode,
+            ),
             exec_server_telemetry::ParentLifetime::Independent,
             exec_server_telemetry::ShutdownBehavior::Immediate,
-        )
-        .await
-        .map_err(anyhow::Error::from_boxed)
+        );
+        run.await.map_err(anyhow::Error::from_boxed)
     }
+}
+
+async fn run_remote_exec_server(
+    cmd: ExecServerCommand,
+    base_url: String,
+    environment_id: String,
+    config: &Config,
+    runtime_paths: ExecServerRuntimePaths,
+    telemetry: ExecServerTelemetry,
+) -> anyhow::Result<()> {
+    let auth_provider =
+        load_exec_server_remote_auth_provider(config, &base_url, cmd.use_agent_identity_auth)
+            .await?;
+    let mut remote_config = RemoteEnvironmentConfig::new(
+        base_url,
+        environment_id,
+        auth_provider,
+        config.http_client_factory(),
+    )?;
+    if let Some(name) = cmd.name {
+        remote_config.name = name;
+    }
+    remote_config.request_dispatch_mode = cmd.request_dispatch_mode;
+    let remote_config = remote_config.with_telemetry(telemetry);
+    let parent_lifetime = if cmd.exit_on_stdin_close {
+        exec_server_telemetry::ParentLifetime::StdinPipe
+    } else {
+        exec_server_telemetry::ParentLifetime::Independent
+    };
+    let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+    let shutdown = async move {
+        let _ = shutdown_receiver.await;
+    };
+    let run = async move {
+        match cmd.command {
+            Some(ExecServerSubcommand::Forward { connect }) => {
+                codex_exec_server::run_remote_environment_forward_until_shutdown(
+                    remote_config,
+                    connect,
+                    shutdown,
+                )
+                .await
+            }
+            None => {
+                codex_exec_server::run_remote_environment_until_shutdown(
+                    remote_config,
+                    runtime_paths,
+                    shutdown,
+                )
+                .await
+            }
+        }
+    };
+    exec_server_telemetry::run_until_shutdown(
+        run,
+        parent_lifetime,
+        exec_server_telemetry::ShutdownBehavior::Graceful(shutdown_sender),
+    )
+    .await?;
+    Ok(())
 }
 
 async fn load_exec_server_remote_auth_provider(
@@ -3836,7 +3852,10 @@ mod tests {
         AppExitInfo {
             token_usage,
             thread_id,
-            resume_hint: codex_utils_cli::resume_hint(thread_name, thread_id),
+            resume_hint: thread_id.map(|thread_id| codex_tui::ResumableThread {
+                thread_id,
+                thread_name: thread_name.map(str::to_string),
+            }),
             disconnect_info: None,
             update_action: None,
             exit_reason: ExitReason::UserRequested,
@@ -3945,27 +3964,26 @@ mod tests {
             lines,
             vec![
                 "Token usage: total=2 input=0 output=2".to_string(),
-                "To continue this session, run codex resume 123e4567-e89b-12d3-a456-426614174000"
-                    .to_string(),
+                "To continue this session, run:".to_string(),
+                "  codex resume 123e4567-e89b-12d3-a456-426614174000".to_string(),
             ]
         );
     }
 
     #[test]
     fn format_exit_messages_includes_resume_hint_without_color() {
-        let exit_info = sample_exit_info(
-            Some("123e4567-e89b-12d3-a456-426614174000"),
-            /*thread_name*/ None,
-        );
+        insta::allow_duplicates! {
+            for thread_name in [None, Some("")] {
+                let exit_info =
+                    sample_exit_info(Some("123e4567-e89b-12d3-a456-426614174000"), thread_name);
         let lines = exit_info.format_exit_messages(/*color_enabled*/ false);
-        assert_eq!(
-            lines,
-            vec![
-                "Token usage: total=2 input=0 output=2".to_string(),
-                "To continue this session, run codex resume 123e4567-e89b-12d3-a456-426614174000"
-                    .to_string(),
-            ]
-        );
+                insta::assert_snapshot!(lines.join("\n"), @"
+                Token usage: total=2 input=0 output=2
+                To continue this session, run:
+                  codex resume 123e4567-e89b-12d3-a456-426614174000
+                ");
+            }
+        }
     }
 
     #[test]
@@ -3975,8 +3993,14 @@ mod tests {
             /*thread_name*/ None,
         );
         let lines = exit_info.format_exit_messages(/*color_enabled*/ true);
-        assert_eq!(lines.len(), 2);
-        assert!(lines[1].contains("\u{1b}[36m"));
+        assert_eq!(
+            lines,
+            vec![
+                "Token usage: total=2 input=0 output=2",
+                "To continue this session, run:",
+                "  \u{1b}[36mcodex resume 123e4567-e89b-12d3-a456-426614174000\u{1b}[39m",
+            ]
+        );
     }
 
     #[test]
@@ -3986,11 +4010,28 @@ mod tests {
             Some("my-thread"),
         );
         let lines = exit_info.format_exit_messages(/*color_enabled*/ false);
+        insta::assert_snapshot!(lines.join("\n"), @"
+        Token usage: total=2 input=0 output=2
+        To continue this session, run:
+          codex resume 123e4567-e89b-12d3-a456-426614174000
+        Or run codex resume and select my-thread.
+        ");
+    }
+
+    #[test]
+    fn format_exit_messages_colors_commands_and_thread_name() {
+        let exit_info = sample_exit_info(
+            Some("123e4567-e89b-12d3-a456-426614174000"),
+            Some("my-thread"),
+        );
+        let lines = exit_info.format_exit_messages(/*color_enabled*/ true);
         assert_eq!(
             lines,
             vec![
-                "Token usage: total=2 input=0 output=2".to_string(),
-                "To continue this session, run codex resume, then select my-thread (123e4567-e89b-12d3-a456-426614174000)".to_string(),
+                "Token usage: total=2 input=0 output=2",
+                "To continue this session, run:",
+                "  \u{1b}[36mcodex resume 123e4567-e89b-12d3-a456-426614174000\u{1b}[39m",
+                "Or run \u{1b}[36mcodex resume\u{1b}[39m and select \u{1b}[36mmy-thread\u{1b}[39m.",
             ]
         );
     }

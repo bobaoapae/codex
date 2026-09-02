@@ -158,7 +158,9 @@ fn response_role(item: &ResponseItem) -> &str {
         ResponseItem::FunctionCallOutput { .. }
         | ResponseItem::CustomToolCallOutput { .. }
         | ResponseItem::ToolSearchOutput { .. } => "tool",
-        ResponseItem::CompactionTrigger { .. } => "system",
+        ResponseItem::ConfigurationUpdate { .. } | ResponseItem::CompactionTrigger { .. } => {
+            "system"
+        }
         ResponseItem::Other => "unknown",
     }
 }
@@ -198,13 +200,17 @@ fn content_kind(item: &ResponseItem) -> String {
         ResponseItem::Compaction { .. } | ResponseItem::ContextCompaction { .. } => {
             "compaction".to_string()
         }
-        ResponseItem::CompactionTrigger { .. } | ResponseItem::Other => "unknown".to_string(),
+        ResponseItem::ConfigurationUpdate { .. }
+        | ResponseItem::CompactionTrigger { .. }
+        | ResponseItem::Other => "unknown".to_string(),
     }
 }
 
 fn response_visibility(item: &ResponseItem) -> ContextVisibility {
     match item {
-        ResponseItem::CompactionTrigger { .. } | ResponseItem::Other => ContextVisibility::Internal,
+        ResponseItem::ConfigurationUpdate { .. }
+        | ResponseItem::CompactionTrigger { .. }
+        | ResponseItem::Other => ContextVisibility::Internal,
         _ => ContextVisibility::Model,
     }
 }
@@ -257,9 +263,9 @@ fn logical_origin(
             ContextLogicalOrigin::Derived
         }
         ResponseItem::AdditionalTools { .. } => ContextLogicalOrigin::ThreadContext,
-        ResponseItem::CompactionTrigger { .. } | ResponseItem::Other => {
-            ContextLogicalOrigin::Unknown
-        }
+        ResponseItem::ConfigurationUpdate { .. }
+        | ResponseItem::CompactionTrigger { .. }
+        | ResponseItem::Other => ContextLogicalOrigin::Unknown,
         ResponseItem::FunctionCallOutput { .. }
         | ResponseItem::CustomToolCallOutput { .. }
         | ResponseItem::ToolSearchOutput { .. } => ContextLogicalOrigin::ToolOutput,

@@ -69,7 +69,6 @@ use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::protocol::W3cTraceContext;
-use codex_rollout::RolloutCompressionMode;
 use codex_rollout::state_db::StateDbHandle;
 use codex_skills_extension::HostSkillsService;
 use codex_thread_store::InMemoryThreadStore;
@@ -87,6 +86,7 @@ use codex_thread_store::ThreadStore;
 use codex_thread_store::ThreadStoreError;
 use codex_thread_store::UpdateThreadMetadataParams;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_git_discovery::GitRootDiscovery;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use std::collections::HashMap;
@@ -352,6 +352,7 @@ pub(crate) struct ThreadManagerState {
     configured_model: Option<String>,
     config_layer_revision: Option<String>,
     runtime_feature_revision: Option<String>,
+    git_root_discovery: Arc<GitRootDiscovery>,
     environment_manager: Arc<EnvironmentManager>,
     starting_mcp_runtimes: std::sync::Mutex<Vec<std::sync::Weak<AtomicBool>>>,
     skills_service: Arc<HostSkillsService>,
@@ -391,14 +392,6 @@ pub fn thread_store_from_config(
             let compression_enabled = config
                 .features
                 .enabled(Feature::LocalThreadStoreCompression);
-            let compression_mode = if config
-                .features
-                .enabled(Feature::LocalThreadStoreSharedCompression)
-            {
-                RolloutCompressionMode::IncludeShared
-            } else {
-                RolloutCompressionMode::Standalone
-            };
             let background_migration_enabled = config
                 .features
                 .enabled(Feature::BackgroundPaginatedRolloutMigration);
@@ -415,17 +408,11 @@ pub fn thread_store_from_config(
                         warn!("failed to migrate legacy rollouts on startup: {err}");
                     }
                     if compression_enabled {
-                        codex_rollout::spawn_rollout_compression_worker(
-                            codex_home,
-                            compression_mode,
-                        );
+                        codex_rollout::spawn_rollout_compression_worker(codex_home);
                     }
                 });
             } else if compression_enabled {
-                codex_rollout::spawn_rollout_compression_worker(
-                    config.codex_home.to_path_buf(),
-                    compression_mode,
-                );
+                codex_rollout::spawn_rollout_compression_worker(config.codex_home.to_path_buf());
             }
             store
         }
@@ -499,6 +486,7 @@ impl ThreadManager {
                 runtime_feature_revision: Some(
                     config.config_layer_stack.runtime_feature_revision(),
                 ),
+                git_root_discovery: Arc::default(),
                 environment_manager,
                 starting_mcp_runtimes: std::sync::Mutex::new(Vec::new()),
                 skills_service,
@@ -650,6 +638,7 @@ impl ThreadManager {
                 configured_model: None,
                 config_layer_revision: None,
                 runtime_feature_revision: None,
+                git_root_discovery: Arc::default(),
                 environment_manager,
                 starting_mcp_runtimes: std::sync::Mutex::new(Vec::new()),
                 skills_service,
@@ -808,6 +797,10 @@ impl ThreadManager {
                 })?;
         }
         Ok(())
+    }
+
+    pub(crate) fn git_root_discovery(&self) -> Arc<GitRootDiscovery> {
+        Arc::clone(&self.state.git_root_discovery)
     }
 
     pub fn get_models_manager(&self) -> SharedModelsManager {
@@ -2131,13 +2124,14 @@ impl ThreadManagerState {
         } else {
             codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile
         };
-        let (session, io) = Box::pin(Session::spawn(SessionSpawnArgs {
+        let (session, io) = Session::spawn(SessionSpawnArgs {
             config,
             allow_provider_model_fallback,
             user_instructions,
             installation_id: self.installation_id.clone(),
             auth_manager,
             models_manager: Arc::clone(&self.models_manager),
+            git_root_discovery: Arc::clone(&self.git_root_discovery),
             environment_manager: Arc::clone(&self.environment_manager),
             skills_service: Arc::clone(&self.skills_service),
             plugins_manager: Arc::clone(&self.plugins_manager),
@@ -2171,7 +2165,7 @@ impl ThreadManagerState {
             inherited_multi_agent_version: multi_agent_version,
             git_enrichment_policy: GitEnrichmentPolicy::Fresh,
             windows_sandbox_proxy_settings_mode,
-        }))
+        })
         .await?;
         // Enable Full Access form input only after session startup so a required MCP server cannot
         // block startup while waiting for form input.

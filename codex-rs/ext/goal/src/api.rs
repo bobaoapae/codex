@@ -285,7 +285,7 @@ impl GoalService {
         };
 
         if let Some(runtime) = runtime.as_ref() {
-            runtime.invalidate_turn_lineage().await;
+            runtime.clear_pending_turn_start_options().await;
         }
 
         if objective.is_some() {
@@ -333,7 +333,7 @@ impl GoalService {
             })?;
         let cleared = cleared_goal.is_some();
         if cleared && let Some(runtime) = runtime.as_ref() {
-            runtime.invalidate_turn_lineage().await;
+            runtime.clear_pending_turn_start_options().await;
         }
         drop(goal_state_permit);
         drop(runtime);

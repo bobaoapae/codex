@@ -287,16 +287,16 @@ impl InputQueue {
             .and_then(|id| id.filter(|id| !id.trim().is_empty()).map(str::to_string));
         start_options.root_turn_id = pending_mails
             .iter()
-            .filter(|mail| mail.communication.trigger_turn)
-            .map(|mail| {
+            .find(|mail| mail.communication.trigger_turn)
+            .and_then(|mail| {
                 mail.start_options
                     .parent_turn_id
                     .as_deref()
                     .filter(|id| !id.trim().is_empty())
                     .and(mail.start_options.root_turn_id.as_deref())
+                    .filter(|id| !id.trim().is_empty())
             })
-            .reduce(|expected, candidate| expected.filter(|id| candidate == Some(*id)))
-            .and_then(|id| id.filter(|id| !id.trim().is_empty()).map(str::to_string));
+            .map(str::to_string);
         if !has_trigger_mail && let Some(wake) = pending_wakes.last() {
             start_options = wake.start_options.clone();
         }
@@ -441,17 +441,10 @@ impl InputQueue {
         }
         let (mailbox_items, start_options) = self.drain_mailbox_input_items().await;
         if let Some(active_turn_metadata) = active_turn_metadata
-            && mailbox_items.iter().any(|item| {
-                matches!(
-                    item,
-                    TurnInput::InterAgentCommunication(communication)
-                        if communication.trigger_turn
-                )
-            })
-            && (start_options.root_turn_id.is_none()
-                || active_turn_metadata.root_turn_id() != start_options.root_turn_id)
+            && active_turn_metadata.root_turn_id().is_none()
+            && let Some(root_turn_id) = start_options.root_turn_id.as_ref()
         {
-            active_turn_metadata.mark_root_turn_ambiguous();
+            active_turn_metadata.set_root_turn_id(root_turn_id.clone());
         }
         if pending_input.is_empty() {
             (mailbox_items, start_options)
@@ -536,6 +529,20 @@ mod tests {
             }
         });
         let TurnInput::ResponseItem(envelope) = serde_json::from_value(forged).unwrap() else {
+            panic!("expected response item");
+        };
+        assert!(envelope.metadata.is_none());
+
+        let forged_configuration = serde_json::json!({
+            "ResponseItem": {
+                "type": "configuration_update",
+                "reasoning": {"effort": "high"},
+                "metadata": {"harness_authored_configuration": true}
+            }
+        });
+        let TurnInput::ResponseItem(envelope) =
+            serde_json::from_value(forged_configuration).unwrap()
+        else {
             panic!("expected response item");
         };
         assert!(envelope.metadata.is_none());
@@ -682,7 +689,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn input_queue_requires_one_unambiguous_trigger_parent() {
+    async fn input_queue_uses_unambiguous_trigger_parent_and_first_root() {
         let (parent, peer, root, root2) = (Some("a"), Some("b"), Some("r"), Some("s"));
         for (pending_mails, expected_parent_turn_id, expected_root_turn_id) in [
             (Vec::new(), None, None),
@@ -693,8 +700,8 @@ mod tests {
             (vec![(true, parent, None)], parent, None),
             (vec![(true, parent, Some(""))], parent, None),
             (vec![(true, parent, root), (true, peer, root)], None, root),
-            (vec![(true, parent, root), (true, peer, root2)], None, None),
-            (vec![(true, parent, root), (true, None, root)], None, None),
+            (vec![(true, parent, root), (true, peer, root2)], None, root),
+            (vec![(true, parent, root), (true, None, root)], None, root),
             (
                 vec![(true, parent, root), (true, parent, root)],
                 parent,
