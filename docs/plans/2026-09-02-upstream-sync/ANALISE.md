@@ -497,3 +497,49 @@ upstream `f40e08478c`, `746798b2f7`, `9d57be71ba`, `a7913390f7`.
 
 **Merge:** árvores `cca47f96cb` (normal) e `e83101bcd1` (`-X ignore-space-change`); base `88f776588f`;
 alvo `f59905647a`.
+
+---
+
+# Execução (02/09) — o que aconteceu
+
+**Merge:** `89433ec271`, feito com `git merge --no-commit -X ignore-space-change origin/main` sobre
+`dcfcb570b2` (não `f59905647a`: o upstream avançou 3 commits durante a análise —
+`dc0dc4f15d`, `301a7c5e01`, `dcfcb570b2`, todos em `windows-sandbox-rs`/`voice-host`/`third_party/voice`).
+Confirmado antes de começar que a lista de conflitos continuava a ser exactamente os mesmos 29
+ficheiros do inventário. Ponto de retorno: tag `pre-sync-20260902`.
+
+Nenhum conflito fora dos 29, e nenhum hunk diferente do inventário. As quatro decisões foram
+aplicadas como escritas.
+
+## Desvios ao previsto
+
+O §4 acertou em todos os 29 conflitos. O §4.1 acertou em 9 das 10 quebras previstas (a #10
+desapareceu com a decisão C′, como antecipado). Apareceram **oito** quebras que o inventário não
+previa — todas da mesma família (um tipo partilhado ganhou um campo, ou um `match` exaustivo ganhou
+uma variante), mas em ficheiros que o §4.1 não tinha varrido:
+
+| ficheiro | causa |
+|---|---|
+| `rollout/src/lib.rs:87` | `pub use compression::spawn_rollout_compression_worker_with_capabilities` sobreviveu fora do hunk de conflito (a decisão C′ apaga a função) |
+| `thread-store/src/local/search_index_extractor.rs:71` | `match` sobre `RolloutItem` sem `RetainedContext`/`TokenUsageRecord` |
+| `thread-store/src/local/search_index_extractor_tests.rs:113` | `AgentMessageItem` ganhou `questions` |
+| `core/src/agent/mailbox/mod.rs:210` | mesmo `match` sobre `RolloutItem` |
+| `core/src/unified_exec/mod.rs:83` | `pub(crate) use …MAX_COMMAND_SUMMARY_BYTES` ficou órfão ao apagar `command_for_display` (§4 #12) |
+| `app-server/src/request_processors/turn_processor.rs:1172` | o upstream trocou `let (thread_id, thread)` por `let (_, thread)` em `turn_steer_inner` (a `seal_realtime_transcript_before_user_input` do fork saiu com o #41924); a `history_recovery_required_error` do fork ainda precisa do `thread_id` |
+| `tui/src/app/recovery.rs:147` | `AppServerSession::resume_thread` ganhou `&LocalSettings` como 1.º argumento (#42202) |
+| `tui/src/app/agents_overview_threads.rs:178` | o ficheiro novo do upstream constrói `ThreadListParams` sem os campos do fork (`thread_classes`, `root_thread_id`, `terminal_outcomes`) — resolvidos com `None` (vista daemon-wide) |
+| `tui/src/app/tests/buffered_replay.rs:21` | `ThreadItem::AgentMessage` ganhou `questions` |
+
+**Lição para o próximo sync:** o §4.1 varreu os literais e `match` a partir dos tipos que os
+*conflitos* mudaram. Faltou o passo simétrico — varrer os ficheiros **exclusivos do fork** por cada
+tipo partilhado que o upstream mudou na janela (`RolloutItem`, `ResponseItem`, `AgentMessageItem`,
+`ThreadItem`, `ThreadListParams`, assinaturas de `AppServerSession`). Sete das oito saíam desse
+varrimento. As duas restantes (`lib.rs`, `unified_exec/mod.rs`) são re-exports órfãos: vale a pena,
+depois de cada remoção decidida, correr `grep` pelo símbolo apagado em todo o `codex-rs`.
+
+**Fora dos conflitos, também:** `codex-cli` continua a depender de `codex-backend-client` (entrada
+do fork em `Cargo.lock`, mantida); `features/src/lib.rs` ficou com o upstream, logo
+`local_thread_store_shared_compression` passa a flag removido/aceite; `fork-invariants.toml` perdeu
+a entrada `rollout.include_shared_capability` e o README do app-server perdeu a secção do gate.
+Os dois `.json.zst` de schema foram regenerados com
+`python app-server-protocol/scripts/write_schema_fixtures.py` (e `--experimental`).

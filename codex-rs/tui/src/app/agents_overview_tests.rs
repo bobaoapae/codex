@@ -226,7 +226,9 @@ async fn shared_overview_seeds_once_and_retains_locally_resumed_history() -> Res
 
     let created = app_server.start_thread(&config).await?.session.thread_id;
     // Closing the view must not cancel a metadata refresh or forget unloaded entries.
-    app.primary_thread_id = Some(ids[0]);
+    // FORK: `/agents` opens the durable fleet dashboard whenever a primary thread is selected,
+    // so the daemon-wide listing this test covers is the no-primary-thread path.
+    app.primary_thread_id = None;
     app.open_agents_overview(&app_server);
     let visible: HashSet<_> = app
         .agents_overview
@@ -266,6 +268,8 @@ async fn shared_overview_seeds_once_and_retains_locally_resumed_history() -> Res
         .await?;
     app.enqueue_primary_thread_session(resumed.session, resumed.turns)
         .await?;
+    // FORK: see above — clear the fleet root so `/agents` shows the daemon-wide listing.
+    app.primary_thread_id = None;
     app.open_agents_overview(&app_server);
     finish_overview_refresh(&mut app, &app_server, &mut event_rx).await;
     expected.insert(ids[1]);

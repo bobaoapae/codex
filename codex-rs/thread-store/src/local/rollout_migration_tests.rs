@@ -1262,8 +1262,7 @@ async fn migration_preserves_answers_before_a_rolled_back_steer() {
     )));
     let path = write_rollout(home.path(), thread_id, SessionSource::Cli, items);
     let store = indexed_store(home.path()).await;
-    store
-        .migrate_rollouts(apply_options())
+    apply_rollouts(&store, apply_options())
         .await
         .expect("migrate rollback of a steer");
     let migrated = read_rollout(&path);
