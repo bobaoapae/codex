@@ -1,43 +1,42 @@
-# Sync upstream 02/09 — duas decisões que precisam de plano
+# Sync upstream 02/09 — análise e plano
 
-> Somente leitura: **o merge não foi iniciado**. Nada da árvore de trabalho foi tocado; toda a
-> análise de conflito saiu de `git merge-tree --write-tree` (árvore `e8bebc2352`), que produz o
-> resultado do merge sem aplicá-lo.
+> Somente leitura até à Fase 1 do plano: **o merge não foi iniciado**. Toda a análise de conflito
+> saiu de `git merge-tree --write-tree` (árvores `cca47f96cb` e, com `-X ignore-space-change`,
+> `e83101bcd1`), que produzem o resultado do merge sem tocar na árvore de trabalho.
 >
-> Este documento existe para virar entrada do plan mode. Ele descreve **funcionamento**, não
-> preferências: as opções aparecem com a consequência de cada uma, e as perguntas em aberto
-> estão marcadas como tal.
+> Revisão 2 (02/09, fim de tarde). A revisão 1 cobria 128 commits e deixava duas decisões em
+> aberto. Esta revisão: (a) actualiza para os 138 commits actuais, (b) fecha as duas decisões com
+> os dados que faltavam (auditoria de leitores + inventário dos módulos do fork), (c) acrescenta o
+> incidente do cache de plugins do Desktop, que o upstream corrigiu hoje, e (d) inclui o plano de
+> execução completo com os 29 conflitos resolvidos um a um.
 
-## Situação do sync
+## 0. Situação
 
 | | |
 |---|---|
 | base upstream do fork | `88f776588f` (30/08) |
-| upstream agora | `1bc8fb16ae` (02/09) |
-| commits novos | 128 |
-| arquivos em conflito | 29 (~40 hunks) |
+| upstream agora | `f59905647a` (02/09, #42330) |
+| commits novos | 138 (os 10 desde a revisão 1 não acrescentam conflitos; hunks idênticos) |
+| ficheiros em conflito | 29 (40 hunks) — 11 mecânicos, 16 costura, 2 com decisão (fechadas abaixo) |
+| CI upstream | **cronicamente vermelho**, 36–64 checks falhados em cada um dos 5 últimos commits (`Build nextest archive`, Bazel, sdk, codespell). Mesma classe de sempre: gate real é local. |
+| árvore do merge-tree | `cca47f96cb3ca02f71dd1b82be3987d0f49aae56` (`git show <árvore>:<caminho>` mostra o ficheiro com marcadores) |
+| árvore c/ `ignore-space-change` | `e83101bcd1` — mesma lista de ficheiros, mas `rollout_reconstruction.rs` cai de 6 para 2 hunks |
 
-**Não conflita e passa intacto:** todo `core/src/ownership/` e `state/src/workflow/lease*` — o
-upstream não encostou em nenhum dos dois nesses 128 commits. O pin de versão `0.146.1` também
-sobrevive: o upstream não mexeu naquela linha do `[workspace.package]`.
+**Passa intacto:** `core/src/ownership/`, `state/src/workflow/lease*`, `agent-roles/`, o carve-out
+`model_provider` em `core/src/agent/role.rs`, `login/src/auth/manager.rs` (bloco FORK), o pin
+`0.146.1`, `model-provider-info` (nenhum `match` novo sobre `WireApi`). Nenhuma das classes
+recorrentes de quebra pós-merge (`ToolHandler::handle`, `ResponseEvent::Completed`,
+`request_command_approval`, `ReasoningEffort`) reaparece nesta janela.
 
-Dos 29 conflitos, 11 são mecânicos (linhas adjacentes em listas de `mod`/`use`/membros do
-workspace, `Cargo.lock`, dois `.zst` regeneráveis), 14 são costura à mão sem escolha de produto
-(o mais pesado é `session/rollout_reconstruction.rs`, 6 hunks, onde o upstream reestruturou o
-replay reverso e os nossos campos `last_plan` / `approved_plan` / `history_recovery_reason`
-precisam ser re-encaixados na forma nova), 2 já foram decididos, e **2 precisam de plano** —
-são os deste documento.
+### Decisões (resumo)
 
-### Já decidido
-
-- **`tools/registry.rs`** — manter o `tool_name` no `tool_log_payload`: readicionar o parâmetro
-  na assinatura nova do upstream e ficar também com as tags de métrica de sandbox que eles
-  acrescentaram.
-- **Plan mode / `update_plan`** — aplicar os dois lados. Detalhe que mudou a decisão: o nosso
-  `resolve_update_plan_enabled` usa `is_none_or` (seção ausente = **ligado**) e o upstream passou
-  a usar `is_some_and` (ausente = **desligado**), então o merge desligaria a tool sem aviso. Já
-  foi escrito `[tools.update_plan] enabled = true` + `survives_compaction = true` explicitamente
-  no `~/.codex/config.toml` (backup: `config.toml.bak-20260902`) para blindar contra a inversão.
+| tema | decisão recomendada | secção |
+|---|---|---|
+| Compressão de rollouts | **C′**: manter a estrutura do fork (worker/journal/validação/writer/cleanup), remover o modo + gate + índice de referências, como o upstream fez | §1.9 |
+| `/agents` overview | **A**: combinar — desvio para a frota quando há thread primária; caminho upstream (sessões recentes) como fallback | §2.6 |
+| `[tools.update_plan]` | já decidido: ambos os lados; config explícita blindada (`config.toml.bak-20260902`) | rev. 1 |
+| `tool_log_payload` | já decidido: manter `tool_name` + tags de sandbox do upstream | §4 #11 |
+| Cache de plugins (Desktop) | **nenhum patch do fork**: o upstream `50fffd5ed3` (#42284) resolve; entra com o sync | §3 |
 
 ---
 
@@ -45,304 +44,456 @@ são os deste documento.
 
 ## 1.1 O problema que a compressão cria
 
-O worker de compressão varre `~/.codex/sessions/` e `~/.codex/archived_sessions/` e converte
-rollouts frios (>7 dias) de `.jsonl` para `.jsonl.zst`.
+O worker varre `~/.codex/sessions/` e `~/.codex/archived_sessions/` e converte rollouts frios
+(>7 dias) de `.jsonl` para `.jsonl.zst`. O caso delicado são as **linhagens partilhadas**: quando
+B é fork de A, o `SessionMeta` de B guarda um `history_base` com `end_byte_offset` — um
+deslocamento em bytes dentro do ficheiro de A. Comprimir A invalida esse offset para qualquer
+leitor que abra o ficheiro directamente; só funciona se o leitor passar pelos helpers zstd-aware.
 
-O caso delicado são as **linhagens compartilhadas**. Quando a thread B é forkada da A, B **não**
-copia o histórico de A: o `SessionMeta` de B guarda um `history_base: HistoryPosition` com
-`thread_id` da origem, `end_ordinal_exclusive` e **`end_byte_offset`** — um deslocamento em bytes
-dentro do arquivo de A. Ler o histórico de B exige abrir o arquivo de A e posicionar naquele
-offset.
-
-Comprimir A invalida esse offset para qualquer leitor que abra o arquivo diretamente. Só funciona
-se o leitor passar pelo `open_rollout_line_reader`, que trata `.jsonl` e `.jsonl.zst` de forma
-transparente.
-
-Isso **não é hipotético**: no mesmo commit em que passou a comprimir linhagens compartilhadas, o
-upstream teve que corrigir um leitor que abria o arquivo direto —
-*"Read rollout files through the compressed-rollout reader when `codex exec resume` determines the
-latest turn's working directory"* (`exec/src/lib.rs`, +30/-­). Ou seja: a classe de bug é real e
-já mordeu o próprio upstream.
+Não é hipotético: no mesmo commit em que passou a comprimir linhagens partilhadas o upstream teve
+de corrigir um leitor directo em `exec/src/lib.rs` (`codex exec resume` a determinar o cwd do
+último turno).
 
 ## 1.2 Como o fork resolve hoje
 
-Três peças:
+- `RolloutCompressionMode { Standalone, IncludeShared }` (`rollout/src/compression.rs:41`).
+- `RolloutCompressionCapabilities { cargo, bazel, tui, app_server, desktop: Option<bool> }`
+  (`compression_capabilities.rs`); `all_readers_support_shared()` exige tudo `true` e
+  `desktop == Some(true)`; `Default` recusa.
+- Gate no worker (`compression_worker.rs:128`): `IncludeShared` sem capabilities **aborta a
+  rodada inteira**. Em `Standalone`, dois filtros (`:298-307`) saltam rollouts referenciados
+  (`RolloutReferenceIndex`) e rollouts com `history_base`.
+- Invariante `fork_invariant_include_shared_fails_closed_without_reader_capabilities`.
 
-**`RolloutCompressionMode`** (`rollout/src/compression.rs:41`)
-
-```rust
-pub enum RolloutCompressionMode {
-    Standalone,     // linhagens compartilhadas ficam em JSONL puro
-    IncludeShared,  // exige que TODO leitor deste codex_home saiba ler .zst compartilhado
-}
-```
-
-**`RolloutCompressionCapabilities`** (`rollout/src/compression_capabilities.rs`)
-
-```rust
-pub struct RolloutCompressionCapabilities {
-    pub cargo: bool,
-    pub bazel: bool,
-    pub tui: bool,
-    pub app_server: bool,
-    pub desktop: Option<bool>,   // Option porque o leitor Desktop instalado
-}                                // nao pode ser inferido desta biblioteca
-```
-
-`all_readers_support_shared()` exige os quatro `true` **e** `desktop == Some(true)`. O `Default`
-deixa tudo `false`/`None`, então o padrão é recusar.
-
-**O gate no worker** (`rollout/src/compression_worker.rs:128`)
-
-```rust
-let capability_blocked =
-    mode == RolloutCompressionMode::IncludeShared && !capabilities.all_readers_support_shared();
-...
-if capability_blocked {
-    metrics::run("skipped_capability_gate");
-    debug!("{}", capabilities.shared_compression_diagnostic());
-    return Ok(CompressionStats::default());   // não comprime NADA nesta rodada
-}
-```
-
-Note o efeito: quando o gate bloqueia, o worker **aborta a rodada inteira**, não só as linhagens
-compartilhadas. É fail-closed no sentido forte.
-
-E quando roda em `Standalone`, dois filtros protegem as linhagens
-(`compression_worker.rs:298-307`):
-
-```rust
-if mode == Standalone && reference_index.reference_count(rollout_id) > 0 { skipped_referenced }
-if mode == Standalone && meta.meta.history_base.is_some()              { skipped_fork_pointer }
-```
-
-O `RolloutReferenceIndex` é o que sabe quais rollouts são apontados por algum fork.
-
-O invariante `fork_invariant_include_shared_fails_closed_without_reader_capabilities`
-(`rollout/src/compression_tests.rs`) tranca esse comportamento.
+**Facto novo (rev. 2):** o único call site (`core/src/thread_manager.rs:393-430`) chama
+`spawn_rollout_compression_worker(codex_home, mode)` — a variante `_with_capabilities` **nunca é
+chamada em produção**. Logo `IncludeShared` é inatingível por construção; o modo só tinha uma
+configuração possível. Isto responde às perguntas 3 e 4 da rev. 1.
 
 ## 1.3 O que o upstream fez
 
-Commit `9d0eae74cd` — *"Include shared histories in rollout compression (#42039)"*, 01/09:
+`9d0eae74cd` — *Include shared histories in rollout compression (#42039)*: apagou o enum, o
+parâmetro de modo, a leitura do índice de referências no worker (`rollout_reference_index.rs`
+perdeu 133 linhas) e os dois `skipped_*`. Resta "comprime todo o ficheiro frio". A segurança passa
+a depender de "todo o leitor usa o reader zstd-aware". O flag `local_thread_store_shared_compression`
+continua aceite em config estrita, sem efeito.
 
-> - Make `local_thread_store_compression` compress cold rollout files across shared and forked
->   histories **without a separate compression mode**.
-> - **Retire** `local_thread_store_shared_compression` while continuing to accept it in strict
->   configuration without changing compression behavior.
+## 1.4 Estado real na máquina
 
-O diff (`-137/+305` no total, mas na direção da remoção):
+Compressão **desligada**: ambos os flags `Stage::UnderDevelopment, default_enabled: false`
+(`features/src/lib.rs:1108-1121`), nenhum ligado em `~/.codex/config.toml`. Nenhum rollout foi
+comprimido até hoje. Tudo aqui é código dormente.
 
-- apagou o enum `RolloutCompressionMode` inteiro;
-- `spawn_rollout_compression_worker(codex_home)` — sem parâmetro de modo;
-- **removeu o `RolloutReferenceIndex` do worker** (`rollout_reference_index.rs` perdeu 133 das
-  suas linhas);
-- removeu a leitura do `SessionMeta` que checava `history_base`;
-- consequentemente removeu os dois `skipped_*`.
+## 1.5 A premissa do gate (Desktop), verificada — rev. 1
 
-Restou: comprime todo arquivo frio, ponto. A segurança passou a depender inteiramente de
-"todo leitor usa o reader que trata `.zst`".
+No bundle `OpenAI.Codex_26.831.2377.0` (`app.asar`, 284,7 MB): as 20 ocorrências de `.zst` são
+da lib `tar`; zero `readFile` perto de `rollout`; os únicos caminhos de rollout que o Desktop toca
+são o staging de import de transcript e o handoff, nenhum sob `sessions/`. A leitura normal de
+thread passa pelo app-server (o nosso binário). Limite honesto: provei ausência de leitor zstd num
+bundle minificado, não a ausência de qualquer leitura directa; vale para 26.831.
 
-Do lado do fork, o upstream **não** tem: `RolloutCompressionCapabilities`, o gate, a extração do
-worker para `compression_worker.rs` (eles mantêm `mod worker { ... }` inline dentro de
-`compression.rs`), nem os módulos `compression_cleanup` / `compression_journal` /
-`compression_validation` / `compression_writer` que o fork separou.
+## 1.6 Auditoria dos leitores do fork — rev. 2 (feita)
 
-## 1.4 O estado real na máquina
+Varrimento completo de `codex-rs` (e `scripts/`) por leituras de rollout, classificadas por
+"passa pelo reader zstd-aware" vs "abre o ficheiro directamente".
 
-**A compressão está desligada.** Os dois flags são `Stage::UnderDevelopment, default_enabled: false`
-(`features/src/lib.rs:1108-1121`) e o `~/.codex/config.toml` não habilita nenhum. Nenhum rollout
-foi comprimido até hoje.
+**Entradas zstd-aware em `rollout/src/`:** `open_rollout_line_reader` (`compression.rs:82`, só
+linhas, sem seek), `open_rollout_seekable_reader` (`seekable_reader.rs:46`, descomprime para
+tempfile anónimo; **seeks por offset original funcionam**), `rollout_contains_prefix(path,
+end_byte_offset)` (`seekable_reader.rs:63`), `existing_rollout_path`, `plain_rollout_path`,
+`materialize_rollout_for_append/_reference`, `RolloutFile::from_path`. Todos os derivados
+(`read_session_meta_line`, `load_rollout_items`, `get_rollout_history`, `search_rollout_matches`,
+`extract_metadata_from_rollout`, `RolloutReferenceIndex::scan`) assentam nestes.
 
-Isso muda a urgência: qualquer decisão aqui afeta **código dormente**. O risco só se materializa
-se alguém ligar `local_thread_store_compression`.
+**Resultado nos módulos exclusivos do fork — nenhum leitor directo:**
 
-## 1.5 A premissa do gate, verificada
-
-O `desktop: Option<bool>` existe porque "o leitor Desktop instalado não pode ser inferido desta
-biblioteca". Fui verificar no bundle instalado
-(`OpenAI.Codex_26.831.2377.0/app/resources/app.asar`, 284,7 MB):
-
-| busca | ocorrências | o que são |
+| módulo | o que lê | como |
 |---|---|---|
-| `.zst` | 20 | **todas** da lib `tar` (`.tar.zst`, `.tzst`) — nenhuma sobre rollout |
-| `.jsonl` | 145 | import do Claude Code, `realtime-*.jsonl`, `transcription-history.jsonl`, staging de import |
-| `rollout` | 320 | majoritariamente strings de erro **vindas do app-server** |
-| `readFile` perto de `rollout` | **0** | — |
+| `thread-store/src/local/model_context.rs:135` | linhagem com `end_byte_offset` | `open_rollout_seekable_reader` + `ReverseJsonlScanner::new_at` — **o principal consumidor do offset, e está correcto** |
+| `thread-store/src/local/{thread_history_materialization,recovery_scan,rollout_lineage,revert_thread,search_index_projection,receipt_append,read_thread,search_threads}.rs` | vários | seekable reader / line reader / `rollout_contains_prefix` / materialize |
+| `thread-store/src/local/rollout_migration*` | migração | 7 `File::open` directos, **todos sobre a cópia já descomprimida** (`rollout_path_is_compressed` em `:821/:849-867`; `preview.rs:515-519` ramifica explicitamente) |
+| `app-server` evidence/artifact/recovery/lease/fleet/search-index | tudo via `thread_store.read_thread` | sem IO próprio |
+| `core/src/chatgpt_web/`, `core/src/claude_code/` (incl. `sessions.rs`), `state/src/workflow/`, `agent/control/fleet.rs`, `core/src/ownership/`, `memories/`, `session/rollout_reconstruction.rs` | — | **não abrem rollouts** (estado de daemon, JSON de contas, SQLite, `&[RolloutItem]` em memória) |
+| `cli/src/doctor/thread_inventory.rs:493-528` | inventário | normaliza com `plain_rollout_path`, dedupe `.zst`/`.jsonl` |
+| `scripts/`, `codex-rs/scripts/` | — | nenhum parser de rollout |
 
-Os únicos pontos em que o Desktop toca um caminho de rollout:
+**Leitores directos que sobram — ambos em ficheiros partilhados com o upstream, ambos fail-soft:**
 
-1. **Import de transcript** — constrói `rollout-${id}.jsonl` num diretório de staging
-   (`fork-transcript-imports`) e **escreve** um rollout novo (payload com `agent_nickname`,
-   `agent_path`, `base_instructions`, `cli_version: "0.0.0"`).
-2. **Handoff** — copia um `rollout.jsonl` para `~/.codex/handoffs/<id>/` e valida
-   `basename(e) !== 'rollout.jsonl'` → erro.
+| ficheiro | estado | consequência |
+|---|---|---|
+| `exec/src/lib.rs:1625` `parse_latest_turn_context_cwd` — `tokio::fs::read_to_string(path)` | **corrigido pelo upstream nesta janela** (`9d0eae74cd`: `open_rollout_seekable_reader` + `ReverseJsonlScanner`) — o sync traz a correcção | — |
+| `tui/src/resume_picker_transcript_preview.rs:152` `scan_legacy_transcript_preview` — `File::open(path)?` | **igual no upstream** (`:153`), não tocado | em rollout comprimido dá `NotFound` → cai em `hydrate_initial_thread_history`; perde-se só o tail scan rápido |
+| `cli/src/doctor.rs:2339` `is_rollout_file` — `extension() == "jsonl"` | igual no upstream (`:2189`) | rollouts `.zst` saem das estatísticas de tamanho/contagem do `doctor` (metadata, sem leitura de conteúdo) |
 
-Nenhum dos dois fica sob `sessions/` ou `archived_sessions/`, que é onde o worker varre. E as
-strings tipo `no rollout found for thread id` / `failed to resolve rollout path` são mensagens do
-**app-server** mapeadas para códigos de UI — ou seja, a leitura normal de thread passa pelo nosso
-binário.
+**Conclusão:** a pergunta 1 da rev. 1 ("algum leitor exclusivo do fork abre rollout sem passar
+pelo reader?") tem resposta **não**. A premissa do gate está vazia dos dois lados: nem o Desktop
+nem o fork leem rollouts directamente. O residual é upstream-partilhado e falha suave.
 
-**Conclusão parcial:** para esta versão do Desktop, a premissa do `desktop: Option<bool>` parece
-mais fraca do que quando o gate foi escrito. O Desktop não tem leitor zstd, mas também não parece
-ler rollout de `sessions/` diretamente.
+## 1.7 O que o fork tem que o upstream não tem (inventário — rev. 2)
 
-**Limite honesto desta verificação:** eu provei a *ausência* de um leitor zstd e a ausência de
-`readFile` perto de `rollout` num bundle minificado. Não provei que nenhum caminho do Desktop abre
-um rollout de `sessions/` — código minificado e indireção por variáveis podem esconder isso. E a
-verificação vale para 26.831; uma versão futura pode mudar.
+`5167390020` (subsistema de workflow) reescreveu o worker em módulos, e **não é só extracção**:
 
-## 1.6 O risco que sobra, e onde ele está
+| módulo | linhas | o que faz |
+|---|---|---|
+| `compression_worker.rs` | 381 | o worker (equivalente ao `mod worker` inline do upstream) + gate |
+| `compression_writer.rs` | 206 | `compress_rollout_if_cold` — escrita atómica com medição |
+| `compression_validation.rs` | 272 | `validate_rollout_replacement` / `inspect_rollout` — verifica que o `.zst` reproduz o JSONL antes de substituir |
+| `compression_journal.rs` | 219 | journal por ficheiro + `recover()` — retoma/reverte uma substituição interrompida |
+| `compression_cleanup.rs` | 110 | limpeza de temporários/journals órfãos |
+| `compression_capabilities.rs` | 73 | o gate |
 
-Se o Desktop não é o problema, o problema é **do nosso lado**: leitores do fork que o upstream não
-tem e que podem abrir rollout direto. Candidatos a auditar (nenhum verificado ainda):
+Fora do crate, só `core/src/thread_manager.rs` referencia estes tipos (o modo). Os 28 testes de
+compressão do fork (P2.3) cobrem journal/validação/recuperação.
 
-- `chatgpt_web/`
-- a ponte `claude_code/` e o `sessions.rs` dela
-- o subsistema de workflow/fleet (`state/src/workflow/`, `agent/control/fleet.rs`)
-- `memories/`
-- os scripts em `scripts/`
+## 1.8 Opções
 
-Esse levantamento é, provavelmente, a primeira tarefa do plano.
-
-## 1.7 Opções
-
-| | o que fica | o que se perde | custo |
+| | fica | perde-se | custo |
 |---|---|---|---|
-| **A. Manter o gate, portar o worker deles** | capabilities + extração em `compression_worker.rs` + invariante | as simplificações deles | costurar as mudanças do corpo do worker deles no nosso arquivo; conflito recorrente nesse arquivo a cada sync |
-| **B. Pegar o deles inteiro** | convergência total com upstream | `RolloutCompressionMode`, `RolloutCompressionCapabilities`, o invariante, a extração em módulos | baixo agora; o risco migra para "se ligar compressão, confie que todo leitor usa o reader certo" |
-| **C. Estrutura deles + gate por cima** | fail-closed preservado, estrutura convergida | a extração em `compression_worker.rs` e módulos irmãos | reimplementar capabilities/mode sobre o `mod worker` inline |
+| **A. Manter gate, portar worker deles** | tudo do fork | simplificação | conflito recorrente a cada sync num gate que nunca é atingível |
+| **B. Pegar o deles inteiro** | convergência total | modo, capabilities, invariante **e os ~1000 linhas de journal/validação/writer/cleanup** | baixo agora; perde robustez real da P2.3 |
+| **C′. Estrutura do fork, semântica do upstream** | journal/validação/writer/cleanup, worker extraído | modo, capabilities, gate, `skipped_referenced`/`skipped_fork_pointer`, invariante | portar as **remoções** do upstream para `compression_worker.rs` (~40 linhas); adaptar testes |
 
-Uma quarta possibilidade, que só faz sentido depois da auditoria de 1.6: **B + auditoria** — pegar
-o deles e, se a auditoria mostrar que todo leitor do fork usa `open_rollout_line_reader`, aceitar
-que o gate virou redundante.
+## 1.9 Decisão: C′
 
-## 1.8 Perguntas em aberto para o plano
+Fundamentos: (1) a auditoria mostra que o gate protege contra um leitor que não existe; (2) o
+modo `IncludeShared` nunca foi atingível, logo o gate nunca fez diferença; (3) os módulos de
+journal/validação são robustez que o upstream não tem e que a P2.3 testou; (4) o
+`rollout_reference_index.rs` encolhido do upstream merge limpo e o único consumidor de
+`scan_until`/`reference_count` era o worker do fork (risco pós-merge #10 do §4 desaparece).
 
-1. Algum leitor exclusivo do fork abre rollout sem passar por `open_rollout_line_reader`?
-2. O gate deveria continuar abortando a **rodada inteira**, ou só pular as linhagens
-   compartilhadas? (Hoje ele aborta tudo.)
-3. Se ficarmos com o gate: quem preencheria `desktop: Some(true)`? Hoje nada preenche — o campo é
-   inalcançável na prática, o que torna `IncludeShared` inatingível por construção.
-4. Faz sentido manter um modo cuja única configuração possível é "desligado"? Se não, a escolha
-   real é entre B e C, não entre A e B.
+O que muda concretamente:
+
+- `compression.rs`: tomar o lado upstream do hunk 1 (`spawn_rollout_compression_worker(codex_home)`),
+  mas no hunk 2 manter `#[path = "compression_worker.rs"] mod worker;` (rejeitar o `mod worker { … }`
+  inline do upstream). Apagar `RolloutCompressionMode`.
+- `compression_worker.rs` (sem conflito, edição manual): `spawn(codex_home)` / `run(codex_home)`;
+  remover `capability_blocked` (`:128-161`), o `RolloutReferenceIndex::scan_until` (`:165`), os
+  parâmetros `reference_index`/`mode` de `compress_rollouts_in_root`, os dois skips (`:298-307`);
+  manter `skipped_unreadable_meta` como o upstream (`read_session_meta_line(...).is_err()`).
+- Apagar `compression_capabilities.rs`; `lib.rs`: tomar o lado upstream (sem os dois `pub use`).
+- `compression_tests.rs`: substituir `worker_compresses_archived_fork_chain_only_with_shared_mode`
+  pelo `worker_compresses_archived_fork_chain` do upstream (comprime ambos, verifica round-trip
+  com `open_rollout_seekable_reader`); apagar o invariante `fork_invariant_include_shared_fails_closed…`
+  e `worker_skips_source_referenced_by_archived_compressed_rollout`; manter todos os testes de
+  journal/validação/recuperação. Actualizar `fork-invariants.toml` se listar o invariante removido.
+- `core/src/thread_manager.rs`: o merge-tree já resolveu o call site para a forma upstream
+  (`:414/:418`); apagar `use codex_rollout::RolloutCompressionMode;` (`:72`) e o cálculo de
+  `compression_mode` (`:393-400`).
+- `features/src/lib.rs`: tomar o upstream — `LocalThreadStoreSharedCompression` fica como flag
+  removido/aceite ("Removed compatibility flag").
+- README do app-server (secção "compression gating" acrescentada na P2): actualizar para dizer que
+  o gate deixou de existir.
+
+Follow-ups opcionais (não bloqueiam; candidatos a PR upstream): trocar `File::open` em
+`resume_picker_transcript_preview.rs:152` por `open_rollout_seekable_reader`; fazer
+`doctor::is_rollout_file` normalizar com `plain_rollout_path` como `thread_inventory.rs` já faz.
 
 ---
 
 # Parte 2 — `tui/src/app/agents_overview.rs`
 
-## 2.1 Correção de escala
+## 2.1 Escala real
 
-Na primeira leitura eu descrevi isso como "duas features concorrentes reescrevendo o mesmo
-arquivo". Está errado, e a diferença muda a decisão.
+O fork mudou **28 linhas** em `agents_overview.rs`; o dashboard de frota vive em
+`agents_fleet.rs` (521 linhas, sem conflito). As três inserções do fork: campo
+`fleet: AgentsFleetState` no estado; desvio no topo de `open_agents_overview` (com thread
+primária → `open_agents_fleet_overview`; sem ela → selection view *"No fleet root selected"*);
+early-return em `refresh_agents_overview_threads` quando `fleet.root_thread_id.is_some()`.
 
-O fork mudou **28 linhas** em `agents_overview.rs`. O dashboard de frota de verdade vive em
-**`agents_fleet.rs`, 521 linhas novas, que não conflita com nada**.
+O fork **já tem** o guard `AppServerTarget::Embedded` do upstream antes do desvio
+(`agents_overview.rs:46`), portanto o desvio só corre com app-server remoto.
 
-## 2.2 O que as nossas 28 linhas fazem
+## 2.2 O que o upstream fez (4 commits: `f40e08478c` #42104, `746798b2f7` #41918, `9d57be71ba` #42202, `a7913390f7` #41911)
 
-`git diff 88f776588f..main -- codex-rs/tui/src/app/agents_overview.rs` = 3 inserções:
+- Estado novo: `threads: HashMap<ThreadId, Option<Thread>>`, `initialized`, `refresh_thread_ids`,
+  `refresh_task: Option<AbortHandle>`, `refresh_notifications`, `input_states`,
+  `dispatched_requests`; `impl Drop` aborta a `refresh_task`.
+- **Facto novo (rev. 2):** `refresh_agents_overview_threads` **saiu deste ficheiro** para o novo
+  `tui/src/app/agents_overview_threads.rs` (336 linhas, sem conflito), decomposta em
+  `refresh_agents_overview_threads` (`:104`), `refresh_changed_agents_overview_threads` (`:111`),
+  `start_agents_overview_refresh` (`:126`) e `track_agents_overview_notification` (`:37`).
+- `open_agents_overview` upstream: guard Embedded → constrói a view a partir de
+  `agents_overview.threads` → `show_bottom_pane_view` → `refresh_agents_overview_threads`.
 
-1. **campo no estado**: `pub(super) fleet: super::agents_fleet::AgentsFleetState`
-2. **desvio no topo de `open_agents_overview`**: se há `self.primary_thread_id`, chama
-   `open_agents_fleet_overview(app_server, root_thread_id)` e retorna. Se não há, mostra uma
-   selection view *"No fleet root selected — Open a session before opening the shared agent-fleet
-   dashboard."*
-3. **early-return em `refresh_agents_overview_threads`**: `if self.agents_overview.fleet.root_thread_id.is_some() { return; }`
+## 2.3 Os dois hunks de conflito
 
-Ou seja: é uma **camada de desvio**. O corpo original do upstream continua no arquivo, apenas
-deixa de ser alcançado quando existe thread primária.
+1. Cabeçalho `//!` — combinar as duas frases.
+2. Corpo: lado fork = desvio `primary_thread_id` + `request_id = None; refresh_pending = false;` +
+   `open_agents_fleet_overview` + **todo o corpo antigo** de `refresh_agents_overview_threads` (que
+   já não deve existir aqui); lado upstream = os 4 statements novos de `open_agents_overview`.
 
-## 2.3 O que o `agents_fleet.rs` é
-
-Cabeçalho: *"Durable fleet status and lifecycle requests for the `/agents` dashboard. The
-app-server owns state and generation compare-and-swap."*
-
-Estado (`AgentsFleetState`): `root_thread_id`, `generation` (CAS), `sealed`, `operation_id`,
-`members: Vec<FleetMember>`, `status`, `notice`, dois request-ids em voo, e uma
-`Arc<Mutex<AgentsFleetViewState>>`.
-
-Operações: `open_agents_fleet_overview`, `show_agents_fleet_view`, `refresh_agents_fleet_status`,
-`apply_agents_fleet_status`, `open_agents_fleet_actions`, `open_agents_fleet_close_confirmation`,
-`request_agents_fleet_suspend` / `_resume` / `_close`, `apply_agents_fleet_operation`.
-
-Resumo: `/agents` deixou de ser "o que está carregado nesta TUI" e virou "a frota durável que o
-app-server conhece", com suspend/resume/close transacionados por geração.
-
-## 2.4 O que o upstream fez no mesmo arquivo
-
-Quatro commits:
-
-| commit | o quê | tamanho |
-|---|---|---|
-| `f40e08478c` | *Show recent sessions in the agent command center* (#42104) | +177/-175 |
-| `746798b2f7` | *Restore agent navigation after TUI reconnects* (#41918) | +19/-3 |
-| `9d57be71ba` | *Separate TUI preferences from server configuration* (#42202) | +10/-4 |
-| `a7913390f7` | *Preserve TUI drafts after app-server disconnects* (#41911) | +1/-1 |
-
-O #42104 é uma reescrita das entranhas. O estado mudou de request-id único para:
-
-```rust
-pub(super) threads: HashMap<ThreadId, Option<Thread>>,   // None = resume local sem metadata
-pub(super) initialized: bool,
-pub(super) refresh_thread_ids: HashSet<ThreadId>,
-pub(super) refresh_task: Option<tokio::task::AbortHandle>,
-pub(super) refresh_notifications: HashMap<ThreadId, Vec<ServerNotification>>,
-```
-
-mais um `impl Drop for AgentsOverviewState` que aborta a `refresh_task`. Sumiram os
-`ThreadLoadedList*` / `ThreadTurnsList*` / `ThreadRead*` do topo do arquivo. O cabeçalho mudou de
-*"overview of loaded root sessions"* para *"overview of recent and locally retained sessions"*.
-
-## 2.5 Os dois pontos de atrito
-
-1. **Cabeçalho do módulo** — trivial, o comentário `//!` de cada lado.
-2. **`refresh_agents_overview_threads`** — o nosso early-return está no topo de uma função que o
-   upstream reescreveu inteira. Além disso, a nossa segunda inserção lê
-   `self.agents_overview.request_id`, campo que o upstream **apagou**. Combinar exige reexprimir o
-   early-return contra o estado novo (provavelmente checando `fleet.root_thread_id` antes de tocar
-   em `refresh_thread_ids` / `refresh_task`).
-
-O desvio em `open_agents_overview` também precisa ser reposicionado, mas é mecânico: ele roda
-antes de qualquer coisa e retorna cedo.
-
-## 2.6 Opções
+## 2.4 Opções
 
 | | resultado | custo |
 |---|---|---|
-| **A. Combinar** | `/agents` continua indo para a frota quando há thread primária; o caminho de fallback ganha sessões recentes, correção de reconexão e a separação de preferências do TUI | reexprimir 1 early-return contra o estado novo; reposicionar o desvio |
-| **B. Só o nosso** | comportamento atual preservado | perde os 4 commits deles nesse arquivo; o mesmo conflito volta no próximo sync, e maior |
-| **C. Só o deles** | convergência | `/agents` volta ao upstream; `agents_fleet.rs` fica órfão (521 linhas sem chamador) |
+| **A. Combinar** | `/agents` vai para a frota com thread primária; sem ela cai na visão de sessões recentes do upstream (em vez de "No fleet root selected") | reposicionar o desvio; 1 early-return no ficheiro novo |
+| B. Só o nosso | comportamento actual | perde 4 commits; o conflito volta maior |
+| C. Só o deles | convergência | `agents_fleet.rs` fica órfão |
 
-## 2.7 Perguntas em aberto para o plano
+## 2.5 Perguntas da rev. 1, respondidas
 
-1. Quando **não** há `primary_thread_id`, hoje mostramos *"No fleet root selected"*. Com o
-   caminho do upstream restaurado como fallback, faria mais sentido cair na visão de sessões
-   recentes deles em vez da mensagem?
-2. O `Drop` que aborta a `refresh_task` do upstream precisa rodar também quando estamos na rota da
-   frota? (Se o desvio acontece antes de a task ser criada, provavelmente não — confirmar.)
-3. `agents_fleet.rs` duplica algo que o #42104 passou a oferecer (listar sessões recentes)? Se
-   sim, vale unificar a fonte de dados em vez de manter duas.
+1. *Sem `primary_thread_id`, mostrar a mensagem ou a visão upstream?* → a visão upstream: é útil
+   e custa apagar um bloco. (Decisão de produto menor; reversível.)
+2. *O `Drop` que aborta a `refresh_task` precisa de correr na rota da frota?* → não: o desvio
+   retorna antes de `start_agents_overview_refresh`, a task nunca é criada. Mas
+   `track_agents_overview_notification` continua a acumular `refresh_thread_ids` a partir de
+   notificações; com o early-return em `start_agents_overview_refresh` isso é inofensivo.
+3. *`agents_fleet.rs` duplica o #42104?* → não: a frota lista membros duráveis de um root com
+   suspend/resume/close por geração (CAS no app-server); o #42104 lista sessões recentes do daemon.
+   Fontes diferentes; unificar não se justifica agora.
+
+## 2.6 Decisão: A
+
+- `agents_overview.rs`: tomar o ficheiro upstream; em `open_agents_overview`, depois do guard
+  Embedded, inserir `if let Some(root_thread_id) = self.primary_thread_id { self.open_agents_fleet_overview(app_server, root_thread_id); return; }`
+  (sem o bloco "No fleet root selected", sem tocar em `request_id`/`refresh_pending`); manter o
+  campo `fleet` em `AgentsOverviewState`.
+- `agents_overview_threads.rs` (ficheiro novo, sem conflito): no topo de
+  `start_agents_overview_refresh`, `if self.agents_overview.fleet.root_thread_id.is_some() { return; }`.
+- Testes: `agents_fleet_tests.rs` (3 testes fixam `fleet.root_thread_id`) devem continuar a passar;
+  o gate TUI da P2.3 (11 testes) + `agents_overview_tests.rs` do upstream (516 linhas novas).
 
 ---
 
-# Apêndice — referências de arquivo
+# Parte 3 — Cache de plugins preso no app-server do Desktop (incidente de 02/09)
 
-**Compressão**
-- `codex-rs/rollout/src/compression.rs:41` — `RolloutCompressionMode`
-- `codex-rs/rollout/src/compression.rs:53,63` — as duas funções de spawn
-- `codex-rs/rollout/src/compression_capabilities.rs` — capabilities e diagnóstico
-- `codex-rs/rollout/src/compression_worker.rs:128` — `capability_blocked`
-- `codex-rs/rollout/src/compression_worker.rs:161` — abort da rodada
-- `codex-rs/rollout/src/compression_worker.rs:298-307` — `skipped_referenced` / `skipped_fork_pointer`
-- `codex-rs/core/src/thread_manager.rs:418,425` — call sites
-- `codex-rs/features/src/lib.rs:1108-1121` — os dois flags, ambos default-off
-- upstream `9d0eae74cd` — o commit que retirou o modo
+## 3.1 Diagnóstico (confirmado)
 
-**agents_overview**
-- `codex-rs/tui/src/app/agents_overview.rs:41,45,117` — as 3 inserções do fork
-- `codex-rs/tui/src/app/agents_fleet.rs` — o dashboard (521 linhas, sem conflito)
-- upstream `f40e08478c`, `746798b2f7`, `9d57be71ba`, `a7913390f7`
+- O app-server do Desktop (PID de 11:16) lançava o plugin `spine-workbench@personal` a partir de
+  `~/.codex/plugins/cache/personal/spine-workbench/<versão-antiga>`, que uma reinstalação feita por
+  outro processo (15:37) tinha **esvaziado mas não apagado** (os `node` MCP vivos tinham cwd lá).
+- `PluginsManager::loaded_plugins_cache` é indexado por `PluginLoadCacheKey` =
+  `{configured_plugins, skill_config_rules, remote_global_catalog_active, auth_identity}`
+  (`core-plugins/src/manager.rs:563-585`). **Não inclui a versão activa no disco.** Só é limpo por
+  `clear_cache()` em mutações feitas *via* app-server; não há watcher.
+- `LoadedPlugin.root` vem de `store.active_plugin_installation(id).root` no momento do load
+  (`core-plugins/src/loader.rs:822-834`) e os MCP servers do plugin são carregados a partir desse
+  `plugin_root` (`loader.rs:1398-1420`, `:1546+`) — logo o cwd dos `node` é o root cacheado.
+- Na thread `01a05582…` (retomada 15:55, ~20 tentativas) o `node ./server/index.mjs` morre com
+  *Cannot find module* e o rmcp devolve `TransportClosed` → *connection closed: initialize response*;
+  como o plugin é `required: true`, a sessão aborta.
 
-**Merge**
-- árvore do merge-tree: `e8bebc2352e68f4d3d4df45192bab6f87452d8c9`
-  (`git show <árvore>:<caminho>` mostra qualquer arquivo já com os marcadores de conflito)
+## 3.2 O upstream corrigiu exactamente isto hoje
+
+`50fffd5ed3` — *Refresh plugin skills after out-of-process version changes (#42284)*, 02/09 14:03 UTC:
+
+```rust
+// LoadedPluginsCache::get(&mut self, key, store: &PluginStore)
+if entry.plugins.iter().any(|plugin| {
+    let Ok(plugin_id) = PluginId::parse(&plugin.config_name) else { return false };
+    let installed_root = store.active_plugin_root(&plugin_id)
+        .unwrap_or_else(|| store.plugin_base_root(&plugin_id));
+    installed_root != plugin.root
+}) { return None; }
+```
+
+Cobre o nosso caso: `active_plugin_root` (`store.rs:169-195`) reenumera as versões no disco a
+cada chamada e escolhe a mais alta (ou `DEFAULT_PLUGIN_VERSION`); a nova `…183714` > antiga
+`…164447`, logo `installed_root != plugin.root` e a entrada é rejeitada → reload → MCP com cwd
+certo. Aplica-se aos dois pontos de consumo (`plugins_for_config` e
+`plugin_skill_snapshots_for_config`). Também traz um LRU de 32 snapshots de skills.
+
+- Está **dentro da janela do sync** e `core-plugins/` não conflita.
+- `git apply --check --3way` do patch sobre o HEAD actual: **limpo** (4 ficheiros). Se o sync
+  atrasar, `git cherry-pick 50fffd5ed3` é uma opção isolada.
+
+## 3.3 Mitigação imediata (sem código)
+
+Reiniciar o Codex Desktop (mata o app-server e os dois `node` órfãos; a pasta vazia pode então
+ser removida). Alternativa: qualquer mutação de config pela UI do Desktop chama `clear_cache()`.
+De qualquer forma, o deploy do binário novo (Fase 6) exige reiniciar o Desktop.
+
+## 3.4 Endurecimento opcional (fork, baixo valor)
+
+`active_plugin_version` não valida que a versão escolhida tem manifesto. Hoje é inofensivo (a
+pasta esvaziada é sempre a *antiga*; se fosse a mais recente, `remove_old_plugin_versions` já
+falha alto via `old_plugin_version_would_stay_active`). Se quisermos: ignorar dirs sem
+`.codex-plugin/plugin.json`/`plugin.json` na enumeração. Não incluído no plano.
+
+---
+
+# Parte 4 — Inventário dos 29 conflitos e resolução
+
+Classes: **mec** = mecânico (linhas adjacentes, manter ambos); **cost** = costura sem escolha de
+produto; **dec** = decisão (fechada acima).
+
+| # | ficheiro | hunks | classe | upstream | resolução |
+|---|---|---|---|---|---|
+| 1 | `Cargo.toml` | 2 | mec | #42102 | manter `plans` **e** `otel-trace-websocket` em members e deps |
+| 2 | `Cargo.lock` | 2 | mec | — | regenerar (`cargo update -w` não; deixar o `cargo check` reescrever) |
+| 3 | `app-server-protocol/schema/precomputed/*.json.zst` ×2 | — | mec | — | tomar upstream; regenerar depois com o gerador de schema do repo (`just`/teste de snapshot) |
+| 4 | `core/src/agent/control/spawn.rs` | 1 | cost | #41744 | `resolve_usage_hints(&parent_config.multi_agent_v2, None, !parent_config.update_plan_enabled)` + `flat_map` do fork com `without_fork_hint_sections` |
+| 5 | `core/src/context/world_state/collaboration_mode.rs` | 1 | cost | #41744 | manter `settings_instructions` + `tracing::warn!` do fork; `let instructions = catalog_instructions.cloned().or(settings_instructions);` e a seguir o bloco upstream que remove instruções de update_plan |
+| 6 | `core/src/mcp_tool_call.rs` | 1 | cost | #42054 (+#42133/#42134) | bloco root-only do fork primeiro; depois `let metadata = match mcp_tool_metadata(prepared_call.tool_info(), prepared_call.plugin_id(), invocation.arguments.as_ref()) { … }` do upstream; sem duplicar `fn mcp_tool_metadata` |
+| 7 | `core/src/session/input_queue.rs` | 1 | cost | #41912 | fechar a cadeia com `.map(str::to_string);` (upstream) e re-inserir `if !has_trigger_mail && let Some(wake) = pending_wakes.last() { start_options = wake.start_options.clone(); }` |
+| 8 | `core/src/session/mod.rs` | 2 | mec | #41924 | `mod plan_reminder;` + `mod realtime_history;`; em `send_event_raw_with_persistence`: `derived_receipt` (fork) → `(before_event, after_event)` (upstream) → envio de `before_event` |
+| 9 | `core/src/session/rollout_reconstruction.rs` | 6 (2 c/ `ignore-space-change`) | cost pesada | #42065, #42293, #41912 | **partir da árvore `e83101bcd1`**: struct = união (`retained_context`, `guardian_history` + `last_plan`, `approved_plan`, `history_recovery_reason`; manter `pub(crate)`); `let rollout_suffix = base_compaction.map_or(rollout_items, \|c\| c.suffix);` do upstream; nas 2 chamadas a `finalize_active_segment` passar `&mut base_compaction` **e** `&mut last_plan`; `truncation_policy` (parâmetro) no lugar de `turn_context.model_info().truncation_policy.into()`; `restore_plans(...)` depois do override legacy de `reference_context_item` e antes do replay de world-state; literal final lê `retained_context`/`guardian_history` **antes** de `into_annotated_items()`; `cargo fmt` |
+| 10 | `core/src/session/session.rs` | 1 | mec | #41912 | manter `let session_source_is_non_root_agent = …;` (usado em `is_subagent`) |
+| 11 | `core/src/state/session.rs` | 1 | mec | #41912 | manter os três `use` |
+| 12 | `core/src/tools/handlers/unified_exec/exec_command.rs` | 1 | cost → upstream | #42113 | apagar `command_for_display` do fork (upstream removeu o único uso; ficaria unused) |
+| 13 | `core/src/tools/registry.rs` | 1 | dec (fechada) | #41933 | `tool_log_payload(&invocation.tool_name, &invocation.payload, &invocation.source)` + `let mut tool_result_tags = …; sandbox_tags.append_metric_tags(&mut tool_result_tags);` |
+| 14 | `core/src/unified_exec/process_manager.rs` | 1 | mec | #42113 | manter os três `use` |
+| 15 | `core/src/thread_manager.rs` | 3 | mec | #42132 | 4 campos do fork + `git_root_discovery: Arc<GitRootDiscovery>` (`Arc::default()` nos 2 construtores); depois a limpeza do §1.9 |
+| 16 | `thread-store/src/local/read_thread.rs` | 1 | cost | #42151 | `is_tombstoned` → `ThreadNotFound` primeiro; depois `sqlite_metadata` / `persisted_model_settings` / `if let Some(metadata) = sqlite_metadata` |
+| 17 | `app-server/src/message_processor.rs` | 1 | cost | #42149 | manter `transient_job_recovery_task` + `job_processor`; `if let Some(startup_config) = plugin_startup_tasks {` (campo é `Option<PluginStartupConfig>`) |
+| 18 | `app-server/src/request_processors.rs` | 1 | mec | #42033 | `mod fleet_processor;` + `mod feedback_thread_index;` |
+| 19 | `app-server/src/request_processors/thread_lifecycle.rs` | 1 | cost | #41924 | apagar a chamada `apply_realtime_event_effects(...)` (fn e `realtime_effects` já não existem); manter `apply_bespoke_event_handling_with_classification(..., &transient_job_classification)` |
+| 20 | `rollout/src/compression.rs` | 2 | dec (C′) | #42039 | §1.9 |
+| 21 | `rollout/src/lib.rs` | 1 | dec (C′) | #42039 | tomar upstream (sem os `pub use`) |
+| 22 | `rollout/src/compression_tests.rs` | 1 | dec (C′) | #42039 | §1.9 |
+| 23 | `tui/src/app.rs` | 1 | mec | #41911 | `mod recovery;` + `mod reconnect;` |
+| 24 | `tui/src/app/agents_overview.rs` | 2 | dec (A) | #42104 … | §2.6 |
+| 25 | `tui/src/app_event.rs` | 1 | mec | #42104 | manter os 4 variants do fork + `AgentsOverviewThreadRefresh` |
+| 26 | `tui/src/chatwidget/interaction.rs` | 1 | cost | #41893 | manter só `let recovery_popup_was_active = self.recovery_popup_active();`; apagar `flush_completed_command_activity()` (upstream retirou-a daqui; continua usada noutros sítios) |
+| 27 | `tui/src/chatwidget/tests.rs` | 1 | mec | #41742, #42325 | `mod recovery;` + os dois `#[path]` mods |
+| 28 | `tui/src/chatwidget/tests/status_and_layout.rs` | 3 | cost | #42202 | em cada hunk `chat.local_settings.tui.status_line = Some(vec![…]);` + `chat.set_plan_mode_reasoning_effort(Some(ReasoningEffortConfig::Medium));`; no fim não pode restar `chat.config.tui_status_line` |
+
+## 4.1 Quebras de compilação previstas fora dos conflitos (código do fork que "mergeou limpo")
+
+Aparecem quase todas só em `cfg(test)` — por isso o gate é `cargo test --no-run --workspace`.
+
+| # | ficheiro | causa | correcção |
+|---|---|---|---|
+| 1 | `core/src/agent/control_tests.rs:1930` | `resolve_usage_hints` ganhou 3.º arg (#41744) | `+ false` (ou `!config.update_plan_enabled`) |
+| 2 | `ext/goal/src/approved_plan.rs:106` | `GoalRuntime::invalidate_turn_lineage` apagada (#41912; `mark_root_turn_ambiguous` → `set_root_turn_id`) | apagar a chamada ou reimplementar só o `thread_extension_data().remove::<TurnStartOptions>()` |
+| 3 | `core/src/agent/control/fork_metrics_tests.rs:86` | `AgentMessageEvent` ganhou `questions` (#42178) | `questions: None` |
+| 4 | `core/src/session/plan_tests.rs:96,172` | `CompactedHistoryMetadata` ganhou `compaction_response_id`; `CompactedItem` ganhou `compaction_response_id`, `guardian_history`, `latest_token_usage_record`, `retained_context` | preencher com `None` / `..Default::default()` |
+| 5 | `thread-store/src/local/search_index_extractor_tests.rs:148` | mesmo literal `CompactedItem` | idem |
+| 6 | `hooks/src/events/post_tool_use_evidence_tests.rs:265` | `ConfiguredHandler` ganhou `builtin` (#42110) | `builtin: false` |
+| 7 | `app-server/src/request_processors/thread_recovery_processor.rs:524` | `ListenerTaskContext` ganhou `thread_unload_delay` (#42320) | `source_config.thread_unload_delay`, como `thread_processor.rs:1072` |
+| 8 | `core/src/context_inspection_items.rs:145,184,240`, `context_inspection_preview.rs:52` | `match` exaustivo sem `ResponseItem::ConfigurationUpdate { .. }` (#42328) | braço novo |
+| 9 | `core/src/context_inspection_provenance.rs:176` | `match` exaustivo sem `RolloutItem::RetainedContext(_)` / `TokenUsageRecord(_)` | acrescentar ao braço `=> 0` |
+| 10 | `rollout/src/compression_worker.rs:165,298,304` | `RolloutReferenceIndex::scan_until` / `reference_count` / `.history_base` alterados no upstream | desaparece com a decisão C′ (§1.9) |
+
+Verificados e sem problema: `codex-mcp/src/binding.rs`, literais `Session { … }` em
+`session/tests.rs` e `session.rs`, destruturação de `RolloutReconstruction` em `session/mod.rs:1583`,
+referências residuais a `realtime_event_handling` (nenhuma), `agent-roles/`, e todos os módulos
+exclusivos do fork (`claude_code/**`, `chatgpt_web/**`, `ownership/**`, `state/src/workflow/**`,
+`agents_fleet*.rs`, `claude_accounts.rs`, `chatgpt_web_cmd.rs`) — não chamam nada cuja assinatura
+mudou nem têm `match` exaustivos sem wildcard sobre `ResponseItem`/`RolloutItem`/`Feature`.
+
+## 4.2 Novidades upstream com impacto no fork (fora dos conflitos)
+
+- **#42284** cache de plugins (§3). **#42324** "Avoid executing PATH helpers before workspace trust"
+  toca `core-plugins/startup_sync.rs`.
+- **#41744** `update_plan` opt-in: já blindado em config; confirmar após o merge que
+  `resolve_update_plan_enabled` do fork e a leitura upstream concordam com a secção explícita.
+- **#42202** LocalSettings da TUI: refactor interno; nenhuma chave de `config.toml` muda
+  (`disable_paste_burst` de #41976 não está no nosso config).
+- **#42320** `thread_unload_delay` configurável no app-server — útil para o Desktop; default mantém.
+- **#42328** `ResponseItem::ConfigurationUpdate` (reasoning durável) — os provedores locais
+  (`claude_code/mod.rs`, `chatgpt_web/mod.rs`) não fazem `match` exaustivo; confirmar no `cargo check`.
+- **#42330/#42326/#42309** sandbox Windows (ACLs dos binários, control socket) — coexistem com o
+  `split_packaged_candidates` do fork em `shell_detect.rs` (não tocado nesta janela).
+- **#42039** compressão (§1); **#42104/#41918** agents overview (§2); Guardian V2 (vários) — só
+  OpenAI-backend, não atinge os provedores locais.
+
+---
+
+# Parte 5 — Plano de execução
+
+Pré-condições: árvore de trabalho limpa excepto `agent_docs/` (untracked, deixar); nenhum build
+Rust largo a correr (o guard de admissão de build do fork bloqueia concorrentes); `RUST_MIN_STACK`
+e o override `RUSTY_V8_*` já no cargo config do utilizador.
+
+### Fase 0 — preparação (5 min)
+1. `git tag pre-sync-20260902 HEAD` (ponto de retorno; `git reset --hard pre-sync-20260902` desfaz tudo).
+2. Confirmar `git merge-tree --write-tree HEAD origin/main` ainda dá `cca47f96cb` (se o upstream
+   avançou, refazer o inventário só para os ficheiros novos: `git log --oneline f59905647a..origin/main`).
+3. Backup `~/.codex/config.toml` já feito (`config.toml.bak-20260902`).
+
+### Fase 1 — merge e resolução dos 29 (1–2 h)
+1. `git merge --no-commit -X ignore-space-change origin/main` (dá a forma `e83101bcd1` a
+   `rollout_reconstruction.rs`; os outros ficheiros têm os mesmos hunks).
+2. Resolver na ordem: mecânicos (#1, 2, 3, 8, 10, 11, 14, 15, 18, 23, 25, 27) → costuras
+   (#4–7, 12, 16, 17, 19, 26, 28) → #13 → #9 → compressão (#20–22 + edições do §1.9) →
+   `/agents` (#24 + `agents_overview_threads.rs`).
+3. `.zst` de schema: tomar upstream e regenerar (o teste de snapshot do app-server-protocol acusa
+   se divergir).
+4. `git diff --check`; **não** correr `just fmt` antes de rever (reescreve `.bazel`/`justfile`
+   para LF — se correr, reverter com `git diff --name-only | grep -v '\.rs$' | xargs git checkout --`).
+
+### Fase 2 — compilação (30–40 min)
+1. `cargo check -p codex-rollout -p codex-core -p codex-app-server -p codex-tui -p codex-ext-goal -p codex-thread-store -p codex-hooks`.
+2. `cargo check --workspace --all-targets` e depois `cargo test --no-run --workspace` (apanha os
+   itens 1, 3–9 do §4.1 — são `cfg(test)`).
+3. Corrigir o que o §4.1 prevê + o que aparecer de novo; catalogar qualquer classe nova na memória
+   de sync.
+4. Commit do merge com mensagem que liste as 4 decisões e os fixes pós-merge (um `fix(fork)`
+   separado se ficar grande).
+
+### Fase 3 — testes focados (30 min)
+Ordem (todos com `RUST_MIN_STACK=8388608`):
+- `just fork-invariants` (49 testes; ajustar `fork-invariants.toml` se listar o invariante de
+  compressão removido).
+- `cargo test -p codex-rollout` (compressão: journal/validação/recuperação + o teste upstream de
+  fork chain).
+- `cargo test -p codex-core -- session::plan_tests session::rollout_reconstruction_tests context_inspection agent::role` (reconstrução, planos, carve-out `model_provider`).
+- `cargo test -p codex-core -- wait_agent mailbox claude_code` (E1–E5 do workflow).
+- `cargo test -p codex-tui -- agents_fleet agents_overview status_and_layout recovery`.
+- `cargo test -p codex-app-server -- skills_list plugins thread_recovery jobs` (inclui os testes
+  novos do #42284 para upgrade/rollback out-of-process).
+- `cargo test -p codex-thread-store`.
+- Confrontar falhas com o catálogo de dívida conhecida antes de diagnosticar.
+- `cargo test --workspace` completo fica **user-gated** (contrato do repo; ~44 falhas conhecidas).
+
+### Fase 4 — config e roles (10 min)
+- Confirmar `[tools.update_plan] enabled = true` continua a produzir a tool com o binário novo
+  (`codex debug context` ou um turno curto).
+- Reconfirmar `~/.codex/agents/claude-*.toml` mantém `model_provider = "claude_code"` efectivo
+  (teste `role_tests` + spawn real na Fase 6).
+
+### Fase 5 — build e deploy (≈25 min de build)
+1. `cargo build --release --bin codex --bin codex-code-mode-host --bin codex-command-runner --bin codex-windows-sandbox-setup`.
+2. Hot-swap no vendor do npm (`%APPDATA%\npm\node_modules\@openai\codex\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\`):
+   `Move-Item` de cada exe em uso para `<nome>-pre-sync0902-<hhmm>.exe`, `Copy-Item` dos novos
+   (`codex.exe` + `codex-code-mode-host.exe` em `bin\`, os outros dois em `codex-resources\`).
+3. `bin\codex.exe --version` (o fork já não reporta 0.0.0 desde `97361a83d3`).
+4. **Reiniciar o Codex Desktop** — obrigatório para o app-server carregar o binário novo, e é o
+   que fecha o incidente do §3 (mata os `node` órfãos; apagar depois a pasta
+   `…/spine-workbench/<versão-antiga>` vazia).
+
+### Fase 6 — validação real (15 min)
+1. Retomar a thread `01a05582…` no Desktop: o plugin `spine-workbench` tem de inicializar
+   (é o teste do #42284 em produção). Reinstalar o plugin pela CLI com o Desktop aberto e retomar
+   outra vez: agora tem de recarregar sem reiniciar.
+2. Um turno real com spawn de agente `claude_code` e `wait_agent` (roles + mailbox), e um
+   `/agents` na TUI ligada ao app-server (frota) e sem thread primária (sessões recentes).
+3. Logs: `logs_2.sqlite` / app-server log sem `required MCP servers failed to initialize`.
+4. Push para `fork` (`git@github.com:bobaoapae/codex.git`).
+
+### Fase 7 — memória e docs (5 min)
+- Actualizar a memória de sync (sync 02/09: HEAD `f59905647a`, 138 commits, merge commit, as 4
+  decisões, classes novas de quebra: `resolve_usage_hints` 3.º arg, `GoalRuntime::invalidate_turn_lineage`
+  removida, `CompactedItem`/`CompactedHistoryMetadata` campos novos, `ListenerTaskContext.thread_unload_delay`,
+  `ResponseItem::ConfigurationUpdate`).
+- Memória do cache de plugins: marcar como resolvido pelo upstream #42284 a partir deste sync.
+- Este documento: anotar o merge commit e o que divergiu do previsto.
+
+### Critérios de paragem
+- Qualquer conflito fora dos 29 ou hunk diferente do inventário → parar e reanalisar esse ficheiro
+  antes de continuar (não resolver "à vista").
+- Falha de teste que não esteja no catálogo de dívida nem seja explicada pelas decisões acima →
+  diagnosticar antes do deploy.
+- `just fork-invariants` vermelho → não deployar.
+
+---
+
+# Apêndice — referências
+
+**Compressão:** `rollout/src/compression.rs:41,53,63` · `compression_capabilities.rs` ·
+`compression_worker.rs:128,161,165,298-307` · `compression_{writer,validation,journal,cleanup}.rs` ·
+`core/src/thread_manager.rs:72,393-430` · `features/src/lib.rs:1108-1121` · upstream `9d0eae74cd` ·
+leitores: `rollout/src/seekable_reader.rs:46,63`, `thread-store/src/local/model_context.rs:135`,
+`tui/src/resume_picker_transcript_preview.rs:152`, `cli/src/doctor.rs:2339`.
+
+**agents_overview:** `tui/src/app/agents_overview.rs:41,45,117` (fork) · upstream
+`agents_overview_threads.rs:37,104,111,126` · `agents_fleet.rs` · `agents_fleet_tests.rs:19,40,72` ·
+upstream `f40e08478c`, `746798b2f7`, `9d57be71ba`, `a7913390f7`.
+
+**Plugins:** `core-plugins/src/manager.rs:525-585,715-830,869-900` · `store.rs:169-195,744-775` ·
+`loader.rs:822-834,1398-1420` · upstream `50fffd5ed3` (#42284) · patch testado com
+`git apply --check --3way`.
+
+**Merge:** árvores `cca47f96cb` (normal) e `e83101bcd1` (`-X ignore-space-change`); base `88f776588f`;
+alvo `f59905647a`.
