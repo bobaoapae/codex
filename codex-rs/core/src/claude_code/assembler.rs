@@ -49,6 +49,16 @@ impl<'a> StreamAssembler<'a> {
         }
     }
 
+    /// FORK: carries the items a previous attempt already authored.
+    ///
+    /// A retry against the same Claude session must report both attempts'
+    /// output as its own, or the partial answer from the failed one comes back
+    /// to Claude as new input on the next turn.
+    pub(crate) fn with_authored(mut self, authored: Vec<u64>) -> Self {
+        self.authored = authored;
+        self
+    }
+
     pub(crate) fn streamed_any_text(&self) -> bool {
         self.streamed_any_text
     }

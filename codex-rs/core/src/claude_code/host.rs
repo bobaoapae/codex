@@ -40,4 +40,14 @@ pub(crate) trait ClaudeHost: Send + Sync + std::fmt::Debug {
 
     /// The tools the bridge advertises, as MCP `tools/list` entries.
     fn bridge_tool_specs(&self) -> BoxFuture<'_, Vec<JsonValue>>;
+
+    /// FORK: tells the user the turn is being retried after an Anthropic-side
+    /// failure, so a two-minute pause does not read as a frozen agent.
+    ///
+    /// Defaulted to nothing: a host that has no UI (the adapter's tests, the
+    /// bridge-only hosts) has nothing to say.
+    fn notify_retry<'a>(&'a self, message: String, detail: String) -> BoxFuture<'a, ()> {
+        let _ = (message, detail);
+        Box::pin(async {})
+    }
 }

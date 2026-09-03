@@ -120,6 +120,16 @@ pub(crate) struct ClaudeCodeWorkspace {
     /// FORK: how long the CLI may produce nothing before the turn is abandoned.
     /// `None` disables the watchdog.
     pub(crate) idle_timeout: Option<std::time::Duration>,
+    /// FORK: pauses before each in-place retry of an Anthropic-side failure.
+    /// A field so a test can drive the retry path without sleeping.
+    pub(crate) transient_retry_delays: &'static [std::time::Duration],
+    /// FORK: the CLI to run — program plus any leading arguments — when it is
+    /// not the one `CODEX_CLAUDE_CODE_BIN` names.
+    ///
+    /// Per workspace so a test can point one turn at a scripted CLI without
+    /// mutating process-wide environment, and a list because on Windows a
+    /// script is reached through `cmd.exe /D /Q /C`.
+    pub(crate) claude_command: Option<Vec<String>>,
     /// FORK: the agent role's own instructions.
     ///
     /// These used to reach the child as part of the rendered transcript, where
@@ -193,6 +203,8 @@ impl ClaudeCodeWorkspace {
             idle_timeout: config
                 .claude_code_idle_timeout_ms
                 .map(std::time::Duration::from_millis),
+            transient_retry_delays: TRANSIENT_RETRY_DELAYS,
+            claude_command: None,
             developer_instructions: config.developer_instructions.clone(),
             control_protocol: config
                 .features
@@ -610,6 +622,8 @@ pub(crate) async fn stream(
                 sticky_min_headroom_pct: 0.0,
                 pinned_account: None,
                 idle_timeout: None,
+                transient_retry_delays: TRANSIENT_RETRY_DELAYS,
+                claude_command: None,
                 developer_instructions: None,
                 control_protocol: false,
                 stream_partial_messages: false,
@@ -672,7 +686,49 @@ enum AttemptOutcome {
         /// `subtype` says what kind of failure this was far more reliably than
         /// the rendered text does.
         frame: Option<JsonValue>,
+        /// FORK: the `error` field of the CLI's `isApiErrorMessage` frame
+        /// (`overloaded`, `server_error`, `rate_limit`, …). The `result`
+        /// subtype is `error_during_execution` for all of them; this is what
+        /// separates "Anthropic is down" from "this account is spent".
+        api_error: Option<String>,
+        /// FORK: the Claude session the attempt ran in, so a retry can
+        /// `--resume` it instead of replaying the whole transcript.
+        session_id: Option<String>,
+        /// FORK: fingerprints of the items the attempt already delivered to
+        /// Codex. A retry must carry them forward, or the partial answer is
+        /// read back to Claude as new input on the next turn.
+        authored: Vec<u64>,
     },
+}
+
+/// FORK: why an attempt ended the whole turn rather than just itself.
+enum AttemptAbort {
+    /// Report this to the consumer and stop; another account would fail the
+    /// same way.
+    Fatal(CodexErr),
+    /// The consumer is gone; stop without reporting anything.
+    Silent,
+}
+
+/// FORK: how many extra attempts one account gets after an Anthropic-side
+/// failure. The CLI has already exhausted its own retries by the time we see
+/// one, so this layer is deliberately slow and short.
+const TRANSIENT_MAX_RETRIES: usize = 2;
+
+/// FORK: pauses before each of those attempts.
+const TRANSIENT_RETRY_DELAYS: &[std::time::Duration] = &[
+    std::time::Duration::from_secs(10),
+    std::time::Duration::from_secs(30),
+];
+
+/// FORK: what a retry has to carry over from the attempt that failed.
+struct RetryPlan {
+    /// The Claude session to `--resume`, so the CLI keeps its context and cache.
+    session_id: String,
+    /// Replaces the planned turn text: the input was already delivered.
+    turn_text: String,
+    /// Fingerprints the failed attempt authored.
+    authored: Vec<u64>,
 }
 
 /// Runs one Codex turn, failing over across configured accounts.
@@ -716,183 +772,104 @@ async fn run_turn(
     let mut failures: Vec<String> = Vec::new();
 
     for (index, account_dir) in candidates.into_iter().enumerate() {
-        // Held for the whole attempt so a concurrent spawn can see this account
-        // is already busy and pick a quieter one.
+        // Held across every attempt on this account so a concurrent spawn can
+        // see it is already busy and pick a quieter one.
         let _in_flight = accounts::InFlightGuard::acquire(account_dir.as_deref());
-        let continuity = state.snapshot();
-        let continuity = if continuity_matches_account(&continuity, account_dir.as_deref()) {
-            continuity
-        } else {
-            // The recorded Claude session lives in another account's history;
-            // replay the conversation into a fresh session instead.
-            ClaudeSessionContinuity::default()
-        };
-        let plan = history::plan_request(&input, &continuity);
-        let resume_session_id = if plan.restart_session {
-            None
-        } else {
-            continuity.session_id.clone()
-        };
+        let mut retries = 0usize;
+        let mut retry: Option<RetryPlan> = None;
 
-        let spawned = match spawn_claude(
-            &model_slug,
-            effort.as_ref(),
-            resume_session_id.as_deref(),
-            &workspace,
-            account_dir.as_deref(),
-        ) {
-            Ok(child) => Ok(child),
-            // Nothing has run yet, so one retry is free of side effects. It
-            // covers the transient cases — a locked binary right after an
-            // upgrade, a momentarily exhausted handle table — without papering
-            // over a missing install, which fails again immediately.
-            Err(_) => {
-                tokio::time::sleep(SPAWN_RETRY_DELAY).await;
-                spawn_claude(
-                    &model_slug,
-                    effort.as_ref(),
-                    resume_session_id.as_deref(),
-                    &workspace,
-                    account_dir.as_deref(),
-                )
-            }
-        };
-        let mut child = match spawned {
-            Ok(child) => child,
-            Err(err) => {
-                // Startup failures (missing binary) are account-independent:
-                // retrying elsewhere would fail identically.
-                let _ = tx_event.send(Err(err)).await;
-                return;
-            }
-        };
-
-        let Some(mut stdin) = child.stdin.take() else {
-            let _ = tx_event
-                .send(Err(CodexErr::UnsupportedOperation(
-                    "claude_code provider could not open the CLI stdin".to_string(),
-                )))
-                .await;
-            return;
-        };
-        // FORK: stdin stays open for the length of the turn and is driven by a
-        // writer task. The old code wrote one line and closed the pipe, which
-        // made the CLI's control protocol unreachable: every "ask" decision it
-        // took was terminal because there was nobody left to ask.
-        //
-        // Writing is concurrent with reading stdout either way: a replayed
-        // transcript easily exceeds the pipe buffer, and the CLI starts emitting
-        // events immediately, so writing to completion first would deadlock both
-        // sides on a full pipe.
-        let (tx_stdin, mut rx_stdin) = mpsc::channel::<String>(CONTROL_CHANNEL_SIZE);
-        let writer = tokio::spawn(async move {
-            while let Some(line) = rx_stdin.recv().await {
-                if let Err(err) = stdin.write_all(format!("{line}\n").as_bytes()).await {
-                    warn!("claude_code: failed to write to the CLI: {err}");
-                    break;
+        let (outcome, class) = loop {
+            let outcome = match run_attempt(
+                &input,
+                &model_slug,
+                effort.as_ref(),
+                &workspace,
+                &state,
+                &tx_event,
+                &consumer_dropped,
+                account_dir.clone(),
+                retry.take(),
+            )
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(AttemptAbort::Fatal(err)) => {
+                    let _ = tx_event.send(Err(err)).await;
+                    return;
                 }
-                if let Err(err) = stdin.flush().await {
-                    warn!("claude_code: failed to flush the CLI stdin: {err}");
-                    break;
-                }
-            }
-            // Closing stdin is what tells the CLI the turn is over; without it a
-            // CLI that has finished its work keeps the pipe (and the process)
-            // alive waiting for more input.
-            let _ = stdin.shutdown().await;
-        });
-        let control = control::ControlChannel::new(tx_stdin.clone());
-        let control_protocol_enabled = workspace.control_protocol;
+                Err(AttemptAbort::Silent) => return,
+            };
 
-        // FORK: the bridge only exists when there is a session behind it.
-        let bridge = workspace
-            .host
-            .clone()
-            .map(|host| Arc::new(bridge::McpBridge::new(host)));
-        let sdk_mcp_servers: &[&str] = if bridge.is_some() {
-            &[bridge::BRIDGE_SERVER_NAME]
-        } else {
-            &[]
-        };
-        // The handshake carries the system prompt and the in-process MCP bridge.
-        //
-        // Sent, not awaited: its answer arrives on stdout, and the only task
-        // that reads stdout is the one we have not started yet. Waiting here
-        // would stall every turn until the request timed out. `translate_stream`
-        // watches for the answer instead, and drops the bridge if the CLI says
-        // it cannot do it.
-        let (mut control, initialize_request_id) = if control_protocol_enabled {
-            let request_id = control
-                .send_request(
-                    "initialize",
-                    control::initialize_payload(
-                        Some(&claude_system_prompt(&workspace)),
-                        sdk_mcp_servers,
+            let AttemptOutcome::Failed {
+                detail,
+                turn_reported,
+                frame,
+                api_error,
+                session_id,
+                authored,
+                ..
+            } = &outcome
+            else {
+                break (outcome, None);
+            };
+            let class = match frame.as_ref() {
+                Some(frame) => {
+                    accounts::classify_result_failure(frame, api_error.as_deref(), detail)
+                }
+                None => accounts::classify_failure(detail),
+            };
+
+            // FORK: Anthropic failing is worth waiting out on this account
+            // rather than failing over — the next account talks to the same
+            // API. The CLI has already spent its own retries by the time we
+            // see one, so this second layer is deliberately slow and short.
+            //
+            // Only a clean `result` frame may be retried: a stream that died
+            // mid-item left a half-delivered answer behind, and there is no
+            // session id to resume it from.
+            let session = session_id.clone().filter(|_| {
+                class.is_retryable_in_place() && *turn_reported && retries < TRANSIENT_MAX_RETRIES
+            });
+            let Some(session) = session else {
+                break (outcome, Some(class));
+            };
+
+            let delay = workspace
+                .transient_retry_delays
+                .get(retries)
+                .copied()
+                .unwrap_or_default();
+            let label = accounts::account_label(account_dir.as_deref());
+            let detail_line = detail.lines().next().unwrap_or(detail).trim().to_string();
+            let attempt = retries + 1;
+            warn!(
+                "claude_code: Anthropic error on {label} ({detail_line}); retrying {attempt}/{TRANSIENT_MAX_RETRIES} in {}s",
+                delay.as_secs()
+            );
+            if let Some(host) = workspace.host.as_ref() {
+                host.notify_retry(
+                    format!(
+                        "Anthropic overloaded; retrying {attempt}/{TRANSIENT_MAX_RETRIES} in {}s",
+                        delay.as_secs()
                     ),
+                    detail_line.clone(),
                 )
                 .await;
-            (Some(control), request_id)
-        } else {
-            (None, None)
-        };
-
-        let turn_line = serde_json::json!({
-            "type": "user",
-            "message": { "role": "user", "content": plan.turn_text },
-        })
-        .to_string();
-        if tx_stdin.send(turn_line).await.is_err() {
-            warn!("claude_code: the CLI closed stdin before the turn was written");
-        }
-
-        let outcome = translate_stream(
-            &mut child,
-            &tx_event,
-            &consumer_dropped,
-            AttemptContext {
-                plan: &plan,
-                account_dir: account_dir.clone(),
-                state: &state,
-                pinned_account: workspace.pinned_account.as_deref(),
-                idle_timeout: workspace.idle_timeout,
-                control: control.as_ref(),
-                cwd: workspace.cwd_uri.clone(),
-                host: workspace.host.clone(),
-                bridge: bridge.clone(),
-                accounts_state_path: workspace.accounts_state_path.clone(),
-                initialize_request_id: initialize_request_id.clone(),
-            },
-        )
-        .await;
-
-        // Ending the turn: close every sender before joining the writer. In
-        // particular, `ControlChannel` owns a clone of `tx_stdin`; dropping only
-        // the local sender leaves the writer waiting for an EOF that can never
-        // arrive. Cancellation is the one explicit path that requests process
-        // termination; a writer timeout is reported, not silently converted into
-        // a kill.
-        let termination = if consumer_dropped.is_cancelled() {
-            teardown::TerminationRequest::ExplicitCancellation
-        } else {
-            teardown::TerminationRequest::WaitForExit
-        };
-        let teardown_result =
-            teardown::finish(&mut child, control.take(), tx_stdin, writer, termination).await;
-        if let Err(error) = teardown_result {
-            if !error.state.child_exited {
-                // `finish` deliberately does not kill a child that ignored
-                // EOF. Keep ownership in a bounded reaper so it is eventually
-                // collected, while stream cancellation remains the explicit
-                // process-tree termination path.
-                teardown::spawn_reaper(child, consumer_dropped.clone());
             }
-            if !matches!(outcome, AttemptOutcome::ConsumerGone) {
-                let _ = tx_event
-                    .send(Err(CodexErr::UnsupportedOperation(error.to_string())))
-                    .await;
+            let authored = authored.clone();
+            tokio::select! {
+                _ = consumer_dropped.cancelled() => return,
+                () = tokio::time::sleep(delay) => {}
             }
-            return;
-        }
+            retry = Some(RetryPlan {
+                session_id: session,
+                turn_text: format!(
+                    "[codex] The previous response was cut off by a transient Anthropic error ({detail_line}). Continue from where you left off; do not repeat completed work."
+                ),
+                authored,
+            });
+            retries += 1;
+        };
 
         match outcome {
             AttemptOutcome::Completed => {
@@ -904,7 +881,7 @@ async fn run_turn(
                 detail,
                 emitted_output,
                 turn_reported,
-                frame,
+                ..
             } => {
                 // Only a session that cannot be resumed is worth forgetting.
                 // `delivered_items` advances on success alone, so keeping the
@@ -914,10 +891,7 @@ async fn run_turn(
                 if session_lost(&detail) {
                     state.invalidate();
                 }
-                let class = match frame.as_ref() {
-                    Some(frame) => accounts::classify_result_failure(frame, &detail),
-                    None => accounts::classify_failure(&detail),
-                };
+                let class = class.unwrap_or(accounts::FailureClass::Other);
                 let label = accounts::account_label(account_dir.as_deref());
                 if let Some(dir) = account_dir.as_deref() {
                     turn_accounts.record_failure(dir, &class, &detail);
@@ -936,7 +910,12 @@ async fn run_turn(
                     continue;
                 }
 
-                let message = if failures.len() > 1 {
+                let message = if retries > 0 {
+                    format!(
+                        "claude_code turn failed after {} attempts (Anthropic server error) [{label}]: {detail}",
+                        retries + 1
+                    )
+                } else if failures.len() > 1 {
                     format!(
                         "claude_code turn failed on every configured account: {}",
                         failures.join("; ")
@@ -959,6 +938,259 @@ async fn run_turn(
             failures.join("; ")
         ))))
         .await;
+}
+
+/// FORK: one attempt against one account.
+///
+/// Split out of [`run_turn`] so an Anthropic-side failure can be retried in
+/// place: the retry keeps the account's in-flight guard, resumes the same
+/// Claude session, and carries the failed attempt's items forward.
+///
+/// `Err` ends the whole turn — a missing binary or a wedged child fails the
+/// same way on every account.
+#[allow(clippy::too_many_arguments)]
+async fn run_attempt(
+    input: &[ResponseItem],
+    model_slug: &str,
+    effort: Option<&ReasoningEffortConfig>,
+    workspace: &ClaudeCodeWorkspace,
+    state: &ClaudeCodeThreadState,
+    tx_event: &mpsc::Sender<Result<ResponseEvent>>,
+    consumer_dropped: &CancellationToken,
+    account_dir: Option<PathBuf>,
+    retry: Option<RetryPlan>,
+) -> std::result::Result<AttemptOutcome, AttemptAbort> {
+    let continuity = state.snapshot();
+    let continuity = if continuity_matches_account(&continuity, account_dir.as_deref()) {
+        continuity
+    } else {
+        // The recorded Claude session lives in another account's history;
+        // replay the conversation into a fresh session instead.
+        ClaudeSessionContinuity::default()
+    };
+    let mut plan = history::plan_request(input, &continuity);
+    let mut resume_session_id = if plan.restart_session {
+        None
+    } else {
+        continuity.session_id.clone()
+    };
+    let mut authored_seed = Vec::new();
+    // FORK: a retry continues the session the failed attempt was already in.
+    // The input it carried has been delivered; what goes on stdin is a nudge to
+    // finish, and the items that attempt already produced travel with it so the
+    // next turn does not read them back to Claude as new input.
+    if let Some(retry) = retry {
+        plan.restart_session = false;
+        plan.turn_text = retry.turn_text;
+        resume_session_id = Some(retry.session_id);
+        authored_seed = retry.authored;
+    }
+
+    let spawned = match spawn_claude(
+        model_slug,
+        effort,
+        resume_session_id.as_deref(),
+        workspace,
+        account_dir.as_deref(),
+    ) {
+        Ok(child) => Ok(child),
+        // Nothing has run yet, so one retry is free of side effects. It
+        // covers the transient cases — a locked binary right after an
+        // upgrade, a momentarily exhausted handle table — without papering
+        // over a missing install, which fails again immediately.
+        Err(_) => {
+            tokio::time::sleep(SPAWN_RETRY_DELAY).await;
+            spawn_claude(
+                model_slug,
+                effort,
+                resume_session_id.as_deref(),
+                workspace,
+                account_dir.as_deref(),
+            )
+        }
+    };
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(err) => {
+            // Startup failures (missing binary) are account-independent:
+            // retrying elsewhere would fail identically.
+            return Err(AttemptAbort::Fatal(err));
+        }
+    };
+
+    let Some(mut stdin) = child.stdin.take() else {
+        return Err(AttemptAbort::Fatal(CodexErr::UnsupportedOperation(
+            "claude_code provider could not open the CLI stdin".to_string(),
+        )));
+    };
+    // FORK: stdin stays open for the length of the turn and is driven by a
+    // writer task. The old code wrote one line and closed the pipe, which
+    // made the CLI's control protocol unreachable: every "ask" decision it
+    // took was terminal because there was nobody left to ask.
+    //
+    // Writing is concurrent with reading stdout either way: a replayed
+    // transcript easily exceeds the pipe buffer, and the CLI starts emitting
+    // events immediately, so writing to completion first would deadlock both
+    // sides on a full pipe.
+    let (tx_stdin, mut rx_stdin) = mpsc::channel::<String>(CONTROL_CHANNEL_SIZE);
+    let writer = tokio::spawn(async move {
+        while let Some(line) = rx_stdin.recv().await {
+            if let Err(err) = stdin.write_all(format!("{line}\n").as_bytes()).await {
+                warn!("claude_code: failed to write to the CLI: {err}");
+                break;
+            }
+            if let Err(err) = stdin.flush().await {
+                warn!("claude_code: failed to flush the CLI stdin: {err}");
+                break;
+            }
+        }
+        // Closing stdin is what tells the CLI the turn is over; without it a
+        // CLI that has finished its work keeps the pipe (and the process)
+        // alive waiting for more input.
+        let _ = stdin.shutdown().await;
+    });
+    let control = control::ControlChannel::new(tx_stdin.clone());
+    let control_protocol_enabled = workspace.control_protocol;
+
+    // FORK: the bridge only exists when there is a session behind it.
+    let bridge = workspace
+        .host
+        .clone()
+        .map(|host| Arc::new(bridge::McpBridge::new(host)));
+    let sdk_mcp_servers: &[&str] = if bridge.is_some() {
+        &[bridge::BRIDGE_SERVER_NAME]
+    } else {
+        &[]
+    };
+    // The handshake carries the system prompt and the in-process MCP bridge.
+    //
+    // Sent, not awaited: its answer arrives on stdout, and the only task
+    // that reads stdout is the one we have not started yet. Waiting here
+    // would stall every turn until the request timed out. `translate_stream`
+    // watches for the answer instead, and drops the bridge if the CLI says
+    // it cannot do it.
+    let (mut control, initialize_request_id) = if control_protocol_enabled {
+        let request_id = control
+            .send_request(
+                "initialize",
+                control::initialize_payload(
+                    Some(&claude_system_prompt(workspace)),
+                    sdk_mcp_servers,
+                ),
+            )
+            .await;
+        (Some(control), request_id)
+    } else {
+        // FORK: drop the channel's `tx_stdin` clone explicitly. Shadowing the
+        // binding with `None` leaves the original `ControlChannel` — and its
+        // sender — alive to the end of the attempt, so the writer never sees
+        // EOF and teardown fails every turn with `WriterTimedOut`.
+        drop(control);
+        (None, None)
+    };
+
+    let turn_line = serde_json::json!({
+        "type": "user",
+        "message": { "role": "user", "content": plan.turn_text },
+    })
+    .to_string();
+    if tx_stdin.send(turn_line).await.is_err() {
+        warn!("claude_code: the CLI closed stdin before the turn was written");
+    }
+
+    let outcome = translate_stream(
+        &mut child,
+        tx_event,
+        consumer_dropped,
+        AttemptContext {
+            plan: &plan,
+            account_dir: account_dir.clone(),
+            state,
+            pinned_account: workspace.pinned_account.as_deref(),
+            idle_timeout: workspace.idle_timeout,
+            control: control.as_ref(),
+            cwd: workspace.cwd_uri.clone(),
+            host: workspace.host.clone(),
+            bridge: bridge.clone(),
+            accounts_state_path: workspace.accounts_state_path.clone(),
+            initialize_request_id: initialize_request_id.clone(),
+            authored_seed,
+        },
+    )
+    .await;
+
+    // Ending the turn: close every sender before joining the writer. In
+    // particular, `ControlChannel` owns a clone of `tx_stdin`; dropping only
+    // the local sender leaves the writer waiting for an EOF that can never
+    // arrive. Cancellation is the one explicit path that requests process
+    // termination; a writer timeout is reported, not silently converted into
+    // a kill.
+    let termination = if consumer_dropped.is_cancelled() {
+        teardown::TerminationRequest::ExplicitCancellation
+    } else {
+        teardown::TerminationRequest::WaitForExit
+    };
+    let teardown_result =
+        teardown::finish(&mut child, control.take(), tx_stdin, writer, termination).await;
+    if let Err(error) = teardown_result {
+        if !error.state.child_exited {
+            // `finish` deliberately does not kill a child that ignored
+            // EOF. Keep ownership in a bounded reaper so it is eventually
+            // collected, while stream cancellation remains the explicit
+            // process-tree termination path.
+            teardown::spawn_reaper(child, consumer_dropped.clone());
+        }
+        if matches!(outcome, AttemptOutcome::ConsumerGone) {
+            return Err(AttemptAbort::Silent);
+        }
+        return Err(AttemptAbort::Fatal(CodexErr::UnsupportedOperation(
+            error.to_string(),
+        )));
+    }
+    Ok(outcome)
+}
+
+/// FORK: the plain text of an `assistant` frame, joined across its blocks.
+fn assistant_frame_text(event: &JsonValue) -> String {
+    event
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(JsonValue::as_array)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|block| block.get("type").and_then(JsonValue::as_str) == Some("text"))
+                .filter_map(|block| block.get("text").and_then(JsonValue::as_str))
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+/// FORK: the first entry of a `result` frame's `errors[]`.
+///
+/// An `error_during_execution` result leaves `result` empty and puts what went
+/// wrong here, so a turn that died on an API error used to report only its
+/// subtype.
+fn result_errors_text(event: &JsonValue) -> Option<String> {
+    let first = event
+        .get("errors")
+        .and_then(JsonValue::as_array)
+        .and_then(|errors| errors.first())?;
+    let text = first
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| {
+            first
+                .get("message")
+                .and_then(JsonValue::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| first.to_string());
+    let text = text.trim().to_string();
+    (!text.is_empty()).then_some(text)
 }
 
 /// FORK: reads a child's stderr to completion in the background.
@@ -1057,7 +1289,14 @@ fn build_claude_command(
     workspace: &ClaudeCodeWorkspace,
     config_dir: Option<&std::path::Path>,
 ) -> Command {
-    let mut command = Command::new(claude_bin());
+    let mut command = match workspace.claude_command.as_deref() {
+        Some([program, leading @ ..]) => {
+            let mut command = Command::new(program);
+            command.args(leading);
+            command
+        }
+        _ => Command::new(claude_bin()),
+    };
     command
         .arg("--print")
         // stream-json output is rejected without --verbose under --print.
@@ -1203,6 +1442,8 @@ struct AttemptContext<'a> {
     /// FORK: the id of the `initialize` request, so its answer can be
     /// recognized among the CLI's other control responses.
     initialize_request_id: Option<String>,
+    /// FORK: fingerprints an earlier attempt on this turn already authored.
+    authored_seed: Vec<u64>,
 }
 
 async fn translate_stream(
@@ -1223,6 +1464,7 @@ async fn translate_stream(
         mut bridge,
         accounts_state_path,
         initialize_request_id,
+        authored_seed,
     } = attempt;
     let mut emitted_output = false;
     let Some(stdout) = child.stdout.take() else {
@@ -1231,6 +1473,9 @@ async fn translate_stream(
             emitted_output,
             turn_reported: false,
             frame: None,
+            api_error: None,
+            session_id: None,
+            authored: Vec::new(),
         };
     };
     // Drained continuously, not only when the turn fails: a chatty child that
@@ -1240,8 +1485,14 @@ async fn translate_stream(
     let mut lines = BufReader::new(stdout).lines();
 
     let mut session_id: Option<String> = None;
+    // FORK: the CLI announces an API failure as an assistant frame flagged
+    // `isApiErrorMessage`, and only afterwards as an error `result` whose
+    // subtype is the same `error_during_execution` it uses for everything else.
+    // The flagged frame is the only place the failure is named.
+    let mut api_error: Option<String> = None;
+    let mut api_error_text: Option<String> = None;
     let account_label_dir = account_dir.clone();
-    let mut assembler = StreamAssembler::new(tx_event);
+    let mut assembler = StreamAssembler::new(tx_event).with_authored(authored_seed);
     // FORK: pairs each `tool_use` with the `tool_result` that closes it.
     let mut pending_tool_uses = tools::PendingToolUses::new(cwd);
 
@@ -1269,6 +1520,9 @@ async fn translate_stream(
                     emitted_output,
                     turn_reported: false,
                     frame: None,
+                    api_error,
+                    session_id,
+                    authored: assembler.take_authored(),
                 };
             }
             Err(()) => {
@@ -1281,6 +1535,9 @@ async fn translate_stream(
                     emitted_output,
                     turn_reported: false,
                     frame: None,
+                    api_error,
+                    session_id,
+                    authored: assembler.take_authored(),
                 };
             }
         };
@@ -1369,6 +1626,21 @@ async fn translate_stream(
                 }
             }
             Some("assistant") => {
+                // FORK: an API failure, not the agent speaking. Pushing it
+                // through the assembler wrote "API Error: 529 ..." into the
+                // Codex transcript as the agent's own answer, and made every
+                // such attempt look like it had produced output. Keep what it
+                // says, emit nothing yet.
+                if event.get("isApiErrorMessage").and_then(JsonValue::as_bool) == Some(true) {
+                    if let Some(error) = event.get("error").and_then(JsonValue::as_str) {
+                        api_error = Some(error.to_string());
+                    }
+                    let text = assistant_frame_text(&event);
+                    if !text.is_empty() {
+                        api_error_text = Some(text);
+                    }
+                    continue;
+                }
                 let blocks = event
                     .get("message")
                     .and_then(|message| message.get("content"))
@@ -1468,23 +1740,41 @@ async fn translate_stream(
                     if !assembler.close(MessagePhase::Commentary).await {
                         return AttemptOutcome::ConsumerGone;
                     }
-                    let detail = if result_text.is_empty() {
+                    // FORK: an `error_during_execution` result carries its
+                    // text in `errors[]`, not in `result`, and the flagged
+                    // assistant frame said it first.
+                    let detail = if !result_text.is_empty() {
+                        result_text.to_string()
+                    } else if let Some(text) = result_errors_text(&event) {
+                        text
+                    } else if let Some(text) = api_error_text.clone() {
+                        text
+                    } else {
                         event
                             .get("subtype")
                             .and_then(JsonValue::as_str)
                             .unwrap_or("unknown error")
                             .to_string()
-                    } else {
-                        result_text.to_string()
                     };
                     return AttemptOutcome::Failed {
                         detail,
                         emitted_output,
                         turn_reported: true,
                         frame: Some(event.clone()),
+                        api_error,
+                        session_id,
+                        authored: assembler.take_authored(),
                     };
                 }
 
+                // FORK: an API failure the CLI recovered from on its own.
+                // It was held back in case it ended the turn; it did not, so
+                // say it once rather than losing it.
+                if let Some(text) = api_error_text.take()
+                    && !assembler.emit_message(text, MessagePhase::Commentary).await
+                {
+                    return AttemptOutcome::ConsumerGone;
+                }
                 // Close whatever block run was in flight; a trailing answer is the
                 // turn's final answer.
                 if !assembler.close(MessagePhase::FinalAnswer).await {
@@ -1584,6 +1874,9 @@ async fn translate_stream(
         emitted_output,
         turn_reported: false,
         frame: None,
+        api_error,
+        session_id,
+        authored: assembler.take_authored(),
     }
 }
 
@@ -1682,6 +1975,10 @@ fn parse_token_usage(usage: Option<&JsonValue>) -> Option<TokenUsage> {
         codex_rollout_budget_units: None,
     })
 }
+
+#[cfg(test)]
+#[path = "run_turn_tests.rs"]
+mod run_turn_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1860,6 +2157,8 @@ mod tests {
             sticky_min_headroom_pct: 20.0,
             pinned_account: None,
             idle_timeout: None,
+            transient_retry_delays: TRANSIENT_RETRY_DELAYS,
+            claude_command: None,
             developer_instructions: None,
             control_protocol: false,
             stream_partial_messages: false,

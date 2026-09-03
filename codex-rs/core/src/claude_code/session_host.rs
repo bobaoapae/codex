@@ -35,6 +35,7 @@ use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolPayload;
 use crate::tools::router::ToolCall;
+use codex_protocol::error::CodexErr;
 pub(crate) struct SessionClaudeHost {
     session: Arc<Session>,
     step_context: Arc<StepContext>,
@@ -293,6 +294,21 @@ impl ClaudeHost for SessionClaudeHost {
                 &self.step_context.tool_router.model_visible_specs(),
                 &collaboration_namespace(&self.step_context.turn.config),
             )
+        }
+        .boxed()
+    }
+
+    /// FORK: reported as a stream error the app-server already maps to
+    /// `ErrorNotification { will_retry: true }`, which is exactly what this is.
+    fn notify_retry<'a>(&'a self, message: String, detail: String) -> BoxFuture<'a, ()> {
+        async move {
+            self.session
+                .notify_stream_error(
+                    &self.step_context.turn,
+                    message,
+                    CodexErr::UnsupportedOperation(detail),
+                )
+                .await;
         }
         .boxed()
     }

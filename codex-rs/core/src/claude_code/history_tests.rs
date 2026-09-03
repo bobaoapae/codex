@@ -418,6 +418,36 @@ fn follow_up_does_not_echo_claude_own_answer() {
     assert_eq!(plan.delivered_items, 3);
 }
 
+/// FORK: an in-place retry after an Anthropic failure records both attempts'
+/// items. The partial answer the failed attempt delivered is in the live Claude
+/// session too, so the next request must drop it along with the retry's answer
+/// — otherwise the abandoned half comes back as fresh input.
+#[test]
+fn follow_up_drops_the_items_a_retried_attempt_authored() {
+    let delivered = vec![user("build the thing")];
+    let partial = assistant("I started by");
+    let answer = assistant("built it");
+    // What `state.record` stores after the retry: the failed attempt's
+    // fingerprints seeded the assembler, so both are echoed.
+    let continuity = established_with_echo(&delivered, &[partial.clone(), answer.clone()]);
+    let mut input = delivered;
+    input.push(partial);
+    input.push(answer);
+    input.push(user("now add tests"));
+
+    let plan = plan_request(&input, &continuity);
+
+    assert!(!plan.restart_session);
+    assert!(
+        !plan.turn_text.contains("I started by"),
+        "{}",
+        plan.turn_text
+    );
+    assert!(!plan.turn_text.contains("built it"), "{}", plan.turn_text);
+    assert!(plan.turn_text.contains("now add tests"));
+    assert_eq!(plan.delivered_items, 4);
+}
+
 /// A replay rebuilds the conversation from scratch, so Claude's turns belong in
 /// it — dropping them would hand it a transcript of only one side.
 #[test]

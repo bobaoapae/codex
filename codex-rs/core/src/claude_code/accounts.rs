@@ -57,6 +57,11 @@ pub(crate) enum FailureClass {
     /// tool-use cap. Not an account problem, and explicitly *not* worth failing
     /// over: another account would hit the same wall.
     Transient,
+    /// FORK: Anthropic itself failed — a 529 overload, a 5xx, a dropped
+    /// connection. Not an account problem either, so failing over buys nothing,
+    /// but unlike everything else here it is worth trying again on the same
+    /// account after a pause.
+    ServerError,
     /// Anything else — not an account problem, so not worth failing over.
     Other,
 }
@@ -66,11 +71,17 @@ impl FailureClass {
         matches!(self, FailureClass::UsageLimit { .. } | FailureClass::Auth)
     }
 
+    /// FORK: whether the same account is worth another attempt after a pause.
+    pub(crate) fn is_retryable_in_place(&self) -> bool {
+        matches!(self, FailureClass::ServerError)
+    }
+
     fn reason(&self) -> &'static str {
         match self {
             FailureClass::UsageLimit { .. } => "usage_limit",
             FailureClass::Auth => "auth",
             FailureClass::Transient => "transient",
+            FailureClass::ServerError => "server_error",
             FailureClass::Other => "other",
         }
     }
@@ -83,7 +94,50 @@ impl FailureClass {
 /// `error.type`); reading that first avoids the guesswork of substring matching,
 /// which cannot tell "the model mentioned a rate limit" from "this account hit
 /// one". The text fallback stays for CLI versions that say nothing structured.
-pub(crate) fn classify_result_failure(frame: &serde_json::Value, text: &str) -> FailureClass {
+pub(crate) fn classify_result_failure(
+    frame: &serde_json::Value,
+    api_error: Option<&str>,
+    text: &str,
+) -> FailureClass {
+    // FORK: the CLI names the API failure on the `assistant` frame it emits
+    // before the `result` (`isApiErrorMessage`), and that name is the only
+    // reliable way to tell "Anthropic is overloaded" from "this account is
+    // spent". The `result` subtype for both is `error_during_execution`.
+    if let Some(api_error) = api_error {
+        match api_error {
+            "overloaded" | "server_error" => return FailureClass::ServerError,
+            "authentication_failed" | "billing_error" => return FailureClass::Auth,
+            // The CLI reports both a plan limit and a raw 429 as `rate_limit`;
+            // only the text says which. A limit message names the window and
+            // its reset, anything else is Anthropic pushing back.
+            "rate_limit" => {
+                return match classify_failure(text) {
+                    limit @ FailureClass::UsageLimit { .. } => limit,
+                    _ => FailureClass::ServerError,
+                };
+            }
+            _ => {}
+        }
+    }
+    // The error text lives in `errors[]` on an `error_during_execution` result,
+    // not in `result`.
+    let fallback = frame
+        .get("errors")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|errors| errors.first())
+        .and_then(|error| {
+            error.as_str().map(str::to_string).or_else(|| {
+                error
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+        });
+    let text = if text.trim().is_empty() {
+        fallback.as_deref().unwrap_or(text)
+    } else {
+        text
+    };
     let structured = frame
         .get("subtype")
         .and_then(serde_json::Value::as_str)
@@ -152,6 +206,23 @@ pub(crate) fn classify_failure(text: &str) -> FailureClass {
     ];
     if AUTH_MARKERS.iter().any(|marker| lower.contains(marker)) {
         return FailureClass::Auth;
+    }
+    // FORK: Anthropic failing, not the account. Checked after the limit and
+    // auth markers so a 429 that names a plan window still reads as a limit.
+    // Never a bare "529": that digit run appears in ordinary text.
+    const SERVER_MARKERS: &[&str] = &[
+        "overloaded",
+        "api error: 5",
+        "internal server error",
+        "service unavailable",
+        "bad gateway",
+        "gateway timeout",
+        "fetch failed",
+        "econnreset",
+        "etimedout",
+    ];
+    if SERVER_MARKERS.iter().any(|marker| lower.contains(marker)) {
+        return FailureClass::ServerError;
     }
     FailureClass::Other
 }
@@ -789,7 +860,9 @@ impl TurnAccounts {
         let cooldown = match class {
             FailureClass::UsageLimit { .. } => USAGE_LIMIT_COOLDOWN_MS,
             FailureClass::Auth => AUTH_COOLDOWN_MS,
-            FailureClass::Transient | FailureClass::Other => return,
+            FailureClass::Transient | FailureClass::ServerError | FailureClass::Other => {
+                return;
+            }
         };
         // Read-modify-write under one lock: a sibling agent recording its own
         // failure at the same moment must not erase this one.
@@ -965,6 +1038,98 @@ mod tests {
         let class = classify_failure("execution error: tool loop aborted");
         assert_eq!(class, FailureClass::Other);
         assert!(!class.is_account_level());
+        assert!(!class.is_retryable_in_place());
+    }
+
+    /// FORK: Anthropic failing is not the account failing. Five turns died on
+    /// 529s that were classified as `Other`, so nothing retried and nothing
+    /// failed over.
+    #[test]
+    fn anthropic_server_errors_are_retryable_in_place() {
+        for text in [
+            "API Error: 529 {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}",
+            "API Error: 500 Internal server error",
+            "Service Unavailable",
+            "Bad Gateway",
+            "fetch failed",
+            "ECONNRESET",
+        ] {
+            let class = classify_failure(text);
+            assert_eq!(class, FailureClass::ServerError, "{text}");
+            assert!(!class.is_account_level(), "{text}");
+            assert!(class.is_retryable_in_place(), "{text}");
+        }
+        // A bare status number in prose is not a server error.
+        assert_eq!(
+            classify_failure("the file has 529 lines"),
+            FailureClass::Other
+        );
+    }
+
+    /// FORK: the `result` subtype is `error_during_execution` for every API
+    /// failure; only the flagged assistant frame names which one it was.
+    #[test]
+    fn the_api_error_name_decides_the_class() {
+        let frame = serde_json::json!({
+            "type": "result",
+            "subtype": "error_during_execution",
+            "is_error": true,
+            "errors": ["API Error: 529 overloaded"],
+        });
+        assert_eq!(
+            classify_result_failure(&frame, Some("overloaded"), ""),
+            FailureClass::ServerError
+        );
+        assert_eq!(
+            classify_result_failure(&frame, Some("server_error"), ""),
+            FailureClass::ServerError
+        );
+        assert_eq!(
+            classify_result_failure(&frame, Some("authentication_failed"), ""),
+            FailureClass::Auth
+        );
+        assert_eq!(
+            classify_result_failure(&frame, Some("billing_error"), ""),
+            FailureClass::Auth
+        );
+        // `rate_limit` covers both a plan limit and a raw 429; the text decides.
+        assert!(matches!(
+            classify_result_failure(
+                &frame,
+                Some("rate_limit"),
+                "You've hit your weekly limit \u{b7} resets Aug 17, 5am"
+            ),
+            FailureClass::UsageLimit { .. }
+        ));
+        assert_eq!(
+            classify_result_failure(&frame, Some("rate_limit"), "429 Too Many Requests"),
+            FailureClass::ServerError
+        );
+        // With no name, the text in `errors[]` still classifies the failure.
+        assert_eq!(
+            classify_result_failure(&frame, None, ""),
+            FailureClass::ServerError
+        );
+    }
+
+    /// FORK: a server error must not put the account in cooldown -- it is not
+    /// the account's fault, and the next turn should try it first again.
+    #[test]
+    fn a_server_error_never_records_an_account_cooldown() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dirs = account_fixture(&temp, &["a"]);
+        let state_path = temp.path().join("accounts.json");
+        let accounts = TurnAccounts {
+            candidates: vec![Some(dirs[0].clone())],
+            state_path: Some(state_path.clone()),
+        };
+        accounts.record_failure(&dirs[0], &FailureClass::ServerError, "API Error: 529");
+        assert!(
+            !state_path.exists(),
+            "a server error must leave the account health file alone"
+        );
+        accounts.record_failure(&dirs[0], &FailureClass::Auth, "OAuth token has expired");
+        assert!(state_path.exists(), "an auth failure is still recorded");
     }
 
     fn account_fixture(temp: &tempfile::TempDir, names: &[&str]) -> Vec<PathBuf> {
