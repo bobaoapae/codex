@@ -617,10 +617,27 @@ por isso o ramo "sem thread primária" só se alcança pelo entry point `codex a
 Dois apontamentos do exercício:
 
 - Num root sem frota registada o `agent/fleet/status` devolve *"fleet root agent is not registered"* e o
-  dashboard mostra `Fleet status unavailable.` em vez de cair para a listagem — o desvio mantém-se. Sair
-  do dashboard (`esc`/`ctrl+c`) devolve à listagem daemon-wide, que é navegação sã.
+  dashboard mostra `Fleet status unavailable.` em vez de cair para a listagem — o desvio mantém-se.
+- Numa primeira captura a listagem daemon-wide aparecia **depois** do dashboard da frota. Repetindo sem
+  enviar `ctrl+c` no fim, não aparece: a transição é causada por essa tecla. O mecanismo não está
+  estabelecido — com uma view do bottom-pane aberta, `ctrl+c` não é tecla de "back"
+  (`BottomPane::handle_key_event` só trata `Esc` enquanto há view no `view_stack`; um `ctrl+c` literal
+  cai no handler genérico da view, que a `AgentsOverviewView` não liga). Fica registado como facto
+  observado, não como explicação.
 - **Lacuna de cobertura:** nenhum teste chama `open_agents_overview` com `primary_thread_id = Some(…)`.
   Os quatro call sites de teste correm todos com `None` (`agents_overview_tests.rs:232,:273,:620` e
   `tests/session_lifecycle_requests.rs:2449`), e `agents_fleet_tests.rs` testa só o *bookkeeping* de
   `apply_agents_fleet_status`/`apply_agents_fleet_operation` sem passar pelo `open_*`. O `early return`
   que implementa a decisão A não tem, hoje, teste que o exerça ponta a ponta.
+
+### Reprodução independente
+
+Um segundo agente repetiu o exercício sem conhecimento da primeira corrida, contra um app-server
+próprio em `ws://127.0.0.1:8931`, e obteve as mesmas duas strings: `Agent command center` por
+`codex agents --remote`, e `Agent fleet` + `root 01a064d9-…  generation 0  open` por `codex --remote`
+seguido de `/agents`. Duas corridas independentes, portos e roots diferentes, mesmo resultado.
+
+Dois detalhes úteis que saíram daí: o listener websocket expõe `GET /readyz` e `/healthz` com 200
+imediato (sinal de prontidão melhor do que fazer scan do banner em stderr), e o keybinding global
+`tui.keymap.global.open_agents` vem **desligado** por omissão (`built_in_defaults()` dá
+`default_bindings![]`), portanto o slash command é o único gatilho sem override de config.
