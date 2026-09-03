@@ -4508,6 +4508,7 @@ async fn set_rate_limits_retains_previous_credits() {
     let initial = RateLimitSnapshot {
         limit_id: None,
         limit_name: None,
+        normal_model_slug: None,
         primary: Some(RateLimitWindow {
             used_percent: 10.0,
             window_minutes: Some(15),
@@ -4529,6 +4530,7 @@ async fn set_rate_limits_retains_previous_credits() {
     let update = RateLimitSnapshot {
         limit_id: Some("codex_other".to_string()),
         limit_name: Some("codex_other".to_string()),
+        normal_model_slug: None,
         primary: Some(RateLimitWindow {
             used_percent: 40.0,
             window_minutes: Some(30),
@@ -4552,6 +4554,7 @@ async fn set_rate_limits_retains_previous_credits() {
         Some(RateLimitSnapshot {
             limit_id: Some("codex_other".to_string()),
             limit_name: Some("codex_other".to_string()),
+            normal_model_slug: None,
             primary: update.primary.clone(),
             secondary: update.secondary,
             credits: initial.credits,
@@ -4624,6 +4627,7 @@ async fn set_rate_limits_updates_plan_type_when_present() {
     let initial = RateLimitSnapshot {
         limit_id: None,
         limit_name: None,
+        normal_model_slug: None,
         primary: Some(RateLimitWindow {
             used_percent: 15.0,
             window_minutes: Some(20),
@@ -4649,6 +4653,7 @@ async fn set_rate_limits_updates_plan_type_when_present() {
     let update = RateLimitSnapshot {
         limit_id: None,
         limit_name: None,
+        normal_model_slug: None,
         primary: Some(RateLimitWindow {
             used_percent: 35.0,
             window_minutes: Some(25),
@@ -4668,6 +4673,7 @@ async fn set_rate_limits_updates_plan_type_when_present() {
         Some(RateLimitSnapshot {
             limit_id: Some("codex".to_string()),
             limit_name: None,
+            normal_model_slug: None,
             primary: update.primary,
             secondary: update.secondary,
             credits: initial.credits,
@@ -5890,13 +5896,13 @@ async fn session_configuration_apply_preserves_absolute_cwd_write_root_on_cwd_up
     assert!(
         updated
             .file_system_sandbox_policy(&[])
-            .can_write_path_with_cwd(original_cwd.as_path(), updated.cwd().as_path()),
+            .can_write_local_path_with_cwd(original_cwd.as_path(), updated.cwd().as_path()),
         "absolute grant to the old cwd must remain writable"
     );
     assert!(
         !updated
             .file_system_sandbox_policy(&[])
-            .can_write_path_with_cwd(next_cwd.as_path(), updated.cwd().as_path()),
+            .can_write_local_path_with_cwd(next_cwd.as_path(), updated.cwd().as_path()),
         "cwd-only update must not reinterpret an absolute old-cwd grant as :workspace_roots"
     );
 }
@@ -5948,6 +5954,7 @@ async fn compaction_checkpoint_waits_for_accepted_settings_persistence() {
                 window_number,
                 window_ids,
                 compaction_response_id: None,
+                compaction_model_hash: None,
             },
         ),
     ));
@@ -9080,6 +9087,7 @@ async fn refresh_mcp_servers_uses_latest_state_for_existing_turns() {
             &turn_context,
             /*selected_capability_roots*/ &[],
             /*required_servers*/ &[],
+            /*required_plugins*/ &HashSet::new(),
         )
         .await;
 

@@ -98,6 +98,7 @@ async fn approved_plan_injection_is_ordered_and_compaction_keeps_one_fragment() 
                 window_number,
                 window_ids,
                 compaction_response_id: None,
+                compaction_model_hash: None,
             },
         )
         .await;

@@ -26,7 +26,7 @@ Supported transports:
 
 - stdio (`--stdio` or `--listen stdio://`, default): newline-delimited JSON (JSONL)
 - websocket (`--listen ws://IP:PORT`): one JSON-RPC message per websocket text frame (**experimental / unsupported**)
-- unix socket (`--listen unix://` or `--listen unix://PATH`): websocket connections over `$CODEX_HOME/app-server-control/app-server-control.sock` or a custom socket path, using the standard HTTP Upgrade handshake
+- unix socket (`--listen unix://` or `--listen unix://PATH`): websocket connections over `$CODEX_HOME/app-server-control/app-server-control.sock` or a custom socket path, using the standard HTTP Upgrade handshake (also supported on Windows)
 - off (`--listen off`): do not expose a local transport
 
 When running with `--listen ws://IP:PORT`, the same listener also serves basic HTTP health probes:
@@ -48,6 +48,10 @@ On Windows, the socket directory is created with a protected current-user-only D
 directories must already have that owner and DACL; startup rejects broader permissions rather
 than attempting to repair previously exposed state. Custom sockets should use a new dedicated
 subdirectory. The listener pins the validated directory until socket cleanup completes.
+
+`codex app-server daemon` manages this local server on Unix and Windows using the standalone
+installation. The TUI discovers an available local daemon; `codex agents` starts it when no explicit
+remote endpoint is supplied. See [daemon lifecycle](../app-server-daemon/README.md) for commands and platform requirements.
 
 Tracing/log output:
 
@@ -236,7 +240,7 @@ Example with notification opt-out:
 - `thread/realtime/appendSpeech` — append text that the realtime model should speak to the user (experimental); returns `{}`. Parent-owned Multi-Agent V2 subagents reject this request.
 - `thread/realtime/stop` — stop the active realtime session for the thread (experimental); returns `{}`. Parent-owned Multi-Agent V2 subagents reject this request.
 - `thread/timeline/list` — page ordinary turn items, durable realtime facts, and turn boundaries together in rollout order (experimental). Entries are tagged `item`, `realtime`, `turnStarted`, or `turnCompleted`. Turn boundaries carry lifecycle metadata without duplicating the turn's items; completed boundaries also cover interrupted and failed turns. Each response contains an opaque continuation cursor and `activeRealtimeSessionAtPageStart`, allowing clients to render any bounded page without loading earlier thread history. Entries at the same rollout position have stable ordering and can span pages. Existing `thread/items/list` remains unchanged.
-- `review/start` — kick off Codex’s automated reviewer for a thread; responds like `turn/start`. Inline reviews emit `item/started`/`item/completed` notifications with `enteredReviewMode` and `exitedReviewMode` items, plus a final assistant `agentMessage` containing the review. Detached reviews stream ordinary turn items on the new review thread. Parent-owned Multi-Agent V2 subagents reject both inline and detached reviews.
+- `review/start` — kick off Codex’s automated reviewer for a thread; responds like `turn/start`. Inline reviews emit `item/started`/`item/completed` notifications with `enteredReviewMode` and `exitedReviewMode` items, plus a final assistant `agentMessage` containing the review. Detached delivery is deprecated and emits `deprecationNotice`; supported detached reviews still stream ordinary turn items on the new review thread. Parent-owned Multi-Agent V2 subagents reject both inline and detached reviews.
 - `command/exec` — run a single command under the server sandbox without starting a thread/turn (handy for utilities and validation).
 - `command/exec/write` — write base64-decoded stdin bytes to a running `command/exec` session or close stdin; returns `{}`.
 - `command/exec/resize` — resize a running PTY-backed `command/exec` session by `processId`; returns `{}`.
@@ -295,17 +299,18 @@ Example with notification opt-out:
 - `remoteControl/client/revoke` — experimental; revoke one controller device's grant for an environment. Pass `environmentId` and `clientId`; returns an empty object. This signed-in account-management operation works while the local relay is disabled or unenrolled.
 - `remoteControl/status/changed` — notification emitted when the remote-control status or client-visible environment id changes. `status` is one of `disabled`, `connecting`, `connected`, or `errored`; `serverName` is the local machine name used by this app-server process; `environmentId` is a string when the app-server has a current enrollment and `null` when that enrollment is cleared, invalidated, or remote control is disabled. Newly initialized app-server clients always receive the current status snapshot.
 - `skills/config/write` — write user-level skill config by name or absolute path.
-- `plugin/install` — install a plugin from a discovered marketplace entry, rejecting marketplace entries marked unavailable for install, install MCPs if any, and return the effective plugin auth policy plus any apps that still need auth. For remote installs, clients may include an optional `installAttemptId`; app-server forwards it unchanged as `install_attempt_id` in the backend POST body, while omission preserves the legacy empty-body request (**under development; do not call from production clients yet**).
+- `plugin/install` — install a plugin from a discovered marketplace entry, rejecting marketplace entries marked unavailable for install, install MCPs if any, and return the effective plugin auth policy plus any apps that still need auth. Local marketplace installation also reloads user configuration for loaded threads before invalidating their MCP runtimes and returning; this applies pending user-config changes, including hook settings. Reload failures are logged without undoing installation, and MCP startup can finish afterward. For remote installs, clients may include an optional `installAttemptId`; app-server forwards it unchanged as `install_attempt_id` in the backend POST body, while omission preserves the legacy empty-body request (**under development; do not call from production clients yet**).
 - `plugin/uninstall` — uninstall a local plugin by `pluginId` in `<plugin>@<marketplace>` form by removing its cached files and clearing its user-level config entry, or uninstall a remote ChatGPT plugin by backend `pluginId` by forwarding the uninstall to the ChatGPT plugin backend and removing any downloaded remote-plugin cache (**under development; do not call from production clients yet**).
 - `mcpServer/oauth/login` — start an OAuth login for a configured MCP server; pass `threadId` to resolve servers from that thread's selected plugins and executor, optionally pass `clientRegistration` (`auto`, `cimd`, or `dcr`) to override client registration for this login only, and receive an `authorization_url` followed by `mcpServer/oauthLogin/completed` once the browser flow finishes. Omitting `clientRegistration` automatically discovers the authorization server's supported registration methods; the override is never persisted in server configuration.
 - `tool/requestUserInput` — prompt the user with 1–3 short questions for a tool call and return their answers (experimental).
 - `config/mcpServer/reload` — reload MCP server config from disk and queue a refresh for loaded threads (applied on each thread's next active turn); returns `{}`. Use this after editing `config.toml` without restarting the server.
-- `mcpServerStatus/list` — enumerate configured MCP servers with their tools, auth status, server info, owning `pluginId` (`null` for servers not contributed by a plugin), and nullable `runtimeStatus` from the current thread’s published connections, plus resources/resource templates for `full` detail; supports optional `threadId` and cursor+limit pagination. If `threadId` is omitted, the server reads from the latest global config directly and `runtimeStatus` is `null`. Runtime status is also `null` when the latest server registration differs from the thread’s published configuration. Runtime status is observed without starting or reconnecting the thread’s servers; it can be `notStarted`, `starting`, `connected`, `authenticationRequired`, `failed`, `cancelled`, or `disabled`. Inventory may be cached or collected separately and does not prove that the thread is connected. Older servers omit `runtimeStatus`; clients should treat that as unknown. If `detail` is omitted, the server defaults to `full`. An `unknown` auth status means OAuth support could not be determined; `unsupported` means OAuth is known not to be supported.
+- `mcpServerStatus/list` — enumerate configured MCP servers with their tools, auth status, server info, owning `pluginId` (`null` for servers not contributed by a plugin), and nullable `runtimeStatus` from the current thread’s published connections, plus resources/resource templates for `full` detail; supports optional `threadId` and cursor+limit pagination. If `threadId` is omitted, the server reads from the latest global config directly and `runtimeStatus` is `null`. Runtime status is also `null` when the latest server registration differs from the thread’s published configuration. Runtime status is observed without starting or reconnecting the thread’s servers; it can be `notStarted`, `starting`, `connected`, `authenticationRequired`, `failed`, `cancelled`, or `disabled`. Inventory may be cached or collected separately and does not prove that the thread is connected. Each server also includes nullable `toolsError`: a startup or tool-list discovery failure is reported when no catalog is returned. Returned catalogs, including cached or empty catalogs, have no error. Healthy servers are returned even when another server fails. Older servers omit `toolsError`; clients must preserve their existing behavior when it is absent. Older servers omit `runtimeStatus`; clients should treat that as unknown. If `detail` is omitted, the server defaults to `full`. An `unknown` auth status means OAuth support could not be determined; `unsupported` means OAuth is known not to be supported.
 - `mcpServer/resource/read` — read a resource from a configured MCP server by optional `threadId`, `server`, and `uri`, returning text/blob resource `contents`. Pass `originCallId` with `threadId` to scope a Codex app widget to the app and account of the completed tool call that produced it; successful scoped reads return the same `originCallId`. Optional `connectorId` restricts other hosted app resources to their originating connector. If `threadId` is omitted, the server reads from the latest MCP config directly.
 - `mcpServer/event/stream/start` (experimental) — subscribe to an MCP event by `threadId`, `server`, `subscriptionId`, event `name`, `arguments`, and optional `_meta`.
 - `mcpServer/event/stream/stop` (experimental) — stop the caller's event subscription by `subscriptionId`.
 - `mcpServer/tool/call` — call a tool on a thread's configured MCP server by `threadId`, `server`, `tool`, optional `arguments`, and optional `_meta`, returning the MCP tool result. Parent-owned Multi-Agent V2 subagents reject direct tool calls.
 - `windowsSandbox/setupStart` — start Windows sandbox setup for the selected mode (`elevated` or `unelevated`); accepts an optional absolute `cwd` to target setup for a specific workspace, returns `{ started: true }` immediately, and later emits `windowsSandbox/setupCompleted`.
+  The default-off `windows_sandbox_service` feature enables attempting service provisioning for elevated setup. Clients can set it through `experimentalFeature/enablement/set` before starting setup; when disabled, setup uses the existing elevated helper directly.
 - `feedback/upload` — submit a feedback report (classification + optional reason/logs, conversation_id, and optional `extraLogFiles` attachments array); returns the tracking thread id. With logs enabled, includes bounded recent failed Guardian review actions, decisions, and reviewer history from the reported thread and its descendants, linked to the reviewed turn and target item where available. Rollout selection preserves the reported thread and prioritizes children with retained failed reviews before newer children, including each selected thread's available Guardian trunk rollout. `feedback-thread-index.json` lists selected filenames and bounded omission details; it describes selection, not successful delivery. Failed-review captures are process-local, so missing evidence does not establish that no denial occurred.
 - `config/read` — fetch the runtime-effective config after resolving config layering and managed requirements, including opaque `desktop` values stored in `config.toml`. When configured, the `packagedDefaults` layer has the lowest precedence.
 - `externalAgentConfig/detect` — detect migratable external-agent artifacts with `includeHome`, optional `cwds`, and an optional `migrationSource` selector. Omitted, `null`, or unrecognized migration-source values retain the default behavior. The deprecated optional `source` field remains accepted for compatibility but does not select the migration source. Each detected item includes `cwd` (`null` for home), and multi-item migrations may additionally include structured `details` with plugin ids, skill names, memory, session metadata, or other artifact names. The response also includes connector candidates inferred from detected source sessions, with a normalized display `name`, the number of detected sessions that used the connector, and the source metadata field used for detection.
@@ -320,6 +325,20 @@ with their original `code`, `message`, and `data`, including authentication
 metadata in `data._meta`. Other operation failures retain the existing
 internal-error response. Tool results with `isError: true` remain results,
 including their `_meta`.
+
+### Application requirements
+
+With experimental API support enabled, `configRequirements/read` returns
+`application.network` from managed requirements, separately from agent-network
+policy in `network`. This endpoint reports policy; it does not enforce it.
+
+```toml
+[application.network.domains]
+"managed.example.com" = "allow"
+```
+
+Application rules use normal managed TOML precedence. A present network block
+is enabled by default and denies unlisted domains; `enabled = false` disables it.
 
 ### Plugin configuration scope
 
@@ -372,6 +391,13 @@ Use `thread/read` or `thread/list` to inspect them without resuming a thread,
 subscribing to it, or dispatching queued work or goal continuations.
 
 Start a fresh thread when you need a new Codex conversation.
+
+Experimental `Thread.environments` returns a loaded thread's current selection as `{ environmentId, cwd, runtimeWorkspaceRoots }` entries.
+The first entry is the primary environment; paths use that environment's native syntax.
+An empty list means no environments are selected; `null` means the thread is not loaded or the server does not expose its selection.
+Start and resume responses report the resulting live selection, and read, list, and unarchive responses include it for loaded threads, even if the client missed `thread/environment/connected`.
+The field is not persisted and does not change executor selection or resume behavior.
+Reading an unloaded thread leaves it unloaded and returns `null`; use `environment/status` to check connection status separately.
 
 ```json
 { "method": "thread/start", "id": 10, "params": {
@@ -541,6 +567,7 @@ Pass any combination of:
 - `sortDirection` — `desc` (default for timestamp sorts) or `asc` (default for `section_position`).
 - `modelProviders` — restrict results to specific providers; unset, null, or an empty array will include all providers.
 - `sourceKinds` — restrict results to specific sources; omit or pass `[]` for interactive sessions only (`cli`, `vscode`).
+- `originators` — an exact-value allowlist for hosted backends that support originator filtering. The local app-server rejects a nonempty list; omission, `null`, and `[]` leave originators unrestricted.
 - `archived` — when `true`, list archived threads only. When `false` or `null`, list non-archived threads (default).
 - `sectionId` — provide an ID from `threadSection/list` to return threads from that section; pass `null` to return only threads without a section; or omit it to include threads from every section and threads without a section.
 - `cwd` — restrict results to threads whose session cwd exactly matches this path, or one of these paths when an array is provided. Relative paths are resolved against the app-server process cwd before matching.
@@ -548,6 +575,7 @@ Pass any combination of:
 - `searchTerm` — restrict results to threads whose extracted title contains this substring (case-sensitive).
 - Responses include `nextCursor` to continue in the same direction and `backwardsCursor` to pass as `cursor` when reversing `sortDirection`.
 - Responses include `agentNickname` and `agentRole` for AgentControl-spawned thread sub-agents when available.
+- Full thread responses and `thread/started` include `originator`, the value recorded at creation, or `null` when unavailable. Opening or resuming a thread does not attribute it to the current client. This is separate from the runtime `source` and does not choose an executor.
 
 Example:
 
@@ -1192,6 +1220,8 @@ Use `thread/inject_items` to append prebuilt Responses API items to a loaded thr
 
 ### Example: Start realtime with WebRTC
 
+Realtime sessions do not require a per-thread feature opt-in. The legacy `features.realtime_conversation` setting is accepted but has no effect, including when set to `false`.
+
 Use `thread/realtime/start` with `transport.type: "webrtc"` when a browser or webview owns the `RTCPeerConnection` and app-server should create the server-side realtime session. The transport `sdp` must be the offer SDP produced by `RTCPeerConnection.createOffer()`, not a hand-written or minimal SDP string.
 
 The offer should include the media sections the client wants to negotiate. For the standard realtime UI flow, create the audio track/transceiver and the `oai-events` data channel before calling `createOffer()`:
@@ -1462,7 +1492,11 @@ Use `review/start` to run Codex’s reviewer on the currently checked-out projec
 - `{"type":"custom","instructions":"Free-form reviewer instructions"}` — fallback prompt equivalent to the legacy manual review request.
 - `delivery` (`"inline"` or `"detached"`, default `"inline"`) — where the review runs:
   - `"inline"`: run the review as a new turn on the existing thread. The response’s `reviewThreadId` equals the original `threadId`, and no new `thread/started` notification is emitted.
-  - `"detached"`: fork a new review thread from the parent conversation and run the review there. The response’s `reviewThreadId` is the id of this new review thread, and the server emits a `thread/started` notification for it before streaming review items.
+  - `"detached"` (deprecated): fork a new review thread from the parent conversation and run the review there. The response’s `reviewThreadId` is the id of this new review thread, and the server emits a `thread/started` notification for it before streaming review items. Paginated parent threads do not support detached delivery.
+
+Detached delivery will be removed in a future release. Requests with `"delivery": "detached"` emit a `deprecationNotice` to the requesting connection before being processed; existing behavior and validation remain in place. No removal date is set yet. Omitted, null, and `"inline"` delivery remain supported without this warning.
+
+To migrate, create a separate thread with `thread/start`, then call `review/start` with `"delivery": "inline"` on that thread. This runs the built-in reviewer without copying the parent conversation. If your reviewer needs the parent conversation's history, use `thread/fork` followed by `turn/start` with your own review instructions.
 
 Example request/response:
 
@@ -1485,7 +1519,7 @@ Example request/response:
 } }
 ```
 
-For a detached review, use `"delivery": "detached"`. The response is the same shape, but `reviewThreadId` will be the id of the new review thread (different from the original `threadId`). The server also emits a `thread/started` notification for that new thread before streaming the review turn. Internally, this is a normal forked thread and turn whose prompt mentions the bundled `$review-agent` skill, so normal turn steering, tool, permission, and item-stream behavior applies.
+Existing callers using the deprecated `"delivery": "detached"` receive the same response shape, but `reviewThreadId` is the id of the new review thread (different from the original `threadId`). The server also emits a `thread/started` notification for that new thread before streaming the review turn. Internally, this is a normal forked thread and turn whose prompt mentions the bundled `$review-agent` skill, so normal turn steering, tool, permission, and item-stream behavior applies.
 
 Detached review is unsupported when the parent thread is paginated.
 
@@ -2753,11 +2787,25 @@ Codex-managed credentials are removed; AWS profiles, environment credentials, an
 
 ### 7) Rate limits (ChatGPT)
 
+Clients that implement automatic Luna Reserve fallback may send
+`"params": { "supportsLunaReserve": true }` on `account/rateLimits/read`. For eligible
+ChatGPT CLI users, this opts into experiment exposure only after the backend reports
+ordinary included usage blocked, for both control and treatment. It does not grant
+Reserve access. Omitted params preserve non-exposing reads; API-key, PAT, and FedRAMP
+sessions do not opt in. Clients connecting to older app servers that reject object
+params should retry without params.
+
+Background polls may also send `"excludeResetCreditDetails": true` to avoid the
+separate reset-credit detail lookup. The usage response still supplies the available
+count. Startup and user-requested usage/reset reads should omit this flag so credit
+details remain available; older servers ignore it and keep their existing behavior.
+
 ```json
 { "method": "account/rateLimits/read", "id": 7 }
 {
   "id": 7,
   "result": {
+    "ordinaryUsageAllowed": true,
     "rateLimits": {
       "primary": { "usedPercent": 25, "windowDurationMins": 15, "resetsAt": 1730947200 },
       "secondary": null,
@@ -2787,9 +2835,11 @@ Field notes:
 - `usedPercent` is current usage within the OpenAI quota window.
 - `windowDurationMins` is the quota window length.
 - `resetsAt` is a Unix timestamp (seconds) for the next reset.
+- `normalModelSlug` optionally identifies the normal model associated with an additional quota, forwarded from `/wham/usage`'s `normal_model_slug`. Clients can use that model's catalog name and reasoning choices without changing the quota alias used for requests. Missing metadata is `null`; it does not grant model access.
 - `rateLimitReachedType` identifies the backend-classified limit state when one has been reached.
 - `individualLimit` describes the effective monthly credit limit when available. In an `account/rateLimits/read` response, `null` means no monthly limit is available. In a sparse `account/rateLimits/updated` notification, nullable account metadata may be unavailable and does not clear a previously observed value.
 - `accountId` identifies the account in the usage snapshot when the backend supplies it.
+- `ordinaryUsageAllowed` is the backend decision for ordinary included usage, validated against the authenticated account and user. It is `null` for unavailable or mismatched identity data. A CLI task that automatically entered Luna Reserve can restore its previous model when a validated read allows included usage or reports usable credits, no backend banner or hard stop remains, and the user has not manually changed models. Percentages, reset timestamps, and sparse notifications do not authorize this transition.
 - `rateLimitUpsell` carries the optional backend-owned `rate_limit_upsell` object from the same usage request, preserving its nested snake_case fields. The backend controls eligibility; clients do not evaluate an experiment or issue another request for it. A missing, null, or unsupported banner leaves the existing client UI in place. Banners whose account or user does not match the authenticated identity are omitted. Sparse notifications do not clear this snapshot-only field.
 - `rateLimitResetCredits` contains the available earned-reset count when the backend provides it; otherwise it is `null`.
 - `rateLimitResetCredits.credits` is `null` when only the count is available. An empty array means details were fetched and no available credits were returned.

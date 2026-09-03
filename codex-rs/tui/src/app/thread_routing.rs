@@ -659,6 +659,7 @@ impl App {
                 Ok(true)
             }
             AppCommand::UserTurn {
+                client_user_message_id,
                 items,
                 cwd,
                 approval_policy,
@@ -681,7 +682,12 @@ impl App {
                     let mut retried_after_turn_mismatch = false;
                     loop {
                         match app_server
-                            .turn_steer(thread_id, steer_turn_id.clone(), items.to_vec())
+                            .turn_steer(
+                                thread_id,
+                                steer_turn_id.clone(),
+                                client_user_message_id.clone(),
+                                items.to_vec(),
+                            )
                             .await
                         {
                             Ok(_) => return Ok(true),
@@ -718,7 +724,7 @@ impl App {
                                             self.thread_event_channels.get(&thread_id)
                                         {
                                             let mut store = channel.store.lock().await;
-                                            store.active_turn_id = Some(actual_turn_id.clone());
+                                            store.set_active_turn_id(actual_turn_id.clone());
                                         }
                                         steer_turn_id = actual_turn_id;
                                         retried_after_turn_mismatch = true;
@@ -730,7 +736,7 @@ impl App {
                                             self.thread_event_channels.get(&thread_id)
                                         {
                                             let mut store = channel.store.lock().await;
-                                            store.active_turn_id = Some(actual_turn_id);
+                                            store.set_active_turn_id(actual_turn_id);
                                         }
                                         return Err(error.into());
                                     }
@@ -754,6 +760,7 @@ impl App {
                     let response = app_server
                         .turn_start(
                             thread_id,
+                            client_user_message_id.clone(),
                             items.to_vec(),
                             cwd.clone(),
                             *approval_policy,
@@ -807,7 +814,7 @@ impl App {
                     .wrap_err("review/start returned invalid review thread id")?;
                 let store = Arc::clone(&self.ensure_thread_channel(review_thread_id).store);
                 let mut store = store.lock().await;
-                store.active_turn_id = Some(response.turn.id);
+                store.set_active_turn_id(response.turn.id);
                 Ok(true)
             }
             AppCommand::CleanBackgroundTerminals => {
@@ -1683,7 +1690,19 @@ impl App {
         let cwd = self.chat_widget.config_ref().cwd.clone();
         let errors = errors_for_cwd(&cwd, &response);
         let errors = self.skill_load_warnings.newly_active_errors(&errors);
-        emit_skill_load_warnings(&self.app_event_tx, &errors);
+        let warnings = skill_load_warning_messages(&errors);
+        if self.skill_load_warnings.startup_complete {
+            for warning in warnings {
+                self.chat_widget.add_warning_message(warning);
+            }
+        } else {
+            self.app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
+                // The per-file diagnostics already identify every affected skill.
+                history_cell::StartupWarningsCell::new(
+                    warnings.into_iter().skip(/*n*/ 1).collect(),
+                ),
+            )));
+        }
         self.chat_widget.handle_skills_list_response(response);
     }
 

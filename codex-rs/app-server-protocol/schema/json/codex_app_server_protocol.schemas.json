@@ -2111,7 +2111,14 @@
               "type": "string"
             },
             "params": {
-              "type": "null"
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/v2/GetAccountRateLimitsParams"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
@@ -7473,6 +7480,40 @@
         "type": "object"
       },
       "AppToolsConfig": {
+        "type": "object"
+      },
+      "ApplicationNetworkRequirements": {
+        "properties": {
+          "domains": {
+            "additionalProperties": {
+              "$ref": "#/definitions/v2/NetworkDomainPermission"
+            },
+            "type": "object"
+          },
+          "enabled": {
+            "description": "When enabled, only explicitly allowed exact domains may be contacted.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "domains",
+          "enabled"
+        ],
+        "type": "object"
+      },
+      "ApplicationRequirements": {
+        "properties": {
+          "network": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/ApplicationNetworkRequirements"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
         "type": "object"
       },
       "ApprovalsReviewer": {
@@ -12950,6 +12991,20 @@
         "title": "GetAccountParams",
         "type": "object"
       },
+      "GetAccountRateLimitsParams": {
+        "description": "Usage-read capabilities of the requesting client, never inferred from its experiment arm.",
+        "properties": {
+          "excludeResetCreditDetails": {
+            "description": "Skip the separate reset-credit detail lookup for background usage polls. The usage response still includes the available count; omitted/false preserves detailed reads.",
+            "type": "boolean"
+          },
+          "supportsLunaReserve": {
+            "description": "The client supports automatic Luna Reserve fallback. For eligible ChatGPT CLI users, allow the backend to record experiment exposure after ordinary usage is blocked.",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
       "GetAccountRateLimitsResponse": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
@@ -12957,6 +13012,13 @@
             "description": "Account associated with this usage snapshot, when supplied by the backend.",
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "ordinaryUsageAllowed": {
+            "description": "Backend permission for ordinary included usage, validated against the active account. Null means unavailable; clients must not infer recovery from percentages or reset times.",
+            "type": [
+              "boolean",
               "null"
             ]
           },
@@ -15420,6 +15482,13 @@
               "$ref": "#/definitions/v2/Tool"
             },
             "type": "object"
+          },
+          "toolsError": {
+            "description": "Tool discovery failed and no catalog was returned. Null when a catalog is returned, including cached or empty catalogs.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -16397,6 +16466,18 @@
           "compact"
         ],
         "type": "string"
+      },
+      "NullableGetAccountRateLimitsParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "anyOf": [
+          {
+            "$ref": "#/definitions/v2/GetAccountRateLimitsParams"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "title": "Nullable_GetAccountRateLimitsParams"
       },
       "NullableGetAccountTokenUsageParams": {
         "$schema": "http://json-schema.org/draft-07/schema#",
@@ -18432,6 +18513,13 @@
               "null"
             ]
           },
+          "normalModelSlug": {
+            "description": "Normal model whose display name and reasoning options describe this quota alias.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "planType": {
             "anyOf": [
               {
@@ -19943,7 +20031,7 @@
               }
             ],
             "default": null,
-            "description": "Where to run the review: inline (default) on the current thread or detached on a new thread (returned in `reviewThreadId`)."
+            "description": "Where to run the review: inline (default) on the current thread or detached on a new thread (returned in `reviewThreadId`). Detached delivery is deprecated and emits `deprecationNotice`. Use `thread/start` followed by an inline review for a separate review thread."
           },
           "target": {
             "$ref": "#/definitions/v2/ReviewTarget"
@@ -21260,6 +21348,13 @@
               "null"
             ]
           },
+          "originator": {
+            "description": "Originator recorded when the thread was created, independent of its current client or executor. Null when the recorded originator is unavailable.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "parentThreadId": {
             "description": "The ID of the parent thread. This will only be set if this thread is a subagent.",
             "type": [
@@ -21546,6 +21641,29 @@
           "threadId"
         ],
         "title": "ThreadDeletedNotification",
+        "type": "object"
+      },
+      "ThreadEnvironment": {
+        "description": "An environment selected by a loaded thread, independent of connection status.",
+        "properties": {
+          "cwd": {
+            "$ref": "#/definitions/v2/LegacyAppPathString"
+          },
+          "environmentId": {
+            "type": "string"
+          },
+          "runtimeWorkspaceRoots": {
+            "items": {
+              "$ref": "#/definitions/v2/LegacyAppPathString"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "cwd",
+          "environmentId",
+          "runtimeWorkspaceRoots"
+        ],
         "type": "object"
       },
       "ThreadExtra": {
@@ -22944,6 +23062,16 @@
             "minimum": 0.0,
             "type": [
               "integer",
+              "null"
+            ]
+          },
+          "originators": {
+            "description": "Optional originator allowlist, matching any supplied value exactly. Supported by hosted backends only; the local app-server rejects a nonempty list. Omitted or empty lists leave originators unrestricted.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
               "null"
             ]
           },

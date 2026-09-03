@@ -362,6 +362,9 @@ impl UsageSnapshot {
             // OpenAI one (and vice versa) in a session that uses both.
             limit_id: Some("claude_code".to_string()),
             limit_name: account_label,
+            // No quota alias here: the Claude account's windows are reported
+            // for the model the turn actually ran on.
+            normal_model_slug: None,
             primary: self.five_hour_pct.map(|used_percent| RateLimitWindow {
                 used_percent,
                 window_minutes: Some(5 * 60),

@@ -22,7 +22,6 @@ use codex_extension_api::ToolStartInput;
 use codex_features::CurrentTimeSource;
 use codex_features::Feature;
 use codex_history::RolloutItem;
-use codex_history::RolloutLine;
 use codex_login::CodexAuth;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ApprovalsReviewer;
@@ -361,7 +360,7 @@ async fn guardian_session_prewarms_and_is_reused_for_first_review(
     let bundled_models = codex_models_manager::bundled_models_response()?.models;
     let catalog_auto_review = bundled_models
         .iter()
-        .find(|model| model.slug == "codex-auto-review")
+        .find(|model| model.slug == expected_model)
         .and_then(|model| model.model_messages.as_ref())
         .and_then(|messages| messages.auto_review.as_ref())
         .expect("bundled auto-review model Guardian policy");
@@ -382,14 +381,6 @@ async fn guardian_session_prewarms_and_is_reused_for_first_review(
     let use_responses_lite = review_model.use_responses_lite;
     if expected_model == "gpt-5.6-luna" {
         assert!(use_responses_lite, "Luna must use Responses Lite");
-        assert!(
-            review_model
-                .model_messages
-                .as_ref()
-                .and_then(|messages| messages.auto_review.as_ref())
-                .is_none(),
-            "Luna must exercise the bundled Guardian policy fallback"
-        );
     }
 
     let tool_args = json!({
@@ -618,7 +609,7 @@ async fn guardian_session_prewarms_and_is_reused_for_first_review(
     test.codex.shutdown_and_wait().await?;
     let guardian_rollout = fs::read_to_string(guardian_rollout_path)?
         .lines()
-        .map(serde_json::from_str::<RolloutLine>)
+        .map(codex_rollout::parse_rollout_line)
         .collect::<serde_json::Result<Vec<_>>>()?;
     assert_eq!(
         guardian_rollout.iter().find_map(|line| match &line.item {

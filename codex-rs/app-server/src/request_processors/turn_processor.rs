@@ -369,6 +369,17 @@ impl TurnRequestProcessor {
         request_id: &ConnectionRequestId,
         params: ReviewStartParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        if matches!(params.delivery, Some(ApiReviewDelivery::Detached)) {
+            self.outgoing
+                .send_server_notification_to_connections(
+                    &[request_id.connection_id],
+                    ServerNotification::DeprecationNotice(DeprecationNoticeNotification {
+                        summary: "review/start with delivery \"detached\" is deprecated and will be removed in a future release.".to_string(),
+                        details: Some("Use thread/start followed by review/start with delivery \"inline\" for a separate review thread, or thread/fork followed by turn/start with your own review instructions.".to_string()),
+                    }),
+                )
+                .await;
+        }
         self.review_start_inner(request_id, params)
             .await
             .map(|()| None)
@@ -1280,12 +1291,6 @@ impl TurnRequestProcessor {
             Err(error) => return Err(error),
         }
 
-        if !thread.enabled(Feature::RealtimeConversation) {
-            return Err(invalid_request(format!(
-                "thread {thread_id} does not support realtime conversation"
-            )));
-        }
-
         Ok(Some((thread_id, thread)))
     }
 
@@ -1607,7 +1612,7 @@ impl TurnRequestProcessor {
 
         if let Some(mut thread) = stored_thread {
             let config_snapshot = review_thread.config_snapshot().await;
-            apply_live_model_settings(&mut thread, &config_snapshot);
+            apply_live_thread_settings(&mut thread, &config_snapshot);
             thread.session_id = review_thread.session_configured().session_id.to_string();
             self.thread_watch_manager
                 .upsert_thread_silently(&thread.id)

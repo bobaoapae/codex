@@ -1010,6 +1010,9 @@
             "content_item_kinds": {
               "type": "boolean"
             },
+            "context_management": {
+              "$ref": "#/definitions/FeatureToml_for_ContextManagementConfigToml"
+            },
             "current_time_reminder": {
               "$ref": "#/definitions/FeatureToml_for_CurrentTimeReminderConfigToml"
             },
@@ -1080,6 +1083,9 @@
               "type": "boolean"
             },
             "guardian_reuse_parent_compaction": {
+              "type": "boolean"
+            },
+            "guardian_thread_context": {
               "type": "boolean"
             },
             "guardianv2": {
@@ -1352,6 +1358,9 @@
             "web_search_request": {
               "type": "boolean"
             },
+            "windows_sandbox_service": {
+              "type": "boolean"
+            },
             "workspace_dependencies": {
               "type": "boolean"
             },
@@ -1449,6 +1458,16 @@
             }
           ],
           "default": null
+        }
+      },
+      "type": "object"
+    },
+    "ContextManagementConfigToml": {
+      "additionalProperties": false,
+      "properties": {
+        "experimental_mode": {
+          "description": "Enables experimental context management.",
+          "type": "boolean"
         }
       },
       "type": "object"
@@ -1563,6 +1582,16 @@
         },
         {
           "$ref": "#/definitions/CodeModeHostConfigToml"
+        }
+      ]
+    },
+    "FeatureToml_for_ContextManagementConfigToml": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "$ref": "#/definitions/ContextManagementConfigToml"
         }
       ]
     },
@@ -4204,6 +4233,7 @@
             "agents": {
               "new_task": null,
               "rename": null,
+              "resume": null,
               "search": null,
               "stop": null,
               "toggle_grouping": null
@@ -4509,6 +4539,14 @@
             }
           ],
           "description": "Rename the selected task."
+        },
+        "resume": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Open the session resume picker."
         },
         "search": {
           "allOf": [
@@ -4977,6 +5015,7 @@
           "default": {
             "new_task": null,
             "rename": null,
+            "resume": null,
             "search": null,
             "stop": null,
             "toggle_grouping": null
@@ -6458,6 +6497,9 @@
         "content_item_kinds": {
           "type": "boolean"
         },
+        "context_management": {
+          "$ref": "#/definitions/FeatureToml_for_ContextManagementConfigToml"
+        },
         "current_time_reminder": {
           "$ref": "#/definitions/FeatureToml_for_CurrentTimeReminderConfigToml"
         },
@@ -6528,6 +6570,9 @@
           "type": "boolean"
         },
         "guardian_reuse_parent_compaction": {
+          "type": "boolean"
+        },
+        "guardian_thread_context": {
           "type": "boolean"
         },
         "guardianv2": {
@@ -6798,6 +6843,9 @@
           "type": "boolean"
         },
         "web_search_request": {
+          "type": "boolean"
+        },
+        "windows_sandbox_service": {
           "type": "boolean"
         },
         "workspace_dependencies": {

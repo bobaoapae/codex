@@ -5,8 +5,50 @@
 
 use super::*;
 use crate::app_backtrack::SIDE_EDIT_PREVIOUS_UNAVAILABLE_MESSAGE;
+use crate::keymap::bindings_for_action;
+use crate::keymap::keymap_action_ids;
 
 impl App {
+    pub(super) fn should_recover_vim_insert_escape(&self, key_event: KeyEvent) -> bool {
+        let active_contexts = self.active_keymap_contexts();
+        // Legacy terminals encode Alt+character and Escape+character identically. Active
+        // bindings and either stroke of a chord win; inactive bindings do not consume input.
+        cfg!(unix)
+            && !self.enhanced_keys_supported
+            && self.overlay.is_none()
+            && self.chat_widget.no_modal_or_popup_active()
+            && matches!(key_event.code, KeyCode::Char(_))
+            && matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+            && (key_event.modifiers == KeyModifiers::ALT
+                || key_event.modifiers == (KeyModifiers::ALT | KeyModifiers::SHIFT))
+            && self
+                .chat_widget
+                .should_handle_vim_insert_escape(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            // ChatWidget's fixed image-paste shortcut is not in the configurable keymap.
+            && !(key_event.kind == KeyEventKind::Press
+                && matches!(key_event.code, KeyCode::Char('v' | 'V')))
+            // Empty-draft agent navigation also has fixed legacy-terminal fallbacks.
+            && !(self.chat_widget.composer_text_with_pending().is_empty()
+                && (previous_agent_shortcut_matches(key_event, /*allow_word_motion_fallback*/ true)
+                    || next_agent_shortcut_matches(key_event, /*allow_word_motion_fallback*/ true)))
+            && !keymap_action_ids()
+                .filter(|action| active_contexts.contains(action.context))
+                .any(|action| {
+                    bindings_for_action(&self.keymap, action.context.config_name(), action.action)
+                        .is_some_and(|bindings| bindings.is_pressed(key_event))
+                })
+            && !matches!(
+                self.key_chord_matcher.clone().advance(
+                    key_event,
+                    &self.keymap.chords,
+                    active_contexts,
+                    tokio::time::Instant::now(),
+                ),
+                crate::keymap::KeyChordMatch::Pending(_)
+                    | crate::keymap::KeyChordMatch::Completed(_)
+            )
+    }
+
     pub(super) fn route_key_chord_event(
         &mut self,
         tui: &mut tui::Tui,
@@ -22,7 +64,7 @@ impl App {
         ) {
             crate::keymap::KeyChordMatch::PassThrough => {
                 if was_pending && !self.key_chord_matcher.is_pending() {
-                    self.chat_widget.set_footer_hint_override(/*items*/ None);
+                    self.set_key_chord_hint_override(/*items*/ None);
                 }
                 Some(key_event)
             }
@@ -30,7 +72,7 @@ impl App {
                 if self.backtrack.primed {
                     self.reset_backtrack_state();
                 }
-                self.chat_widget.set_footer_hint_override(Some(vec![
+                self.set_key_chord_hint_override(Some(vec![
                     (
                         format!("{} …", prefix.display_label()),
                         "waiting for next key".to_string(),
@@ -42,11 +84,11 @@ impl App {
                 None
             }
             crate::keymap::KeyChordMatch::Completed(dispatch_event) => {
-                self.chat_widget.set_footer_hint_override(/*items*/ None);
+                self.set_key_chord_hint_override(/*items*/ None);
                 Some(dispatch_event)
             }
             crate::keymap::KeyChordMatch::Cancelled => {
-                self.chat_widget.set_footer_hint_override(/*items*/ None);
+                self.set_key_chord_hint_override(/*items*/ None);
                 None
             }
             crate::keymap::KeyChordMatch::Ignored => None,
@@ -59,14 +101,23 @@ impl App {
             .key_chord_matcher
             .expire(contexts, tokio::time::Instant::now())
         {
-            self.chat_widget.set_footer_hint_override(/*items*/ None);
+            self.set_key_chord_hint_override(/*items*/ None);
         }
     }
 
     pub(super) fn cancel_pending_key_chord(&mut self) {
         if self.key_chord_matcher.cancel() {
-            self.chat_widget.set_footer_hint_override(/*items*/ None);
+            self.set_key_chord_hint_override(/*items*/ None);
         }
+    }
+
+    fn set_key_chord_hint_override(&mut self, items: Option<Vec<(String, String)>>) {
+        self.agents_overview
+            .view_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .key_chord_hint = items.clone();
+        self.chat_widget.set_footer_hint_override(items);
     }
 
     fn active_keymap_contexts(&self) -> crate::keymap::KeymapContextSet {

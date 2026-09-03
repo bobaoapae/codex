@@ -242,6 +242,8 @@ fn sample_thread_with_metadata(
     parent_thread_id: Option<String>,
 ) -> Thread {
     Thread {
+        originator: None,
+        environments: None,
         id: thread_id.to_string(),
         extra: None,
         session_id: format!("session-{thread_id}"),
@@ -859,6 +861,7 @@ fn plugin_measurements(rows: Vec<PluginMeasurementRow>) -> PluginMeasurementsInp
         thread_id: "thread-1".to_string(),
         turn_id: "turn-1".to_string(),
         item_id: "item-1".to_string(),
+        originator: "codex_cli_rs".to_string(),
         plugin_id: "sample@openai-curated".to_string(),
         execution_id: "execution-1".to_string(),
         operation: "security_scan".to_string(),
@@ -2795,6 +2798,7 @@ async fn plugin_measurement_batch_emits_directly_and_filters_invalid_rows() {
                     "execution_id": "execution-1",
                     "operation": "security_scan",
                     "measurement_name": "finding_count",
+                    "originator": "codex_cli_rs",
                     "number_value": 3.0,
                     "dimensions": {"severity": "high"},
                 },
@@ -2809,6 +2813,7 @@ async fn plugin_measurement_batch_emits_directly_and_filters_invalid_rows() {
                     "execution_id": "execution-1",
                     "operation": "security_scan",
                     "measurement_name": "files_scanned",
+                    "originator": "codex_cli_rs",
                     "number_value": 17.0,
                     "dimensions": null,
                 },

@@ -1,6 +1,7 @@
 mod shared;
 
 mod account;
+mod application;
 mod apps;
 mod artifact;
 mod attestation;
@@ -43,6 +44,7 @@ mod windows_sandbox;
 mod workspace_lease;
 
 pub use account::*;
+pub use application::*;
 pub use apps::*;
 pub use artifact::*;
 pub use attestation::*;

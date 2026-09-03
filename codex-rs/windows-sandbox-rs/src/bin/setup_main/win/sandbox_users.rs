@@ -7,10 +7,11 @@ use rand::rngs::SmallRng;
 use serde::Serialize;
 use std::ffi::OsStr;
 use std::ffi::c_void;
+use std::fs::File;
 use std::io::Write;
+use std::os::windows::io::FromRawHandle;
 use std::path::Path;
 use std::path::PathBuf;
-use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
 use windows_sys::Win32::Foundation::GENERIC_WRITE;
 use windows_sys::Win32::Foundation::GetLastError;
@@ -48,6 +49,9 @@ use codex_windows_sandbox::sandbox_dir;
 use codex_windows_sandbox::sandbox_secrets_dir;
 use codex_windows_sandbox::string_from_sid_bytes;
 use codex_windows_sandbox::to_wide;
+use codex_windows_sandbox::write_file_atomically;
+
+use super::SetupMode;
 
 const SID_USERS: &str = "S-1-5-32-545";
 
@@ -55,11 +59,13 @@ pub fn resolve_sandbox_users_group_sid() -> Result<Vec<u8>> {
     resolve_sid(SANDBOX_USERS_GROUP)
 }
 
-pub fn provision_sandbox_users(
+pub(super) fn provision_sandbox_users(
     codex_home: &Path,
     offline_username: &str,
     online_username: &str,
+    new_user_flags: u32,
     log: &mut dyn Write,
+    mode: SetupMode,
 ) -> Result<()> {
     if let Err(err) = ensure_sandbox_users_group() {
         let message = format!("failed to create local group {SANDBOX_USERS_GROUP}: {err}");
@@ -75,25 +81,36 @@ pub fn provision_sandbox_users(
     )?;
     let offline_password = random_password();
     let online_password = random_password();
-    ensure_sandbox_user(offline_username, &offline_password, log)?;
-    ensure_sandbox_user(online_username, &online_password, log)?;
+    ensure_sandbox_user(offline_username, &offline_password, new_user_flags, log)?;
+    ensure_sandbox_user(online_username, &online_password, new_user_flags, log)?;
     write_secrets(
         codex_home,
         offline_username,
         &offline_password,
         online_username,
         &online_password,
+        mode,
     )?;
     Ok(())
 }
 
-pub fn ensure_sandbox_user(username: &str, password: &str, log: &mut dyn Write) -> Result<()> {
-    ensure_local_user(username, password, log)?;
+pub fn ensure_sandbox_user(
+    username: &str,
+    password: &str,
+    new_user_flags: u32,
+    log: &mut dyn Write,
+) -> Result<()> {
+    ensure_local_user(username, password, new_user_flags, log)?;
     ensure_local_group_member(SANDBOX_USERS_GROUP, username)?;
     Ok(())
 }
 
-pub fn ensure_local_user(name: &str, password: &str, log: &mut dyn Write) -> Result<()> {
+pub fn ensure_local_user(
+    name: &str,
+    password: &str,
+    new_user_flags: u32,
+    log: &mut dyn Write,
+) -> Result<()> {
     let name_w = to_wide(OsStr::new(name));
     let pwd_w = to_wide(OsStr::new(password));
     unsafe {
@@ -104,7 +121,7 @@ pub fn ensure_local_user(name: &str, password: &str, log: &mut dyn Write) -> Res
             usri1_priv: USER_PRIV_USER,
             usri1_home_dir: std::ptr::null_mut(),
             usri1_comment: std::ptr::null_mut(),
-            usri1_flags: UF_SCRIPT | UF_DONT_EXPIRE_PASSWD,
+            usri1_flags: UF_SCRIPT | UF_DONT_EXPIRE_PASSWD | new_user_flags,
             usri1_script_path: std::ptr::null_mut(),
         };
         let status = NetUserAdd(
@@ -295,6 +312,7 @@ fn write_secrets(
     offline_pwd: &str,
     online_user: &str,
     online_pwd: &str,
+    mode: SetupMode,
 ) -> Result<()> {
     let secrets_dir = sandbox_secrets_dir(codex_home);
     std::fs::create_dir_all(&secrets_dir).map_err(|err| {
@@ -336,7 +354,13 @@ fn write_secrets(
             format!("serialize sandbox users failed: {err}"),
         ))
     })?;
-    std::fs::write(&users_path, users_json).map_err(|err| {
+    let write_result = match mode {
+        SetupMode::ProvisionOnly => write_file_atomically(&users_path, &users_json),
+        SetupMode::Full | SetupMode::InteractiveProvision | SetupMode::ReadAclsOnly => {
+            std::fs::write(&users_path, users_json).map_err(anyhow::Error::from)
+        }
+    };
+    write_result.map_err(|err| {
         anyhow::Error::new(SetupFailure::new(
             SetupErrorCode::HelperUsersFileWriteFailed,
             format!(
@@ -348,11 +372,19 @@ fn write_secrets(
     Ok(())
 }
 
-// Create the final marker path with its protected ACL before provisioning begins. The empty file
-// intentionally fails readiness checks while setup is in progress, and sandbox users cannot read,
-// modify, or replace it. Once every setup step succeeds, `commit_setup_marker` writes the valid
-// marker contents without changing the file's ACL.
-pub(super) fn prepare_setup_marker(codex_home: &Path, real_user: &str) -> Result<()> {
+/// Service provisioning retains the marker's exclusive handle; legacy setup reopens it at commit.
+pub(super) enum PreparedSetupMarker {
+    Retained(File),
+    Reopen,
+}
+
+// Create the final marker with its protected ACL. The empty file intentionally fails readiness
+// checks until setup succeeds. Only service provisioning pins it for the entire operation.
+pub(super) fn prepare_setup_marker(
+    codex_home: &Path,
+    real_user: &str,
+    mode: SetupMode,
+) -> Result<PreparedSetupMarker> {
     let marker_path = sandbox_dir(codex_home).join("setup_marker.json");
     match std::fs::remove_file(&marker_path) {
         Ok(()) => {}
@@ -429,13 +461,18 @@ pub(super) fn prepare_setup_marker(codex_home: &Path, real_user: &str) -> Result
             ),
         )));
     }
-    unsafe {
-        CloseHandle(marker_handle);
+    let file = unsafe { File::from_raw_handle(marker_handle as *mut c_void) };
+    match mode {
+        SetupMode::ProvisionOnly => Ok(PreparedSetupMarker::Retained(file)),
+        SetupMode::Full | SetupMode::InteractiveProvision | SetupMode::ReadAclsOnly => {
+            drop(file);
+            Ok(PreparedSetupMarker::Reopen)
+        }
     }
-    Ok(())
 }
 
 pub(super) fn commit_setup_marker(
+    file: PreparedSetupMarker,
     codex_home: &Path,
     offline_user: &str,
     online_user: &str,
@@ -459,7 +496,11 @@ pub(super) fn commit_setup_marker(
             format!("serialize setup marker failed: {err}"),
         ))
     })?;
-    std::fs::write(&marker_path, marker_json).map_err(|err| {
+    let write_result = match file {
+        PreparedSetupMarker::Retained(mut file) => file.write_all(&marker_json),
+        PreparedSetupMarker::Reopen => std::fs::write(&marker_path, marker_json),
+    };
+    write_result.map_err(|err| {
         anyhow::Error::new(SetupFailure::new(
             SetupErrorCode::HelperSetupMarkerWriteFailed,
             format!(

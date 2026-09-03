@@ -104,6 +104,7 @@ members = [
     "tools",
     "v8-poc",
     "websocket-client",
+    "windows-sandbox-service",
     "worktree",
     "workload-identity",
     "utils/absolute-path",
@@ -156,12 +157,14 @@ resolver = "2"
 # chat), so the side chat fails with "Forking is not available for threads using
 # paginated history yet."
 #
-# Pinned to the version of the `@openai/codex` npm wrapper that vendors this
-# binary, so the two never disagree. Our upstream base (88f776588f, 30/08) is
-# newer than the rust-v0.146.1 tag (05/08), so this understates rather than
-# overstates what the build contains. Re-check after a sync that moves the
-# wrapper.
-version = "0.146.1"
+# Pinned to the latest published `@openai/codex` release, so the version this
+# binary reports over the app-server handshake is one the server recognizes --
+# upstream leaves this at 0.0.0 on main and stamps it only when a release tag
+# is cut, and the server-side gates reject that. Our upstream base
+# (280ae8b9fc, 03/09) is newer than the rust-v0.153.1 tag, so this understates
+# rather than overstates what the build contains. Re-check after every sync:
+# `gh release list --repo openai/codex` / `npm view @openai/codex version`.
+version = "0.153.1"
 # Track the edition for all workspace crates in one place. Individual
 # crates can still override this value, but keeping it here means new
 # crates created with `cargo new -w ...` automatically inherit the 2024
@@ -430,7 +433,7 @@ rcgen = { version = "0.14.7", default-features = false, features = [
 regex = "1.12.3"
 regex-lite = "0.1.8"
 reqwest = { version = "0.12", features = ["cookies"] }
-rmcp = { version = "=3.1.3", default-features = false }
+rmcp = { version = "=3.2.0", default-features = false }
 runfiles = { git = "https://github.com/dzbarsky/rules_rust", rev = "b56cbaa8465e74127f1ea216f813cd377295ad81" }
 rustix = { version = "1.1.4", features = ["net"] }
 rustls = { version = "0.23", default-features = false, features = [

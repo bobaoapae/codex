@@ -446,6 +446,7 @@ impl App {
                 (session, turns, false)
             }
         };
+        self.agents_overview.activity.remove(&thread_id);
         let recap_progress =
             if live_attached && let Some(channel) = self.thread_event_channels.remove(&thread_id) {
                 let store = channel.store.lock().await;
@@ -701,6 +702,7 @@ impl App {
     pub(super) fn reset_thread_event_state(&mut self) {
         self.abort_all_thread_event_listeners();
         self.thread_event_channels.clear();
+        self.agents_overview.activity.clear();
         self.agent_navigation.clear();
         self.side_threads.clear();
         self.active_thread_id = None;
@@ -799,8 +801,18 @@ impl App {
             }
             Err(err) if self.recover_transport_error(&err) => {}
             Err(err) => {
+                let warnings = self
+                    .transcript_cells
+                    .iter()
+                    .find_map(|cell| {
+                        cell.as_any()
+                            .downcast_ref::<history_cell::StartupWarningsCell>()
+                    })
+                    .filter(|cell| cell.pending_header)
+                    .map(|cell| format!("\n\nStartup warnings:\n{}", cell.messages.join("\n")))
+                    .unwrap_or_default();
                 return Err(color_eyre::eyre::eyre!(
-                    "Failed to start a fresh session through the app server: {err}"
+                    "Failed to start a fresh session through the app server: {err}{warnings}"
                 ));
             }
         }
@@ -1158,7 +1170,7 @@ impl App {
                         .await;
                     }
                     Err(err) => {
-                        self.chat_widget.add_error_message(format!(
+                        self.add_session_picker_error(format!(
                             "Failed to attach to resumed app-server thread: {err}"
                         ));
                     }
@@ -1166,7 +1178,7 @@ impl App {
             }
             Err(err) => {
                 let path_display = target_session.display_label();
-                self.chat_widget.add_error_message(format!(
+                self.add_session_picker_error(format!(
                     "Failed to resume session from {path_display}: {err}"
                 ));
             }

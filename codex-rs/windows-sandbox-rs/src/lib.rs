@@ -69,6 +69,8 @@ mod dpapi;
 #[cfg(target_os = "windows")]
 mod env;
 #[cfg(target_os = "windows")]
+mod file_write;
+#[cfg(target_os = "windows")]
 mod framed_io;
 #[cfg(target_os = "windows")]
 mod helper_materialization;
@@ -78,6 +80,8 @@ mod hide_users;
 mod identity;
 #[cfg(target_os = "windows")]
 mod logging;
+#[cfg(target_os = "windows")]
+mod no_reparse_dir;
 #[cfg(target_os = "windows")]
 mod path_normalization;
 #[cfg(target_os = "windows")]
@@ -100,6 +104,8 @@ mod winutil;
 mod workspace_acl;
 
 mod deny_read_resolver;
+#[cfg(target_os = "windows")]
+mod uninstall_windows;
 
 #[cfg(target_os = "windows")]
 mod conpty;
@@ -121,6 +127,12 @@ mod setup;
 
 #[cfg(target_os = "windows")]
 mod setup_error;
+
+#[cfg(target_os = "windows")]
+mod setup_launch;
+
+#[cfg(target_os = "windows")]
+mod setup_mutex;
 
 #[cfg(target_os = "windows")]
 mod spawn_prep;
@@ -195,6 +207,8 @@ pub use elevated_impl::ElevatedSandboxProfileCaptureRequest;
 #[cfg(target_os = "windows")]
 pub use elevated_impl::run_windows_sandbox_capture_for_permission_profile as run_windows_sandbox_capture_for_permission_profile_elevated;
 #[cfg(target_os = "windows")]
+pub use file_write::write_file_atomically;
+#[cfg(target_os = "windows")]
 pub use helper_materialization::resolve_current_exe_for_launch;
 #[cfg(target_os = "windows")]
 pub use helper_materialization::resolve_exe_for_launch;
@@ -248,6 +262,16 @@ pub use logging::log_file_path_for_utc_date;
 pub use logging::log_note;
 #[cfg(target_os = "windows")]
 pub use logging::log_writer;
+#[cfg(target_os = "windows")]
+pub use logging::setup_log_writer;
+#[cfg(target_os = "windows")]
+pub use no_reparse_dir::DirectoryOpenDisposition;
+#[cfg(target_os = "windows")]
+pub use no_reparse_dir::create_directory_guard;
+#[cfg(target_os = "windows")]
+pub use no_reparse_dir::open_directory_no_reparse;
+#[cfg(target_os = "windows")]
+pub use no_reparse_dir::validate_local_directory_path;
 #[cfg(target_os = "windows")]
 pub use path_normalization::canonicalize_path;
 #[cfg(target_os = "windows")]
@@ -305,6 +329,8 @@ pub use setup::SetupRootOverrides;
 #[cfg(target_os = "windows")]
 pub use setup::run_elevated_provisioning_setup;
 #[cfg(target_os = "windows")]
+pub use setup::run_elevated_provisioning_setup_with_retained_handles;
+#[cfg(target_os = "windows")]
 pub use setup::run_elevated_setup;
 #[cfg(target_os = "windows")]
 pub use setup::run_setup_refresh;
@@ -333,6 +359,8 @@ pub use setup_error::setup_error_path;
 #[cfg(target_os = "windows")]
 pub use setup_error::write_setup_error_report;
 #[cfg(target_os = "windows")]
+pub use setup_mutex::acquire_sandbox_setup_lock;
+#[cfg(target_os = "windows")]
 pub use stdio_bridge::forward_sandbox_session_stdio;
 #[cfg(target_os = "windows")]
 #[doc(hidden)]
@@ -360,6 +388,8 @@ pub use unified_exec::spawn_windows_sandbox_session_for_level;
 #[cfg(target_os = "windows")]
 pub use unified_exec::spawn_windows_sandbox_session_legacy;
 #[cfg(target_os = "windows")]
+pub use uninstall_windows::clean_up_packaged_windows_sandbox;
+#[cfg(target_os = "windows")]
 pub use wfp::install_wfp_filters_for_account;
 #[cfg(target_os = "windows")]
 pub use wfp_setup::install_wfp_filters;
@@ -376,9 +406,13 @@ pub use winutil::SANDBOX_USERS_GROUP;
 #[cfg(target_os = "windows")]
 pub use winutil::ensure_sandbox_users_group;
 #[cfg(target_os = "windows")]
+pub use winutil::local_user_flags;
+#[cfg(target_os = "windows")]
 pub use winutil::quote_windows_arg;
 #[cfg(target_os = "windows")]
 pub use winutil::resolve_sid;
+#[cfg(target_os = "windows")]
+pub use winutil::set_local_user_flags;
 #[cfg(target_os = "windows")]
 pub use winutil::string_from_sid_bytes;
 #[cfg(target_os = "windows")]

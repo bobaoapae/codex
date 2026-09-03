@@ -212,6 +212,7 @@ mod agents_fleet_actions;
 mod agents_fleet_tests;
 mod agents_fleet_view;
 mod agents_overview;
+mod agents_overview_details;
 mod agents_overview_threads;
 mod agents_overview_view;
 pub(crate) use agents_overview::AGENTS_OVERVIEW_VIEW_ID;
@@ -233,6 +234,7 @@ mod input;
 /// FORK: `/jobs` — durable transient job history and controls.
 mod jobs_picker;
 mod loaded_threads;
+mod misalignment_policy;
 mod pending_interactive_replay;
 mod permission_shortcuts;
 mod pets;
@@ -248,9 +250,11 @@ mod resize_reflow;
 mod resume_config;
 mod safety_buffering;
 mod session_lifecycle;
+mod session_picker;
 mod side;
 mod startup;
 mod startup_prompts;
+mod startup_warnings;
 mod thread_event_buffer;
 mod thread_events;
 mod thread_goal_actions;
@@ -846,7 +850,16 @@ impl App {
             self.handle_draw_pre_render(tui, screen_size)?;
         }
 
-        let event = if let TuiEvent::Key(key_event) = event {
+        let event = if let TuiEvent::Key(mut key_event) = event {
+            let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+            if self.should_recover_vim_insert_escape(key_event) {
+                // Restore both strokes before chords or global shortcuts can consume them.
+                if let Some(escape) = self.route_key_chord_event(tui, escape) {
+                    self.handle_key_event(tui, app_server, escape).await;
+                }
+                key_event.modifiers.remove(KeyModifiers::ALT);
+            }
+
             let Some(key_event) = self.route_key_chord_event(tui, key_event) else {
                 return Ok(AppRunControl::Continue);
             };

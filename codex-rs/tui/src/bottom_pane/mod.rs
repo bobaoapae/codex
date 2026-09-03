@@ -209,6 +209,7 @@ pub(crate) use chat_composer_history::HistoryEntry;
 
 use crate::status_indicator_widget::StatusDetailsCapitalization;
 use crate::status_indicator_widget::StatusIndicatorWidget;
+#[cfg(test)]
 pub(crate) use experimental_features_view::ExperimentalFeatureItem;
 pub(crate) use experimental_features_view::ExperimentalFeaturesView;
 pub(crate) use list_selection_view::SELECTION_TOGGLE_BLOCKED_PREFIX;
@@ -737,14 +738,15 @@ impl BottomPane {
             if self.handle_inline_banner_key(key_event) {
                 return InputResult::None;
             }
-            // If a task is running and a status line is visible, allow the
-            // configured action to interrupt even while the composer has focus.
+            // Allow the configured interrupt while a task is running, even when its
+            // status row is hidden or the composer has focus.
             // When a popup is active, prefer dismissing it over interrupting the task.
-            if self.should_interrupt_running_task(key_event)
-                && let Some(status) = &self.status
-            {
-                // Send Op::Interrupt
-                status.interrupt();
+            if self.should_interrupt_running_task(key_event) {
+                if let Some(status) = &self.status {
+                    status.interrupt();
+                } else {
+                    self.app_event_tx.interrupt();
+                }
                 self.request_redraw();
                 return InputResult::None;
             }
@@ -873,10 +875,10 @@ impl BottomPane {
     }
 
     fn schedule_active_view_frame(&self) {
-        if let Some(delay) = self
-            .active_view()
-            .and_then(BottomPaneView::next_frame_delay)
-        {
+        if let Some(delay) = self.active_view().map_or_else(
+            || self.composer.footer_flash_delay(),
+            BottomPaneView::next_frame_delay,
+        ) {
             self.request_redraw_in(delay);
         }
     }
@@ -1498,7 +1500,6 @@ impl BottomPane {
             && !(is_agent_command && key_event.code == KeyCode::Esc)
             && self.no_modal_or_popup_active()
             && !self.composer_should_handle_vim_insert_escape(key_event)
-            && self.status_widget().is_some()
     }
 
     pub(crate) fn terminal_title_requires_action(&self) -> bool {
@@ -1963,6 +1964,12 @@ impl BottomPane {
 
     pub(crate) fn set_status_line(&mut self, status_line: Option<Line<'static>>) {
         if self.composer.set_status_line(status_line) {
+            self.request_redraw();
+        }
+    }
+
+    pub(crate) fn set_luna_reserve_active(&mut self, active: bool) {
+        if self.composer.set_luna_reserve_active(active) {
             self.request_redraw();
         }
     }
@@ -3206,6 +3213,13 @@ mod tests {
             matches!(rx.try_recv(), Ok(AppEvent::CodexOp(Op::Interrupt))),
             "expected Esc to send Op::Interrupt while a task is running"
         );
+
+        pane.hide_status_indicator();
+        pane.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppEvent::CodexOp(Op::Interrupt))
+        ));
     }
 
     #[test]
@@ -3230,6 +3244,13 @@ mod tests {
             matches!(rx.try_recv(), Ok(AppEvent::CodexOp(Op::Interrupt))),
             "expected configured key to interrupt while `/subagents` is being edited"
         );
+
+        pane.hide_status_indicator();
+        pane.handle_key_event(KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppEvent::CodexOp(Op::Interrupt))
+        ));
     }
 
     #[test]

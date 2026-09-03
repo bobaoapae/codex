@@ -47,6 +47,7 @@ use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::openai_models::GuardianV2ModelConfig;
 use codex_protocol::openai_models::GuardianV2TranscriptModelConfig;
+use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
@@ -74,6 +75,7 @@ use super::should_classify_tool;
 use crate::async_scorer::config::CLASSIFICATION_OUTPUT_INSTRUCTIONS;
 use crate::async_scorer::config::DEFAULT_MODEL_CONTEXT_ITEM_TOKENS;
 use crate::async_scorer::config::DEFAULT_PARENT_COMPACTION_TOKENS;
+use crate::async_scorer::config::GuardianV2Config;
 use crate::async_scorer::config::GuardianV2ReviewScope;
 use crate::async_scorer::metrics::CLASSIFICATION_DURATION_METRIC;
 use crate::async_scorer::metrics::CLASSIFICATION_METRIC;
@@ -229,6 +231,13 @@ async fn installed_extension_reconnects_after_auth_refresh() -> Result<()> {
     let progress = thread_store
         .get::<GuardianV2ScoreProgress>()
         .expect("Guardian v2 should initialize");
+    let mut model = test
+        .thread_manager
+        .get_models_manager()
+        .get_model_info("gpt-5.5", &config.to_models_manager_config())
+        .await;
+    model.node_repl_auto_review_required = true;
+    thread_store.insert(model);
     let turn_store = ExtensionData::new("turn-1");
     let tool_name = ToolName::namespaced("mcp__node_repl__", "js");
     let payload = ToolPayload::Function {
@@ -359,9 +368,13 @@ struct TestConversationHistory(Vec<ResponseItem>);
 struct TestRetainedHistory {
     current: TestConversationHistory,
     retained: Vec<ResponseItem>,
+    compaction_model_hash: Option<String>,
 }
 
 impl ConversationHistorySnapshot for TestRetainedHistory {
+    fn latest_compaction_model_hash(&self) -> Option<&str> {
+        self.compaction_model_hash.as_deref()
+    }
     fn history_version(&self) -> u64 {
         self.current.history_version()
     }
@@ -550,6 +563,14 @@ async fn computer_use_only_scores_cannot_approve_other_actions() -> Result<()> {
 
     let fixture = GuardianFailureFixture::new().await?;
     let thread_store = fixture.test.codex.thread_extension_data();
+    let mut model = fixture
+        .test
+        .thread_manager
+        .get_models_manager()
+        .get_model_info("gpt-5.5", &fixture.test.config.to_models_manager_config())
+        .await;
+    model.node_repl_auto_review_required = true;
+    thread_store.insert(model);
     let mut config = thread_store
         .get::<crate::async_scorer::config::GuardianV2Config>()
         .expect("Guardian v2 should have initialized")
@@ -686,6 +707,41 @@ async fn computer_use_only_scores_cannot_approve_other_actions() -> Result<()> {
             fast_decision_metric("deferred", "missing_score"),
         ]
     );
+
+    let mut model = thread_store.get::<ModelInfo>().unwrap().as_ref().clone();
+    model.node_repl_auto_review_required = false;
+    thread_store.insert(model.clone());
+    fixture
+        .score_tool(ToolName::namespaced("mcp__node_repl__", "js"))
+        .await;
+    assert!(
+        progress.latest_failed_tool_call.load(Ordering::Acquire)
+            > progress.latest_scored_tool_call.load(Ordering::Acquire)
+    );
+    for required in [false, true] {
+        model.node_repl_auto_review_required = required;
+        thread_store.insert(model.clone());
+        // Also reject a low score published by an older, in-flight classifier.
+        thread_store.insert(SecurityRiskScore {
+            scores: BTreeMap::from([("action_risk".to_owned(), 0.0)]),
+            call_id: None,
+            action: None,
+            sampled_at: None,
+        });
+        assert_eq!(
+            fixture
+                .registry
+                .fast_approval_decision(
+                    &fixture.session_store,
+                    thread_store,
+                    r#"{"tool":"mcp_tool_call","server":"node_repl","tool_name":"js"}"#,
+                    /*extension_metrics*/ None,
+                )
+                .await,
+            None,
+            "switching back to a reviewed model must not revive a skipped score"
+        );
+    }
 
     Ok(())
 }
@@ -1046,10 +1102,16 @@ struct GuardianFailureFixture {
 
 impl GuardianFailureFixture {
     async fn new() -> Result<Self> {
-        let (_, test, registry) = sample_conversation_history(
+        Self::with_config("").await
+    }
+
+    async fn with_config(guardian_config: &str) -> Result<Self> {
+        let (_, test, registry) = sample_configured_conversation_history(
             Vec::new(),
             r#"{"path":"README.md"}"#,
             Some(TEST_GUARDIAN_POLICY),
+            guardian_config,
+            /*model_defaults*/ None,
         )
         .await?;
         let thread_store = test.codex.thread_extension_data();
@@ -2380,6 +2442,110 @@ async fn cached_score_survives_compaction_and_internal_context_but_not_user_inpu
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incompatible_compaction_blocks_cached_score_and_initial_cua_allowance() -> Result<()> {
+    assert_compaction_approval_policy(/*thread_context_enabled*/ true).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_incompatible_compaction_preserves_cached_score_and_initial_cua_allowance()
+-> Result<()> {
+    assert_compaction_approval_policy(/*thread_context_enabled*/ false).await
+}
+
+async fn assert_compaction_approval_policy(thread_context_enabled: bool) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let fixture = GuardianFailureFixture::with_config(&format!(
+        "[features]\nguardian_thread_context = {thread_context_enabled}\n"
+    ))
+    .await?;
+    let thread_store = fixture.test.codex.thread_extension_data();
+    thread_store.insert(SecurityRiskScore {
+        scores: BTreeMap::from([("action_risk".to_owned(), 0.0)]),
+        call_id: None,
+        action: None,
+        sampled_at: None,
+    });
+    assert_eq!(
+        fixture
+            .registry
+            .fast_approval_decision(
+                &fixture.session_store,
+                thread_store,
+                "review action",
+                /*extension_metrics*/ None
+            )
+            .await,
+        Some(ReviewDecision::Approved)
+    );
+    let authorization = fixture.test.codex.guardian_authorization_version().await;
+    fixture
+        .test
+        .codex
+        .inject_response_items(vec![ResponseItem::Compaction {
+            id: Some(ResponseItemId::from_server(
+                "incompatible-checkpoint".to_owned(),
+            )),
+            encrypted_content: "opaque parent summary".to_owned(),
+            internal_chat_message_metadata_passthrough: None,
+        }])
+        .await?;
+    let mut model = (*thread_store
+        .get::<ModelInfo>()
+        .expect("parent model metadata"))
+    .clone();
+    model.comp_hash = Some("incompatible-parent".to_owned());
+    model.node_repl_auto_review_required = true;
+    thread_store.insert(model);
+    assert_eq!(
+        fixture.test.codex.guardian_authorization_version().await,
+        authorization
+    );
+    // No new sample runs: only the enabled path rejects cached and initial-call approvals.
+    for (scope, prompt) in [
+        (
+            GuardianV2ReviewScope::Standard {
+                sandboxed_exec_commands: true,
+            },
+            "review action",
+        ),
+        (
+            GuardianV2ReviewScope::ComputerUseOnly,
+            r#"{"tool":"mcp_tool_call","server":"node_repl","connector_id":"node_repl","tool_name":"js"}"#,
+        ),
+    ] {
+        let mut config = (*thread_store
+            .get::<GuardianV2Config>()
+            .expect("Guardian configuration"))
+        .clone();
+        config.review_scope = scope;
+        thread_store.insert(config);
+        thread_store
+            .get::<GuardianV2ScoreProgress>()
+            .expect("score progress")
+            .js_executions
+            .store(/*val*/ 1, Ordering::Release);
+        assert_eq!(
+            fixture
+                .registry
+                .fast_approval_decision(
+                    &fixture.session_store,
+                    thread_store,
+                    prompt,
+                    /*extension_metrics*/ None
+                )
+                .await,
+            (!thread_context_enabled).then_some(ReviewDecision::Approved)
+        );
+        assert_eq!(
+            thread_store.remove::<StrictReviewReason>().as_deref(),
+            thread_context_enabled.then_some(&StrictReviewReason::IncompatibleCompaction)
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn contributor_counts_failed_thread_lookups_toward_score_lag() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -2813,11 +2979,26 @@ async fn contributor_sends_compacted_conversation_history_to_luna() -> Result<()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn contributor_reuses_the_latest_compatible_parent_compaction() -> Result<()> {
+    assert_parent_compaction_reuse(/*thread_context_enabled*/ true).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_contributor_reuses_the_latest_compatible_parent_compaction() -> Result<()> {
+    assert_parent_compaction_reuse(/*thread_context_enabled*/ false).await
+}
+
+async fn assert_parent_compaction_reuse(thread_context_enabled: bool) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let thread_server = responses::start_mock_server().await;
     let test = test_codex()
-        .with_config(|config| config.approvals_reviewer = ApprovalsReviewer::AutoReview)
+        .with_config(move |config| {
+            config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+            config
+                .features
+                .set_enabled(Feature::GuardianThreadContext, thread_context_enabled)
+                .expect("test context mode");
+        })
         .with_pre_build_hook(|home| {
             std::fs::write(
                 home.join("config.toml"),
@@ -2915,6 +3096,7 @@ async fn contributor_reuses_the_latest_compatible_parent_compaction() -> Result<
     let conversation_history = TestRetainedHistory {
         retained,
         current: conversation_history,
+        compaction_model_hash: parent_model.comp_hash.clone(),
     };
     thread_store.insert(parent_model);
 
@@ -2975,6 +3157,8 @@ async fn contributor_reuses_the_latest_compatible_parent_compaction() -> Result<
     })
     .await?;
     assert_eq!(previous_score.scores.get("action_risk"), Some(&0.0));
+    // Raw injection did not attach producer provenance to the live checkpoint.
+    // The sample's mock snapshot cannot make that live checkpoint safe for approval.
     assert_eq!(
         registry
             .fast_approval_decision(
@@ -2984,7 +3168,7 @@ async fn contributor_reuses_the_latest_compatible_parent_compaction() -> Result<
                 /*extension_metrics*/ None,
             )
             .await,
-        Some(ReviewDecision::Approved)
+        (!thread_context_enabled).then_some(ReviewDecision::Approved),
     );
 
     let oversized_compaction = ResponseItem::Compaction {
@@ -3003,10 +3187,13 @@ async fn contributor_reuses_the_latest_compatible_parent_compaction() -> Result<
             tool_name: &tool_name,
             mcp_tool: None,
             payload: &tool_payload,
-            conversation_history: Arc::new(TestConversationHistory(vec![
-                latest_compaction,
-                oversized_compaction,
-            ])),
+            conversation_history: Arc::new(TestRetainedHistory {
+                current: TestConversationHistory(vec![latest_compaction, oversized_compaction]),
+                retained: Vec::new(),
+                compaction_model_hash: thread_store
+                    .get::<ModelInfo>()
+                    .and_then(|model| model.comp_hash.clone()),
+            }),
             source: ToolCallSource::Direct,
         })
         .await;
@@ -3072,7 +3259,7 @@ async fn contributor_can_disable_parent_compaction_reuse() -> Result<()> {
             internal_chat_message_metadata_passthrough: None,
         },
     ];
-    let configuration = "[features.guardianv2]\nenabled = true\nreuse_parent_compaction = false\nmax_parent_compaction_tokens = 256\n";
+    let configuration = "[features]\nguardian_thread_context = true\n\n[features.guardianv2]\nenabled = true\nreuse_parent_compaction = false\nmax_parent_compaction_tokens = 256\n";
     let (request, test, _registry) = sample_configured_conversation_history(
         conversation_history,
         r#"{"path":"README.md"}"#,

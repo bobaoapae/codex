@@ -362,7 +362,7 @@ impl ManagedClientStartup {
                     }
                 };
                 start_server_task(
-                    server_name,
+                    server_name.clone(),
                     client,
                     StartServerTaskParams {
                         is_codex_apps_mcp_server,
@@ -385,6 +385,10 @@ impl ManagedClientStartup {
                 Ok(result) => result,
                 Err(CancelErr::Cancelled) => Err(StartupOutcomeError::Cancelled),
             };
+            // Log once per startup attempt, including discovery without startup notifications.
+            if let Err(StartupOutcomeError::Failed { error, .. }) = &outcome {
+                warn!(server_name, %error, "MCP server startup failed");
+            }
             if outcome.is_ok()
                 && let Some(refresh_start) = refresh_start
             {
@@ -573,17 +577,17 @@ impl AsyncManagedClient {
             })
     }
 
-    pub(crate) async fn listed_tools(&self) -> Option<Vec<ToolInfo>> {
+    pub(crate) async fn listed_tools(&self) -> Result<Vec<ToolInfo>, StartupOutcomeError> {
         // Plugin provenance is resolved per-session rather than stored in shared cache payloads.
         if !self.startup_complete.load(Ordering::Acquire)
             && let Some(startup_tools) = self.cached_tools()
         {
-            Some(startup_tools)
+            Ok(startup_tools)
         } else {
             match self.client().await {
-                Ok(client) => Some(client.listed_tools()),
-                Err(_) if self.is_codex_apps_mcp_server => self.cached_tools(),
-                Err(_) => None,
+                Ok(client) => Ok(client.listed_tools()),
+                Err(error) if self.is_codex_apps_mcp_server => self.cached_tools().ok_or(error),
+                Err(error) => Err(error),
             }
         }
     }
@@ -618,7 +622,7 @@ impl From<anyhow::Error> for StartupOutcomeError {
     fn from(error: anyhow::Error) -> Self {
         let is_authentication_required = is_authentication_required_error(&error);
         Self::Failed {
-            error: error.to_string(),
+            error: format!("{error:#}"),
             is_authentication_required,
         }
     }
@@ -1084,11 +1088,6 @@ pub(crate) async fn make_rmcp_client(
     runtime_auth_provider: Option<SharedAuthProvider>,
     protocol_mode: McpProtocolMode,
 ) -> Result<RmcpClient, StartupOutcomeError> {
-    if oauth_refresh_mode == McpOAuthRefreshMode::Coordinated {
-        warn!(
-            "MCP OAuth refresh coordination is not available in this build; using legacy refresh"
-        );
-    }
     let config = server.config().clone();
     if matches!(config.auth, McpServerAuth::ChatGpt)
         && !config.is_local_environment()
@@ -1211,6 +1210,7 @@ pub(crate) async fn make_rmcp_client(
                 runtime_auth_provider,
                 protocol_mode,
                 redirect_mode,
+                oauth_refresh_mode,
             )
             .await
             .map_err(StartupOutcomeError::from)

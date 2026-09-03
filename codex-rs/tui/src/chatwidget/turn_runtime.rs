@@ -36,6 +36,12 @@ impl ChatWidget {
                 || self.review.is_review_mode
                 || self.mcp_startup_status.is_some(),
         );
+        if self.mcp_startup_status.is_some()
+            && !self.turn_lifecycle.agent_turn_running
+            && !self.review.is_review_mode
+        {
+            self.bottom_pane.hide_status_indicator();
+        }
         self.refresh_status_surfaces();
     }
 
@@ -83,6 +89,7 @@ impl ChatWidget {
         self.quit_shortcut_expires_at = None;
         self.quit_shortcut_key = None;
         self.update_task_running_state();
+        self.bottom_pane.ensure_status_indicator();
         self.bottom_pane.reset_status_timer(Duration::ZERO);
         self.status_state.retry_status_header = None;
         self.clear_active_hook_cell();
@@ -419,6 +426,7 @@ impl ChatWidget {
     }
 
     pub(super) fn on_rate_limit_error(&mut self, error_kind: RateLimitErrorKind, message: String) {
+        self.invalidate_ordinary_usage_recovery();
         // on_error can drain queued input, before the asynchronous recovery read completes.
         self.input_queue.rate_limit_recovery_pending = self.has_chatgpt_account;
         let usage_limit_error = matches!(error_kind, RateLimitErrorKind::UsageLimit);

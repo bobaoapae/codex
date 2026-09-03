@@ -18,10 +18,11 @@ use crate::codex_thread::BackgroundTerminalInfo;
 use crate::exec_env::CODEX_PERMISSION_PROFILE_ENV_VAR;
 use crate::exec_env::CODEX_SESSION_ID_ENV_VAR;
 use crate::exec_env::CODEX_THREAD_ID_ENV_VAR;
+use crate::exec_env::CODEX_VERSION_ENV_VAR;
 use crate::exec_env::create_env;
 use crate::exec_env::inject_apply_patch_env;
 use crate::exec_env::inject_permission_profile_env;
-use crate::exec_env::inject_session_id_env;
+use crate::exec_env::inject_session_env;
 use crate::exec_policy::ExecApprovalRequest;
 use crate::guardian::GuardianReviewContext;
 use crate::plugins::metrics::finish_and_track_measurements;
@@ -147,6 +148,7 @@ pub(super) fn exec_env_policy_from_shell_policy(
         .collect::<Vec<_>>();
     exclude.extend([
         CODEX_PERMISSION_PROFILE_ENV_VAR.to_string(),
+        CODEX_VERSION_ENV_VAR.to_string(),
         codex_apply_patch::CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS_ENV_VAR.to_string(),
         PLUGIN_METRICS_OUTPUT_ENV_VAR.to_string(),
     ]);
@@ -154,6 +156,7 @@ pub(super) fn exec_env_policy_from_shell_policy(
     r#set.retain(|key, _| {
         ![
             CODEX_PERMISSION_PROFILE_ENV_VAR,
+            CODEX_VERSION_ENV_VAR,
             codex_apply_patch::CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS_ENV_VAR,
             PLUGIN_METRICS_OUTPUT_ENV_VAR,
         ]
@@ -185,6 +188,7 @@ fn env_overlay_for_exec_server(
                 && (matches!(
                     key.as_str(),
                     CODEX_PERMISSION_PROFILE_ENV_VAR
+                        | CODEX_VERSION_ENV_VAR
                         | codex_apply_patch::CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS_ENV_VAR
                 ) || local_policy_env.get(*key) != Some(*value))
         })
@@ -222,6 +226,7 @@ fn exec_server_env_for_request(
 fn exec_server_params_for_request(
     process_id: i32,
     request: &ExecRequest,
+    tool_ctx: Option<&ToolCtx>,
     windows_sandbox_proxy_settings_mode: codex_sandboxing::WindowsSandboxProxySettingsMode,
     tty: bool,
 ) -> codex_exec_server::ExecParams {
@@ -240,6 +245,10 @@ fn exec_server_params_for_request(
         };
     codex_exec_server::ExecParams {
         process_id: exec_server_process_id.into(),
+        metadata: tool_ctx.map(|ctx| codex_exec_server::ExecMetadata {
+            thread_id: Some(ctx.session.thread_id()),
+            tool_call_id: Some(ctx.call_id.clone()),
+        }),
         argv: request.command.clone(),
         cwd: request.cwd.clone(),
         env_policy,
@@ -1527,6 +1536,7 @@ impl UnifiedExecProcessManager {
     pub(crate) async fn open_session_with_exec_env(
         &self,
         process_id: i32,
+        tool_ctx: &ToolCtx,
         command: SandboxCommand,
         options: ExecOptions,
         attempt: &SandboxAttempt<'_>,
@@ -1559,6 +1569,7 @@ impl UnifiedExecProcessManager {
         self.open_session_with_prepared_exec_env(
             process_id,
             &request,
+            Some(tool_ctx),
             windows_sandbox_proxy_settings_mode,
             network_policy_decider,
             tty,
@@ -1583,6 +1594,7 @@ impl UnifiedExecProcessManager {
         &self,
         process_id: i32,
         request: &ExecRequest,
+        tool_ctx: Option<&ToolCtx>,
         windows_sandbox_proxy_settings_mode: codex_sandboxing::WindowsSandboxProxySettingsMode,
         network_policy_decider: Option<Arc<dyn NetworkPolicyDecider>>,
         tty: bool,
@@ -1602,6 +1614,7 @@ impl UnifiedExecProcessManager {
             let params = exec_server_params_for_request(
                 process_id,
                 request,
+                tool_ctx,
                 windows_sandbox_proxy_settings_mode,
                 tty,
             );
@@ -1734,7 +1747,7 @@ impl UnifiedExecProcessManager {
             CODEX_THREAD_ID_ENV_VAR.to_string(),
             context.session.thread_id.to_string(),
         );
-        inject_session_id_env(&mut env, context.session.session_id());
+        inject_session_env(&mut env, context.session.session_id());
         inject_apply_patch_env(&mut env, &turn.config.features);
         let active_permission_profile = request.turn_environment.active_permission_profile();
         inject_permission_profile_env(&mut env, active_permission_profile.as_ref());

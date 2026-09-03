@@ -206,6 +206,7 @@ mod tests {
             preview: String::new(),
             name: None,
             model_provider: "mock".to_string(),
+            originator: Some("mock".to_string()),
             model: None,
             reasoning_effort: None,
             created_at: Utc::now(),
