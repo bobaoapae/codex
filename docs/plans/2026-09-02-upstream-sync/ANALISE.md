@@ -641,3 +641,37 @@ Dois detalhes úteis que saíram daí: o listener websocket expõe `GET /readyz`
 imediato (sinal de prontidão melhor do que fazer scan do banner em stderr), e o keybinding global
 `tui.keymap.global.open_agents` vem **desligado** por omissão (`built_in_defaults()` dá
 `default_bindings![]`), portanto o slash command é o único gatilho sem override de config.
+
+## Fase 6.1 — a metade testável, provada por contrafactual
+
+O que a Fase 6.1 pede em concreto é *"reinstalar o plugin pela CLI com o Desktop aberto e retomar de
+novo: recarrega sem reiniciar (prova do #42284)"*. A propriedade — **um app-server de vida longa segue
+uma troca de versão feita fora do processo** — não precisa do Desktop para ser exercida: precisa de um
+app-server que não morra entre as duas observações. O `codex exec` não serve (levanta um app-server
+por turno); um `codex app-server` por stdio serve.
+
+Sonda (replica o cenário do teste upstream `skills_list_refreshes_externally_updated_plugin_versions`,
+mas contra binários reais, num `CODEX_HOME` isolado — não toca no `~/.codex` nem no Desktop):
+
+1. `CODEX_HOME` temporário com `[features] plugins = true` + `[plugins."sample@test"] enabled = true`
+   e `plugins/cache/test/sample/1.0.0/` (um `.codex-plugin/plugin.json` e um `skills/SKILL.md` cuja
+   `description` identifica a versão).
+2. Arrancar `codex app-server` (stdio), `initialize`, e `skills/list` → observar que versão é servida.
+3. Criar `…/sample/2.0.0/` **por fora**, sem avisar o app-server. `skills/list` outra vez, no **mesmo**
+   processo.
+4. Apagar a `2.0.0`. `skills/list` uma terceira vez.
+
+| passo | `codex-pre-sync0902-2122.exe` (antigo) | `codex.exe` (deployado) |
+|---|---|---|
+| 1) só 1.0.0 instalada | `version 1.0.0` | `version 1.0.0` |
+| 2) após instalar 2.0.0 | **`version 1.0.0`** — serve a raiz obsoleta | `version 2.0.0` |
+| 3) após remover 2.0.0 | `version 1.0.0` | `version 1.0.0` |
+
+O binário antigo fica preso na raiz que cacheou no primeiro load — que é exactamente o incidente do §3,
+com a pasta esvaziada no lugar da `1.0.0`. O deployado segue as duas trocas, subida e descida, sem
+reiniciar. Guardar o binário substituído no hot-swap (`Move-Item` para `*-pre-sync<data>-<hhmm>.exe`)
+é o que torna este contrafactual possível — vale a pena manter esse hábito.
+
+Fica por fazer, e só isso, a parte que é física no Desktop: reiniciá-lo para o app-server dele passar ao
+binário novo, e a seguir apagar a pasta de versão vazia (confirmado que está retida por outro processo,
+por isso depende mesmo do reinício).
