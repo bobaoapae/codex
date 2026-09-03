@@ -117,12 +117,24 @@ mod tests {
         let slugs: Vec<&str> = models.iter().map(|model| model.slug.as_str()).collect();
         assert!(slugs.contains(&"claude-opus-5"), "got {slugs:?}");
         assert!(slugs.contains(&"claude-sonnet-5"), "got {slugs:?}");
+        assert!(slugs.contains(&"claude-fable-5"), "got {slugs:?}");
         assert!(
             models
                 .iter()
                 .all(|model| model.visibility == ModelVisibility::Hide),
             "locally served models must be agent-only and hidden from the /model picker"
         );
+        // FORK: all three Anthropic models are 1M-context on the API. Without a
+        // bundled entry the caller falls back to a 272k default and sizes the
+        // window (and the auto-compaction point) wrong.
+        for slug in ["claude-opus-5", "claude-sonnet-5", "claude-fable-5"] {
+            let model = models
+                .iter()
+                .find(|model| model.slug == slug)
+                .unwrap_or_else(|| panic!("{slug} should be bundled"));
+            assert_eq!(model.context_window, Some(1_000_000), "{slug}");
+            assert_eq!(model.max_context_window, Some(1_000_000), "{slug}");
+        }
     }
 
     /// FORK: the ChatGPT Web bundle — one line per reasoning level, each
