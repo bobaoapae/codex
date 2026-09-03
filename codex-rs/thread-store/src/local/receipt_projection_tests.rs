@@ -290,7 +290,7 @@ async fn duplicate_receipt_is_idempotent_and_divergent_duplicate_marks_generatio
     .await
     .expect("read conflict journal")
     .expect("conflict journal row");
-    assert_eq!(journal_status, "dirty");
+    assert_eq!(journal_status, "recoverable");
     assert_eq!(
         workflow
             .get_receipt("receipt-duplicate")
@@ -356,6 +356,6 @@ async fn live_receipt_projection_is_best_effort_and_marks_conflict_dirty() {
     .await
     .expect("read live conflict journal")
     .expect("live conflict journal");
-    assert_eq!(journal_status, "dirty");
+    assert_eq!(journal_status, "recoverable");
     runtime.close().await;
 }
