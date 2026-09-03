@@ -2,6 +2,8 @@ use super::ResponsesStreamRequest;
 use super::log_retry;
 use crate::session::tests::make_session_and_context;
 use codex_protocol::error::CodexErr;
+use codex_protocol::error::UnexpectedResponseError;
+use http::StatusCode;
 use std::time::Duration;
 use tracing_test::internal::MockWriter;
 
@@ -40,4 +42,27 @@ async fn sampling_retry_logs_stream_error_context() {
     assert!(logs.contains(
         "sampling_error=stream disconnected before completion: websocket closed by server before response.completed"
     ));
+}
+
+/// FORK: the sampling loop gates on `is_retryable` before it reaches
+/// `handle_retryable_response_stream_error`, so a terminal 4xx costs zero
+/// websocket attempts and never triggers the HTTPS transport fallback. A 404
+/// used to burn five attempts on each transport before the turn died anyway.
+#[test]
+fn sampling_treats_404_as_terminal_and_5xx_as_retryable() {
+    fn unexpected(status: StatusCode) -> CodexErr {
+        CodexErr::UnexpectedStatus(UnexpectedResponseError {
+            status,
+            body: String::new(),
+            user_message: None,
+            url: None,
+            cf_ray: None,
+            request_id: None,
+            identity_authorization_error: None,
+            identity_error_code: None,
+        })
+    }
+
+    assert!(!unexpected(StatusCode::NOT_FOUND).is_retryable());
+    assert!(unexpected(StatusCode::SERVICE_UNAVAILABLE).is_retryable());
 }

@@ -450,7 +450,6 @@ impl CodexErr {
             | CodexErrorDetails::RateLimitExceeded(_)
             | CodexErrorDetails::Timeout
             | CodexErrorDetails::RequestTimeout
-            | CodexErrorDetails::UnexpectedStatus(_)
             | CodexErrorDetails::ResponseStreamFailed(_)
             | CodexErrorDetails::ConnectionFailed(_)
             | CodexErrorDetails::InternalServerError
@@ -458,6 +457,16 @@ impl CodexErr {
             | CodexErrorDetails::Io(_)
             | CodexErrorDetails::Json(_)
             | CodexErrorDetails::TokioJoin(_) => true,
+            // FORK: an HTTP status the client did not expect is only worth
+            // retrying when the server said it was transient. A 4xx (404 on a
+            // sampling endpoint, above all) is terminal: retrying it burned
+            // five websocket attempts plus five more over HTTP before the turn
+            // died anyway.
+            CodexErrorDetails::UnexpectedStatus(err) => {
+                err.status.is_server_error()
+                    || err.status == StatusCode::REQUEST_TIMEOUT
+                    || err.status == StatusCode::TOO_MANY_REQUESTS
+            }
             #[cfg(target_os = "linux")]
             CodexErrorDetails::LandlockRuleset(_) | CodexErrorDetails::LandlockPathFd(_) => false,
         }

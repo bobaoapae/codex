@@ -78,6 +78,52 @@ fn retryability_preserves_error_details_distinctions() {
     }
 }
 
+/// FORK: a status the client did not expect is retryable only when the server
+/// said the failure was transient. A 404 on a sampling endpoint used to cost
+/// five websocket attempts plus a full HTTP fallback before the turn died.
+#[test]
+fn unexpected_status_is_retryable_only_for_transient_statuses() {
+    fn unexpected(status: StatusCode) -> CodexErr {
+        CodexErr::UnexpectedStatus(UnexpectedResponseError {
+            status,
+            body: String::new(),
+            user_message: None,
+            url: None,
+            cf_ray: None,
+            request_id: None,
+            identity_authorization_error: None,
+            identity_error_code: None,
+        })
+    }
+
+    for status in [
+        StatusCode::NOT_FOUND,
+        StatusCode::BAD_REQUEST,
+        StatusCode::UNAUTHORIZED,
+        StatusCode::FORBIDDEN,
+        StatusCode::CONFLICT,
+    ] {
+        assert!(
+            !unexpected(status).is_retryable(),
+            "{status} must be terminal"
+        );
+    }
+
+    for status in [
+        StatusCode::REQUEST_TIMEOUT,
+        StatusCode::TOO_MANY_REQUESTS,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        StatusCode::BAD_GATEWAY,
+        StatusCode::SERVICE_UNAVAILABLE,
+        StatusCode::GATEWAY_TIMEOUT,
+    ] {
+        assert!(
+            unexpected(status).is_retryable(),
+            "{status} must be retryable"
+        );
+    }
+}
+
 #[test]
 fn history_recovery_error_is_structured_and_non_retryable() {
     let err = CodexErr::history_recovery_required(
