@@ -233,6 +233,27 @@ pub(crate) fn model_family_base(default_slug: Option<&str>) -> String {
         .into_owned()
 }
 
+/// FORK: an exact slug needs no fresh catalog. If the cached list already
+/// names it, answer from the cache and skip the `GET /backend-api/models`
+/// entirely; anything else falls through to the fetch.
+fn resolved_from_cached_models(
+    api: &ChatGptApi<'_>,
+    spec: Option<&ModelSpec>,
+) -> Option<ResolvedModel> {
+    let ModelSpec::Slug(slug) = spec? else {
+        return None;
+    };
+    let models = api.cached_models()?;
+    models
+        .models
+        .iter()
+        .any(|model| model.slug == *slug)
+        .then(|| ResolvedModel {
+            slug: Some(slug.clone()),
+            ..ResolvedModel::default()
+        })
+}
+
 /// Pure half of `resolveModel` (`ops.ts:110-148`), over an already fetched
 /// model list. `None`/`Auto` leave the account default untouched.
 pub(crate) fn resolve_model_with(
@@ -1076,6 +1097,9 @@ impl ChatGptOps {
             return Ok(ResolvedModel::default());
         }
         let api = self.api_for(None).await?;
+        if let Some(resolved) = resolved_from_cached_models(&api, spec) {
+            return Ok(resolved);
+        }
         let models = api.models().await?;
         resolve_model_with(spec, &models)
     }
@@ -1089,7 +1113,11 @@ impl ChatGptOps {
         if spec.is_none_or(|spec| *spec == ModelSpec::Auto) {
             return Ok(ResolvedModel::default());
         }
-        let models = self.api_on(tab_id).models().await?;
+        let api = self.api_on(tab_id);
+        if let Some(resolved) = resolved_from_cached_models(&api, spec) {
+            return Ok(resolved);
+        }
+        let models = api.models().await?;
         resolve_model_with(spec, &models)
     }
 

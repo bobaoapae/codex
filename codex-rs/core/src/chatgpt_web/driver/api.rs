@@ -32,6 +32,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::Semaphore;
 use tracing::info;
+use tracing::warn;
 
 use super::DriverError;
 use super::DriverErrorKind;
@@ -944,6 +945,18 @@ impl<'a> ChatGptApi<'a> {
         Ok(())
     }
 
+    /// FORK: the cached model list for this `base_url`, at any age.
+    ///
+    /// Callers that only need to confirm an exact slug do not need a fresh
+    /// catalog, and the catalog barely moves.
+    pub(crate) fn cached_models(&self) -> Option<ModelsInfo> {
+        MODELS_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&self.base_url)
+            .map(|(_, data)| data.clone())
+    }
+
     /// `GET /backend-api/models?history_and_training_disabled=false`, cached
     /// for [`MODELS_CACHE_TTL`] per `base_url`.
     pub(crate) async fn models(&self) -> DriverResult<ModelsInfo> {
@@ -958,13 +971,36 @@ impl<'a> ChatGptApi<'a> {
                 return Ok(data.clone());
             }
         }
-        let json = self
+        let json = match self
             .call_ok(
                 "/backend-api/models?history_and_training_disabled=false",
                 "GET",
                 None,
             )
-            .await?;
+            .await
+        {
+            Ok(json) => json,
+            // FORK: the TTL decides when to *refresh* the list, not when the
+            // list stops being usable. The catalog barely moves, so a stale
+            // entry beats killing the turn -- one 404 here cost 18 minutes of
+            // work.
+            Err(err) => {
+                let cached = MODELS_CACHE
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&self.base_url)
+                    .map(|(_, data)| data.clone());
+                let Some(data) = cached else {
+                    return Err(err);
+                };
+                warn!(
+                    base_url = %self.base_url,
+                    error = %err,
+                    "chatgpt_web models refresh failed; serving the cached catalog"
+                );
+                return Ok(data);
+            }
+        };
         let raw: RawModels = serde_json::from_value(json)?;
         let data = ModelsInfo {
             default_slug: raw.default_model_slug,
@@ -1010,7 +1046,12 @@ fn http_error(method: &str, path: &str, res: &ApiResponse) -> DriverError {
     };
     let kind = match res.status {
         401 | 403 => DriverErrorKind::LoginRequired,
-        404 => DriverErrorKind::ConversationNotFound,
+        // FORK: only a conversation endpoint can report a missing
+        // conversation. A 404 on `/backend-api/models` was being reported as
+        // `ConversationNotFound`, which sent callers looking for a thread that
+        // was never involved.
+        404 if path.contains("/conversation/") => DriverErrorKind::ConversationNotFound,
+        404 => DriverErrorKind::Other,
         429 => DriverErrorKind::RateLimited,
         500..=599 => DriverErrorKind::Upstream,
         _ => DriverErrorKind::Other,

@@ -853,6 +853,54 @@ async fn models_are_cached_per_base_url_for_five_minutes() {
     clear_models_cache(other);
 }
 
+/// FORK: the TTL decides when to *refresh* the catalog, not when it stops being
+/// usable. A failed refresh serves the stale entry instead of killing the turn.
+#[tokio::test]
+async fn a_failed_models_refresh_serves_the_stale_cache() {
+    let base = "https://models-stale-cache-test.invalid";
+    clear_models_cache(base);
+    let eval = FakePageEval::new(vec![http(
+        200,
+        json!({
+            "models": [{ "slug": "gpt-5-2", "title": "GPT-5.2" }],
+            "default_model_slug": "gpt-5-2",
+            "categories": []
+        }),
+    )]);
+    let cached = ChatGptApi::new(&eval, 1, base)
+        .models()
+        .await
+        .expect("first fetch");
+
+    // Age the entry past the refresh TTL without touching its contents.
+    let stale_at = Instant::now()
+        .checked_sub(MODELS_CACHE_TTL + Duration::from_secs(1))
+        .expect("process uptime exceeds the models cache TTL");
+    MODELS_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(base.to_string(), (stale_at, cached.clone()));
+
+    let eval_err = FakePageEval::new(vec![http_text(404, "not found")]);
+    let served = ChatGptApi::new(&eval_err, 1, base)
+        .models()
+        .await
+        .expect("a stale catalog still answers");
+    assert_eq!(served, cached);
+    assert_eq!(eval_err.evals.load(Ordering::SeqCst), 1);
+
+    // With nothing cached the same failure is still an error -- and a 404 off a
+    // conversation endpoint is not a missing conversation.
+    clear_models_cache(base);
+    let eval_empty = FakePageEval::new(vec![http_text(404, "not found")]);
+    let err = ChatGptApi::new(&eval_empty, 1, base)
+        .models()
+        .await
+        .expect_err("nothing to fall back to");
+    assert_eq!(err.kind, DriverErrorKind::Other);
+    clear_models_cache(base);
+}
+
 /// FORK: the process-wide limiter spaces backend calls.
 #[tokio::test]
 async fn the_backend_limiter_spaces_calls_by_the_minimum_interval() {
