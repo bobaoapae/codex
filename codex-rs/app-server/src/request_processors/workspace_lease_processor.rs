@@ -16,7 +16,6 @@ use codex_app_server_protocol::WorkspaceLeaseListResponse;
 use codex_app_server_protocol::WorkspaceLeaseReleaseParams;
 use codex_app_server_protocol::WorkspaceLeaseReleaseResponse;
 use codex_core::ThreadManager;
-use codex_core::ownership::AuthorizedWorkspaceRoots;
 use codex_core::ownership::OwnershipActor;
 use codex_core::ownership::OwnershipEnvironment;
 use codex_core::ownership::OwnershipError;
@@ -176,7 +175,7 @@ impl WorkspaceLeaseRequestProcessor {
             Err(error) => return Err(ownership_error("service", error)),
         }
         let workflow = self.workflow_store()?;
-        let roots = AuthorizedWorkspaceRoots::new(self.config.effective_workspace_roots())
+        let roots = codex_core::ownership::authorized_roots_for_config(&self.config)
             .map_err(|error| ownership_error("service", OwnershipError::Path(error)))?;
         Ok(Arc::new(WorkspaceOwnershipService::new(
             workflow,

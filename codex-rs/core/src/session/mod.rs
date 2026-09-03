@@ -40,7 +40,6 @@ use crate::image_preparation::ImagePreparationMode;
 use crate::image_preparation::ImageResizeNoticeMode;
 use crate::image_preparation::prepare_response_items as prepare_image_response_items;
 use crate::image_preparation::unified_image_budget_enabled;
-use crate::ownership::AuthorizedWorkspaceRoots;
 use crate::ownership::OwnershipError;
 use crate::ownership::OwnershipOverrideReceipt;
 use crate::ownership::OwnershipReceiptSink;
@@ -1256,8 +1255,7 @@ impl Session {
         &self,
     ) -> Result<std::sync::Arc<WorkspaceOwnershipService>, OwnershipError> {
         let config = self.get_config().await;
-        let authorized_roots = AuthorizedWorkspaceRoots::new(config.effective_workspace_roots())?
-            .with_lease_exempt_roots(config.lease_exempt_workspace_roots());
+        let authorized_roots = crate::ownership::authorized_roots_for_config(&config)?;
         self.services
             .agent_control
             .ownership_service(authorized_roots)

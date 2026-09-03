@@ -251,3 +251,45 @@ fn revalidation_of_a_missing_leaf_survives_a_sibling_write() {
     fs::write(root.join("someone-else.txt"), "theirs").expect("sibling file should be created");
     assert_eq!(lease.revalidate_before_mutation(), Ok(()));
 }
+
+/// FORK: ownership must admit a path under `<codex_home>/visualizations` even
+/// when the Desktop handed this turn no scratch root under it -- two grants
+/// were refused as `OutsideRoots`. Admission is not write permission: the
+/// directory stays out of `effective_workspace_roots`, and paths there need no
+/// lease.
+#[tokio::test]
+async fn the_visualizations_directory_is_admitted_without_needing_a_lease() {
+    let codex_home = TempDir::new().expect("codex home tempdir");
+    let config = crate::config::ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(codex_home.path().to_path_buf())
+        .build()
+        .await
+        .expect("config should load");
+
+    let authorized =
+        super::authorized_roots_for_config(&config).expect("roots should be authorized");
+
+    // The helper creates the directory the Desktop would have created lazily.
+    let scratch = config
+        .visualizations_dir()
+        .join("01999999-0000-7000-8000-000000000000")
+        .join("chart.html");
+    let normalized = authorized
+        .normalize(scratch.as_path())
+        .expect("a scratch path must be admitted");
+    assert!(authorized.is_lease_exempt(&normalized));
+
+    // Admission stops at the scratch directory: the rest of CODEX_HOME is not
+    // suddenly reachable.
+    assert!(matches!(
+        authorized.normalize(config.codex_home.join("config.toml").as_path()),
+        Err(OwnershipPathError::OutsideRoots { .. })
+    ));
+
+    // A path in the workspace is admitted and still needs its lease.
+    let repo_file = config.cwd.join("src").join("lib.rs");
+    let repo_normalized = authorized
+        .normalize(repo_file.as_path())
+        .expect("the workspace root must stay admitted");
+    assert!(!authorized.is_lease_exempt(&repo_normalized));
+}

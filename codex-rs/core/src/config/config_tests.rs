@@ -13102,7 +13102,35 @@ async fn visualization_scratch_roots_are_authorized_but_never_leased() -> std::i
         "the scratch root must stay authorized, or paths inside it normalize as OutsideRoots"
     );
     assert_eq!(config.lease_scoped_workspace_roots(), vec![repo]);
-    assert_eq!(config.lease_exempt_workspace_roots(), vec![scratch]);
+    assert_eq!(
+        config.lease_exempt_workspace_roots(),
+        vec![scratch, config.visualizations_dir()]
+    );
+    Ok(())
+}
+
+/// FORK: the visualizations directory is exempt whether or not this turn was
+/// handed a scratch root under it -- ownership has to admit a path there even
+/// when the Desktop named none. It stays out of the sandbox's own root list.
+#[tokio::test]
+async fn the_visualizations_directory_is_always_lease_exempt() -> std::io::Result<()> {
+    let codex_home = tempdir()?;
+    let config = Config::load_from_base_config_with_overrides(
+        ConfigToml::default(),
+        ConfigOverrides::default(),
+        codex_home.abs(),
+    )
+    .await?;
+
+    let visualizations = config.visualizations_dir();
+    assert_eq!(visualizations, config.codex_home.join("visualizations"));
+    assert_eq!(config.lease_exempt_workspace_roots(), vec![visualizations]);
+    assert!(
+        !config
+            .effective_workspace_roots()
+            .contains(&config.visualizations_dir()),
+        "the scratch directory must not become a sandbox writable root"
+    );
     Ok(())
 }
 

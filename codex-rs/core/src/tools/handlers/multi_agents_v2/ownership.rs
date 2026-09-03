@@ -1,4 +1,5 @@
 use super::*;
+use crate::ownership::AuthorizedWorkspaceRoots;
 use crate::ownership::MutationOperation;
 use crate::ownership::OwnershipEnvironment;
 use crate::ownership::OwnershipError;
@@ -150,6 +151,9 @@ pub(crate) struct OwnershipLeaseResult {
 #[derive(Debug, Serialize)]
 pub(crate) struct OwnershipGrantResult {
     leases: Vec<OwnershipLeaseResult>,
+    /// FORK: set when some requested path needed no lease at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
 }
 
 impl From<WorkflowPathLease> for OwnershipLeaseResult {
@@ -299,6 +303,8 @@ async fn handle_grant(
         .ownership_service()
         .await
         .map_err(ownership_error_to_tool)?;
+    let paths: Vec<PathBuf> = args.paths.into_iter().map(PathBuf::from).collect();
+    let exempt = exempt_path_count(service.authorized_roots(), &paths);
     let leases = session
         .services
         .agent_control
@@ -307,7 +313,7 @@ async fn handle_grant(
             OwnershipGrantRequest {
                 requester,
                 target,
-                paths: args.paths.into_iter().map(PathBuf::from).collect(),
+                paths,
                 mode,
                 lease_duration,
                 environment,
@@ -315,14 +321,46 @@ async fn handle_grant(
         )
         .await
         .map_err(ownership_error_to_tool)?;
-    if leases.is_empty() {
+    // FORK: scratch space under `<codex_home>/visualizations` is private to the
+    // thread and admission never consults a lease over it. A grant that names
+    // only such paths is a no-op, not a failure.
+    let note = if exempt > 0 {
+        let scratch = session.get_config().await.visualizations_dir();
+        Some(scratch_note(exempt, scratch.as_path()))
+    } else {
+        None
+    };
+    if leases.is_empty() && note.is_none() {
         return Err(ownership_tool_error(
             "ownership grant returned no lease".to_string(),
         ));
     }
     Ok(OwnershipGrantResult {
         leases: leases.into_iter().map(Into::into).collect(),
+        note,
     })
+}
+
+/// FORK: how many of `paths` lie in scratch space that needs no lease.
+///
+/// A path that does not normalize at all is not counted: the grant itself will
+/// report that failure.
+fn exempt_path_count(roots: &AuthorizedWorkspaceRoots, paths: &[PathBuf]) -> usize {
+    paths
+        .iter()
+        .filter(|path| {
+            roots
+                .normalize(path)
+                .is_ok_and(|normalized| roots.is_lease_exempt(&normalized))
+        })
+        .count()
+}
+
+fn scratch_note(exempt: usize, scratch: &std::path::Path) -> String {
+    format!(
+        "{exempt} path(s) under {} are private scratch space and need no lease",
+        scratch.display()
+    )
 }
 
 async fn handle_release(

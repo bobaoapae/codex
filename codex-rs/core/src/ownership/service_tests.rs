@@ -680,3 +680,59 @@ async fn releasing_by_owner_clears_every_lease_an_evicted_agent_held() {
             .is_empty()
     );
 }
+
+/// FORK: admission never consults a lease over a lease-exempt scratch path, so
+/// granting one produced a row nothing would ever read -- and a grant naming
+/// only scratch paths failed outright. It is a no-op now; a mixed request still
+/// leases the shared path.
+#[tokio::test]
+async fn a_grant_over_scratch_space_leases_nothing() {
+    let home = tempfile::tempdir().expect("temporary home");
+    let root = home.path().join("workspace");
+    let scratch = home.path().join("visualizations").join("thread-1");
+    std::fs::create_dir_all(root.join("src")).expect("workspace source directory");
+    std::fs::create_dir_all(&scratch).expect("scratch directory");
+    let state = home.path().join("state");
+    std::fs::create_dir_all(&state).expect("state directory");
+    let store = WorkflowStore::open(&SqliteConfig::new_for_testing(
+        AbsolutePathBuf::from_absolute_path(&state).expect("absolute state home"),
+    ))
+    .await
+    .expect("workflow store");
+    let authorized_roots = AuthorizedWorkspaceRoots::new([root.clone(), scratch.clone()])
+        .expect("authorized roots")
+        .with_lease_exempt_roots([scratch.clone()]);
+    let root_run_id = ThreadId::new();
+    let service = WorkspaceOwnershipService::new(store, root_run_id, authorized_roots);
+    let editor = || {
+        OwnershipActor::subagent(
+            ThreadId::new(),
+            capabilities_for_canonical_role("executor_luna"),
+        )
+    };
+
+    let leases = service
+        .grant_agent_ownership(grant_request(
+            root_run_id,
+            editor(),
+            vec![scratch.join("chart.html")],
+        ))
+        .await
+        .expect("a scratch-only grant is a no-op, not a failure");
+    assert!(leases.is_empty(), "{leases:?}");
+
+    let leases = service
+        .grant_agent_ownership(grant_request(
+            root_run_id,
+            editor(),
+            vec![scratch.join("chart.html"), root.join("src")],
+        ))
+        .await
+        .expect("a mixed grant still leases the shared path");
+    assert_eq!(leases.len(), 1, "{leases:?}");
+    assert!(
+        leases[0].path.display.ends_with("src"),
+        "{}",
+        leases[0].path.display
+    );
+}

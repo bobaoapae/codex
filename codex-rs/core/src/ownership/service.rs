@@ -229,7 +229,20 @@ impl WorkspaceOwnershipService {
         {
             return Err(OwnershipError::ReadOnlyRole);
         }
-        let (_, paths) = self.normalize_paths(&request.paths)?;
+        let (normalized, paths) = self.normalize_paths(&request.paths)?;
+        // FORK: a lease-exempt scratch path is private to the thread, and
+        // admission never consults a lease over it. Granting one anyway made a
+        // real row nothing would ever read; drop them here so a grant over
+        // scratch space alone is simply a no-op.
+        let paths: Vec<_> = paths
+            .into_iter()
+            .zip(&normalized)
+            .filter(|(_, normalized)| !self.authorized_roots.is_lease_exempt(normalized))
+            .map(|(path, _)| path)
+            .collect();
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
         let lease_duration_ms = duration_millis(request.lease_duration)?;
         let state_request = WorkflowLeaseAcquireRequest {
             root_run_id: self.root_run_id.to_string(),

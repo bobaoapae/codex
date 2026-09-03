@@ -1934,19 +1934,32 @@ impl Config {
 
     /// FORK: the roots [`Self::lease_scoped_workspace_roots`] leaves out.
     ///
-    /// These stay in [`Self::effective_workspace_roots`]: dropping them there
-    /// would make paths inside them normalize as `OutsideRoots` instead of
-    /// simply not needing a lease.
+    /// A root the Desktop happens to have added stays in
+    /// [`Self::effective_workspace_roots`] as well: dropping it there would
+    /// make paths inside it normalize as `OutsideRoots` instead of simply not
+    /// needing a lease. The visualizations directory itself is always listed,
+    /// whether or not this turn was handed a scratch root under it, so
+    /// ownership admits a path there even when the Desktop never named one.
     pub fn lease_exempt_workspace_roots(&self) -> Vec<AbsolutePathBuf> {
-        self.effective_workspace_roots()
+        let mut roots: Vec<AbsolutePathBuf> = self
+            .effective_workspace_roots()
             .into_iter()
             .filter(|root| self.is_lease_exempt_root(root))
-            .collect()
+            .collect();
+        roots.push(self.visualizations_dir());
+        dedupe_absolute_paths(&mut roots);
+        roots
+    }
+
+    /// FORK: scratch directory the Desktop hands each thread for rendered
+    /// visuals, as `<codex_home>/visualizations`.
+    pub fn visualizations_dir(&self) -> AbsolutePathBuf {
+        self.codex_home.join(VISUALIZATIONS_DIR_NAME)
     }
 
     fn is_lease_exempt_root(&self, root: &AbsolutePathBuf) -> bool {
-        let visualizations = self.codex_home.join(VISUALIZATIONS_DIR_NAME);
-        root.as_path().starts_with(visualizations.as_path())
+        root.as_path()
+            .starts_with(self.visualizations_dir().as_path())
     }
 
     pub fn to_models_manager_config(&self) -> ModelsManagerConfig {
