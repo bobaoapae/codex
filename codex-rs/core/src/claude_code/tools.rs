@@ -23,6 +23,7 @@ use codex_api::ProviderExecutedFileChangeKind;
 use codex_api::ProviderExecutedTool;
 use codex_api::ProviderExecutedToolPhase;
 use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem;
+use codex_protocol::dynamic_tools::PROVIDER_EXECUTED_TOOL_NAMESPACE;
 use codex_protocol::items::CommandExecutionItem;
 use codex_protocol::items::CommandExecutionStatus;
 use codex_protocol::items::DynamicToolCallItem;
@@ -46,9 +47,10 @@ use std::path::PathBuf;
 /// Namespace recorded on the history items produced here.
 ///
 /// It is what tells the rest of the system these calls were already executed:
-/// the router never sees them, and the history renderer drops them on replay so
-/// Claude is not fed its own trace back.
-pub(crate) const CLAUDE_TOOL_NAMESPACE: &str = "claude_code";
+/// the router never sees them, the app-server never asks the client to run
+/// them, and the history renderer drops them on replay so Claude is not fed its
+/// own trace back.
+pub(crate) const CLAUDE_TOOL_NAMESPACE: &str = PROVIDER_EXECUTED_TOOL_NAMESPACE;
 
 /// Ceiling on tool calls tracked at once within a turn.
 ///
@@ -225,7 +227,7 @@ fn started_item(item_id: &str, name: &str, input: &JsonValue, cwd: &PathUri) -> 
         }),
         ClaudeTool::Other => TurnItem::DynamicToolCall(DynamicToolCallItem {
             id: item_id.to_string(),
-            namespace: Some("claude".to_string()),
+            namespace: Some(CLAUDE_TOOL_NAMESPACE.to_string()),
             tool: name.to_string(),
             arguments: input.clone(),
             status: DynamicToolCallStatus::InProgress,
@@ -353,7 +355,7 @@ fn completed_item(
         ClaudeTool::Other => (
             TurnItem::DynamicToolCall(DynamicToolCallItem {
                 id: item_id,
-                namespace: Some("claude".to_string()),
+                namespace: Some(CLAUDE_TOOL_NAMESPACE.to_string()),
                 tool: pending.name.clone(),
                 arguments: pending.input.clone(),
                 status: if is_error {

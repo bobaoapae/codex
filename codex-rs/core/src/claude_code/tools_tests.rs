@@ -256,7 +256,7 @@ fn an_unknown_tool_degrades_to_a_dynamic_cell() {
         panic!("expected a dynamic cell");
     };
     assert_eq!(item.tool, "WebFetch");
-    assert_eq!(item.namespace.as_deref(), Some("claude"));
+    assert_eq!(item.namespace.as_deref(), Some(CLAUDE_TOOL_NAMESPACE));
     assert_eq!(item.status, DynamicToolCallStatus::Completed);
     assert_eq!(item.success, Some(true));
 }

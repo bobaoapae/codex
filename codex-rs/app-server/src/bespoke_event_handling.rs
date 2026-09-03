@@ -101,6 +101,7 @@ use codex_core::ThreadManager;
 use codex_features::Feature;
 use codex_guardian_v2::StrictReviewReason;
 use codex_protocol::ThreadId;
+use codex_protocol::dynamic_tools::is_provider_executed_namespace;
 use codex_protocol::error::history_recovery_reason_from_error_message;
 use codex_protocol::items::CollabAgentTool as CoreCollabAgentTool;
 use codex_protocol::items::TurnItem as CoreTurnItem;
@@ -1143,14 +1144,24 @@ pub(crate) async fn apply_bespoke_event_handling_with_classification(
                 _ => true,
             };
             let dynamic_tool_call_params = match &event.item {
-                CoreTurnItem::DynamicToolCall(item) => Some(DynamicToolCallParams {
-                    thread_id: conversation_id.to_string(),
-                    turn_id: event.turn_id.clone(),
-                    call_id: item.id.clone(),
-                    namespace: item.namespace.clone(),
-                    tool: item.tool.clone(),
-                    arguments: item.arguments.clone(),
-                }),
+                // FORK: a call the model provider already executed is history,
+                // not work. Asking the client to run it produced one useless
+                // round trip and one `No pending dynamic tool call found` WARN
+                // per tool use. The `ItemStarted` notification below still goes
+                // out, so the fleet processor keeps counting the call as
+                // pending until its `Completed` item arrives.
+                CoreTurnItem::DynamicToolCall(item)
+                    if !is_provider_executed_namespace(item.namespace.as_deref()) =>
+                {
+                    Some(DynamicToolCallParams {
+                        thread_id: conversation_id.to_string(),
+                        turn_id: event.turn_id.clone(),
+                        call_id: item.id.clone(),
+                        namespace: item.namespace.clone(),
+                        tool: item.tool.clone(),
+                        arguments: item.arguments.clone(),
+                    })
+                }
                 _ => None,
             };
             if should_emit {
@@ -2239,6 +2250,8 @@ fn now_unix_timestamp_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_protocol::dynamic_tools::PROVIDER_EXECUTED_TOOL_NAMESPACE;
+
     use crate::CHANNEL_CAPACITY;
     use crate::outgoing_message::ConnectionId;
     use crate::outgoing_message::OutgoingEnvelope;
@@ -3588,6 +3601,84 @@ mod tests {
                 tool: "lookup".to_string(),
                 arguments: json!({"id": "123"}),
             }
+        );
+        Ok(())
+    }
+
+    /// FORK: a call the Claude Code CLI already ran is history. The item still
+    /// reaches the client, but no execution request follows it -- one used to
+    /// go out per tool use, each answered with `No pending dynamic tool call
+    /// found`.
+    #[tokio::test]
+    async fn provider_executed_dynamic_tool_start_emits_item_without_client_request() -> Result<()>
+    {
+        let codex_home = TempDir::new()?;
+        let config = load_default_config_for_test(&codex_home).await;
+        let thread_manager = Arc::new(
+            codex_core::test_support::thread_manager_with_models_provider_and_home(
+                CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+                config.model_provider.clone(),
+                config.codex_home.to_path_buf(),
+                Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+            ),
+        );
+        let codex_core::NewThread {
+            thread_id: conversation_id,
+            thread: conversation,
+            ..
+        } = thread_manager
+            .start_thread(codex_core::StartThreadOptions::new(config))
+            .await?;
+        let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        let outgoing = ThreadScopedOutgoingMessageSender::new(
+            outgoing,
+            vec![ConnectionId(1)],
+            conversation_id,
+        );
+
+        apply_bespoke_event_handling(
+            Event {
+                id: "turn-1".to_string(),
+                msg: EventMsg::ItemStarted(ItemStartedEvent {
+                    thread_id: conversation_id,
+                    turn_id: "turn-1".to_string(),
+                    item: CoreTurnItem::DynamicToolCall(DynamicToolCallItem {
+                        id: "claude-toolu_1".to_string(),
+                        namespace: Some(PROVIDER_EXECUTED_TOOL_NAMESPACE.to_string()),
+                        tool: "Read".to_string(),
+                        arguments: json!({"file_path": "/repo/src/lib.rs"}),
+                        status: CoreDynamicToolCallStatus::InProgress,
+                        content_items: None,
+                        success: None,
+                        error: None,
+                        duration: None,
+                    }),
+                    started_at_ms: 42,
+                }),
+            },
+            conversation_id,
+            conversation,
+            thread_manager,
+            outgoing,
+            new_thread_state(),
+            ThreadWatchManager::new(),
+            Arc::new(tokio::sync::Semaphore::new(/*permits*/ 1)),
+            "test-provider".to_string(),
+        )
+        .await;
+
+        let item_started = recv_broadcast_notification(&mut rx).await?;
+        let ServerNotification::ItemStarted(payload) = item_started else {
+            bail!("unexpected message: {item_started:?}");
+        };
+        assert_eq!(payload.item.id(), "claude-toolu_1");
+        assert!(
+            rx.try_recv().is_err(),
+            "a provider-executed tool call must not be sent back to the client"
         );
         Ok(())
     }

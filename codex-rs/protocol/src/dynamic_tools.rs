@@ -42,6 +42,21 @@ pub enum DynamicToolNamespaceTool {
     Function(DynamicToolFunctionSpec),
 }
 
+/// FORK: namespace reserved for tool calls the model provider already ran on
+/// its own side.
+///
+/// The Claude Code CLI runs its own tool loop, so its calls reach us as
+/// history: the router never routes them and the client must never be asked to
+/// execute them. Shared here so the producer (`core`) and the consumer
+/// (`app-server`) cannot drift apart.
+pub const PROVIDER_EXECUTED_TOOL_NAMESPACE: &str = "claude_code";
+
+/// Whether a dynamic tool call was already executed by the model provider and
+/// therefore needs no execution request to the client.
+pub fn is_provider_executed_namespace(namespace: Option<&str>) -> bool {
+    namespace == Some(PROVIDER_EXECUTED_TOOL_NAMESPACE)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct DynamicToolCallRequest {
