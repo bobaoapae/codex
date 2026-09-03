@@ -589,3 +589,38 @@ aberto e retomar de novo (prova do #42284 sem reiniciar), e um `/agents` na TUI 
 primária. O log do app-server antigo
 (`…/LocalCache/Local/Codex/Logs/2026/09/02/codex-desktop-*-141650-0.log`) tem 54 ocorrências de
 `required MCP servers failed to initialize`; com o binário novo não devem voltar.
+
+## `/agents` na TUI — verificado ao vivo (02/09, madrugada)
+
+A decisão A foi exercida contra o binário deployado, não só contra testes. No Windows isto exige um
+rodeio que vale a pena registar: `AppServerTarget::LocalDaemon` é **inatingível** — o probe do socket
+de controlo (`maybe_probe_default_daemon_socket`, `tui/src/lib.rs:447-475`) é `#[cfg(unix)]` e o gémeo
+`#[cfg(not(unix))]` devolve sempre `None`; `codex agents` sem `--remote` aborta com *"`codex agents`
+requires `--remote` on this platform"*; e `app-server daemon start` / `remote-control start` recusam
+com *"only supported on Unix platforms"*. O único alvo não-Embedded no Windows é
+`AppServerTarget::Remote`, contra um `codex app-server --listen ws://…` arrancado à mão.
+
+Montagem: `codex app-server --listen ws://127.0.0.1:41777` num porto dedicado (o app-server do Desktop
+é stdio, não colide), e a TUI conduzida por um binding directo à `winpty.dll` via ctypes — o
+`winpty.exe` não serve, porque exige uma consola real dimensionada que um chamador headless não tem.
+
+| ramo | comando | renderizou | ausente |
+|---|---|---|---|
+| **sem** thread primária | `codex agents --remote ws://127.0.0.1:41777` | `Agent command center` + `0 need input   0 working   0 ready` | `Agent fleet` |
+| **com** thread primária | `codex --remote ws://127.0.0.1:41777`, depois `/agents` | `Agent fleet` + `root 01a064d3-…  generation 0  open` | `Agent command center` |
+
+Os dois ramos são mutuamente exclusivos na captura, que é exactamente o `early return` da §2.6. Uma
+sessão normal já tem `primary_thread_id` antes de se escrever fosse o que fosse (`startup.rs:583-599`),
+por isso o ramo "sem thread primária" só se alcança pelo entry point `codex agents`
+(`SessionSelection::AgentsOverview`, que não anexa thread nenhuma).
+
+Dois apontamentos do exercício:
+
+- Num root sem frota registada o `agent/fleet/status` devolve *"fleet root agent is not registered"* e o
+  dashboard mostra `Fleet status unavailable.` em vez de cair para a listagem — o desvio mantém-se. Sair
+  do dashboard (`esc`/`ctrl+c`) devolve à listagem daemon-wide, que é navegação sã.
+- **Lacuna de cobertura:** nenhum teste chama `open_agents_overview` com `primary_thread_id = Some(…)`.
+  Os quatro call sites de teste correm todos com `None` (`agents_overview_tests.rs:232,:273,:620` e
+  `tests/session_lifecycle_requests.rs:2449`), e `agents_fleet_tests.rs` testa só o *bookkeeping* de
+  `apply_agents_fleet_status`/`apply_agents_fleet_operation` sem passar pelo `open_*`. O `early return`
+  que implementa a decisão A não tem, hoje, teste que o exerça ponta a ponta.
