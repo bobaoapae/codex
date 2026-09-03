@@ -697,3 +697,24 @@ sessão — foi isso que aconteceu ~20 vezes nesta mesma thread com o binário a
 Único desvio à letra do plano: correu na TUI e não dentro da UI do Desktop, porque o Desktop está
 fora de alcance por instrução do utilizador. O processo que carrega o plugin é o mesmo `codex.exe
 app-server`; o que muda é quem o hospeda.
+
+## Fase 5.4 — quem retém a pasta, verificado
+
+A segunda metade da Fase 5.4 (*"depois apagar a pasta vazia"*) falha com *"being used by another
+process"*. O detentor foi identificado com `psutil` (`.cwd()` de cada processo), não inferido:
+
+    PID 53684  node.exe  "./server/index.mjs"
+      cwd:    ~/.codex/plugins/cache/personal/spine-workbench/0.1.0+codex.20260902223342
+      parent: PID 72848  = o app-server do Desktop (arrancado 11:16:52)
+
+É o servidor MCP do plugin que o app-server antigo lançou a partir da raiz que tinha em cache — o
+incidente do §3 em forma de processo. O `node` continua vivo porque carregou o módulo antes de a
+reinstalação esvaziar o directório; é o `cwd` dele que fixa a pasta no Windows.
+
+Matar só o PID 53684 libertaria a pasta sem reiniciar o Desktop, mas é um filho do processo do Desktop
+e derrubaria a ligação MCP das sessões dele. Fica por fazer deliberadamente: é a ordem que o próprio
+plano estabelece — *"reiniciar o Codex Desktop (mata o app-server antigo e os `node` órfãos do plugin);
+**depois** apagar a pasta vazia"*.
+
+Técnica que vale a pena reter: `psutil.Process(pid).cwd()` sobre todos os processos é a forma mais
+directa de descobrir quem prende um directório no Windows sem Sysinternals.
