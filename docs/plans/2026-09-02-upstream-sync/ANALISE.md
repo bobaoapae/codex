@@ -675,3 +675,25 @@ reiniciar. Guardar o binário substituído no hot-swap (`Move-Item` para `*-pre-
 Fica por fazer, e só isso, a parte que é física no Desktop: reiniciá-lo para o app-server dele passar ao
 binário novo, e a seguir apagar a pasta de versão vazia (confirmado que está retida por outro processo,
 por isso depende mesmo do reinício).
+
+## Fase 6.1 — a thread `01a05582…`, retomada de facto
+
+A primeira frase da fase — *"Retomar a thread `01a05582…`: `spine-workbench` inicializa"* — não
+precisava do Desktop, precisava do binário novo. A thread é
+`01a05582-c48f-7d50-9081-41360560ddda`
+(`~/.codex/sessions/2026/08/30/rollout-2026-08-30T22-50-28-01a05582-….jsonl`) e foi retomada com o
+binário deployado, pela TUI conduzida por winpty, sem enviar turno nenhum:
+
+- respondeu-se ao prompt de working directory escolhendo a da sessão
+  (`~\Documents\Codex\2026-08-30\localizar-a-melhora-ferramenta-um-nuvem`);
+- o histórico próprio da thread reapareceu e o modelo próprio dela (`gpt-5.6-sol ultra`) foi restaurado;
+- `Starting MCP servers (4/5)` desceu até a sessão ficar **`Ready`**;
+- zero ocorrências de `required MCP servers failed to initialize`.
+
+O `.mcp.json` do plugin declara `"required": true`, portanto uma falha a inicializar **aborta** a
+sessão — foi isso que aconteceu ~20 vezes nesta mesma thread com o binário antigo. Chegar a `Ready`
+é, por construção, a prova de que o `spine-workbench` inicializou.
+
+Único desvio à letra do plano: correu na TUI e não dentro da UI do Desktop, porque o Desktop está
+fora de alcance por instrução do utilizador. O processo que carrega o plugin é o mesmo `codex.exe
+app-server`; o que muda é quem o hospeda.
