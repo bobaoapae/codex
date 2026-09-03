@@ -718,3 +718,22 @@ plano estabelece — *"reiniciar o Codex Desktop (mata o app-server antigo e os 
 
 Técnica que vale a pena reter: `psutil.Process(pid).cwd()` sobre todos os processos é a forma mais
 directa de descobrir quem prende um directório no Windows sem Sysinternals.
+
+## Fase 5.4 — limpeza feita (03/09)
+
+Com o Desktop fechado pelo utilizador, o `node` PID 53684 desapareceu e a pasta libertou-se.
+Removida `~/.codex/plugins/cache/personal/spine-workbench/0.1.0+codex.20260902223342`; ficou só a
+versão activa `0.1.0+codex.20260903003557`. Varrido o resto de `~/.codex/plugins/cache` à procura de
+irmãs do mesmo problema (pastas de versão vazias em qualquer marketplace/plugin): nenhuma.
+
+Nota apurada durante a limpeza, que muda o peso desta pasta: as duas versões diferiam **só** nos
+metadados de build, e `compare_plugin_versions` delega em `semver::Version::cmp`, que ignora
+metadados de build na precedência — logo comparavam iguais, e o vencedor saía de `sort_unstable` +
+`pop()`, ou seja da ordem do `read_dir`. Em réplica isolada a versão nova ganhou 6/6 (incluindo com a
+antiga vazia), portanto a pasta era inofensiva na prática; mas era um empate por resolver, não uma
+precedência definida. Como o `spine-workbench` se versiona sempre `0.1.0+codex.<timestamp>`, **todas**
+as suas versões caem nesse empate. Registado na memória do incidente.
+
+Falta só a última linha da Fase 6.3: confirmar que o app-server do Desktop, já no binário novo, não
+volta a emitir `required MCP servers failed to initialize`. Os logs existentes são todos do processo
+antigo (PID 17420); a verificação corre assim que o Desktop reabrir.
