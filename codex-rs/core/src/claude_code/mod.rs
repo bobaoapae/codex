@@ -265,6 +265,15 @@ Writable roots: {}",
 This turn is read-only: inspect and report, do not modify files.",
         );
     }
+    // FORK: `plan` is the CLI's read-only mode and it does not hand the agent a
+    // `Bash` tool at all. Children spent a dozen calls each rediscovering that
+    // by failure; say it once instead.
+    if workspace.permission_mode == "plan" {
+        environment.push_str(
+            "
+Bash is unavailable in this read-only session; use Read, Glob and Grep, and report commands you would have run.",
+        );
+    }
     if let Some(notice) = workspace.ownership_notice.as_deref() {
         environment.push_str(&format!("\n{notice}"));
     }
@@ -1859,6 +1868,34 @@ mod tests {
             host: None,
             ownership_notice: None,
         }
+    }
+
+    /// FORK: `plan` is the CLI's read-only mode and it exposes no `Bash` tool.
+    /// A child that is not told spends its first calls finding out by failure.
+    #[test]
+    fn claude_system_prompt_mentions_missing_bash_in_plan_mode() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut workspace = test_workspace(&temp);
+        workspace.permission_mode = "plan";
+        workspace.writable_roots = Vec::new();
+
+        let prompt = claude_system_prompt(&workspace);
+        assert!(
+            prompt.contains("This turn is read-only"),
+            "read-only notice missing: {prompt}"
+        );
+        assert!(
+            prompt
+                .contains("Bash is unavailable in this read-only session; use Read, Glob and Grep"),
+            "missing-Bash notice missing: {prompt}"
+        );
+
+        // A writable turn keeps its `Bash`, and must not be told otherwise.
+        let writable = test_workspace(&temp);
+        assert!(
+            !claude_system_prompt(&writable).contains("Bash is unavailable"),
+            "a bypassPermissions turn has Bash"
+        );
     }
 
     /// The command line is the whole contract with the CLI, and none of it is
