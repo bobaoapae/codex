@@ -245,6 +245,53 @@ async fn live_overlay_is_bounded_and_best_effort_on_parse_failure() {
     .bind(thread_id.to_string())
     .fetch_one(runtime.workflow().pool())
     .await
-    .expect("dirty source journal");
-    assert_eq!(status, "dirty");
+    .expect("recoverable source journal");
+    assert_eq!(status, "recoverable");
+}
+
+#[tokio::test]
+async fn parse_failure_does_not_disturb_a_journal_row_being_processed() {
+    let home = TempDir::new().expect("temp home");
+    let thread_id = ThreadId::default();
+    let path = rollout_path(home.path(), "rollout-processing.jsonl");
+    let mut file = fs::File::create(&path).expect("create rollout");
+    writeln!(
+        file,
+        "{}",
+        session_meta(thread_id, home.path(), ThreadHistoryMode::Legacy)
+    )
+    .expect("write metadata");
+    writeln!(file, "not-json").expect("write malformed line");
+
+    let config = super::super::test_support::test_config(home.path());
+    let runtime =
+        codex_state::StateRuntime::init(config.sqlite.clone(), "test-provider".to_string())
+            .await
+            .expect("open state runtime");
+    let store = LocalThreadStore::new(config, Some(runtime.clone()));
+
+    // A coordinator already owns this rollout.
+    sqlx::query(
+        "INSERT INTO workflow_backfill_journal
+            (rollout_id, source_path, byte_offset, rollout_ordinal, status,
+             updated_at_ms, owner_id, generation)
+         VALUES (?, ?, 0, 0, 'processing', 1, 'owner-1', 0)",
+    )
+    .bind(thread_id.to_string())
+    .bind(path.to_string_lossy().to_string())
+    .execute(runtime.workflow().pool())
+    .await
+    .expect("seed processing journal row");
+
+    project_live_rollout(&store, thread_id, thread_id, &path).await;
+
+    let (status, owner_id) = sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT status, owner_id FROM workflow_backfill_journal WHERE rollout_id = ?",
+    )
+    .bind(thread_id.to_string())
+    .fetch_one(runtime.workflow().pool())
+    .await
+    .expect("processing source journal");
+    assert_eq!(status, "processing");
+    assert_eq!(owner_id.as_deref(), Some("owner-1"));
 }

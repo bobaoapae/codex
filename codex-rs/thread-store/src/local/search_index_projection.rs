@@ -9,6 +9,7 @@ use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionSource;
 use codex_state::SearchDocumentCreate;
 use codex_state::SearchMetadata;
+use codex_state::WorkflowBackfillJournalStatus;
 use codex_state::WorkflowStore;
 use codex_state::WorkflowThreadClass;
 use serde_json::Value;
@@ -352,21 +353,24 @@ pub(super) async fn mark_source_dirty(
         "INSERT INTO workflow_backfill_journal
             (rollout_id, source_path, byte_offset, rollout_ordinal, status,
              error_json, updated_at_ms, generation_id, source_size_bytes, source_mtime_ms)
-         VALUES (?, ?, ?, ?, 'dirty', ?, ?, NULL, ?, ?)
+         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
          ON CONFLICT(rollout_id) DO UPDATE SET
             source_path = excluded.source_path,
             byte_offset = excluded.byte_offset,
             rollout_ordinal = excluded.rollout_ordinal,
-            status = 'dirty',
+            status = excluded.status,
             error_json = excluded.error_json,
             updated_at_ms = excluded.updated_at_ms,
             source_size_bytes = excluded.source_size_bytes,
-            source_mtime_ms = excluded.source_mtime_ms",
+            source_mtime_ms = excluded.source_mtime_ms
+         WHERE workflow_backfill_journal.status
+            NOT IN ('processing', 'complete', 'skippedPermanent')",
     )
     .bind(rollout_id.to_string())
     .bind(source_path)
     .bind(i64::try_from(cursor.byte_offset).unwrap_or(i64::MAX))
     .bind(i64::try_from(cursor.ordinal).unwrap_or(i64::MAX))
+    .bind(WorkflowBackfillJournalStatus::Recoverable.as_str())
     .bind(error_json)
     .bind(now_ms)
     .bind(source_size_bytes)
