@@ -543,3 +543,49 @@ do fork em `Cargo.lock`, mantida); `features/src/lib.rs` ficou com o upstream, l
 a entrada `rollout.include_shared_capability` e o README do app-server perdeu a secção do gate.
 Os dois `.json.zst` de schema foram regenerados com
 `python app-server-protocol/scripts/write_schema_fixtures.py` (e `--experimental`).
+
+## Portão de testes
+
+`just fork-invariants` passa 48/48 (49 menos o invariante de compressão removido pela decisão C′).
+Focados: `codex-rollout` 128/128, `codex-core` 188/188 nos filtros do plano, `codex-app-server`
+45/45, TUI 218/219, `codex-thread-store` 269/272.
+
+`cargo test --workspace --no-fail-fast` deu 82 falhas em 14 alvos. Repetidas as duas suites de
+integração isoladas (`--test-threads=4`), caem para 37 — metade do que a corrida completa acusa é
+contenção, não código. Contra a baseline `pre-sync-20260902` (worktree separada, target próprio) o
+merge **melhorou** muito: `codex-core tests/all.rs` passou de **151 falhas para 17**.
+
+Nenhuma das 37 é regressão:
+
+| falhas | veredicto |
+|---|---|
+| 13 das 17 do core, 10 das 11 antigas do app-server | falham igual na baseline pré-sync |
+| `suite::v2::plugin_install::plugin_install_starts_mcp_oauth_through_configured_http_proxy` | passa isolada — contenção de porta/proxy |
+| `suite::cyber_exec_policy::*` (4) | não é regressão: os testes correm `git version` e afirmam que o output da tool contém essa string. O guard do fork (`unified_exec.rs`, *"destructive Git override requires an explicit command approval"*) já rejeitava o comando antes do sync — mas a mensagem de erro do fork era ``exec_command failed for `git version`: …`` e continha a string, pelo que a asserção passava por acidente. O #42113 tirou o comando da mensagem e expôs a rejeição. Corrigir, se for caso disso, é no guard, não nos testes. |
+| TUI `rolling_rate_limit_snapshot_preserves_prior_individual_limit` | separador decimal pt-BR ("8.000" vs "8,000"), balde de locale já catalogado |
+| `codex-thread-store` (3) | `workflow_backfill_journal` sem linha `dirty`; reproduzem na baseline |
+
+Nota de operação: `cargo test --workspace` com paralelismo total esgota recursos do `link.exe`
+(erro 1201) e deixa um PDB corrompido (LNK1285 na corrida seguinte); usar `-j 4` e, se acontecer,
+`cargo clean -p <crate>` antes de repetir.
+
+## Deploy e validação
+
+Build release: 32m31s, quatro binários. Hot-swap no vendor do npm às 21:22 (cópias antigas em
+`*-pre-sync0902-2122.exe`). `bin\codex.exe --version` → `codex-cli 0.146.1`.
+
+Validado com turnos reais no binário novo:
+- `spawn_agent` com role `claude-opus` (`model_provider = "claude_code"`) + `wait_agent` → o
+  subagente respondeu `PONG`. O carve-out de `model_provider` em roles continua efectivo.
+- `update_plan` produz a tool: a checklist renderizou (`✓ check` / `• report`) e o turno respondeu
+  `DONE`. A secção explícita `[tools.update_plan]` do `config.toml` neutraliza a passagem do
+  upstream para opt-in.
+
+`git push fork main` → `ba01741fd7..b27060f46a`.
+
+Falta (exige o Desktop, acção do utilizador): reiniciar o Codex Desktop, retomar a thread
+`01a05582…` para ver o `spine-workbench` inicializar, reinstalar o plugin pela CLI com o Desktop
+aberto e retomar de novo (prova do #42284 sem reiniciar), e um `/agents` na TUI com e sem thread
+primária. O log do app-server antigo
+(`…/LocalCache/Local/Codex/Logs/2026/09/02/codex-desktop-*-141650-0.log`) tem 54 ocorrências de
+`required MCP servers failed to initialize`; com o binário novo não devem voltar.
