@@ -33,6 +33,7 @@ use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_retry::ResponsesStreamRequest;
 use crate::responses_retry::ResponsesStreamRetryState;
 use crate::responses_retry::handle_retryable_response_stream_error;
+use crate::responses_retry::try_terminal_transport_fallback;
 use crate::session::PreviousTurnSettings;
 use crate::session::TurnInput;
 use crate::session::session::Session;
@@ -1516,7 +1517,23 @@ async fn run_sampling_request(
         }
 
         if !err.is_retryable() {
-            return Err(err);
+            // FORK: terminal for *this* transport is not terminal for the
+            // request. A websocket endpoint that answers 404 is not there at
+            // all, and the HTTPS one may well be — take the one-time fallback
+            // before giving up, but never retry the same transport.
+            if !try_terminal_transport_fallback(
+                &mut retry_state,
+                &err,
+                client_session,
+                &sess,
+                &turn_context,
+            )
+            .await
+            {
+                return Err(err);
+            }
+            turn_context.turn_timing_state.record_sampling_retry();
+            continue;
         }
 
         handle_retryable_response_stream_error(

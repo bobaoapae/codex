@@ -128,6 +128,41 @@ pub(crate) async fn handle_retryable_response_stream_error(
     Err(err)
 }
 
+/// FORK: takes the one-time websocket-to-HTTPS fallback for an error that is
+/// terminal on the current transport.
+///
+/// A status the server will keep returning is not worth retrying — a 404 on a
+/// sampling endpoint used to cost five websocket attempts and five more over
+/// HTTP. But a websocket endpoint answering 404 is saying it does not exist,
+/// which is exactly what the fallback is for. Switch once, then let the error
+/// stand: `try_switch_fallback_transport` is a no-op once the session is
+/// already on HTTPS.
+pub(crate) async fn try_terminal_transport_fallback(
+    retry_state: &mut ResponsesStreamRetryState,
+    err: &CodexErr,
+    client_session: &mut ModelClientSession,
+    sess: &Session,
+    turn_context: &TurnContext,
+) -> bool {
+    if !matches!(err.details(), CodexErrorDetails::UnexpectedStatus(_)) {
+        return false;
+    }
+    if !client_session
+        .try_switch_fallback_transport(&turn_context.session_telemetry, turn_context.model_info())
+    {
+        return false;
+    }
+    sess.send_event(
+        turn_context,
+        EventMsg::Warning(WarningEvent {
+            message: format!("Falling back from WebSockets to HTTPS transport. {err:#}"),
+        }),
+    )
+    .await;
+    retry_state.retries = 0;
+    true
+}
+
 fn log_retry(
     request: ResponsesStreamRequest,
     turn_context: &TurnContext,

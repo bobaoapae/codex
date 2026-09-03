@@ -2,6 +2,7 @@ use super::ResponsesStreamRequest;
 use super::log_retry;
 use crate::session::tests::make_session_and_context;
 use codex_protocol::error::CodexErr;
+use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::UnexpectedResponseError;
 use http::StatusCode;
 use std::time::Duration;
@@ -44,25 +45,48 @@ async fn sampling_retry_logs_stream_error_context() {
     ));
 }
 
+fn unexpected(status: StatusCode) -> CodexErr {
+    CodexErr::UnexpectedStatus(UnexpectedResponseError {
+        status,
+        body: String::new(),
+        user_message: None,
+        url: None,
+        cf_ray: None,
+        request_id: None,
+        identity_authorization_error: None,
+        identity_error_code: None,
+    })
+}
+
 /// FORK: the sampling loop gates on `is_retryable` before it reaches
 /// `handle_retryable_response_stream_error`, so a terminal 4xx costs zero
-/// websocket attempts and never triggers the HTTPS transport fallback. A 404
-/// used to burn five attempts on each transport before the turn died anyway.
+/// retries on the transport that produced it. A 404 used to burn five attempts
+/// on each transport before the turn died anyway.
 #[test]
 fn sampling_treats_404_as_terminal_and_5xx_as_retryable() {
-    fn unexpected(status: StatusCode) -> CodexErr {
-        CodexErr::UnexpectedStatus(UnexpectedResponseError {
-            status,
-            body: String::new(),
-            user_message: None,
-            url: None,
-            cf_ray: None,
-            request_id: None,
-            identity_authorization_error: None,
-            identity_error_code: None,
-        })
-    }
-
     assert!(!unexpected(StatusCode::NOT_FOUND).is_retryable());
     assert!(unexpected(StatusCode::SERVICE_UNAVAILABLE).is_retryable());
+}
+
+/// FORK: terminal on one transport is not terminal for the request. A
+/// websocket endpoint answering 404 is saying it does not exist, which is
+/// precisely what the HTTPS fallback is for -- the guardian's review endpoint
+/// reaches its mock server that way. Only an unexpected status may take it;
+/// everything else that is terminal stays terminal.
+#[test]
+fn only_an_unexpected_status_may_take_the_terminal_transport_fallback() {
+    assert!(matches!(
+        unexpected(StatusCode::NOT_FOUND).details(),
+        CodexErrorDetails::UnexpectedStatus(_)
+    ));
+    for err in [
+        CodexErr::ContextWindowExceeded,
+        CodexErr::ServerOverloaded,
+        CodexErr::new(CodexErrorDetails::ToolCollision("update_plan".to_string())),
+    ] {
+        assert!(
+            !matches!(err.details(), CodexErrorDetails::UnexpectedStatus(_)),
+            "{err:?} must not switch transport"
+        );
+    }
 }
