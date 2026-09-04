@@ -158,14 +158,15 @@ resolver = "2"
 # chat), so the side chat fails with "Forking is not available for threads using
 # paginated history yet."
 #
-# Pinned to the latest published `@openai/codex` release, so the version this
-# binary reports over the app-server handshake is one the server recognizes --
-# upstream leaves this at 0.0.0 on main and stamps it only when a release tag
-# is cut, and the server-side gates reject that. Our upstream base
-# (280ae8b9fc, 03/09) is newer than the rust-v0.153.1 tag, so this understates
-# rather than overstates what the build contains. Re-check after every sync:
-# `gh release list --repo openai/codex` / `npm view @openai/codex version`.
-version = "0.153.1"
+# Rule for this pin: at every sync, merge the newest stable `rust-v*` tag
+# (never an `-alpha`) and let its version stamp win here. Release tags live on
+# side branches, not on `main`, so the merge also brings the release-only
+# backports; `main` itself is newer than the tag, which means this number
+# understates rather than overstates what the build contains. Never 0.0.0 (the
+# Desktop rejects it) and never `-alpha`. `codex-cli/package.json` stays at
+# 0.0.0-dev. Fork-only commits from here on are
+# `git log --no-merges main ^origin/main ^rust-v0.153.3`.
+version = "0.153.3"
 # Track the edition for all workspace crates in one place. Individual
 # crates can still override this value, but keeping it here means new
 # crates created with `cargo new -w ...` automatically inherit the 2024
