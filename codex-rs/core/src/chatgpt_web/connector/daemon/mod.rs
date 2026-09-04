@@ -159,6 +159,34 @@ fn http_client() -> reqwest::Client {
         .unwrap_or_default()
 }
 
+/// FORK: how to ask `tunnel-client` who the configured tunnel is shared with.
+///
+/// Only the `openai` transport has an audience at all, and only when we know
+/// the tunnel id, where the admin key lives and where the binary is. Returns
+/// `None` otherwise, which the registry treats as "no extra detail".
+pub fn tunnel_admin_access(
+    settings: &ChatGptWebSettings,
+    paths: &DaemonPaths,
+) -> Option<(std::path::PathBuf, String, std::path::PathBuf)> {
+    if settings.tunnel != ChatGptWebTunnel::Openai {
+        return None;
+    }
+    let tunnel_id = settings.tunnel_id.clone()?;
+    let key_path = settings
+        .tunnel_key_file
+        .clone()
+        .unwrap_or_else(|| paths.tunnel_key.clone());
+    if !key_path.exists() {
+        return None;
+    }
+    let binary = tunnel::resolve_tunnel_client(
+        settings.tunnel_client_path.as_deref(),
+        &paths.bin_dir,
+        &settings.tunnel_client_version,
+    )?;
+    Some((binary, tunnel_id, key_path))
+}
+
 /// Chooses the tunnel adapter from settings.
 pub async fn build_tunnel_adapter(
     settings: &ChatGptWebSettings,
@@ -314,7 +342,8 @@ pub async fn start(config: DaemonRunConfig) -> anyhow::Result<RunningDaemon> {
                 paths.connector.clone(),
                 tunnel.state(),
                 Arc::clone(&registry),
-            );
+            )
+            .with_tunnel_admin(tunnel_admin_access(settings, &paths));
             let hook = service.hook();
             registry_service = Some(service);
             Some(hook)

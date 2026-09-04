@@ -92,6 +92,11 @@ pub const TUNNEL_CLIENT_API_KEY_ENV: &str = "CONTROL_PLANE_API_KEY";
 pub const TUNNEL_CLIENT_MCP_URL_ENV: &str = "MCP_SERVER_URL";
 pub const TUNNEL_CLIENT_STARTUP_WAIT_ENV: &str = "MCP_STARTUP_WAIT_TIMEOUT";
 
+/// `tunnel-client admin tunnels get` reads who a tunnel is shared with.
+pub const TUNNEL_CLIENT_ADMIN_ARGS: &[&str] = &["admin", "tunnels", "get"];
+pub const TUNNEL_CLIENT_ADMIN_KEY_FLAG: &str = "--admin-key";
+const TUNNEL_ADMIN_TIMEOUT: Duration = Duration::from_secs(15);
+
 const READY_TIMEOUT: Duration = Duration::from_secs(120);
 const CLOUDFLARED_URL_TIMEOUT: Duration = Duration::from_secs(45);
 const CLOUDFLARED_READY_TIMEOUT: Duration = Duration::from_secs(60);
@@ -1125,3 +1130,100 @@ pub async fn ensure_tunnel_client(
 #[cfg(test)]
 #[path = "tunnel_tests.rs"]
 mod tests;
+
+// ---------------------------------------------------------------------------
+// FORK: who an OpenAI tunnel is shared with.
+
+/// What `tunnel-client admin tunnels get` says about a tunnel's audience.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TunnelAdminAccess {
+    /// ChatGPT account ids the tunnel is shared with.
+    pub chatgpt_accounts: Vec<String>,
+    /// Workspace ids, when the tunnel is shared that way instead.
+    pub workspaces: Vec<String>,
+}
+
+impl TunnelAdminAccess {
+    pub fn is_empty(&self) -> bool {
+        self.chatgpt_accounts.is_empty() && self.workspaces.is_empty()
+    }
+
+    /// One phrase for a refusal message.
+    pub fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.chatgpt_accounts.is_empty() {
+            parts.push(format!("account(s) {}", self.chatgpt_accounts.join(", ")));
+        }
+        if !self.workspaces.is_empty() {
+            parts.push(format!("workspace(s) {}", self.workspaces.join(", ")));
+        }
+        if parts.is_empty() {
+            "nobody".to_string()
+        } else {
+            parts.join(" and ")
+        }
+    }
+}
+
+/// Pulls the audience out of the admin JSON. The shape has moved before, so
+/// every level is optional and an unreadable answer is simply no answer.
+pub fn parse_tunnel_audience(value: &serde_json::Value) -> TunnelAdminAccess {
+    let ids = |keys: &[&str]| -> Vec<String> {
+        keys.iter()
+            .filter_map(|key| value.get(*key).or_else(|| value.get("tunnel")?.get(*key)))
+            .filter_map(serde_json::Value::as_array)
+            .flatten()
+            .filter_map(|entry| match entry {
+                serde_json::Value::String(id) => Some(id.clone()),
+                other => other
+                    .get("id")
+                    .or_else(|| other.get("account_id"))
+                    .or_else(|| other.get("workspace_id"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+            })
+            .collect()
+    };
+    TunnelAdminAccess {
+        chatgpt_accounts: ids(&["chatgpt_accounts", "chatgpt_account_ids", "accounts"]),
+        workspaces: ids(&["chatgpt_workspaces", "workspaces", "workspace_ids"]),
+    }
+}
+
+/// Runs `tunnel-client admin tunnels get <id> --admin-key file:<path> --json`.
+///
+/// Best-effort: any failure is `None`, because this only ever enriches a
+/// message that is already actionable without it.
+pub async fn read_tunnel_audience(
+    binary: &Path,
+    tunnel_id: &str,
+    admin_key_file: &Path,
+) -> Option<TunnelAdminAccess> {
+    let mut command = Command::new(binary);
+    command
+        .args(TUNNEL_CLIENT_ADMIN_ARGS)
+        .arg(tunnel_id)
+        .arg(TUNNEL_CLIENT_ADMIN_KEY_FLAG)
+        .arg(format!("file:{}", admin_key_file.display()))
+        .arg("--json")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+
+    let output = tokio::time::timeout(TUNNEL_ADMIN_TIMEOUT, command.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        tracing::debug!(
+            "chatgpt_web tunnel: admin tunnels get exited with {}",
+            output.status
+        );
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let access = parse_tunnel_audience(&value);
+    (!access.is_empty()).then_some(access)
+}

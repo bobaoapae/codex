@@ -100,6 +100,7 @@ fn a_changed_url_deletes_the_old_connector_and_recreates() {
         links: vec![link("link_old", "asdk_app_old", "Codex Native")],
         persisted: Some(record("asdk_app_old", "link_old", URL_A)),
         known_tunnels: None,
+        account: None,
     };
     let ops = plan(&observed, &desired(URL_B)).expect("plan");
     assert_eq!(
@@ -121,6 +122,7 @@ fn the_same_endpoint_only_verifies_and_refreshes_the_record() {
         links: vec![link("link_1", "asdk_app_1", "Codex Native")],
         persisted: Some(record("asdk_app_1", "link_1", URL_A)),
         known_tunnels: None,
+        account: None,
     };
     let ops = plan(&observed, &desired(URL_A)).expect("plan");
     assert_eq!(
@@ -152,6 +154,7 @@ fn a_lost_record_adopts_the_connector_that_already_points_here() {
         ],
         persisted: None,
         known_tunnels: None,
+        account: None,
     };
     let ops = plan(&observed, &desired(URL_A)).expect("plan");
     assert_eq!(
@@ -201,6 +204,7 @@ fn old_contract_names_and_spike_leftovers_are_swept() {
         ],
         persisted: None,
         known_tunnels: None,
+        account: None,
     };
     let ops = plan(&observed, &wanted).expect("plan");
     assert_eq!(
@@ -295,11 +299,14 @@ struct FakeState {
     failures: VecDeque<(&'static str, ApiError)>,
     open_calls: usize,
     close_calls: usize,
+    /// FORK: who Chrome is logged in as, for the tunnel-not-visible message.
+    account: AccountInfo,
 }
 
 fn op_kind(op: &RegistryOp) -> &'static str {
     match op {
         RegistryOp::ReadDeveloperMode => "ReadDeveloperMode",
+        RegistryOp::ReadAccount => "ReadAccount",
         RegistryOp::EnableDeveloperMode => "EnableDeveloperMode",
         RegistryOp::ListConnectors => "ListConnectors",
         RegistryOp::ListLinks => "ListLinks",
@@ -373,6 +380,7 @@ impl FakeApi {
         };
         match op {
             RegistryOp::ReadDeveloperMode => Ok(ApiResult::DeveloperMode(state.developer_mode)),
+            RegistryOp::ReadAccount => Ok(ApiResult::Account(state.account.clone())),
             RegistryOp::EnableDeveloperMode => {
                 state.developer_mode = true;
                 Ok(ApiResult::DeveloperMode(true))
@@ -1559,4 +1567,127 @@ async fn a_manual_reconcile_resets_the_backoff() {
         matches!(status, RegistryStatus::Verified { .. }),
         "the injected failure was consumed: {status:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// FORK: naming the account behind a tunnel-visibility refusal.
+
+#[test]
+fn a_tunnel_refusal_names_the_account_when_it_is_known() {
+    let wanted = DesiredConnector::for_endpoint(
+        "Codex Native",
+        "Codex tools",
+        TunnelEndpoint::OpenAi {
+            tunnel_id: "tunnel_0123456789abcdef0123456789abcdef".into(),
+        },
+    );
+    let observed = Observed {
+        developer_mode: Some(true),
+        known_tunnels: Some(vec!["tunnel_ffffffffffffffffffffffffffffffff".into()]),
+        account: Some(AccountInfo {
+            account_id: "b7000e3e-0000-4000-8000-000000000000".into(),
+            email: Some("someone@example.com".into()),
+            plan_type: Some("plus".into()),
+        }),
+        ..Observed::default()
+    };
+
+    let refusal = plan(&observed, &wanted).expect_err("refused");
+
+    assert!(
+        refusal
+            .reason
+            .contains("b7000e3e-0000-4000-8000-000000000000"),
+        "{}",
+        refusal.reason
+    );
+    assert!(refusal.reason.contains("someone@example.com"), "{}", refusal.reason);
+    assert!(refusal.reason.contains("plus"), "{}", refusal.reason);
+}
+
+#[tokio::test]
+async fn observe_reads_the_account_only_when_the_tunnel_is_missing() {
+    let tunnel_id = "tunnel_0123456789abcdef0123456789abcdef";
+    let wanted = DesiredConnector::for_endpoint(
+        "Codex Native",
+        "Codex tools",
+        TunnelEndpoint::OpenAi {
+            tunnel_id: tunnel_id.into(),
+        },
+    );
+
+    // Listed: no reason to spend two page fetches on the account.
+    let listed = FakeApi::new(true).with(|state| state.tunnels = vec![tunnel_id.into()]);
+    let observed = observe(listed.as_ref(), &wanted, None)
+        .await
+        .expect("observe");
+    assert_eq!(listed.count("ReadAccount"), 0);
+    assert_eq!(observed.account, None);
+
+    // Missing: the account is exactly what the refusal needs to name.
+    let missing = FakeApi::new(true).with(|state| {
+        state.tunnels = vec!["tunnel_ffffffffffffffffffffffffffffffff".into()];
+        state.account = AccountInfo {
+            account_id: "b7000e3e".into(),
+            email: Some("someone@example.com".into()),
+            plan_type: None,
+        };
+    });
+    let observed = observe(missing.as_ref(), &wanted, None)
+        .await
+        .expect("observe");
+    assert_eq!(missing.count("ReadAccount"), 1);
+    assert_eq!(
+        observed.account.as_ref().map(AccountInfo::describe),
+        Some("b7000e3e (someone@example.com)".to_string())
+    );
+}
+
+#[test]
+fn a_public_endpoint_never_reads_the_account() {
+    // Cloudflared has no tunnel audience at all, so nothing to look up.
+    let wanted = desired(URL_A);
+    let observed = Observed {
+        developer_mode: Some(true),
+        ..Observed::default()
+    };
+    assert!(plan(&observed, &wanted).is_ok());
+}
+
+/// FORK: `ReadAccount` is two page fetches — `accounts/check` for the id and
+/// plan, `auth/session` for the email — and every field is optional because
+/// both shapes have moved before.
+#[tokio::test]
+async fn the_page_api_reads_the_account_and_email() {
+    let daemon = FakeTabDaemon::new(
+        vec![chatgpt_tab(5)],
+        vec![
+            page(
+                200,
+                json!({
+                    "account_ordering": ["b7000e3e-0000-4000-8000-000000000000"],
+                    "accounts": {
+                        "b7000e3e-0000-4000-8000-000000000000": {
+                            "account": { "plan_type": "plus" }
+                        }
+                    }
+                }),
+            ),
+            page(200, json!({ "user": { "email": "someone@example.com" } })),
+        ],
+    );
+    let api = ChromeMcpPageApi::with_daemon(daemon.clone(), "https://chatgpt.com")
+        .with_registry_path(None);
+
+    let result = api.call(&RegistryOp::ReadAccount).await.expect("ok");
+
+    assert_eq!(
+        result,
+        ApiResult::Account(AccountInfo {
+            account_id: "b7000e3e-0000-4000-8000-000000000000".into(),
+            email: Some("someone@example.com".into()),
+            plan_type: Some("plus".into()),
+        })
+    );
+    api.close().await;
 }

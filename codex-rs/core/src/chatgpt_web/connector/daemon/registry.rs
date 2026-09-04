@@ -25,6 +25,7 @@ use super::state::ConnectorRecord;
 use super::state::FailureKind;
 use super::state::RegistryStatus;
 use super::state::now_ms;
+use super::tunnel::TunnelAdminAccess;
 use super::tunnel::TunnelEndpoint;
 use super::tunnel::TunnelState;
 use crate::chatgpt_web::connector::contract;
@@ -177,6 +178,36 @@ pub struct Observed {
     /// Tunnel ids the account can see (`mcp/tunnels`); only read for the
     /// `openai` transport.
     pub known_tunnels: Option<Vec<String>>,
+    /// FORK: who Chrome is logged in as. Only read when the tunnel turns out to
+    /// be invisible, because that is the one failure where naming the account
+    /// is the difference between an actionable message and a puzzle.
+    pub account: Option<AccountInfo>,
+}
+
+/// FORK: the ChatGPT account behind the Chrome session.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccountInfo {
+    pub account_id: String,
+    pub email: Option<String>,
+    pub plan_type: Option<String>,
+}
+
+impl AccountInfo {
+    /// `id (email, plan)`, skipping whatever was not readable.
+    pub fn describe(&self) -> String {
+        let mut detail = Vec::new();
+        if let Some(email) = self.email.as_deref().filter(|value| !value.is_empty()) {
+            detail.push(email.to_string());
+        }
+        if let Some(plan) = self.plan_type.as_deref().filter(|value| !value.is_empty()) {
+            detail.push(plan.to_string());
+        }
+        if detail.is_empty() {
+            self.account_id.clone()
+        } else {
+            format!("{} ({})", self.account_id, detail.join(", "))
+        }
+    }
 }
 
 /// A connector id that may only be known after `Create` ran.
@@ -198,6 +229,8 @@ pub enum LinkRef {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegistryOp {
     ReadDeveloperMode,
+    /// FORK: which ChatGPT account this Chrome session belongs to.
+    ReadAccount,
     EnableDeveloperMode,
     ListConnectors,
     ListLinks,
@@ -229,6 +262,8 @@ pub enum RegistryOp {
 pub enum ApiResult {
     Unit,
     DeveloperMode(bool),
+    /// FORK: the answer to [`RegistryOp::ReadAccount`].
+    Account(AccountInfo),
     Connectors(Vec<ObservedConnector>),
     Links(Vec<ObservedLink>),
     Tunnels(Vec<String>),
@@ -362,10 +397,17 @@ pub fn plan(
         && let Some(known) = &observed.known_tunnels
         && !known.iter().any(|known| known == tunnel_id)
     {
+        // FORK: name the account. "not visible to the ChatGPT account logged
+        // in Chrome" left the one fact that resolves it — *which* account —
+        // for the user to go and find.
+        let account = match observed.account.as_ref() {
+            Some(account) => format!(" The account is {}.", account.describe()),
+            None => String::new(),
+        };
         return Err(PlanRefusal {
             kind: FailureKind::TunnelNotVisible,
             reason: format!(
-                "tunnel `{tunnel_id}` is not visible to the ChatGPT account logged in Chrome ({} tunnel(s) listed). On platform.openai.com > Settings > Organization > Tunnels, edit the tunnel and add this ChatGPT account under \"ChatGPT workspaces\" (for a personal account, search its account id — the `account_id` from chatgpt.com/backend-api/accounts/check); then run `codex chatgpt-web registry reconcile` (or `codex chatgpt-web setup --tunnel-id {tunnel_id} --api-key-file <path>` if the key changed)",
+                "tunnel `{tunnel_id}` is not visible to the ChatGPT account logged in Chrome ({} tunnel(s) listed).{account} On platform.openai.com > Settings > Organization > Tunnels, edit the tunnel and add this ChatGPT account under \"ChatGPT workspaces\" (for a personal account, search its account id — the `account_id` from chatgpt.com/backend-api/accounts/check); then run `codex chatgpt-web registry reconcile` (or `codex chatgpt-web setup --tunnel-id {tunnel_id} --api-key-file <path>` if the key changed)",
                 known.len()
             ),
         });
@@ -645,6 +687,7 @@ pub async fn execute(
             RegistryOp::DeleteLink(_)
             | RegistryOp::DeleteConnector(_)
             | RegistryOp::ReadDeveloperMode
+            | RegistryOp::ReadAccount
             | RegistryOp::ListConnectors
             | RegistryOp::ListLinks
             | RegistryOp::ListTunnels => {
@@ -704,6 +747,24 @@ pub async fn observe(
             // The tunnel list is a pre-flight check, not a requirement.
             Err(error) => {
                 tracing::warn!("chatgpt_web registry: could not list tunnels: {error}");
+            }
+        }
+        // FORK: only when the configured tunnel is missing from that list. The
+        // account read costs two extra page fetches, and it is only worth
+        // making when its answer is going to be in the refusal.
+        let tunnel_missing = match (&desired.endpoint, &observed.known_tunnels) {
+            (TunnelEndpoint::OpenAi { tunnel_id }, Some(known)) => {
+                !known.iter().any(|known| known == tunnel_id)
+            }
+            _ => false,
+        };
+        if tunnel_missing {
+            match api.call(&RegistryOp::ReadAccount).await {
+                Ok(ApiResult::Account(account)) => observed.account = Some(account),
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!("chatgpt_web registry: could not read the account: {error}");
+                }
             }
         }
     }
@@ -954,6 +1015,11 @@ pub struct RegistryService {
     last_failure: Mutex<Option<String>>,
     /// FORK: how many times in a row the same terminal failure has come back.
     identical_terminal_failures: AtomicUsize,
+    /// FORK: `(tunnel-client binary, tunnel id, admin key file)`, when the
+    /// configured transport has an audience to read.
+    tunnel_admin: Option<(PathBuf, String, PathBuf)>,
+    /// FORK: the audience, read at most once per daemon lifetime.
+    tunnel_audience: tokio::sync::OnceCell<Option<TunnelAdminAccess>>,
     /// FORK: when the last attempt finished, for the turn debounce.
     last_attempt_ms: AtomicU64,
 }
@@ -988,7 +1054,34 @@ impl RegistryService {
             last_failure: Mutex::new(None),
             identical_terminal_failures: AtomicUsize::new(0),
             last_attempt_ms: AtomicU64::new(0),
+            tunnel_admin: None,
+            tunnel_audience: tokio::sync::OnceCell::new(),
         })
+    }
+
+    /// FORK: teaches the service how to read the tunnel's audience, so a
+    /// `tunnel_not_visible` refusal can also say who the tunnel *is* shared
+    /// with — the fact that turns "add this account" into a two-minute fix.
+    pub fn with_tunnel_admin(
+        mut self: Arc<Self>,
+        admin: Option<(PathBuf, String, PathBuf)>,
+    ) -> Arc<Self> {
+        if let Some(service) = Arc::get_mut(&mut self) {
+            service.tunnel_admin = admin;
+        }
+        self
+    }
+
+    /// FORK: the audience, read once and then remembered. A failure to read it
+    /// is remembered too: this only ever enriches a message.
+    async fn tunnel_audience(&self) -> Option<&TunnelAdminAccess> {
+        let (binary, tunnel_id, key_file) = self.tunnel_admin.as_ref()?;
+        self.tunnel_audience
+            .get_or_init(|| async {
+                super::tunnel::read_tunnel_audience(binary, tunnel_id, key_file).await
+            })
+            .await
+            .as_ref()
     }
 
     pub fn status(&self) -> RegistryStatus {
@@ -1112,8 +1205,23 @@ impl RegistryService {
                         failure.message
                     );
                 }
+                // FORK: the one failure worth an extra round trip — say who
+                // the tunnel is actually shared with, once per daemon.
+                let reason_suffix = if failure_kind_of(&failure.status)
+                    == Some(FailureKind::TunnelNotVisible)
+                {
+                    match self.tunnel_audience().await {
+                        Some(audience) => {
+                            format!(" The tunnel is shared with {}.", audience.describe())
+                        }
+                        None => String::new(),
+                    }
+                } else {
+                    String::new()
+                };
                 match failure.status {
                     RegistryStatus::Failed { reason, kind, .. } => {
+                        let reason = format!("{reason}{reason_suffix}");
                         // FORK: a terminal failure that keeps coming back is
                         // not going to fix itself; after a few widely spaced
                         // attempts the watcher parks and stops churning tabs.
@@ -1260,6 +1368,14 @@ impl RegistryService {
                 }
             }
         })
+    }
+}
+
+/// FORK: the kind of a `Failed` status, if it is one.
+fn failure_kind_of(status: &RegistryStatus) -> Option<FailureKind> {
+    match status {
+        RegistryStatus::Failed { kind, .. } => Some(*kind),
+        _ => None,
     }
 }
 

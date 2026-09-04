@@ -126,3 +126,35 @@ fn a_missing_cloudflared_path_is_none_and_the_local_install_is_found_when_presen
         assert!(path.is_file());
     }
 }
+
+/// FORK: `tunnel-client admin tunnels get --json` says who a tunnel is shared
+/// with. That is the fact that turns "not visible to the account logged in
+/// Chrome" into a two-minute fix, so the parser tolerates the shapes this API
+/// has used and simply says nothing when it recognises none of them.
+#[test]
+fn tunnel_audience_is_parsed_from_the_admin_json() {
+    let flat = parse_tunnel_audience(&serde_json::json!({
+        "chatgpt_accounts": ["fbf63138-0000-4000-8000-000000000000"],
+        "chatgpt_workspaces": [],
+    }));
+    assert_eq!(
+        flat.chatgpt_accounts,
+        vec!["fbf63138-0000-4000-8000-000000000000".to_string()]
+    );
+    assert!(flat.workspaces.is_empty());
+    assert!(flat.describe().contains("fbf63138"));
+
+    let nested = parse_tunnel_audience(&serde_json::json!({
+        "tunnel": {
+            "accounts": [{ "account_id": "acc_1" }],
+            "workspaces": [{ "id": "ws_1" }],
+        }
+    }));
+    assert_eq!(nested.chatgpt_accounts, vec!["acc_1".to_string()]);
+    assert_eq!(nested.workspaces, vec!["ws_1".to_string()]);
+    assert_eq!(nested.describe(), "account(s) acc_1 and workspace(s) ws_1");
+
+    let unknown = parse_tunnel_audience(&serde_json::json!({ "something": "else" }));
+    assert!(unknown.is_empty());
+    assert_eq!(unknown.describe(), "nobody");
+}

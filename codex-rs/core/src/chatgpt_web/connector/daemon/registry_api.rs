@@ -13,6 +13,7 @@
 //! `chatgpt-pro-mcp` or a Codex session never adopts it mid-use, and closed
 //! again after the reconcile.
 
+use super::registry::AccountInfo;
 use super::registry::ApiError;
 use super::registry::ApiResult;
 use super::registry::ConnectorApi;
@@ -544,6 +545,36 @@ fn parse_tunnels(value: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// FORK: `accounts/check` names the account and its plan; `auth/session` adds
+/// the email. Both shapes have moved before, so every field is optional.
+fn parse_account(check: &Value, session: Option<&Value>) -> AccountInfo {
+    let account_id = check
+        .get("account_ordering")
+        .and_then(Value::as_array)
+        .and_then(|ordering| ordering.first())
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_default();
+    let plan_type = check
+        .get("accounts")
+        .and_then(Value::as_object)
+        .and_then(|accounts| {
+            accounts
+                .get(&account_id)
+                .or_else(|| accounts.values().next())
+        })
+        .and_then(|account| account.get("account"))
+        .and_then(|account| string_field(account, &["plan_type", "structure"]));
+    let email = session
+        .and_then(|session| session.get("user"))
+        .and_then(|user| string_field(user, &["email"]));
+    AccountInfo {
+        account_id,
+        email,
+        plan_type,
+    }
+}
+
 fn create_body(desired: &DesiredConnector) -> Value {
     let mut body = json!({
         "name": desired.display_name(),
@@ -632,6 +663,20 @@ impl ConnectorApi for ChromeMcpPageApi {
                         .fetch_ok("GET", "/backend-api/aip/connectors/mcp/tunnels", None)
                         .await?;
                     Ok(ApiResult::Tunnels(parse_tunnels(&answer)))
+                }
+                // FORK: which account this Chrome session is. The email comes
+                // from a second endpoint and is best-effort — the account id is
+                // the part that matches what the tunnel's audience lists.
+                RegistryOp::ReadAccount => {
+                    let account = self
+                        .fetch_ok(
+                            "GET",
+                            "/backend-api/accounts/check/v4-2023-04-27",
+                            None,
+                        )
+                        .await?;
+                    let session = self.fetch_ok("GET", "/api/auth/session", None).await.ok();
+                    Ok(ApiResult::Account(parse_account(&account, session.as_ref())))
                 }
                 RegistryOp::DeleteLink(link_id) => ok_or_gone(
                     self.fetch_ok(
