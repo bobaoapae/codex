@@ -18,9 +18,29 @@ pub struct HealthResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_url: Option<String>,
     pub registry_status: String,
+    /// FORK: the registry's own words for why it failed, so the turn-side gate
+    /// can say something better than "not ready within 90s".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_reason: Option<String>,
+    /// FORK: `FailureKind::label()`; a terminal kind fails the turn at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_failure_kind: Option<String>,
+    /// FORK: when the daemon will try again, in Unix milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_retry_at_ms: Option<u64>,
+    /// FORK: the watcher has stopped retrying on its own.
+    #[serde(default)]
+    pub registry_parked: bool,
     pub tunnel_state: String,
     pub sessions: usize,
     pub active_turns: usize,
+}
+
+/// FORK: `POST /v1/registry/reconcile` and `POST /v1/registry/refresh`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReconcileResponse {
+    pub registry_status: String,
+    pub detail: crate::chatgpt_web::connector::daemon::state::RegistryStatus,
 }
 
 /// `POST /v1/sessions`.

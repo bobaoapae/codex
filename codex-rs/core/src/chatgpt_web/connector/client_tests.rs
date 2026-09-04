@@ -277,3 +277,217 @@ async fn a_browser_that_never_comes_back_fails_at_the_deadline() {
     drop(broker);
     daemon.shutdown().await;
 }
+
+/// FORK: a failure the user has to fix should not burn the turn's whole budget.
+/// Before this, a tunnel the ChatGPT account could not see cost every consultant
+/// turn the full 90s before failing with "not ready within 90s".
+#[tokio::test]
+async fn a_terminal_registry_failure_fails_the_turn_at_once() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let daemon = start_daemon(&temp).await;
+    daemon.control.set_registry_status(RegistryStatus::Failed {
+        reason: "tunnel `tunnel_abc` is not visible to the ChatGPT account logged in Chrome"
+            .into(),
+        retry_at_ms: now_ms() + 300_000,
+        kind: FailureKind::TunnelNotVisible,
+        parked: false,
+    });
+
+    let broker = DaemonSessionBroker::connect(
+        daemon.endpoint.control_url.clone(),
+        daemon.endpoint.token.clone(),
+        "Codex Native".into(),
+    )
+    .await
+    .expect("broker connects");
+
+    let started = std::time::Instant::now();
+    let error = match broker.begin_turn(probe_turn(Duration::from_secs(90))).await {
+        Ok(_) => panic!("a terminal registry failure must fail the turn"),
+        Err(error) => error,
+    };
+
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "took {:?}, which is most of the budget",
+        started.elapsed()
+    );
+    assert!(error.contains("not visible"), "{error}");
+    assert!(error.contains("tunnel_not_visible"), "{error}");
+    assert!(error.contains("registry reconcile"), "{error}");
+
+    drop(broker);
+    daemon.shutdown().await;
+}
+
+/// A transient failure is still waited out — it is exactly the kind the daemon
+/// may well fix on its next attempt.
+#[tokio::test]
+async fn a_transient_registry_failure_is_waited_out() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let daemon = start_daemon(&temp).await;
+    daemon.control.set_registry_status(RegistryStatus::Failed {
+        reason: "HTTP 500: boom".into(),
+        retry_at_ms: now_ms() + 1_000,
+        kind: FailureKind::Transient,
+        parked: false,
+    });
+
+    let broker = DaemonSessionBroker::connect(
+        daemon.endpoint.control_url.clone(),
+        daemon.endpoint.token.clone(),
+        "Codex Native".into(),
+    )
+    .await
+    .expect("broker connects");
+
+    let control = daemon.control.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        control.set_registry_status(RegistryStatus::Verified {
+            connector_id: "asdk_app_test".into(),
+            link_id: "link_test".into(),
+            mcp_url: "https://example.trycloudflare.com/mcp/x".into(),
+        });
+    });
+
+    let turn = broker
+        .begin_turn(probe_turn(Duration::from_secs(20)))
+        .await
+        .expect("a transient failure resolves within the budget");
+
+    broker.end_turn(&turn.turn_token, "done").await;
+    drop(broker);
+    daemon.shutdown().await;
+}
+
+/// FORK: `/healthz` carries the failure detail, not only its label — that is
+/// what lets the turn-side gate decide whether waiting is worth anything.
+#[tokio::test]
+async fn healthz_carries_the_registry_failure() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let daemon = start_daemon(&temp).await;
+    let retry_at_ms = now_ms() + 300_000;
+    daemon.control.set_registry_status(RegistryStatus::Failed {
+        reason: "tunnel `tunnel_abc` is not visible".into(),
+        retry_at_ms,
+        kind: FailureKind::TunnelNotVisible,
+        parked: true,
+    });
+
+    let health = daemon.control.health();
+
+    assert_eq!(health.registry_status, "failed");
+    assert_eq!(
+        health.registry_failure_kind.as_deref(),
+        Some("tunnel_not_visible")
+    );
+    assert_eq!(
+        health.registry_reason.as_deref(),
+        Some("tunnel `tunnel_abc` is not visible")
+    );
+    assert_eq!(health.registry_retry_at_ms, Some(retry_at_ms));
+    assert!(health.registry_parked);
+
+    // A healthy registry carries none of it.
+    daemon
+        .control
+        .set_registry_status(RegistryStatus::Verified {
+            connector_id: "asdk_app_test".into(),
+            link_id: "link_test".into(),
+            mcp_url: "https://example.trycloudflare.com/mcp/x".into(),
+        });
+    let health = daemon.control.health();
+    assert_eq!(health.registry_reason, None);
+    assert_eq!(health.registry_failure_kind, None);
+    assert!(!health.registry_parked);
+
+    daemon.shutdown().await;
+}
+
+/// FORK: the refresh route is the turn's synchronous ask. It is behind the
+/// bearer like every other control route, and answers with the resulting
+/// status — 501 on a build with no registry, which is what makes it safe for
+/// `wait_verified` to fall through to its poll.
+#[tokio::test]
+async fn the_refresh_route_needs_the_bearer_and_answers_the_resulting_status() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let daemon = start_daemon(&temp).await;
+    let url = format!("{}/v1/registry/refresh", daemon.endpoint.control_url);
+    let http = reqwest::Client::new();
+
+    let unauthorized = http.post(&url).send().await.expect("request");
+    assert_eq!(unauthorized.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let no_registry = http
+        .post(&url)
+        .bearer_auth(&daemon.endpoint.token)
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(no_registry.status(), reqwest::StatusCode::NOT_IMPLEMENTED);
+
+    daemon.shutdown().await;
+}
+
+/// FORK: a starting turn asks the daemon to reconcile rather than polling a
+/// status its own backoff may not revisit for half an hour. The trigger is
+/// `Turn`, the only one allowed to override a parked registry.
+#[tokio::test]
+async fn begin_turn_asks_the_daemon_to_refresh_the_registry_first() {
+    use crate::chatgpt_web::connector::daemon::control::ReconcileHook;
+    use crate::chatgpt_web::connector::daemon::control::ReconcileTrigger;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    let hook_refreshes = Arc::clone(&refreshes);
+    let hook: ReconcileHook = Arc::new(move |trigger| {
+        assert_eq!(trigger, ReconcileTrigger::Turn);
+        let hook_refreshes = Arc::clone(&hook_refreshes);
+        Box::pin(async move {
+            hook_refreshes.fetch_add(1, Ordering::SeqCst);
+            Ok(RegistryStatus::Verified {
+                connector_id: "asdk_app_test".into(),
+                link_id: "link_test".into(),
+                mcp_url: "https://example.trycloudflare.com/mcp/x".into(),
+            })
+        })
+    });
+
+    let mut config = daemon::DaemonRunConfig::new(
+        crate::config::ChatGptWebSettings::default(),
+        temp.path().to_path_buf(),
+    );
+    config.tunnel_override = Some(Arc::new(NoopTunnel {
+        endpoint: TunnelEndpoint::Public {
+            mcp_url: "https://example.trycloudflare.com/mcp/x".into(),
+        },
+    }));
+    config.reconcile = Some(hook);
+    let daemon = daemon::start(config).await.expect("daemon starts");
+
+    let broker = DaemonSessionBroker::connect(
+        daemon.endpoint.control_url.clone(),
+        daemon.endpoint.token.clone(),
+        "Codex Native".into(),
+    )
+    .await
+    .expect("broker connects");
+
+    // The registry has never been reconciled; the turn's own refresh is what
+    // brings it to `Verified`.
+    let turn = broker
+        .begin_turn(probe_turn(Duration::from_secs(20)))
+        .await
+        .expect("the refresh verified the connector");
+    assert!(
+        refreshes.load(Ordering::SeqCst) >= 1,
+        "begin_turn did not ask for a refresh"
+    );
+
+    broker.end_turn(&turn.turn_token, "done").await;
+    drop(broker);
+    daemon.shutdown().await;
+}

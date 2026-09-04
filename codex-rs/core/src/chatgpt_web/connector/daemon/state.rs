@@ -62,6 +62,61 @@ impl DaemonPaths {
     }
 }
 
+/// FORK: why a reconcile failed, and whether waiting can fix it.
+///
+/// The turn-side gate used to wait out its whole `ready_timeout` for every
+/// failure alike. A tunnel the ChatGPT account cannot see, a login that is
+/// gone, or a connector that will not converge are not going to resolve in 90
+/// seconds of polling — naming them lets the turn fail in a couple of seconds
+/// with something the user can act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureKind {
+    /// Retrying may well work (network hiccup, tunnel still coming up).
+    #[default]
+    Transient,
+    /// The ChatGPT API is rate limiting us; wait longer, but do wait.
+    RateLimited,
+    /// The configured tunnel is not visible to the ChatGPT account in Chrome.
+    TunnelNotVisible,
+    /// The page has no ChatGPT login.
+    LoginRequired,
+    /// The connector cannot be brought into the shape we need.
+    SetupRequired,
+}
+
+impl FailureKind {
+    /// Whether waiting is pointless: the user has to change something.
+    pub fn is_terminal(self) -> bool {
+        match self {
+            Self::Transient | Self::RateLimited => false,
+            Self::TunnelNotVisible | Self::LoginRequired | Self::SetupRequired => true,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Transient => "transient",
+            Self::RateLimited => "rate_limited",
+            Self::TunnelNotVisible => "tunnel_not_visible",
+            Self::LoginRequired => "login_required",
+            Self::SetupRequired => "setup_required",
+        }
+    }
+
+    /// Parses the label back, for the turn-side client reading `/healthz`.
+    pub fn parse(label: &str) -> Option<Self> {
+        match label {
+            "transient" => Some(Self::Transient),
+            "rate_limited" => Some(Self::RateLimited),
+            "tunnel_not_visible" => Some(Self::TunnelNotVisible),
+            "login_required" => Some(Self::LoginRequired),
+            "setup_required" => Some(Self::SetupRequired),
+            _ => None,
+        }
+    }
+}
+
 /// Where the registry stands; the daemon reports it on `/healthz` and refuses
 /// turns until it is `Verified`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -80,6 +135,15 @@ pub enum RegistryStatus {
     Failed {
         reason: String,
         retry_at_ms: u64,
+        /// FORK: what kind of failure this is, so a turn can fail fast on the
+        /// ones no amount of waiting fixes.
+        #[serde(default)]
+        kind: FailureKind,
+        /// FORK: the watcher has stopped retrying this one (see
+        /// `PARK_AFTER_IDENTICAL_TERMINAL_FAILURES`). A turn, a manual
+        /// reconcile or a tunnel change wakes it.
+        #[serde(default)]
+        parked: bool,
     },
     /// The registry is not implemented in this build (C1); C2 replaces it.
     NotImplemented,

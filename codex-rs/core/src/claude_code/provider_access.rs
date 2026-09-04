@@ -19,7 +19,7 @@ impl ClaudeProviderAccess {
     /// A subagent is launched in `auto` mode even when the parent policy is
     /// `Never`, because only that mode reaches the host's `can_use_tool`
     /// callback where the destructive-Git denial lives.
-    pub(crate) fn requires_tool_authorization(&self) -> bool {
+    pub(crate) fn requires_tool_authorization(self) -> bool {
         matches!(self, Self::Subagent)
     }
 

@@ -54,9 +54,25 @@ use tokio_util::sync::CancellationToken;
 pub const MAX_POLL_WAIT: Duration = Duration::from_secs(30);
 const DEFAULT_POLL_WAIT: Duration = Duration::from_secs(25);
 
+/// FORK: who asked for a reconcile. The watcher respects the backoff and the
+/// parked flag; a turn overrides the park once; a manual reconcile or a tunnel
+/// change starts the ladder over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconcileTrigger {
+    /// The daemon's own background watcher.
+    Watcher,
+    /// A turn is about to start and needs a verified connector.
+    Turn,
+    /// `codex chatgpt-web registry reconcile`.
+    Manual,
+    /// The tunnel published a new endpoint.
+    TunnelChange,
+}
+
 /// Registry hook: C2 supplies the reconcile; until then `None` → 501.
-pub type ReconcileHook =
-    Arc<dyn Fn() -> BoxFuture<'static, Result<RegistryStatus, String>> + Send + Sync>;
+pub type ReconcileHook = Arc<
+    dyn Fn(ReconcileTrigger) -> BoxFuture<'static, Result<RegistryStatus, String>> + Send + Sync,
+>;
 
 /// Shared by every handler.
 pub struct ControlState {
@@ -94,7 +110,7 @@ impl ControlState {
         }
         let state = Arc::clone(self);
         tokio::spawn(async move {
-            match hook().await {
+            match hook(ReconcileTrigger::Turn).await {
                 Ok(status) => state.set_registry_status(status),
                 Err(reason) => {
                     tracing::warn!("chatgpt_web registry: background reconcile failed: {reason}");
@@ -121,6 +137,24 @@ impl ControlState {
     pub fn health(&self) -> HealthResponse {
         let (sessions, active_turns) = self.broker.stats();
         let tunnel = self.tunnel.borrow().clone();
+        let registry = self.registry_status();
+        // FORK: carry the failure detail, not just the label — the turn-side
+        // gate used to wait out its whole budget because `/healthz` could not
+        // tell it that no amount of waiting would help.
+        let (reason, kind, retry_at_ms, parked) = match &registry {
+            RegistryStatus::Failed {
+                reason,
+                retry_at_ms,
+                kind,
+                parked,
+            } => (
+                Some(reason.clone()),
+                Some(kind.label().to_string()),
+                Some(*retry_at_ms),
+                *parked,
+            ),
+            _ => (None, None, None, false),
+        };
         HealthResponse {
             ok: true,
             pid: std::process::id(),
@@ -128,7 +162,11 @@ impl ControlState {
             public_url: tunnel
                 .endpoint()
                 .map(super::tunnel::TunnelEndpoint::public_label),
-            registry_status: self.registry_status().label().to_string(),
+            registry_status: registry.label().to_string(),
+            registry_reason: reason,
+            registry_failure_kind: kind,
+            registry_retry_at_ms: retry_at_ms,
+            registry_parked: parked,
             tunnel_state: tunnel.label(),
             sessions,
             active_turns,
@@ -306,13 +344,27 @@ async fn post_result(
 }
 
 async fn reconcile(State(state): State<Arc<ControlState>>) -> Response {
+    run_reconcile(&state, ReconcileTrigger::Manual).await
+}
+
+/// FORK: `POST /v1/registry/refresh` — the turn-side gate's synchronous ask.
+///
+/// Same shape as `reconcile`, but the `Turn` trigger is the one allowed to
+/// override a parked registry exactly once, so a user who has just fixed their
+/// tunnel gets a fresh attempt on the very next turn instead of waiting for the
+/// backoff ladder.
+async fn registry_refresh(State(state): State<Arc<ControlState>>) -> Response {
+    run_reconcile(&state, ReconcileTrigger::Turn).await
+}
+
+async fn run_reconcile(state: &Arc<ControlState>, trigger: ReconcileTrigger) -> Response {
     let Some(hook) = state.reconcile.clone() else {
         return error(
             StatusCode::NOT_IMPLEMENTED,
             "connector registry is not implemented in this build",
         );
     };
-    match hook().await {
+    match hook(trigger).await {
         Ok(status) => {
             let label = status.label().to_string();
             let body = serde_json::to_value(&status).unwrap_or_else(|_| json!({}));
@@ -346,6 +398,7 @@ pub fn router(state: Arc<ControlState>) -> Router {
         .route("/v1/turns/{turn_token}", delete(end_turn))
         .route("/v1/calls/{call_id}/result", post(post_result))
         .route("/v1/registry/reconcile", post(reconcile))
+        .route("/v1/registry/refresh", post(registry_refresh))
         .route("/v1/admin/shutdown_when_idle", post(shutdown_when_idle))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),

@@ -20,7 +20,9 @@
 //! itself (`PATCH /backend-api/settings/account_user_setting`).
 
 use super::control::ReconcileHook;
+use super::control::ReconcileTrigger;
 use super::state::ConnectorRecord;
+use super::state::FailureKind;
 use super::state::RegistryStatus;
 use super::state::now_ms;
 use super::tunnel::TunnelEndpoint;
@@ -31,6 +33,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -40,12 +43,34 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 /// Backoff between failed reconciles, then `FAILURE_BACKOFF_CAP`.
-pub const FAILURE_BACKOFF: [Duration; 3] = [
+///
+/// FORK: the ladder used to stop at 60s, so a cause that never resolves —
+/// a tunnel the ChatGPT account cannot see — produced one reconcile a minute
+/// forever, and each one opens and closes a dedicated chatgpt.com tab. 04/09
+/// spent an afternoon at 60 tabs an hour.
+pub const FAILURE_BACKOFF: [Duration; 8] = [
     Duration::from_secs(2),
     Duration::from_secs(5),
     Duration::from_secs(10),
+    Duration::from_secs(60),
+    Duration::from_secs(120),
+    Duration::from_secs(300),
+    Duration::from_secs(900),
+    Duration::from_secs(1800),
 ];
-pub const FAILURE_BACKOFF_CAP: Duration = Duration::from_secs(60);
+pub const FAILURE_BACKOFF_CAP: Duration = Duration::from_secs(1800);
+/// FORK: a failure the user has to fix gets three widely spaced attempts and
+/// then stops; retrying it faster only churns tabs.
+pub const TERMINAL_BACKOFF: [Duration; 3] = [
+    Duration::from_secs(60),
+    Duration::from_secs(300),
+    Duration::from_secs(1800),
+];
+/// FORK: after this many identical terminal failures the watcher parks.
+pub const PARK_AFTER_IDENTICAL_TERMINAL_FAILURES: usize = 3;
+/// FORK: a turn asking for a refresh this soon after the last attempt is told
+/// the current status instead of starting another reconcile.
+pub const TURN_RECONCILE_DEBOUNCE: Duration = Duration::from_secs(10);
 /// How long to wait before retrying when the chrome-mcp daemon is unreachable.
 pub const BROWSER_UNAVAILABLE_RETRY: Duration = Duration::from_secs(60);
 /// Retry delay while the tunnel is still coming up.
@@ -307,9 +332,26 @@ fn delete_ops_for(observed: &Observed, connector_id: &str, ops: &mut Vec<Registr
     ops.push(RegistryOp::DeleteConnector(connector_id.to_string()));
 }
 
+/// FORK: why the planner refuses, with the kind that decides whether a turn
+/// should wait for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanRefusal {
+    pub kind: FailureKind,
+    pub reason: String,
+}
+
+impl std::fmt::Display for PlanRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
 /// Decides what to do. `Err` is a refusal with an actionable reason (the
 /// configured tunnel is not visible to this account).
-pub fn plan(observed: &Observed, desired: &DesiredConnector) -> Result<Vec<RegistryOp>, String> {
+pub fn plan(
+    observed: &Observed,
+    desired: &DesiredConnector,
+) -> Result<Vec<RegistryOp>, PlanRefusal> {
     // (4) Developer Mode gates every connector endpoint; switch it on first
     // and observe again.
     if observed.developer_mode == Some(false) {
@@ -320,10 +362,13 @@ pub fn plan(observed: &Observed, desired: &DesiredConnector) -> Result<Vec<Regis
         && let Some(known) = &observed.known_tunnels
         && !known.iter().any(|known| known == tunnel_id)
     {
-        return Err(format!(
-            "tunnel `{tunnel_id}` is not visible to the ChatGPT account logged in Chrome ({} tunnel(s) listed). On platform.openai.com > Settings > Organization > Tunnels, edit the tunnel and add this ChatGPT account under \"ChatGPT workspaces\" (for a personal account, search its account id — the `account_id` from chatgpt.com/backend-api/accounts/check); then run `codex chatgpt-web registry reconcile` (or `codex chatgpt-web setup --tunnel-id {tunnel_id} --api-key-file <path>` if the key changed)",
-            known.len()
-        ));
+        return Err(PlanRefusal {
+            kind: FailureKind::TunnelNotVisible,
+            reason: format!(
+                "tunnel `{tunnel_id}` is not visible to the ChatGPT account logged in Chrome ({} tunnel(s) listed). On platform.openai.com > Settings > Organization > Tunnels, edit the tunnel and add this ChatGPT account under \"ChatGPT workspaces\" (for a personal account, search its account id — the `account_id` from chatgpt.com/backend-api/accounts/check); then run `codex chatgpt-web registry reconcile` (or `codex chatgpt-web setup --tunnel-id {tunnel_id} --api-key-file <path>` if the key changed)",
+                known.len()
+            ),
+        });
     }
 
     let mut ops = Vec::new();
@@ -687,11 +732,18 @@ pub async fn reconcile(
 }
 
 fn fail(reason: String, retry_after: Duration) -> RegistryFailure {
+    fail_kind(reason, retry_after, FailureKind::Transient)
+}
+
+/// FORK: the same, with the kind that decides whether a turn waits for it.
+fn fail_kind(reason: String, retry_after: Duration, kind: FailureKind) -> RegistryFailure {
     RegistryFailure {
         message: reason.clone(),
         status: RegistryStatus::Failed {
             reason,
             retry_at_ms: now_ms() + retry_after.as_millis() as u64,
+            kind,
+            parked: false,
         },
     }
 }
@@ -707,6 +759,20 @@ fn map_api(error: ApiError) -> RegistryFailure {
             message: error.to_string(),
             status: RegistryStatus::DeveloperModeOff,
         }
+    } else if error.login_required {
+        // FORK: no login, no connector API; polling cannot log anyone in.
+        fail_kind(
+            error.to_string(),
+            TERMINAL_BACKOFF[0],
+            FailureKind::LoginRequired,
+        )
+    } else if error.rate_limited {
+        // FORK: worth retrying, but not at the transient cadence.
+        fail_kind(
+            error.to_string(),
+            FAILURE_BACKOFF[3],
+            FailureKind::RateLimited,
+        )
     } else {
         fail(error.to_string(), FAILURE_BACKOFF[0])
     }
@@ -724,7 +790,9 @@ async fn reconcile_open(
         let observed = observe(api, desired, persisted.clone())
             .await
             .map_err(map_api)?;
-        let ops = plan(&observed, desired).map_err(|reason| fail(reason, FAILURE_BACKOFF_CAP))?;
+        let ops = plan(&observed, desired).map_err(|refusal| {
+            fail_kind(refusal.reason, TERMINAL_BACKOFF[0], refusal.kind)
+        })?;
         if ops.first() == Some(&RegistryOp::EnableDeveloperMode) {
             if enabled_developer_mode {
                 return Err(RegistryFailure {
@@ -787,17 +855,26 @@ async fn reconcile_open(
                 continue;
             }
             Err(error @ ExecError::VerifyMismatch { .. }) => {
-                return Err(fail(error.to_string(), FAILURE_BACKOFF_CAP));
+                return Err(fail_kind(
+                    error.to_string(),
+                    TERMINAL_BACKOFF[0],
+                    FailureKind::SetupRequired,
+                ));
             }
             Err(ExecError::Api(error)) => return Err(map_api(error)),
             Err(error @ ExecError::Unresolved(_)) => {
-                return Err(fail(error.to_string(), FAILURE_BACKOFF_CAP));
+                return Err(fail_kind(
+                    error.to_string(),
+                    TERMINAL_BACKOFF[0],
+                    FailureKind::SetupRequired,
+                ));
             }
         }
     }
-    Err(fail(
+    Err(fail_kind(
         "reconcile did not converge after 4 rounds".to_string(),
-        FAILURE_BACKOFF_CAP,
+        TERMINAL_BACKOFF[0],
+        FailureKind::SetupRequired,
     ))
 }
 
@@ -875,6 +952,10 @@ pub struct RegistryService {
     failures: AtomicUsize,
     /// FORK: the last failure message, so an identical repeat logs at `debug`.
     last_failure: Mutex<Option<String>>,
+    /// FORK: how many times in a row the same terminal failure has come back.
+    identical_terminal_failures: AtomicUsize,
+    /// FORK: when the last attempt finished, for the turn debounce.
+    last_attempt_ms: AtomicU64,
 }
 
 impl std::fmt::Debug for RegistryService {
@@ -905,6 +986,8 @@ impl RegistryService {
             gate: Semaphore::new(1),
             failures: AtomicUsize::new(0),
             last_failure: Mutex::new(None),
+            identical_terminal_failures: AtomicUsize::new(0),
+            last_attempt_ms: AtomicU64::new(0),
         })
     }
 
@@ -957,15 +1040,24 @@ impl RegistryService {
     }
 
     /// Runs a reconcile now unless one is in progress (then waits for it) or
-    /// the last failure's backoff has not elapsed (then reports that status).
-    pub async fn reconcile_now(&self) -> RegistryStatus {
+    /// the caller is not entitled to one yet (then reports the current status).
+    ///
+    /// FORK: `trigger` decides what "entitled" means. The watcher respects the
+    /// backoff and the parked flag; a `Turn` may override a park once (the user
+    /// has probably just fixed whatever it was), subject to a short debounce;
+    /// `Manual` and `TunnelChange` start the ladder over.
+    pub async fn reconcile_now(&self, trigger: ReconcileTrigger) -> RegistryStatus {
         let _permit = match self.gate.acquire().await {
             Ok(permit) => permit,
             Err(_) => return self.status(),
         };
-        if let RegistryStatus::Failed { retry_at_ms, .. } = self.status()
-            && now_ms() < retry_at_ms
-        {
+        if matches!(
+            trigger,
+            ReconcileTrigger::Manual | ReconcileTrigger::TunnelChange
+        ) {
+            self.reset_backoff();
+        }
+        if !self.may_reconcile(trigger) {
             return self.status();
         }
         let desired = match self.desired() {
@@ -974,19 +1066,18 @@ impl RegistryService {
                 let status = RegistryStatus::Failed {
                     reason,
                     retry_at_ms: now_ms() + TUNNEL_NOT_READY_RETRY.as_millis() as u64,
+                    kind: FailureKind::Transient,
+                    parked: false,
                 };
                 self.set_status(status.clone());
                 return status;
             }
         };
+        self.last_attempt_ms.store(now_ms(), Ordering::SeqCst);
         self.set_status(RegistryStatus::Reconciling);
         let status = match reconcile(self.api.as_ref(), &desired, &self.connector_path).await {
             Ok(record) => {
-                self.failures.store(0, Ordering::SeqCst);
-                *self
-                    .last_failure
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                self.reset_backoff();
                 tracing::info!(
                     "chatgpt_web registry: connector `{}` verified ({} actions)",
                     record.name,
@@ -1022,10 +1113,37 @@ impl RegistryService {
                     );
                 }
                 match failure.status {
-                    RegistryStatus::Failed { reason, .. } => RegistryStatus::Failed {
-                        reason,
-                        retry_at_ms: now_ms() + backoff_for(attempt).as_millis() as u64,
-                    },
+                    RegistryStatus::Failed { reason, kind, .. } => {
+                        // FORK: a terminal failure that keeps coming back is
+                        // not going to fix itself; after a few widely spaced
+                        // attempts the watcher parks and stops churning tabs.
+                        let identical_terminal = if kind.is_terminal() && repeated {
+                            self.identical_terminal_failures
+                                .fetch_add(1, Ordering::SeqCst)
+                                + 1
+                        } else {
+                            self.identical_terminal_failures.store(
+                                usize::from(kind.is_terminal()),
+                                Ordering::SeqCst,
+                            );
+                            usize::from(kind.is_terminal())
+                        };
+                        let parked =
+                            identical_terminal >= PARK_AFTER_IDENTICAL_TERMINAL_FAILURES;
+                        if parked {
+                            tracing::warn!(
+                                "chatgpt_web registry: parking automatic retries after {identical_terminal} identical {} failures; run `codex chatgpt-web registry reconcile` after fixing it",
+                                kind.label()
+                            );
+                        }
+                        RegistryStatus::Failed {
+                            reason,
+                            retry_at_ms: now_ms()
+                                + backoff_for(kind, attempt).as_millis() as u64,
+                            kind,
+                            parked,
+                        }
+                    }
                     other => other,
                 }
             }
@@ -1034,12 +1152,63 @@ impl RegistryService {
         status
     }
 
-    /// The hook the control API calls on `POST /v1/registry/reconcile`.
+    /// FORK: whether this trigger gets to run a reconcile right now.
+    fn may_reconcile(&self, trigger: ReconcileTrigger) -> bool {
+        let RegistryStatus::Failed {
+            retry_at_ms,
+            parked,
+            ..
+        } = self.status()
+        else {
+            return true;
+        };
+        match trigger {
+            // The watcher honours both the backoff and the park.
+            ReconcileTrigger::Watcher => !parked && now_ms() >= retry_at_ms,
+            // A turn is the user in front of us: it overrides the park, but
+            // not two turns in the same breath.
+            ReconcileTrigger::Turn => {
+                now_ms().saturating_sub(self.last_attempt_ms.load(Ordering::SeqCst))
+                    >= TURN_RECONCILE_DEBOUNCE.as_millis() as u64
+            }
+            // Explicitly asked for, or the world changed underneath us.
+            ReconcileTrigger::Manual | ReconcileTrigger::TunnelChange => true,
+        }
+    }
+
+    /// FORK: pretends every wait has elapsed — the current failure's retry
+    /// deadline and the turn debounce alike — so a test can drive the ladder
+    /// without sleeping through 60s, 5min and 30min. The failure history itself
+    /// is untouched: that is what the ladder counts.
+    #[cfg(test)]
+    pub(crate) fn advance_clock_for_tests(&self) {
+        self.last_attempt_ms.store(0, Ordering::SeqCst);
+        let mut status = self
+            .status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let RegistryStatus::Failed { retry_at_ms, .. } = &mut *status {
+            *retry_at_ms = now_ms();
+        }
+    }
+
+    /// FORK: forget the failure history so the ladder starts over.
+    fn reset_backoff(&self) {
+        self.failures.store(0, Ordering::SeqCst);
+        self.identical_terminal_failures.store(0, Ordering::SeqCst);
+        *self
+            .last_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    /// The hook the control API calls on `POST /v1/registry/reconcile` and
+    /// `POST /v1/registry/refresh`.
     pub fn hook(self: &Arc<Self>) -> ReconcileHook {
         let service = Arc::clone(self);
-        Arc::new(move || {
+        Arc::new(move |trigger| {
             let service = Arc::clone(&service);
-            Box::pin(async move { Ok(service.reconcile_now().await) })
+            Box::pin(async move { Ok(service.reconcile_now(trigger).await) })
         })
     }
 
@@ -1053,9 +1222,12 @@ impl RegistryService {
             loop {
                 let ready = matches!(&*tunnel.borrow(), TunnelState::Ready { .. });
                 if ready && !matches!(service.status(), RegistryStatus::Verified { .. }) {
-                    service.reconcile_now().await;
+                    service.reconcile_now(ReconcileTrigger::Watcher).await;
                 }
                 let wait = match service.status() {
+                    // FORK: a parked registry is not on a timer any more; only
+                    // a turn, a manual reconcile or a new tunnel wakes it.
+                    RegistryStatus::Failed { parked: true, .. } => Duration::from_secs(3600),
                     RegistryStatus::Failed { retry_at_ms, .. } => {
                         Duration::from_millis(retry_at_ms.saturating_sub(now_ms()).max(500))
                     }
@@ -1077,6 +1249,12 @@ impl RegistryService {
                         {
                             service.set_status(RegistryStatus::Unknown);
                         }
+                        // FORK: a new tunnel is exactly the kind of change that
+                        // can fix a parked failure; un-park and try again.
+                        if matches!(service.status(), RegistryStatus::Failed { parked: true, .. }) {
+                            service.reset_backoff();
+                            service.set_status(RegistryStatus::Unknown);
+                        }
                     }
                     _ = tokio::time::sleep(wait) => {}
                 }
@@ -1085,7 +1263,16 @@ impl RegistryService {
     }
 }
 
-fn backoff_for(attempt: usize) -> Duration {
+/// FORK: terminal failures climb a much slower ladder — each attempt costs a
+/// dedicated chatgpt.com tab, and no number of them fixes a tunnel the account
+/// cannot see.
+fn backoff_for(kind: FailureKind, attempt: usize) -> Duration {
+    if kind.is_terminal() {
+        return TERMINAL_BACKOFF
+            .get(attempt)
+            .copied()
+            .unwrap_or(*TERMINAL_BACKOFF.last().unwrap_or(&FAILURE_BACKOFF_CAP));
+    }
     FAILURE_BACKOFF
         .get(attempt)
         .copied()

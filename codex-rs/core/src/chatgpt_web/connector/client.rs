@@ -18,6 +18,9 @@ use super::BeginTurn;
 use super::ConnectorBroker;
 use super::ConnectorTurn;
 use super::ToolRequest;
+use super::daemon::state::FailureKind;
+use super::daemon::state::RegistryStatus;
+use super::daemon::state::now_ms;
 use super::daemon::wire;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
@@ -31,6 +34,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
+use tracing::debug;
 use tracing::warn;
 
 /// Bound on the tool-call channel handed to one connector turn.
@@ -68,6 +72,32 @@ impl DaemonHandle {
             control_url,
             token,
         }
+    }
+
+    /// FORK: asks the daemon to reconcile now, on behalf of a starting turn.
+    ///
+    /// The `Turn` trigger is the one allowed to override a parked registry, so
+    /// a user who has just fixed their tunnel gets a fresh attempt on the very
+    /// next turn instead of waiting out the backoff ladder.
+    async fn refresh_registry(
+        &self,
+        timeout: Duration,
+    ) -> Result<wire::ReconcileResponse, String> {
+        let response = self
+            .http
+            .post(format!("{}/v1/registry/refresh", self.control_url))
+            .bearer_auth(&self.token)
+            .timeout(timeout)
+            .send()
+            .await
+            .map_err(|err| err.to_string())?;
+        if !response.status().is_success() {
+            return Err(format!("HTTP {}", response.status()));
+        }
+        response
+            .json::<wire::ReconcileResponse>()
+            .await
+            .map_err(|err| err.to_string())
     }
 
     async fn health(&self) -> Result<wire::HealthResponse, String> {
@@ -402,7 +432,31 @@ impl DaemonSessionBroker {
     }
 
     async fn wait_verified(&self, ready_timeout: Duration) -> Result<(), String> {
+
         let deadline = tokio::time::Instant::now() + ready_timeout;
+        // FORK: ask for a reconcile up front rather than polling a status the
+        // daemon's own backoff may not revisit for half an hour. This is also
+        // the only trigger that overrides a parked registry, so the turn right
+        // after the user fixes something gets a real attempt.
+        match self
+            .session
+            .daemon
+            .refresh_registry(ready_timeout.min(Duration::from_secs(60)))
+            .await
+        {
+            Ok(response) => {
+                if let Some(error) = terminal_registry_error(&response.detail) {
+                    return Err(error);
+                }
+                if matches!(response.detail, RegistryStatus::Verified { .. }) {
+                    return Ok(());
+                }
+            }
+            // 501 on a build without the registry, or the daemon is busy: the
+            // poll below is still the right fallback.
+            Err(err) => debug!("chatgpt_web connector: registry refresh unavailable: {err}"),
+        }
+        let mut last_seen: Option<String> = None;
         // FORK (verified live): `browser_unavailable` is transient — the
         // chrome-mcp extension's service worker sleeps and the daemon's next
         // reconcile brings the connector back (67s, once). Failing the turn on
@@ -421,6 +475,17 @@ impl DaemonSessionBroker {
                 }
                 Ok(health) => {
                     browser_unavailable = health.registry_status == "browser_unavailable";
+                    // FORK: a failure the user has to fix is not going to
+                    // resolve inside this budget; say what it is now.
+                    if health.registry_status == "failed"
+                        && let Some(error) = terminal_health_error(&health)
+                    {
+                        return Err(error);
+                    }
+                    last_seen = Some(match health.registry_reason.as_deref() {
+                        Some(reason) => format!("{} ({reason})", health.registry_status),
+                        None => health.registry_status.clone(),
+                    });
                 }
                 Err(err) => warn!("chatgpt_web connector: health check failed: {err}"),
             }
@@ -432,13 +497,69 @@ impl DaemonSessionBroker {
                     );
                 }
                 return Err(format!(
-                    "the ChatGPT connector was not ready within {}s; run `codex chatgpt-web registry show` to see why",
-                    ready_timeout.as_secs()
+                    "the ChatGPT connector was not ready within {}s (last status: {}); run `codex chatgpt-web registry show` to see why",
+                    ready_timeout.as_secs(),
+                    last_seen.as_deref().unwrap_or("unknown")
                 ));
             }
             tokio::time::sleep(READY_POLL_INTERVAL).await;
         }
     }
+}
+
+/// FORK: the message for a registry failure no amount of waiting will fix.
+fn terminal_registry_error(status: &RegistryStatus) -> Option<String> {
+    let RegistryStatus::Failed {
+        reason,
+        retry_at_ms,
+        kind,
+        parked,
+    } = status
+    else {
+        return None;
+    };
+    if !kind.is_terminal() {
+        return None;
+    }
+    Some(render_terminal_registry_error(
+        reason,
+        kind.label(),
+        *parked,
+        Some(*retry_at_ms),
+    ))
+}
+
+/// The same, from the `/healthz` shape the poll loop sees.
+fn terminal_health_error(health: &wire::HealthResponse) -> Option<String> {
+    let kind = FailureKind::parse(health.registry_failure_kind.as_deref()?)?;
+    if !kind.is_terminal() {
+        return None;
+    }
+    Some(render_terminal_registry_error(
+        health.registry_reason.as_deref().unwrap_or("no reason given"),
+        kind.label(),
+        health.registry_parked,
+        health.registry_retry_at_ms,
+    ))
+}
+
+fn render_terminal_registry_error(
+    reason: &str,
+    kind: &str,
+    parked: bool,
+    retry_at_ms: Option<u64>,
+) -> String {
+    let retry = if parked {
+        "automatic retries are parked".to_string()
+    } else {
+        let seconds = retry_at_ms
+            .map(|at| at.saturating_sub(now_ms()) / 1000)
+            .unwrap_or(0);
+        format!("the daemon retries in {seconds}s")
+    };
+    format!(
+        "the ChatGPT connector cannot be used right now: {reason} (registry status failed/{kind}; {retry}).          Run `codex chatgpt-web registry show` to see the current state, then `codex chatgpt-web registry reconcile` after fixing it"
+    )
 }
 
 impl ConnectorBroker for DaemonSessionBroker {

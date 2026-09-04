@@ -220,10 +220,30 @@ async fn run_registry_show(codex_home: &Path) -> Result<()> {
     // FORK (C2): the live status comes from the running daemon, if any.
     let status = chatgpt_web_daemon::status(codex_home).await;
     match status.health {
-        Some(health) => println!(
-            "daemon pid {}: registry {}, tunnel {}",
-            health.pid, health.registry_status, health.tunnel_state
-        ),
+        Some(health) => {
+            println!(
+                "daemon pid {}: registry {}, tunnel {}",
+                health.pid, health.registry_status, health.tunnel_state
+            );
+            // FORK: a failed registry knows why; printing only the label sent
+            // the user looking through daemon.log for it.
+            if let Some(kind) = health.registry_failure_kind.as_deref() {
+                println!("failure: {kind}");
+            }
+            if let Some(reason) = health.registry_reason.as_deref() {
+                println!("reason:  {reason}");
+            }
+            if health.registry_parked {
+                println!(
+                    "retry:   parked (run `codex chatgpt-web registry reconcile` after fixing it)"
+                );
+            } else if let Some(retry_at_ms) = health.registry_retry_at_ms {
+                let seconds = retry_at_ms
+                    .saturating_sub(chatgpt_web_daemon::state::now_ms())
+                    / 1000;
+                println!("retry:   in {seconds}s");
+            }
+        }
         None => println!("daemon not running"),
     }
     Ok(())

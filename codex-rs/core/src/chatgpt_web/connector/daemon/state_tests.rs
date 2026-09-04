@@ -89,3 +89,57 @@ fn our_own_pid_is_alive_and_a_dead_child_is_not() {
     // The pid may be recycled in theory; in practice it is dead right after wait.
     assert!(!pid_alive(pid) || cfg!(windows));
 }
+
+/// FORK: `Failed` carries the failure kind and the parked flag, and a state
+/// file written by an older build still loads.
+#[test]
+fn a_registry_failure_round_trips_its_kind_and_park() {
+    let failed = RegistryStatus::Failed {
+        reason: "tunnel `tunnel_abc` is not visible".into(),
+        retry_at_ms: 1_700_000_000_000,
+        kind: FailureKind::TunnelNotVisible,
+        parked: true,
+    };
+    let json = serde_json::to_value(&failed).expect("json");
+    assert_eq!(json["status"], "failed");
+    assert_eq!(json["kind"], "tunnel_not_visible");
+    assert_eq!(json["parked"], true);
+    assert_eq!(
+        serde_json::from_value::<RegistryStatus>(json).expect("round trip"),
+        failed
+    );
+
+    // The shape older builds wrote: no kind, no parked.
+    let legacy: RegistryStatus = serde_json::from_value(serde_json::json!({
+        "status": "failed",
+        "reason": "boom",
+        "retry_at_ms": 1_700_000_000_000_u64,
+    }))
+    .expect("legacy shape still loads");
+    assert_eq!(
+        legacy,
+        RegistryStatus::Failed {
+            reason: "boom".into(),
+            retry_at_ms: 1_700_000_000_000,
+            kind: FailureKind::Transient,
+            parked: false,
+        }
+    );
+}
+
+#[test]
+fn only_the_failures_a_user_must_fix_are_terminal() {
+    for kind in [FailureKind::Transient, FailureKind::RateLimited] {
+        assert!(!kind.is_terminal(), "{kind:?}");
+    }
+    for kind in [
+        FailureKind::TunnelNotVisible,
+        FailureKind::LoginRequired,
+        FailureKind::SetupRequired,
+    ] {
+        assert!(kind.is_terminal(), "{kind:?}");
+        // The label is the wire form the turn-side client parses back.
+        assert_eq!(FailureKind::parse(kind.label()), Some(kind));
+    }
+    assert_eq!(FailureKind::parse("something else"), None);
+}

@@ -232,7 +232,10 @@ fn an_unknown_tunnel_id_is_refused_with_a_setup_hint() {
         known_tunnels: Some(vec!["tunnel_ffffffffffffffffffffffffffffffff".into()]),
         ..Observed::default()
     };
-    let reason = plan(&observed, &wanted).expect_err("refused");
+    let refusal = plan(&observed, &wanted).expect_err("refused");
+    assert_eq!(refusal.kind, FailureKind::TunnelNotVisible);
+    assert!(refusal.kind.is_terminal());
+    let reason = &refusal.reason;
     assert!(reason.contains("codex chatgpt-web setup"), "{reason}");
     assert!(reason.contains("not visible"), "{reason}");
 
@@ -731,8 +734,14 @@ async fn a_rate_limited_api_becomes_failed_with_a_retry_time() {
         RegistryStatus::Failed {
             reason,
             retry_at_ms,
+            kind,
+            parked,
         } => {
             assert!(reason.contains("429"), "{reason}");
+            // FORK: a 429 is worth retrying, but not at the transient cadence.
+            assert_eq!(kind, FailureKind::RateLimited);
+            assert!(!kind.is_terminal());
+            assert!(!parked);
             assert!(retry_at_ms >= before + FAILURE_BACKOFF[0].as_millis() as u64);
         }
         other => panic!("unexpected status {other:?}"),
@@ -807,7 +816,7 @@ async fn the_service_verifies_when_the_tunnel_is_ready_and_waits_otherwise() {
     let (_temp, path) = temp_connector_path();
     let (service, tx) = service_for(Arc::clone(&api), path, TunnelState::Connecting);
 
-    let status = service.reconcile_now().await;
+    let status = service.reconcile_now(ReconcileTrigger::Watcher).await;
     assert!(
         matches!(status, RegistryStatus::Failed { ref reason, .. } if reason.contains("tunnel not ready")),
         "{status:?}"
@@ -820,7 +829,7 @@ async fn the_service_verifies_when_the_tunnel_is_ready_and_waits_otherwise() {
         endpoint: public(URL_A),
     })
     .expect("send");
-    let status = service.reconcile_now().await;
+    let status = service.reconcile_now(ReconcileTrigger::Watcher).await;
     assert!(
         matches!(status, RegistryStatus::Verified { ref mcp_url, .. } if mcp_url == URL_A),
         "{status:?}"
@@ -847,11 +856,11 @@ async fn a_failed_reconcile_is_not_retried_before_its_backoff() {
         },
     );
 
-    let first = service.reconcile_now().await;
+    let first = service.reconcile_now(ReconcileTrigger::Watcher).await;
     assert!(matches!(first, RegistryStatus::Failed { .. }), "{first:?}");
     let creates = api.count("Create");
 
-    let second = service.reconcile_now().await;
+    let second = service.reconcile_now(ReconcileTrigger::Watcher).await;
     assert_eq!(second, first);
     assert_eq!(
         api.count("Create"),
@@ -1222,7 +1231,8 @@ async fn a_registered_turn_triggers_a_background_reconcile() {
     let temp = tempfile::tempdir().expect("tempdir");
     let calls = Arc::new(AtomicUsize::new(0));
     let hook_calls = Arc::clone(&calls);
-    let hook: ReconcileHook = Arc::new(move || {
+    let hook: ReconcileHook = Arc::new(move |trigger| {
+        assert_eq!(trigger, ReconcileTrigger::Turn);
         let hook_calls = Arc::clone(&hook_calls);
         Box::pin(async move {
             hook_calls.fetch_add(1, Ordering::SeqCst);
@@ -1344,4 +1354,209 @@ async fn live_registry_reconciles_a_manual_url() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// FORK: failure classification, the slow ladder, and parking.
+
+#[test]
+fn backoff_is_slow_for_terminal_failures_and_capped_for_transient_ones() {
+    // A transient failure retries quickly at first and then settles at the cap.
+    assert_eq!(backoff_for(FailureKind::Transient, 0), FAILURE_BACKOFF[0]);
+    assert_eq!(backoff_for(FailureKind::Transient, 3), FAILURE_BACKOFF[3]);
+    assert_eq!(backoff_for(FailureKind::Transient, 99), FAILURE_BACKOFF_CAP);
+
+    // A failure the user has to fix gets three widely spaced attempts; each one
+    // costs a dedicated chatgpt.com tab, so the first retry is a full minute.
+    assert_eq!(
+        backoff_for(FailureKind::TunnelNotVisible, 0),
+        TERMINAL_BACKOFF[0]
+    );
+    assert_eq!(
+        backoff_for(FailureKind::LoginRequired, 1),
+        TERMINAL_BACKOFF[1]
+    );
+    assert_eq!(
+        backoff_for(FailureKind::SetupRequired, 99),
+        TERMINAL_BACKOFF[TERMINAL_BACKOFF.len() - 1]
+    );
+    assert!(backoff_for(FailureKind::TunnelNotVisible, 0) >= Duration::from_secs(60));
+}
+
+#[test]
+fn map_api_classifies_failure_kinds() {
+    let kind_of = |error: ApiError| match map_api(error).status {
+        RegistryStatus::Failed { kind, .. } => Some(kind),
+        _ => None,
+    };
+
+    assert_eq!(
+        kind_of(ApiError {
+            status: Some(401),
+            message: "not logged in".into(),
+            login_required: true,
+            ..ApiError::default()
+        }),
+        Some(FailureKind::LoginRequired)
+    );
+    assert_eq!(
+        kind_of(ApiError {
+            status: Some(429),
+            message: "slow down".into(),
+            rate_limited: true,
+            ..ApiError::default()
+        }),
+        Some(FailureKind::RateLimited)
+    );
+    assert_eq!(
+        kind_of(ApiError {
+            status: Some(500),
+            message: "boom".into(),
+            ..ApiError::default()
+        }),
+        Some(FailureKind::Transient)
+    );
+    // These two keep their own statuses rather than becoming `Failed`.
+    assert!(matches!(
+        map_api(ApiError::browser_unavailable("no extension")).status,
+        RegistryStatus::BrowserUnavailable
+    ));
+    assert!(matches!(
+        map_api(ApiError {
+            developer_mode_required: true,
+            ..ApiError::new("developer mode")
+        })
+        .status,
+        RegistryStatus::DeveloperModeOff
+    ));
+}
+
+/// A tunnel the ChatGPT account cannot see is the case that produced 60 tabs an
+/// hour: the same terminal failure, forever, one dedicated tab per attempt.
+fn service_with_invisible_tunnel(
+    path: PathBuf,
+) -> (Arc<RegistryService>, Arc<FakeApi>, watch::Sender<TunnelState>) {
+    let api = FakeApi::new(true).with(|state| {
+        state.tunnels = vec!["tunnel_ffffffffffffffffffffffffffffffff".into()];
+    });
+    let (service, tx) = service_for(
+        Arc::clone(&api),
+        path,
+        TunnelState::Ready {
+            endpoint: TunnelEndpoint::OpenAi {
+                tunnel_id: "tunnel_0123456789abcdef0123456789abcdef".into(),
+            },
+        },
+    );
+    (service, api, tx)
+}
+
+#[tokio::test]
+async fn identical_terminal_failures_climb_the_ladder_and_park() {
+    let (_temp, path) = temp_connector_path();
+    let (service, api, _tx) = service_with_invisible_tunnel(path);
+
+    let mut last = RegistryStatus::Unknown;
+    for attempt in 1..=PARK_AFTER_IDENTICAL_TERMINAL_FAILURES {
+        // Drive the watcher's own ladder without sleeping through 60s, 5min
+        // and 30min. `Manual` would not do: it deliberately forgets the failure
+        // history, which is exactly what is being counted here.
+        service.advance_clock_for_tests();
+        last = service.reconcile_now(ReconcileTrigger::Watcher).await;
+        let RegistryStatus::Failed { kind, parked, .. } = &last else {
+            panic!("expected a failure, got {last:?}");
+        };
+        assert_eq!(*kind, FailureKind::TunnelNotVisible);
+        assert_eq!(
+            *parked,
+            attempt >= PARK_AFTER_IDENTICAL_TERMINAL_FAILURES,
+            "parked after {attempt} attempt(s): {last:?}"
+        );
+    }
+    let attempts = api.count("ListTunnels");
+
+    // Parked: the watcher stops asking, so no more tabs.
+    let watched = service.reconcile_now(ReconcileTrigger::Watcher).await;
+    assert_eq!(watched, last);
+    assert_eq!(api.count("ListTunnels"), attempts);
+}
+
+#[tokio::test]
+async fn a_parked_registry_reconciles_once_when_a_turn_asks() {
+    let (_temp, path) = temp_connector_path();
+    let (service, api, _tx) = service_with_invisible_tunnel(path);
+    for _ in 0..PARK_AFTER_IDENTICAL_TERMINAL_FAILURES {
+        service.advance_clock_for_tests();
+        service.reconcile_now(ReconcileTrigger::Watcher).await;
+    }
+    let attempts = api.count("ListTunnels");
+
+    // The user in front of us may well have just fixed it.
+    service.advance_clock_for_tests();
+    service.reconcile_now(ReconcileTrigger::Turn).await;
+    assert_eq!(api.count("ListTunnels"), attempts + 1);
+
+    // But two turns in the same breath are one attempt.
+    service.reconcile_now(ReconcileTrigger::Turn).await;
+    assert_eq!(api.count("ListTunnels"), attempts + 1);
+}
+
+#[tokio::test]
+async fn a_parked_registry_resumes_on_a_tunnel_change() {
+    let (_temp, path) = temp_connector_path();
+    let (service, api, _tx) = service_with_invisible_tunnel(path);
+    for _ in 0..PARK_AFTER_IDENTICAL_TERMINAL_FAILURES {
+        service.advance_clock_for_tests();
+        service.reconcile_now(ReconcileTrigger::Watcher).await;
+    }
+    assert!(matches!(
+        service.status(),
+        RegistryStatus::Failed { parked: true, .. }
+    ));
+    let attempts = api.count("ListTunnels");
+
+    // A new endpoint is exactly the kind of change that can fix this.
+    let status = service.reconcile_now(ReconcileTrigger::TunnelChange).await;
+    assert_eq!(api.count("ListTunnels"), attempts + 1);
+    // The ladder starts over: this failure is the first one again, not the
+    // fourth, so it is not parked.
+    assert!(
+        matches!(status, RegistryStatus::Failed { parked: false, .. }),
+        "{status:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_manual_reconcile_resets_the_backoff() {
+    let api = FakeApi::new(true).fail(
+        "Create",
+        ApiError {
+            status: Some(500),
+            message: "boom".into(),
+            ..ApiError::default()
+        },
+    );
+    let (_temp, path) = temp_connector_path();
+    let (service, _tx) = service_for(
+        Arc::clone(&api),
+        path,
+        TunnelState::Ready {
+            endpoint: public(URL_A),
+        },
+    );
+
+    let failed = service.reconcile_now(ReconcileTrigger::Watcher).await;
+    assert!(matches!(failed, RegistryStatus::Failed { .. }), "{failed:?}");
+    let creates = api.count("Create");
+
+    // The watcher waits out the backoff; a manual reconcile does not.
+    assert_eq!(service.reconcile_now(ReconcileTrigger::Watcher).await, failed);
+    assert_eq!(api.count("Create"), creates);
+
+    let status = service.reconcile_now(ReconcileTrigger::Manual).await;
+    assert!(api.count("Create") > creates);
+    assert!(
+        matches!(status, RegistryStatus::Verified { .. }),
+        "the injected failure was consumed: {status:?}"
+    );
 }
