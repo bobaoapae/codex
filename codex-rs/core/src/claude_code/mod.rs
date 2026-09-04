@@ -153,11 +153,6 @@ pub(crate) struct ClaudeCodeWorkspace {
     pub(crate) host: Option<Arc<dyn host::ClaudeHost>>,
     /// FORK: stream partial assistant text and thinking as it is produced.
     pub(crate) stream_partial_messages: bool,
-    /// FORK: why write access is paused for this request, when it is.
-    ///
-    /// Ownership is re-checked per sampling request, so this is a temporary
-    /// state the agent should report around rather than fail on.
-    pub(crate) ownership_notice: Option<String>,
 }
 
 impl ClaudeCodeWorkspace {
@@ -215,7 +210,6 @@ impl ClaudeCodeWorkspace {
                 .features
                 .enabled(codex_features::Feature::ClaudeCodeControlProtocol),
             // Decided per sampling request, once the session is known.
-            ownership_notice: None,
         }
     }
 }
@@ -285,9 +279,6 @@ This turn is read-only: inspect and report, do not modify files.",
             "
 Bash is unavailable in this read-only session; use Read, Glob and Grep, and report commands you would have run.",
         );
-    }
-    if let Some(notice) = workspace.ownership_notice.as_deref() {
-        environment.push_str(&format!("\n{notice}"));
     }
     // Saying so up front avoids a turn spent discovering it by failure.
     if !workspace.sandbox.has_full_network_access() {
@@ -627,7 +618,6 @@ pub(crate) async fn stream(
                 developer_instructions: None,
                 control_protocol: false,
                 stream_partial_messages: false,
-                ownership_notice: None,
             }
         }
     };
@@ -2165,7 +2155,6 @@ mod tests {
             sandbox: SandboxPolicy::new_workspace_write_policy(),
             writable_roots: Vec::new(),
             host: None,
-            ownership_notice: None,
         }
     }
 

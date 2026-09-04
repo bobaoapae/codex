@@ -4,8 +4,6 @@
 //! selected turn environment filesystem for both local and remote turns, with
 //! sandboxing enforced by the explicit filesystem sandbox context.
 use crate::exec::is_likely_sandbox_denied;
-use crate::ownership::MutationGuard;
-use crate::ownership::WorkspaceOwnershipService;
 use crate::session::turn_context::TurnEnvironment;
 use crate::tools::sandboxing::Approvable;
 use crate::tools::sandboxing::ApprovalAction;
@@ -57,8 +55,6 @@ pub struct ApplyPatchRequest {
 #[derive(Default)]
 pub struct ApplyPatchRuntime {
     committed_delta: AppliedPatchDelta,
-    ownership_service: Option<Arc<WorkspaceOwnershipService>>,
-    ownership_guard: Option<MutationGuard>,
 }
 
 #[derive(Debug)]
@@ -70,17 +66,6 @@ pub struct ApplyPatchRuntimeOutput {
 impl ApplyPatchRuntime {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    pub(crate) fn with_ownership(
-        ownership_service: Arc<WorkspaceOwnershipService>,
-        ownership_guard: MutationGuard,
-    ) -> Self {
-        Self {
-            ownership_service: Some(ownership_service),
-            ownership_guard: Some(ownership_guard),
-            ..Self::default()
-        }
     }
 
     pub fn committed_delta(&self) -> &AppliedPatchDelta {
@@ -186,14 +171,6 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
         attempt: &SandboxAttempt<'_>,
         _ctx: &ToolCtx,
     ) -> Result<ApplyPatchRuntimeOutput, ToolError> {
-        if let (Some(service), Some(guard)) = (
-            self.ownership_service.as_ref(),
-            self.ownership_guard.as_ref(),
-        ) {
-            service.revalidate_guard(guard).await.map_err(|error| {
-                ToolError::Rejected(format!("apply_patch ownership check failed: {error}"))
-            })?;
-        }
         let started_at = Instant::now();
         let fs = req.turn_environment.environment.get_filesystem();
         let sandbox = Self::file_system_sandbox_context_for_attempt(req, attempt);

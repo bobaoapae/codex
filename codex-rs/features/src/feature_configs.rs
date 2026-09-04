@@ -311,41 +311,6 @@ impl FeatureConfig for MultiAgentV2ConfigToml {
     }
 }
 
-/// FORK: runtime coordination knobs for workspace path leases.
-///
-/// Lease coordination is a runtime responsibility (acquire, renew, release,
-/// wait); these knobs exist so a bad interaction can be switched off without a
-/// rebuild. `enabled = false` is the kill-switch: admission falls back to the
-/// pre-lease behavior while the destructive-Git and read-only-role denials stay
-/// in force.
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct WorkspaceOwnershipConfigToml {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub enabled: Option<bool>,
-    /// Whether the runtime acquires a subagent's write lease on demand.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub auto_acquire: Option<bool>,
-    /// Lifetime of a runtime-acquired lease. The renewal interval is a third of it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(range(min = 1000, max = 86400000))]
-    pub auto_ttl_ms: Option<i64>,
-    /// How long an exec admission may wait for a sibling to release a path.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(range(min = 0, max = 600000))]
-    pub exec_wait_ms: Option<i64>,
-    /// How long a Claude sampling request may wait before degrading to read-only.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(range(min = 0, max = 600000))]
-    pub provider_wait_ms: Option<i64>,
-}
-
-impl FeatureConfig for WorkspaceOwnershipConfigToml {
-    fn enabled(&self) -> Option<bool> {
-        self.enabled
-    }
-}
-
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ContextManagementConfigToml {

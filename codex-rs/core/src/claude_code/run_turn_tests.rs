@@ -201,7 +201,6 @@ fn workspace(
         sandbox: SandboxPolicy::DangerFullAccess,
         writable_roots: Vec::new(),
         host: None,
-        ownership_notice: None,
     }
 }
 

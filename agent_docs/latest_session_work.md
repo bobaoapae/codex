@@ -10,6 +10,7 @@ Implement the approved durable-workflow program in milestone order: P0 cross-pro
 - P1.1 provenance/fork invariants and P1.2 workflow database foundation are complete.
 - P1.3 transient jobs/indexed navigation, P1.4 approved-plan contracts, and P1.5 receipts/evidence are complete with focused gates.
 - P2.1 durable mailbox/fleet and P2.2 ownership enforcement are implemented with focused gates; their final cross-crate gates are paused.
+- 2026-09-03: P2.2 workspace ownership (path leases, `grant/release/override_agent_ownership`, `workspaceLease/*`, `[features.workspace_ownership]`, role mutation capabilities) was removed after a measured audit: 3,538 leases in one thread, 83% on the checkout root, 603 wait timeouts, zero real same-file collisions prevented. Kept: subagent destructive-Git denial (exec and Claude Bash) and build admission. The `workflow_path_leases` tables stay in the migrations but nothing writes them.
 - An approved causal-correction amendment now has priority over further P2 expansion. The already-running migration apply slice is being stabilized, after which no new P2 front starts until the amendment closes.
 
 ## Mandatory causal-correction amendment

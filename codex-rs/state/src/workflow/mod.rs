@@ -15,9 +15,6 @@ mod fleet_helpers;
 mod fleet_types;
 mod fork_metrics;
 mod fork_metrics_types;
-mod lease;
-mod lease_helpers;
-mod lease_types;
 mod mailbox;
 mod mailbox_recovery;
 mod mailbox_types;
@@ -59,19 +56,6 @@ pub use fork_metrics_types::WorkflowForkContextOrigin;
 pub use fork_metrics_types::WorkflowForkMetrics;
 pub use fork_metrics_types::WorkflowForkMetricsCreate;
 pub use fork_metrics_types::WorkflowForkTurns;
-pub use lease_types::WorkflowLeaseAcquireRequest;
-pub use lease_types::WorkflowLeaseAuthority;
-pub use lease_types::WorkflowLeaseConflict;
-pub use lease_types::WorkflowLeaseError;
-pub use lease_types::WorkflowLeaseExtendRequest;
-pub use lease_types::WorkflowLeaseMode;
-pub use lease_types::WorkflowLeaseOverride;
-pub use lease_types::WorkflowLeaseOverrideCreate;
-pub use lease_types::WorkflowLeaseOverrideUse;
-pub use lease_types::WorkflowLeasePath;
-pub use lease_types::WorkflowLeaseReleaseRequest;
-pub use lease_types::WorkflowLeaseState;
-pub use lease_types::WorkflowPathLease;
 pub use mailbox_types::DEFAULT_WORKFLOW_MAILBOX_CAPACITY;
 pub use mailbox_types::WorkflowMailboxAckRequest;
 pub use mailbox_types::WorkflowMailboxChannel;
@@ -124,10 +108,6 @@ mod tests;
 #[cfg(test)]
 #[path = "mailbox_tests.rs"]
 mod mailbox_tests;
-
-#[cfg(test)]
-#[path = "lease_tests.rs"]
-mod lease_tests;
 
 #[cfg(test)]
 #[path = "backfill_tests.rs"]

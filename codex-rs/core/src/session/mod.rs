@@ -40,10 +40,6 @@ use crate::image_preparation::ImagePreparationMode;
 use crate::image_preparation::ImageResizeNoticeMode;
 use crate::image_preparation::prepare_response_items as prepare_image_response_items;
 use crate::image_preparation::unified_image_budget_enabled;
-use crate::ownership::OwnershipError;
-use crate::ownership::OwnershipOverrideReceipt;
-use crate::ownership::OwnershipReceiptSink;
-use crate::ownership::WorkspaceOwnershipService;
 use crate::parse_turn_item;
 use crate::realtime_conversation::RealtimeConversationManager;
 use crate::realtime_history::RealtimeEventOrder;
@@ -59,7 +55,6 @@ use crate::turn_timing::now_unix_timestamp_ms;
 use async_channel::Receiver;
 use async_channel::Sender;
 use chrono::Local;
-use chrono::SecondsFormat;
 use chrono::Utc;
 use codex_analytics::AnalyticsEventsClient;
 use codex_analytics::ImagePreparationFact;
@@ -77,10 +72,6 @@ use codex_extension_api::ExtensionDataInit;
 use codex_extension_api::LoadedUserInstructions;
 use codex_extension_api::PromptSlot;
 use codex_extension_api::TurnContextContributionInput;
-use codex_extension_items::ExtensionItem;
-use codex_extension_items::receipt::ReceiptAttachedItem;
-use codex_extension_items::receipt::ReceiptReference;
-use codex_extension_items::receipt::ReceiptStatus;
 use codex_features::FEATURES;
 use codex_features::Feature;
 use codex_features::unstable_features_warning_event;
@@ -188,8 +179,6 @@ use futures::future::Shared;
 use futures::prelude::*;
 use rmcp::model::RequestId;
 use serde_json::Value;
-use sha2::Digest;
-use sha2::Sha256;
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 use tokio::sync::oneshot;
@@ -1252,16 +1241,6 @@ impl Session {
 
     pub(crate) fn state_db(&self) -> Option<state_db::StateDbHandle> {
         self.services.state_db.clone()
-    }
-
-    pub(crate) async fn ownership_service(
-        &self,
-    ) -> Result<std::sync::Arc<WorkspaceOwnershipService>, OwnershipError> {
-        let config = self.get_config().await;
-        let authorized_roots = crate::ownership::authorized_roots_for_config(&config)?;
-        self.services
-            .agent_control
-            .ownership_service(authorized_roots)
     }
 
     pub(crate) fn live_thread_for_persistence(
@@ -2411,67 +2390,6 @@ impl Session {
     pub(crate) async fn send_event_raw(&self, event: Event) {
         self.send_event_raw_with_persistence(event, /*persist*/ true)
             .await;
-    }
-
-    /// Append a root ownership override receipt before a state override token
-    /// is issued. Paths and reasons are represented only by bounded digests.
-    pub(crate) async fn persist_ownership_override_receipt(
-        &self,
-        receipt: OwnershipOverrideReceipt,
-    ) -> anyhow::Result<()> {
-        let path_reference = ownership_reference("ownership.paths", |digest| {
-            for path in &receipt.paths {
-                digest.update(path.display.as_bytes());
-                digest.update([0]);
-                digest.update(path.comparison_key.as_bytes());
-                digest.update([0]);
-            }
-        });
-        let owner_reference = ownership_reference("ownership.owners", |digest| {
-            for owner in &receipt.conflict_owner_run_ids {
-                digest.update(owner.as_bytes());
-                digest.update([0]);
-            }
-        });
-        let reason_reference = ownership_reference("ownership.reason", |digest| {
-            digest.update(receipt.reason.as_bytes());
-        });
-        let mut item = ReceiptAttachedItem::new(
-            receipt.receipt_id.clone(),
-            1,
-            "ownership.override",
-            "workspace ownership override",
-            ReceiptStatus::Informational,
-            Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-            "codex.core",
-        )?;
-        item.thread_id = Some(receipt.root_run_id.to_string());
-        item.refs = vec![path_reference, owner_reference];
-        item.provenance = Some(serde_json::json!({
-            "operationDigest": receipt.operation_digest,
-            "reasonDigest": reason_reference.id,
-        }));
-        item.metadata = Some(serde_json::json!({
-            "pathCount": receipt.paths.len(),
-            "ownerCount": receipt.conflict_owner_run_ids.len(),
-        }));
-        item.validate()?;
-        let turn_id = receipt.root_run_id.to_string();
-        let event = Event {
-            id: receipt.receipt_id,
-            msg: EventMsg::ItemCompleted(ItemCompletedEvent {
-                thread_id: receipt.root_run_id,
-                turn_id,
-                item: TurnItem::Extension(ExtensionItem::ReceiptAttached(item)),
-                started_at_ms: None,
-                completed_at_ms: now_unix_timestamp_ms(),
-            }),
-        };
-        self.live_thread_for_persistence("persist ownership override receipt")?
-            .append_items(&[RolloutItem::EventMsg(event.msg.clone())])
-            .await?;
-        self.deliver_event_raw(event).await;
-        Ok(())
     }
 
     /// Persists trusted hook evidence as local receipt items without routing it
@@ -5117,29 +5035,6 @@ impl Session {
 
     fn show_raw_agent_reasoning(&self) -> bool {
         self.services.show_raw_agent_reasoning
-    }
-}
-
-fn ownership_reference(kind: &str, update: impl FnOnce(&mut Sha256)) -> ReceiptReference {
-    let mut digest = Sha256::new();
-    update(&mut digest);
-    let id = digest
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    ReceiptReference {
-        kind: kind.to_string(),
-        id,
-    }
-}
-
-impl OwnershipReceiptSink for Session {
-    fn append_ownership_override_receipt(
-        &self,
-        receipt: OwnershipOverrideReceipt,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>> {
-        Box::pin(async move { self.persist_ownership_override_receipt(receipt).await })
     }
 }
 

@@ -1299,9 +1299,6 @@ pub struct Config {
     /// Settings specific to the task-path-based multi-agent tool surface.
     pub multi_agent_v2: MultiAgentV2Config,
 
-    /// FORK: runtime coordination policy for workspace path leases.
-    pub workspace_ownership: WorkspaceOwnershipConfig,
-
     /// Context-window token budget configuration, when enabled.
     pub token_budget: Option<TokenBudgetConfig>,
     /// Shared token budget for the root thread and its sub-agents.
@@ -1519,53 +1516,6 @@ impl Default for CurrentTimeReminderConfig {
         }
     }
 }
-
-/// FORK: runtime coordination policy for workspace path leases.
-///
-/// Enforcement without a runtime that acquires, renews and releases leases is
-/// a deadlock: every executor stalls asking a root that never grants. These
-/// knobs configure that runtime and, with `enforce = false`, switch the lease
-/// requirement off entirely without touching the destructive-Git or
-/// read-only-role denials that do not depend on it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct WorkspaceOwnershipConfig {
-    /// Kill-switch. When false, lease admission falls back to legacy behavior.
-    pub enforce: bool,
-    /// Whether the runtime acquires a subagent's write lease on demand.
-    pub auto_acquire: bool,
-    /// Lifetime of a runtime-acquired lease, in milliseconds.
-    pub auto_ttl_ms: i64,
-    /// Bounded wait for a conflicting sibling during exec/patch/MCP admission.
-    pub exec_wait_ms: i64,
-    /// Bounded wait before a Claude sampling request degrades to read-only.
-    pub provider_wait_ms: i64,
-}
-
-impl Default for WorkspaceOwnershipConfig {
-    fn default() -> Self {
-        Self {
-            enforce: true,
-            auto_acquire: true,
-            auto_ttl_ms: DEFAULT_WORKSPACE_OWNERSHIP_AUTO_TTL_MS,
-            exec_wait_ms: DEFAULT_WORKSPACE_OWNERSHIP_EXEC_WAIT_MS,
-            provider_wait_ms: DEFAULT_WORKSPACE_OWNERSHIP_PROVIDER_WAIT_MS,
-        }
-    }
-}
-
-impl WorkspaceOwnershipConfig {
-    /// Renew well inside the TTL so one missed tick cannot expire the lease.
-    pub fn renew_interval_ms(&self) -> i64 {
-        (self.auto_ttl_ms / 3).clamp(1_000, self.auto_ttl_ms.max(1_000))
-    }
-}
-
-/// FORK: scratch directory the Desktop hands each thread for rendered visuals.
-const VISUALIZATIONS_DIR_NAME: &str = "visualizations";
-
-const DEFAULT_WORKSPACE_OWNERSHIP_AUTO_TTL_MS: i64 = 600_000;
-const DEFAULT_WORKSPACE_OWNERSHIP_EXEC_WAIT_MS: i64 = 20_000;
-const DEFAULT_WORKSPACE_OWNERSHIP_PROVIDER_WAIT_MS: i64 = 5_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MultiAgentV2Config {
@@ -1916,50 +1866,6 @@ impl Config {
         workspace_roots.extend(self.permissions.profile_workspace_roots().iter().cloned());
         dedupe_absolute_paths(&mut workspace_roots);
         workspace_roots
-    }
-
-    /// FORK: workspace roots that ownership leases must actually cover.
-    ///
-    /// The Desktop adds a per-thread scratch directory under
-    /// `<codex_home>/visualizations` to the writable roots. It is private to the
-    /// thread that owns it, so leasing it buys no coordination — but because a
-    /// generic exec scope asks for *every* root, it silently made every command
-    /// depend on a lease for someone else's scratch folder.
-    pub fn lease_scoped_workspace_roots(&self) -> Vec<AbsolutePathBuf> {
-        self.effective_workspace_roots()
-            .into_iter()
-            .filter(|root| !self.is_lease_exempt_root(root))
-            .collect()
-    }
-
-    /// FORK: the roots [`Self::lease_scoped_workspace_roots`] leaves out.
-    ///
-    /// A root the Desktop happens to have added stays in
-    /// [`Self::effective_workspace_roots`] as well: dropping it there would
-    /// make paths inside it normalize as `OutsideRoots` instead of simply not
-    /// needing a lease. The visualizations directory itself is always listed,
-    /// whether or not this turn was handed a scratch root under it, so
-    /// ownership admits a path there even when the Desktop never named one.
-    pub fn lease_exempt_workspace_roots(&self) -> Vec<AbsolutePathBuf> {
-        let mut roots: Vec<AbsolutePathBuf> = self
-            .effective_workspace_roots()
-            .into_iter()
-            .filter(|root| self.is_lease_exempt_root(root))
-            .collect();
-        roots.push(self.visualizations_dir());
-        dedupe_absolute_paths(&mut roots);
-        roots
-    }
-
-    /// FORK: scratch directory the Desktop hands each thread for rendered
-    /// visuals, as `<codex_home>/visualizations`.
-    pub fn visualizations_dir(&self) -> AbsolutePathBuf {
-        self.codex_home.join(VISUALIZATIONS_DIR_NAME)
-    }
-
-    fn is_lease_exempt_root(&self, root: &AbsolutePathBuf) -> bool {
-        root.as_path()
-            .starts_with(self.visualizations_dir().as_path())
     }
 
     pub fn to_models_manager_config(&self) -> ModelsManagerConfig {
@@ -3059,41 +2965,6 @@ fn resolve_code_mode_config(config_toml: &ConfigToml) -> CodeModeConfig {
     }
 }
 
-fn resolve_workspace_ownership_config(
-    config_toml: &ConfigToml,
-    features: &ManagedFeatures,
-) -> WorkspaceOwnershipConfig {
-    let base = config_toml
-        .features
-        .as_ref()
-        .and_then(|features| features.workspace_ownership.as_ref())
-        .and_then(|feature| match feature {
-            FeatureToml::Enabled(_) => None,
-            FeatureToml::Config(config) => Some(config),
-        });
-    let default = WorkspaceOwnershipConfig::default();
-    WorkspaceOwnershipConfig {
-        // Resolved through the feature stack so profiles and managed overrides
-        // reach the kill-switch the same way they reach every other feature.
-        enforce: features.enabled(Feature::WorkspaceOwnership),
-        auto_acquire: base
-            .and_then(|config| config.auto_acquire)
-            .unwrap_or(default.auto_acquire),
-        auto_ttl_ms: base
-            .and_then(|config| config.auto_ttl_ms)
-            .filter(|value| (1_000..=86_400_000).contains(value))
-            .unwrap_or(default.auto_ttl_ms),
-        exec_wait_ms: base
-            .and_then(|config| config.exec_wait_ms)
-            .filter(|value| (0..=600_000).contains(value))
-            .unwrap_or(default.exec_wait_ms),
-        provider_wait_ms: base
-            .and_then(|config| config.provider_wait_ms)
-            .filter(|value| (0..=600_000).contains(value))
-            .unwrap_or(default.provider_wait_ms),
-    }
-}
-
 fn resolve_multi_agent_v2_config(config_toml: &ConfigToml) -> MultiAgentV2Config {
     let base = multi_agent_v2_toml_config(config_toml.features.as_ref());
     let max_concurrent_threads_per_session = base
@@ -4117,7 +3988,6 @@ impl Config {
         };
         let code_mode = resolve_code_mode_config(&cfg);
         let multi_agent_v2 = resolve_multi_agent_v2_config(&cfg);
-        let workspace_ownership = resolve_workspace_ownership_config(&cfg, &features);
         let token_budget = resolve_token_budget_config(&cfg, &features)?;
         let rollout_budget = resolve_rollout_budget_config(&cfg, &features)?;
         let current_time_reminder = resolve_current_time_reminder_config(&cfg, &features)?;
@@ -4769,7 +4639,6 @@ impl Config {
             thread_unload_delay,
             ghost_snapshot,
             multi_agent_v2,
-            workspace_ownership,
             token_budget,
             rollout_budget,
             current_time_reminder,

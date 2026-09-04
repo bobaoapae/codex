@@ -6,7 +6,6 @@ use crate::exec::DEFAULT_EXEC_COMMAND_TIMEOUT_MS;
 use crate::exec_policy::prompt_is_rejected_by_policy;
 use crate::function_tool::FunctionCallError;
 use crate::maybe_emit_implicit_skill_invocation;
-use crate::ownership::OwnershipOverrideAuthorization;
 use crate::tools::context::ExecCommandToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
@@ -27,7 +26,6 @@ use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::PostToolUsePayload;
 use crate::tools::registry::PreToolUsePayload;
 use crate::tools::registry::ToolExecutor;
-use crate::tools::runtimes::unified_exec_ownership::authorize_exec_command;
 use crate::unified_exec::ExecCommandRequest;
 use crate::unified_exec::UnifiedExecContext;
 use crate::unified_exec::UnifiedExecError;
@@ -293,11 +291,6 @@ impl ExecCommandHandler {
             prefix_rule,
             ..
         } = args;
-        let root_override_reason = justification
-            .as_deref()
-            .filter(|reason| !reason.trim().is_empty())
-            .filter(|_| sandbox_permissions.requires_escalated_permissions())
-            .map(str::to_owned);
         let completion_timeout = match self.lifetime {
             ExecCommandLifetime::Interactive => None,
             ExecCommandLifetime::OneShot => {
@@ -408,34 +401,20 @@ impl ExecCommandHandler {
             }));
         }
 
-        let defer_root_override = root_override_reason.is_some()
-            && !turn.session_source.is_non_root_agent()
+        // FORK: a subagent shares the root's dirty checkout, so it never gets to
+        // reset, restore or stash it. This is the one workspace check that stayed
+        // when path leases were removed.
+        if turn.session_source.is_non_root_agent()
             && matches!(
                 codex_shell_command::classify_command(&command),
                 codex_shell_command::MutationIntent::DestructiveGit { .. }
-            );
-        let mutation_authorization = if defer_root_override {
-            None
-        } else {
-            match authorize_exec_command(
-                session.as_ref(),
-                turn.as_ref(),
-                &command,
-                &cwd,
-                tty,
-                turn_environment,
-                OwnershipOverrideAuthorization::NotRequested,
-                Some(&context.cancellation_token),
             )
-            .await
-            {
-                Ok(authorization) => authorization,
-                Err(error) => {
-                    manager.release_process_id(process_id).await;
-                    return Err(FunctionCallError::RespondToModel(error));
-                }
-            }
-        };
+        {
+            manager.release_process_id(process_id).await;
+            return Err(FunctionCallError::RespondToModel(
+                "subagents cannot execute destructive Git commands".to_string(),
+            ));
+        }
 
         emit_unified_exec_tty_metric(&turn.session_telemetry, tty);
         let request = ExecCommandRequest {
@@ -457,8 +436,6 @@ impl ExecCommandHandler {
                 .permissions_preapproved,
             justification,
             prefix_rule,
-            mutation_authorization,
-            root_override_reason,
         };
         let result = match completion_timeout {
             Some(timeout) => {

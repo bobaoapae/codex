@@ -46,7 +46,6 @@ use crate::tools::sandboxing::ToolCtx;
 use crate::tools::sandboxing::ToolError;
 use crate::unified_exec::BuildAdmissionError;
 use crate::unified_exec::ExecCommandRequest;
-use crate::unified_exec::ExecMutationAuthorization;
 use crate::unified_exec::MAX_UNIFIED_EXEC_PROCESSES;
 use crate::unified_exec::MAX_YIELD_TIME_MS;
 use crate::unified_exec::MIN_EMPTY_YIELD_TIME_MS;
@@ -275,7 +274,6 @@ struct PreparedProcessHandles {
     hook_command: String,
     process_id: i32,
     tty: bool,
-    mutation_authorization: Option<ExecMutationAuthorization>,
 }
 
 struct InitialExecCommandGuard {
@@ -715,7 +713,6 @@ impl UnifiedExecProcessManager {
             process,
             metrics_sidecar,
             permissions,
-            mutation_authorization,
         } = attempt;
         let process = Arc::new(process);
         if let Some(completion) = completion.as_ref() {
@@ -778,7 +775,6 @@ impl UnifiedExecProcessManager {
                 cwd.clone(),
                 request.turn_environment.selection.environment_id.clone(),
                 permissions,
-                mutation_authorization,
                 plugin_attribution.clone(),
                 start,
                 request.process_id,
@@ -1107,7 +1103,6 @@ impl UnifiedExecProcessManager {
             hook_command,
             process_id,
             tty,
-            mutation_authorization: _mutation_authorization,
             ..
         } = self
             .prepare_process_handles(process_id, &locked_process)
@@ -1329,7 +1324,6 @@ impl UnifiedExecProcessManager {
             hook_command: entry.hook_command.clone(),
             process_id: entry.process_id,
             tty: entry.tty,
-            mutation_authorization: entry.mutation_authorization.clone(),
         })
     }
 
@@ -1343,7 +1337,6 @@ impl UnifiedExecProcessManager {
         cwd: PathUri,
         environment_id: String,
         permissions: super::TerminalPermissions,
-        mut mutation_authorization: Option<ExecMutationAuthorization>,
         plugin_attribution: Option<PluginCommandAttribution>,
         started_at: Instant,
         process_id: i32,
@@ -1367,10 +1360,6 @@ impl UnifiedExecProcessManager {
             tty,
             environment_id,
             permissions,
-            _lease_hold: mutation_authorization
-                .as_mut()
-                .and_then(|authorization| authorization.lease_hold.take()),
-            mutation_authorization,
             network_approval,
             _build_admission: process.build_admission(),
             session: Arc::downgrade(&context.session),
@@ -1481,19 +1470,6 @@ impl UnifiedExecProcessManager {
                 }
 
                 if !alive {
-                    // FORK: the terminal entry outlives the process on purpose -
-                    // the model can still read its output - but the write lease
-                    // must not. Releasing only on eviction left a finished
-                    // command holding the whole checkout while the renewer
-                    // extended it indefinitely, starving every sibling.
-                    {
-                        let mut store = process_store.lock().await;
-                        if let Some(entry) = store.processes.get_mut(&process_id)
-                            && Arc::ptr_eq(&entry.process, &process)
-                        {
-                            entry._lease_hold = None;
-                        }
-                    }
                     let should_reap = {
                         let store = process_store.lock().await;
                         store.processes.get(&process_id).is_some_and(|entry| {
@@ -1819,8 +1795,6 @@ impl UnifiedExecProcessManager {
             additional_permissions_preapproved: request.additional_permissions_preapproved,
             justification: request.justification.clone(),
             exec_approval_requirement,
-            mutation_authorization: request.mutation_authorization.clone(),
-            root_override_reason: request.root_override_reason.clone(),
         };
         let tool_ctx = ToolCtx {
             session: context.session.clone(),

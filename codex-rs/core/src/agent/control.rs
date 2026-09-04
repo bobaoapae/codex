@@ -15,14 +15,6 @@ use crate::config::Config;
 use crate::config::RolloutBudgetConfig;
 use crate::context::SubagentNotification;
 use crate::environment_selection::TurnEnvironmentSnapshot;
-use crate::ownership::AuthorizedWorkspaceRoots;
-use crate::ownership::MutationAuthorizationRequest;
-use crate::ownership::MutationGuard;
-use crate::ownership::OwnershipActor;
-use crate::ownership::OwnershipError;
-use crate::ownership::OwnershipGrantRequest;
-use crate::ownership::OwnershipReleaseRequest;
-use crate::ownership::WorkspaceOwnershipService;
 use crate::rollout_budget::RolloutBudget;
 use crate::session::emit_subagent_session_started;
 use crate::session::multi_agents::ResolvedMultiAgentV2UsageHints;
@@ -193,9 +185,6 @@ pub(crate) struct AgentControl {
     /// Workflow mailbox store shared by all sessions in this agent tree once
     /// the first durable session has initialized its local state database.
     workflow_store: Arc<std::sync::OnceLock<WorkflowStore>>,
-    /// Lazily constructed ownership service for this agent tree. Roots are
-    /// supplied by the current session and retained only in memory.
-    ownership_service: Arc<std::sync::OnceLock<Arc<WorkspaceOwnershipService>>>,
     /// Causal fork timing/cache projection shared by every child control clone.
     fork_metrics: Arc<ForkMetricsTracker>,
 }
@@ -227,7 +216,6 @@ impl AgentControl {
             rollout_budget: Arc::default(),
             root_service_tier: Arc::new(ArcSwapOption::from(None)),
             workflow_store: Arc::new(std::sync::OnceLock::new()),
-            ownership_service: Arc::new(std::sync::OnceLock::new()),
             fork_metrics: ForkMetricsTracker::new(),
         };
         if let Some(rollout_budget) = rollout_budget {
@@ -268,102 +256,6 @@ impl AgentControl {
         self.state
             .agent_id_for_path(&AgentPath::root())
             .unwrap_or_else(|| ThreadId::from(self.session_id))
-    }
-
-    pub(crate) fn ownership_actor(&self, thread_id: ThreadId) -> CodexResult<OwnershipActor> {
-        if thread_id == self.root_thread_id() {
-            return Ok(OwnershipActor::root(thread_id));
-        }
-        let metadata = self
-            .state
-            .agent_metadata_for_thread(thread_id)
-            .ok_or(CodexErr::ThreadNotFound(thread_id))?;
-        Ok(OwnershipActor::subagent(
-            thread_id,
-            metadata.role_capabilities(),
-        ))
-    }
-
-    pub(crate) fn ownership_service(
-        &self,
-        authorized_roots: AuthorizedWorkspaceRoots,
-    ) -> Result<Arc<WorkspaceOwnershipService>, OwnershipError> {
-        if let Some(service) = self.ownership_service.get() {
-            return Ok(Arc::clone(service));
-        }
-        let workflow = self.workflow_store().ok_or(OwnershipError::Unavailable)?;
-        let service = Arc::new(WorkspaceOwnershipService::new(
-            workflow,
-            self.root_thread_id(),
-            authorized_roots,
-        ));
-        let _ = self.ownership_service.set(Arc::clone(&service));
-        Ok(self.ownership_service.get().cloned().unwrap_or(service))
-    }
-
-    /// FORK: hand back every lease an agent still holds as it goes away.
-    ///
-    /// Shutdown and residency eviction destroy the in-memory fences that the
-    /// lease coordinator would have released, so without this the rows stay
-    /// active and block the agent's siblings until their TTL runs out.
-    pub(crate) async fn release_agent_leases(&self, agent_id: ThreadId) {
-        let Some(service) = self.ownership_service.get().cloned() else {
-            return;
-        };
-        if let Err(error) = service.release_leases_for_owner(agent_id).await {
-            tracing::debug!("could not release workspace leases for {agent_id}: {error}");
-        }
-    }
-
-    pub(crate) async fn grant_agent_ownership(
-        &self,
-        authorized_roots: AuthorizedWorkspaceRoots,
-        request: OwnershipGrantRequest,
-    ) -> Result<Vec<codex_state::WorkflowPathLease>, OwnershipError> {
-        self.ownership_service(authorized_roots)?
-            .grant_agent_ownership(request)
-            .await
-    }
-
-    pub(crate) async fn release_agent_ownership(
-        &self,
-        authorized_roots: AuthorizedWorkspaceRoots,
-        request: OwnershipReleaseRequest,
-    ) -> Result<codex_state::WorkflowPathLease, OwnershipError> {
-        self.ownership_service(authorized_roots)?
-            .release_agent_ownership(request)
-            .await
-    }
-
-    pub(crate) async fn list_agent_ownership(
-        &self,
-        authorized_roots: AuthorizedWorkspaceRoots,
-        requester: crate::ownership::OwnershipActor,
-    ) -> Result<Vec<codex_state::WorkflowPathLease>, OwnershipError> {
-        self.ownership_service(authorized_roots)?
-            .list_agent_ownership(requester)
-            .await
-    }
-
-    pub(crate) async fn read_agent_ownership(
-        &self,
-        authorized_roots: AuthorizedWorkspaceRoots,
-        requester: crate::ownership::OwnershipActor,
-        lease_id: &str,
-    ) -> Result<Option<codex_state::WorkflowPathLease>, OwnershipError> {
-        self.ownership_service(authorized_roots)?
-            .read_agent_ownership(requester, lease_id)
-            .await
-    }
-
-    pub(crate) async fn authorize_mutation(
-        &self,
-        authorized_roots: AuthorizedWorkspaceRoots,
-        request: MutationAuthorizationRequest,
-    ) -> Result<MutationGuard, OwnershipError> {
-        self.ownership_service(authorized_roots)?
-            .authorize_mutation(request)
-            .await
     }
 
     /// Send rich user input items to an existing agent thread.

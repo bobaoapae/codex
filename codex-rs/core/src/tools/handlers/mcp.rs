@@ -8,7 +8,6 @@ use crate::context::node_repl_review_evidence_mode;
 use crate::function_tool::FunctionCallError;
 use crate::mcp_tool_call::handle_mcp_tool_call;
 use crate::original_image_detail::can_request_original_image_detail;
-use crate::ownership::authorize_mcp_mutation;
 use crate::session::session::Session;
 use crate::tools::context::McpToolOutput;
 use crate::tools::context::ToolCallSource;
@@ -217,45 +216,6 @@ impl McpHandler {
                     "mcp handler received unsupported payload".to_string(),
                 ));
             }
-        };
-
-        let read_only_hint = self
-            .tool_info
-            .tool
-            .annotations
-            .as_ref()
-            .and_then(|annotations| annotations.read_only_hint)
-            == Some(true);
-        let _ownership_guard = if read_only_hint {
-            None
-        } else {
-            let Some(server_environment_id) = prepared_mcp_call
-                .as_ref()
-                .map(codex_mcp::PreparedMcpCall::server_environment_id)
-            else {
-                return Err(FunctionCallError::RespondToModel(
-                    "MCP ownership check could not resolve the server environment".to_string(),
-                ));
-            };
-            let Some(environment) = turn
-                .environments
-                .turn_environments()
-                .find(|environment| environment.selection.environment_id == server_environment_id)
-            else {
-                return Err(FunctionCallError::RespondToModel(format!(
-                    "MCP server environment `{server_environment_id}` is not selected for this turn"
-                )));
-            };
-            authorize_mcp_mutation(
-                session.as_ref(),
-                &turn,
-                environment,
-                &mcp_hook_tool_input(&payload),
-            )
-            .await
-            .map_err(|error| {
-                FunctionCallError::RespondToModel(format!("MCP ownership check failed: {error}"))
-            })?
         };
 
         // Capture presentation policy from the same config snapshot used for execution.

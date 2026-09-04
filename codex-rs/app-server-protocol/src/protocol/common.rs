@@ -813,27 +813,6 @@ client_request_definitions! {
         serialization: global("fleet"),
         response: v2::AgentFleetCloseResponse,
     },
-    #[experimental("workspaceLease/list")]
-    /// List display-safe workspace leases for one root.
-    WorkspaceLeaseList => "workspaceLease/list" {
-        params: v2::WorkspaceLeaseListParams,
-        serialization: global_shared_read("workspace-leases"),
-        response: v2::WorkspaceLeaseListResponse,
-    },
-    #[experimental("workspaceLease/grant")]
-    /// Atomically grant one or more workspace path leases.
-    WorkspaceLeaseGrant => "workspaceLease/grant" {
-        params: v2::WorkspaceLeaseGrantParams,
-        serialization: global("workspace-leases"),
-        response: v2::WorkspaceLeaseGrantResponse,
-    },
-    #[experimental("workspaceLease/release")]
-    /// Release one workspace path lease with its fencing token.
-    WorkspaceLeaseRelease => "workspaceLease/release" {
-        params: v2::WorkspaceLeaseReleaseParams,
-        serialization: global("workspace-leases"),
-        response: v2::WorkspaceLeaseReleaseResponse,
-    },
     ThreadList => "thread/list" {
         params: v2::ThreadListParams,
         inspect_params: true,

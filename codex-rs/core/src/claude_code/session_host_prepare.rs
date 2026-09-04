@@ -2,7 +2,7 @@
 
 use super::ClaudeCodeWorkspace;
 use super::SessionClaudeHost;
-use crate::ownership::authorize_claude_provider;
+use super::provider_access::ClaudeProviderAccess;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::tools::context::SharedTurnDiffTracker;
@@ -16,20 +16,16 @@ pub(super) async fn prepare(
     cancel: CancellationToken,
 ) -> Result<(ClaudeCodeWorkspace, Arc<SessionClaudeHost>), String> {
     let turn = step_context.turn.as_ref();
-    let environment = turn
-        .environments
+    turn.environments
         .primary()
         .ok_or_else(|| "Claude provider has no selected execution environment".to_string())?;
-    let provider_access = authorize_claude_provider(session.as_ref(), turn, environment).await?;
+    let provider_access = if turn.session_source.is_non_root_agent() {
+        ClaudeProviderAccess::Subagent
+    } else {
+        ClaudeProviderAccess::Root
+    };
     let cwd = turn.config.cwd.clone();
     let mut workspace = ClaudeCodeWorkspace::from_config(turn.config.as_ref());
-    if provider_access.is_read_only() {
-        workspace.sandbox = codex_protocol::protocol::SandboxPolicy::new_read_only_policy();
-        workspace.writable_roots.clear();
-    }
-    // A degraded request says why, so the agent reports instead of retrying a
-    // write it cannot make. The next request re-runs this and may recover.
-    workspace.ownership_notice = provider_access.ownership_notice().map(str::to_string);
     workspace.permission_mode = super::super::permission_mode_for_access(
         &workspace.sandbox,
         turn.config.permissions.approval_policy.value(),

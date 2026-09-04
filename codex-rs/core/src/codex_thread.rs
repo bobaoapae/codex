@@ -3,8 +3,6 @@ use crate::config::ConstraintResult;
 use crate::context::ContextualUserFragment;
 use crate::context::GuardianReviewEvidence;
 use crate::elicitation::ElicitationRegistration;
-use crate::ownership::OwnershipError;
-use crate::ownership::WorkspaceOwnershipService;
 use crate::session::SessionIo;
 use crate::session::SessionSettingsUpdate;
 use crate::session::new_submission_id;
@@ -749,13 +747,6 @@ impl CodexThread {
 
     pub fn state_db(&self) -> Option<StateDbHandle> {
         self.session.state_db()
-    }
-
-    /// Return the root-scoped ownership service for this thread's workspace.
-    pub async fn ownership_service(
-        &self,
-    ) -> Result<Arc<WorkspaceOwnershipService>, OwnershipError> {
-        self.session.ownership_service().await
     }
 
     pub async fn config_snapshot(&self) -> ThreadConfigSnapshot {

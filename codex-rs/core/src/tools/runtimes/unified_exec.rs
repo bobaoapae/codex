@@ -23,8 +23,6 @@ use crate::tools::runtimes::apply_zsh_fork_path_prepend;
 use crate::tools::runtimes::exec_env_for_sandbox_permissions;
 use crate::tools::runtimes::maybe_wrap_shell_lc_with_snapshot;
 use crate::tools::runtimes::prepare_powershell_command_for_elevated_windows_sandbox;
-use crate::tools::runtimes::unified_exec_ownership::authorize_exec_command;
-use crate::tools::runtimes::unified_exec_ownership::revalidate_exec_authorization;
 use crate::tools::runtimes::zsh_fork;
 use crate::tools::sandboxing::Approvable;
 use crate::tools::sandboxing::ApprovalAction;
@@ -36,7 +34,6 @@ use crate::tools::sandboxing::ToolError;
 use crate::tools::sandboxing::ToolRuntime;
 use crate::tools::sandboxing::managed_network_for_sandbox_permissions;
 use crate::tools::sandboxing::sandbox_permissions_preserving_denied_reads;
-use crate::unified_exec::ExecMutationAuthorization;
 use crate::unified_exec::NoopSpawnLifecycle;
 use crate::unified_exec::TerminalPermissions;
 use crate::unified_exec::TerminalSandboxSource;
@@ -86,8 +83,6 @@ pub struct UnifiedExecRequest {
     pub additional_permissions_preapproved: bool,
     pub justification: Option<String>,
     pub exec_approval_requirement: ExecApprovalRequirement,
-    pub mutation_authorization: Option<ExecMutationAuthorization>,
-    pub root_override_reason: Option<String>,
 }
 
 /// Cache key for approval decisions that can be reused across equivalent
@@ -114,7 +109,6 @@ pub(crate) struct UnifiedExecAttempt {
     pub(crate) process: UnifiedExecProcess,
     pub(crate) metrics_sidecar: Option<PluginMetricsSidecar>,
     pub(crate) permissions: TerminalPermissions,
-    pub(crate) mutation_authorization: Option<ExecMutationAuthorization>,
 }
 
 fn unified_exec_options(
@@ -442,50 +436,6 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
             req.additional_permissions.as_ref(),
             sidecar_permissions.as_ref(),
         );
-        let mutation_authorization = match (
-            req.mutation_authorization.as_ref(),
-            req.root_override_reason.as_deref(),
-        ) {
-            (Some(authorization), _) => {
-                revalidate_exec_authorization(authorization).await?;
-                Some(authorization.clone())
-            }
-            (None, Some(reason)) => {
-                if !matches!(
-                    &req.exec_approval_requirement,
-                    ExecApprovalRequirement::NeedsApproval { .. }
-                ) {
-                    return Err(ToolError::Rejected(
-                        "destructive Git override requires an explicit command approval"
-                            .to_string(),
-                    ));
-                }
-                let authorization = authorize_exec_command(
-                    &ctx.session,
-                    &ctx.step_context.turn,
-                    &req.command,
-                    &req.cwd,
-                    req.tty,
-                    &req.turn_environment,
-                    crate::ownership::OwnershipOverrideAuthorization::Request(
-                        crate::ownership::OwnershipOverrideRequest {
-                            reason: reason.to_string(),
-                            receipt_sink: ctx.session.clone(),
-                        },
-                    ),
-                    Some(&ctx.cancellation_token),
-                )
-                .await
-                .map_err(ToolError::Rejected)?;
-                Some(authorization.ok_or_else(|| {
-                    ToolError::Rejected(
-                        "destructive Git override did not produce an ownership guard".to_string(),
-                    )
-                })?)
-            }
-            (None, None) => None,
-        };
-
         if let UnifiedExecShellMode::ZshFork(zsh_fork_config) = &self.shell_mode {
             let command = build_unified_exec_sandbox_command(
                 &command,
@@ -550,7 +500,6 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
                         process,
                         metrics_sidecar,
                         permissions,
-                        mutation_authorization: mutation_authorization.clone(),
                     });
                 }
                 None => {
@@ -598,7 +547,6 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
             process,
             metrics_sidecar,
             permissions,
-            mutation_authorization,
         })
     }
 }
@@ -733,8 +681,6 @@ mod tests {
                 bypass_sandbox: false,
                 proposed_execpolicy_amendment: None,
             },
-            mutation_authorization: None,
-            root_override_reason: None,
         };
 
         assert_eq!(
@@ -835,8 +781,6 @@ mod tests {
             additional_permissions_preapproved: false,
             justification: None,
             exec_approval_requirement,
-            mutation_authorization: None,
-            root_override_reason: None,
         }
     }
 

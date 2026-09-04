@@ -60,7 +60,6 @@ use codex_core_api::TurnInputRequest;
 use codex_core_api::UriBasedFileOpener;
 use codex_core_api::UserInput;
 use codex_core_api::WebSearchMode;
-use codex_core_api::WorkspaceOwnershipConfig;
 use codex_core_api::arg0_dispatch_or_else;
 use codex_core_api::build_models_manager;
 use codex_core_api::built_in_model_providers;
@@ -313,7 +312,6 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
         thread_unload_delay: std::time::Duration::from_secs(60),
         ghost_snapshot: GhostSnapshotConfig::default(),
         multi_agent_v2: MultiAgentV2Config::default(),
-        workspace_ownership: WorkspaceOwnershipConfig::default(),
         max_goal_token_budget: None,
         token_budget: None,
         rollout_budget: None,

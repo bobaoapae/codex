@@ -23,8 +23,6 @@ use crate::tools::context::boxed_tool_output;
 use crate::tools::events::ToolEmitter;
 use crate::tools::events::ToolEventCtx;
 use crate::tools::handlers::apply_granted_turn_permissions;
-use crate::tools::handlers::apply_patch_ownership::ApplyPatchOwnership;
-use crate::tools::handlers::apply_patch_ownership::authorize_apply_patch;
 use crate::tools::handlers::apply_patch_spec::create_apply_patch_freeform_tool;
 use crate::tools::handlers::file_system_sandbox_policy_context_for_cwd;
 use crate::tools::handlers::resolve_tool_environment;
@@ -582,13 +580,6 @@ async fn execute_verified_patch(
         sandbox_route,
         action,
     )?;
-    let ownership = authorize_apply_patch(
-        tool_ctx.session.as_ref(),
-        tool_ctx.step_context.turn.as_ref(),
-        &apply.action,
-        &file_paths,
-    )
-    .await?;
     let changes = convert_apply_patch_to_protocol(&apply.action);
     let emitter = ToolEmitter::apply_patch_for_environment(
         changes.clone(),
@@ -613,19 +604,7 @@ async fn execute_verified_patch(
         permissions_preapproved: effective_additional_permissions.permissions_preapproved,
     };
     let mut orchestrator = ToolOrchestrator::new();
-    // The lease hold stays in scope for the whole run: dropping it here would
-    // hand the paths back while the patch is still being written.
-    let (mut runtime, _lease_hold) = match ownership {
-        Some(ApplyPatchOwnership {
-            service,
-            guard,
-            _lease_hold,
-        }) => (
-            ApplyPatchRuntime::with_ownership(service, guard),
-            _lease_hold,
-        ),
-        None => (ApplyPatchRuntime::new(), None),
-    };
+    let mut runtime = ApplyPatchRuntime::new();
     let result = orchestrator
         .run(&mut runtime, &request, &tool_ctx)
         .await

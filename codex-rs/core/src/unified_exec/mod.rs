@@ -38,8 +38,6 @@ use rand::rng;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::ownership::MutationGuard;
-use crate::ownership::WorkspaceOwnershipService;
 use crate::sandboxing::SandboxPermissions;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
@@ -140,28 +138,6 @@ pub(crate) struct ExecCommandRequest {
     pub additional_permissions_preapproved: bool,
     pub justification: Option<String>,
     pub prefix_rule: Option<Vec<String>>,
-    pub mutation_authorization: Option<ExecMutationAuthorization>,
-    pub root_override_reason: Option<String>,
-}
-
-/// Ownership admission retained alongside a unified-exec process until its
-/// process entry is removed. Spawn revalidates the guard after approval;
-/// stdin continuation uses this same immutable admission.
-#[derive(Clone)]
-pub(crate) struct ExecMutationAuthorization {
-    pub(crate) service: Arc<WorkspaceOwnershipService>,
-    pub(crate) guard: MutationGuard,
-    /// FORK: custody of a lease the runtime acquired for this command, kept for
-    /// as long as the process it admitted can still write.
-    pub(crate) lease_hold: Option<crate::ownership::LeaseHold>,
-}
-
-impl std::fmt::Debug for ExecMutationAuthorization {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ExecMutationAuthorization")
-            .finish_non_exhaustive()
-    }
 }
 
 #[derive(Debug)]
@@ -246,12 +222,8 @@ struct ProcessEntry {
     tty: bool,
     environment_id: String,
     permissions: TerminalPermissions,
-    mutation_authorization: Option<ExecMutationAuthorization>,
     network_approval: Option<DeferredNetworkApproval>,
     _build_admission: Option<Arc<BuildAdmissionGuard>>,
-    /// FORK: a background process outlives the turn that started it, so it has
-    /// to keep the write lease alive past that turn's own custody.
-    _lease_hold: Option<crate::ownership::LeaseHold>,
     session: Weak<Session>,
     last_used: tokio::time::Instant,
 }

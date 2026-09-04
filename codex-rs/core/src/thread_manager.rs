@@ -918,19 +918,6 @@ impl ThreadManager {
             .await
     }
 
-    /// Return the root-scoped ownership service for a loaded thread.
-    pub async fn ownership_service(
-        &self,
-        thread_id: ThreadId,
-    ) -> Result<Arc<crate::ownership::WorkspaceOwnershipService>, crate::ownership::OwnershipError>
-    {
-        self.get_thread(thread_id)
-            .await
-            .map_err(|_| crate::ownership::OwnershipError::Unavailable)?
-            .ownership_service()
-            .await
-    }
-
     /// Updates metadata for loaded and cold threads through one entrypoint.
     ///
     /// Loaded threads route through `CodexThread`/`LiveThread`, so metadata changes stay ordered

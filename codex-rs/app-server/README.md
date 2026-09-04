@@ -2887,12 +2887,11 @@ Use `creditType: "credits"` when workspace credits are depleted, or `creditType:
 
 The new v2 methods in this section, and the marked fields on existing v2 methods, are fork-only
 experimental surfaces. A client must advertise `capabilities.experimentalApi: true` in
-`initialize`; all request and response fields below use their camelCase wire names. The evidence,
-context, and workspace-lease methods are host-side control-plane APIs and are never exposed as
-model tools.
+`initialize`; all request and response fields below use their camelCase wire names. The evidence
+and context methods are host-side control-plane APIs and are never exposed as model tools.
 
 List methods use opaque keyset cursors. `job/list`, `evidence/list`, `plan/list`,
-`agent/fleet/status`, and `workspaceLease/list` default to 50 entries and cap a page at 200;
+and `agent/fleet/status` default to 50 entries and cap a page at 200;
 `thread/search` uses a 25-entry default and a 100-entry cap. These surfaces do not retry jobs,
 purge threads or receipts, or apply migrations automatically.
 
@@ -3136,47 +3135,6 @@ entire tree.
 
 Each mutation response has the same `generation`, `sealed`, `operationId`, `results`, and
 `nextCursor` fields. The fleet projection is host-side control-plane state and is not a model tool.
-
-### Workspace leases and token isolation
-
-`workspaceLease/list` returns display-safe lease summaries only. `workspaceLease/grant` atomically
-claims normalized absolute paths and returns a fencing `token`; `workspaceLease/release` requires
-that token and the current `generation`. Tokens never appear in list or release responses.
-
-```json
-{ "method": "workspaceLease/list", "id": 22, "params": {
-    "rootThreadId": "thr_root", "ownerThreadId": "thr_worker", "path": "/workspace",
-    "limit": 50, "cursor": null
-} }
-{ "id": 22, "result": { "data": [{
-    "leaseId": "lease_1", "rootThreadId": "thr_root", "ownerThreadId": "thr_worker",
-    "normalizedPaths": ["/workspace"], "mode": "write", "state": "active", "generation": 1,
-    "environmentId": null, "issuedAt": 1730831111, "expiresAt": 1730832011, "releasedAt": null
-}], "nextCursor": null } }
-
-{ "method": "workspaceLease/grant", "id": 23, "params": {
-    "rootThreadId": "thr_root", "ownerThreadId": "thr_worker", "paths": ["/workspace"],
-    "mode": "write", "ttlSeconds": 900
-} }
-{ "id": 23, "result": { "leases": [{
-    "lease": { "leaseId": "lease_1", "rootThreadId": "thr_root", "ownerThreadId": "thr_worker",
-        "normalizedPaths": ["/workspace"], "mode": "write", "state": "active", "generation": 1,
-        "environmentId": null, "issuedAt": 1730831111, "expiresAt": 1730832011, "releasedAt": null },
-    "token": "opaque-fencing-token"
-}] } }
-
-{ "method": "workspaceLease/release", "id": 24, "params": {
-    "rootThreadId": "thr_root", "leaseId": "lease_1", "token": "opaque-fencing-token", "generation": 1
-} }
-{ "id": 24, "result": { "lease": {
-    "leaseId": "lease_1", "rootThreadId": "thr_root", "ownerThreadId": "thr_worker",
-    "normalizedPaths": ["/workspace"], "mode": "write", "state": "released", "generation": 1,
-    "environmentId": null, "issuedAt": 1730831111, "expiresAt": 1730832011, "releasedAt": 1730832020
-} } }
-```
-
-Lease grants default to a 15-minute TTL and cap it at 24 hours. Lease methods are host-side
-control-plane APIs and are not model tools.
 
 ### Context inspection
 

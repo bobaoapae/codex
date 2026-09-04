@@ -575,7 +575,6 @@ mod thread_sections;
 mod token_usage_replay;
 mod turn_processor;
 mod windows_sandbox_processor;
-mod workspace_lease_processor;
 
 pub(crate) use account_processor::AccountRequestProcessor;
 pub(crate) use apps_processor::AppsRequestProcessor;
@@ -610,7 +609,6 @@ pub(crate) use thread_recovery_processor::ThreadRecoveryRequestProcessor;
 pub(crate) use thread_recovery_processor::ThreadRecoveryRequestProcessorArgs;
 pub(crate) use turn_processor::TurnRequestProcessor;
 pub(crate) use windows_sandbox_processor::WindowsSandboxRequestProcessor;
-pub(crate) use workspace_lease_processor::WorkspaceLeaseRequestProcessor;
 
 use crate::error_code::internal_error;
 use crate::error_code::invalid_request;

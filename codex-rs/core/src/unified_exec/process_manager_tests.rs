@@ -462,8 +462,6 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
         additional_permissions_preapproved: false,
         justification: None,
         prefix_rule: None,
-        mutation_authorization: None,
-        root_override_reason: None,
     };
 
     let transcript = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default()));
@@ -628,10 +626,8 @@ async fn pruning_does_not_evict_live_process_while_exited_process_is_finalizing(
                     /*additional_permissions*/ None,
                     /*internal_permissions*/ None,
                 ),
-                mutation_authorization: None,
                 network_approval: None,
                 _build_admission: None,
-                _lease_hold: None,
                 session: std::sync::Weak::new(),
                 last_used: if is_exited {
                     now - Duration::from_secs(1)
@@ -698,10 +694,8 @@ async fn reaper_removes_proven_exit_but_keeps_a_terminal_snapshot() {
                 /*additional_permissions*/ None,
                 /*internal_permissions*/ None,
             ),
-            mutation_authorization: None,
             network_approval: None,
             _build_admission: None,
-            _lease_hold: None,
             session: Arc::downgrade(&session),
             last_used: Instant::now(),
         },

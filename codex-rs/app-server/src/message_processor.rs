@@ -56,7 +56,6 @@ use crate::request_processors::ThreadRecoveryRequestProcessorArgs;
 use crate::request_processors::ThreadRequestProcessor;
 use crate::request_processors::TurnRequestProcessor;
 use crate::request_processors::WindowsSandboxRequestProcessor;
-use crate::request_processors::WorkspaceLeaseRequestProcessor;
 use crate::request_processors::read_server_diagnostics;
 use crate::request_serialization::QueuedInitializedRequest;
 use crate::request_serialization::RequestSerializationQueueKey;
@@ -179,7 +178,6 @@ pub(crate) struct MessageProcessor {
     thread_processor: ThreadRequestProcessor,
     turn_processor: TurnRequestProcessor,
     windows_sandbox_processor: WindowsSandboxRequestProcessor,
-    workspace_lease_processor: WorkspaceLeaseRequestProcessor,
     transient_job_recovery_task: Mutex<Option<JoinHandle<()>>>,
     request_serialization_queues: RequestSerializationQueues,
 }
@@ -415,12 +413,6 @@ impl MessageProcessor {
             Arc::clone(&config),
             thread_watch_manager.clone(),
             thread_state_manager.clone(),
-        );
-        let workspace_lease_processor = WorkspaceLeaseRequestProcessor::new(
-            Arc::clone(&thread_manager),
-            Arc::clone(&thread_store),
-            Arc::clone(&config),
-            state_db.clone(),
         );
         let thread_list_state_permit = Arc::new(Semaphore::new(/*permits*/ 1));
         let app_list_shutdown_token = CancellationToken::new();
@@ -694,7 +686,6 @@ impl MessageProcessor {
             thread_processor,
             turn_processor,
             windows_sandbox_processor,
-            workspace_lease_processor,
             transient_job_recovery_task: Mutex::new(transient_job_recovery_task),
             request_serialization_queues,
         }
@@ -1317,15 +1308,6 @@ impl MessageProcessor {
             }
             ClientRequest::AgentFleetClose { params, .. } => {
                 self.fleet_processor.fleet_close(params).await
-            }
-            ClientRequest::WorkspaceLeaseList { params, .. } => {
-                self.workspace_lease_processor.list(params).await
-            }
-            ClientRequest::WorkspaceLeaseGrant { params, .. } => {
-                self.workspace_lease_processor.grant(params).await
-            }
-            ClientRequest::WorkspaceLeaseRelease { params, .. } => {
-                self.workspace_lease_processor.release(params).await
             }
             ClientRequest::ThreadUnsubscribe { params, .. } => {
                 let thread_id = params.thread_id.clone();

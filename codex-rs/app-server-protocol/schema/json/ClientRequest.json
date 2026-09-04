@@ -5899,14 +5899,6 @@
         "mode"
       ],
       "type": "object"
-    },
-    "WorkspaceLeaseMode": {
-      "description": "Access requested for a workspace lease.",
-      "enum": [
-        "read",
-        "write"
-      ],
-      "type": "string"
     }
   },
   "description": "Request from the client to the server.",

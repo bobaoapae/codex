@@ -1,4 +1,3 @@
-use codex_agent_roles::AgentRoleCapabilities;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
@@ -133,22 +132,6 @@ pub(crate) struct AgentMetadata {
     pub(crate) agent_path: Option<AgentPath>,
     pub(crate) agent_nickname: Option<String>,
     pub(crate) agent_role: Option<String>,
-}
-
-impl AgentMetadata {
-    /// Resolve role capabilities without persisting or injecting extra context.
-    ///
-    /// Role names are untrusted metadata; the resolver fails closed for omitted,
-    /// custom, and unknown names.
-    pub(crate) fn role_capabilities(&self) -> AgentRoleCapabilities {
-        crate::agent::role::role_capabilities(self.agent_role.as_deref())
-    }
-
-    /// Whether mutation is effective after the ownership layer grants a lease.
-    pub(crate) fn effective_mutation_allowed(&self, workspace_lease_held: bool) -> bool {
-        self.role_capabilities()
-            .effective_mutation_allowed(workspace_lease_held)
-    }
 }
 
 impl AgentRegistry {

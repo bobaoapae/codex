@@ -47,11 +47,8 @@ use crate::tools::handlers::multi_agents_spec::MULTI_AGENT_V1_NAMESPACE;
 use crate::tools::handlers::multi_agents_spec::SpawnAgentToolOptions;
 use crate::tools::handlers::multi_agents_spec::WaitAgentTimeoutOptions;
 use crate::tools::handlers::multi_agents_v2::FollowupTaskHandler as FollowupTaskHandlerV2;
-use crate::tools::handlers::multi_agents_v2::GrantAgentOwnershipHandler;
 use crate::tools::handlers::multi_agents_v2::InterruptAgentHandler;
 use crate::tools::handlers::multi_agents_v2::ListAgentsHandler as ListAgentsHandlerV2;
-use crate::tools::handlers::multi_agents_v2::OverrideAgentOwnershipHandler;
-use crate::tools::handlers::multi_agents_v2::ReleaseAgentOwnershipHandler;
 use crate::tools::handlers::multi_agents_v2::SendMessageHandler as SendMessageHandlerV2;
 use crate::tools::handlers::multi_agents_v2::SpawnAgentHandler as SpawnAgentHandlerV2;
 use crate::tools::handlers::multi_agents_v2::WaitAgentHandler as WaitAgentHandlerV2;
@@ -1386,20 +1383,6 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
                 multi_agent_v2_handler(ListAgentsHandlerV2, tool_namespace),
                 exposure,
             );
-            if !turn_context.session_source.is_non_root_agent() {
-                registry.register_trusted_with_exposure(
-                    multi_agent_v2_handler(GrantAgentOwnershipHandler, tool_namespace),
-                    exposure,
-                );
-                registry.register_trusted_with_exposure(
-                    multi_agent_v2_handler(ReleaseAgentOwnershipHandler, tool_namespace),
-                    exposure,
-                );
-                registry.register_trusted_with_exposure(
-                    multi_agent_v2_handler(OverrideAgentOwnershipHandler, tool_namespace),
-                    exposure,
-                );
-            }
         } else {
             let agent_type_description =
                 agent_type_description(turn_context, context.default_agent_type_description);

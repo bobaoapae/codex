@@ -58,18 +58,6 @@ tests = [
 ]
 
 [[invariant]]
-id = "ownership.fail_closed"
-owner = "codex-core"
-tests = [
-    "fork_invariant_destructive_git_requires_explicit_override",
-    "fork_invariant_read_only_provider_denies_mutating_tools",
-    # The lease kill-switch sits after these denials, not before them: they
-    # never depended on a lease, and a shared dirty tree is where they matter.
-    "fork_invariant_destructive_git_survives_disabled_lease_enforcement",
-    "fork_invariant_unmanaged_provider_still_denies_destructive_git",
-]
-
-[[invariant]]
 id = "receipts.evidence_boundary"
 owner = "codex-core"
 tests = [
@@ -137,7 +125,6 @@ tests = [
     "fork_invariant_evidence_requests_are_experimental_and_host_only",
     "fork_invariant_artifact_read_is_opaque_bounded_and_experimental",
     "fork_invariant_agent_fleet_methods_are_camel_case_and_generation_bound",
-    "fork_invariant_workspace_lease_methods_keep_tokens_out_of_list_data",
     "fork_invariant_context_requests_are_experimental_and_thread_scoped",
     "fork_invariant_experimental_capability_gate_is_unambiguous",
 ]

@@ -23,12 +23,13 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 #[path = "session_host_prepare.rs"]
 mod prepare;
+#[path = "provider_access.rs"]
+mod provider_access;
 use super::bridge::BRIDGE_SERVER_NAME;
 use super::control::CanUseTool;
 use super::control::ToolPermissionDecision;
 use super::host::APPROVAL_TIMEOUT;
 use super::host::ClaudeHost;
-use crate::ownership::ClaudeProviderAccess;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::tools::context::SharedTurnDiffTracker;
@@ -36,6 +37,7 @@ use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolPayload;
 use crate::tools::router::ToolCall;
 use codex_protocol::error::CodexErr;
+use provider_access::ClaudeProviderAccess;
 pub(crate) struct SessionClaudeHost {
     session: Arc<Session>,
     step_context: Arc<StepContext>,

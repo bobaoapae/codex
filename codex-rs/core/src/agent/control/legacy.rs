@@ -43,7 +43,6 @@ impl AgentControl {
                 .await
         };
         let _ = state.remove_thread(&agent_id).await;
-        self.release_agent_leases(agent_id).await;
         self.forget_v2_residency(agent_id);
         self.state.release_active_slot(agent_id);
         result
