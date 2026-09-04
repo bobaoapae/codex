@@ -321,11 +321,15 @@ impl ManagedChild {
             .kill_on_drop(true);
         #[cfg(windows)]
         {
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+            // FORK: the job object's suspended spawn overwrites the creation
+            // flags, so `CREATE_NO_WINDOW` has to be handed to it rather than
+            // set on the command; otherwise the tunnel child (tunnel-client or
+            // cloudflared) comes up with a visible empty console.
             command.creation_flags(CREATE_NO_WINDOW);
             match codex_utils_pty::JobObject::create_without_breakaway() {
                 Ok(job) => {
-                    let child = job.spawn_contained(&mut command)?;
+                    let child = job.spawn_contained_with_flags(&mut command, CREATE_NO_WINDOW)?;
                     Ok(Self {
                         child,
                         job: Some(job),
@@ -390,12 +394,15 @@ impl ManagedChild {
                 .is_err()
                 && let Some(pid) = self.child.id()
             {
-                let _ = Command::new("taskkill")
+                let mut taskkill = Command::new("taskkill");
+                taskkill
                     .args(["/T", "/F", "/PID", &pid.to_string()])
                     .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .await;
+                    .stderr(Stdio::null());
+                #[cfg(windows)]
+                taskkill
+                    .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+                let _ = taskkill.status().await;
                 let _ = self.child.wait().await;
             }
         }

@@ -512,10 +512,14 @@ pub async fn status(codex_home: &Path) -> DaemonStatus {
 fn kill_pid(pid: u32) {
     #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+        // FORK: without this the stop path flashes a console window.
         let _ = std::process::Command::new("taskkill")
             .args(["/T", "/F", "/PID", &pid.to_string()])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
             .status();
     }
     #[cfg(not(windows))]
@@ -699,9 +703,9 @@ pub fn spawn_detached(codex_home: &Path, overrides: &[String]) -> anyhow::Result
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
+        use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+        use windows_sys::Win32::System::Threading::DETACHED_PROCESS;
         command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
         // FORK: `Stdio::null()` only replaces the child's *standard* handles.
         // `CreateProcess` still copies every other inheritable handle, and when

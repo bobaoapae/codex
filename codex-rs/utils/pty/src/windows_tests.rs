@@ -241,6 +241,66 @@ async fn contained_spawn_owns_immediate_descendant() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// FORK: `prepare_suspended_spawn` sets the creation flags outright, so a
+/// caller that wanted `CREATE_NO_WINDOW` used to lose it and its child came up
+/// with a console window. `spawn_contained_with_flags` keeps it while still
+/// containing the child.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn contained_spawn_keeps_extra_creation_flags() -> anyhow::Result<()> {
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let Some(python) = find_python() else {
+        eprintln!("python not found; skipping Windows creation-flag test");
+        return Ok(());
+    };
+
+    let mut command = Command::new(&python);
+    command
+        .args([
+            "-u",
+            "-c",
+            "import ctypes,time; h=ctypes.windll.kernel32.GetConsoleWindow();              print(1 if (not h or not ctypes.windll.user32.IsWindowVisible(h)) else 0, flush=True);              time.sleep(60)",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+    let job = crate::JobObject::create()?;
+    let mut child = job.spawn_contained_with_flags(&mut command, CREATE_NO_WINDOW)?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("missing contained process stdout"))?;
+    let mut stdout = BufReader::new(stdout);
+    let mut hidden = String::new();
+    tokio::time::timeout(Duration::from_secs(10), stdout.read_line(&mut hidden)).await??;
+    anyhow::ensure!(
+        hidden.trim() == "1",
+        "contained child kept a visible console: {hidden:?}"
+    );
+
+    let child_pid = child
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("missing contained process id"))?;
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, child_pid) };
+    anyhow::ensure!(!process.is_null(), "failed to open the contained child");
+    let process = unsafe { OwnedHandle::from_raw_handle(process.cast()) };
+    let mut in_job = 0;
+    let checked = unsafe {
+        IsProcessInJob(
+            process.as_raw_handle().cast(),
+            job.as_raw_handle().cast(),
+            &mut in_job,
+        )
+    };
+    anyhow::ensure!(checked != 0, "failed to inspect child Job Object");
+    anyhow::ensure!(in_job != 0, "child escaped its Job Object");
+
+    job.terminate()?;
+    tokio::time::timeout(Duration::from_secs(10), child.wait()).await??;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rejected_job_assignment_resumes_existing_job_member() -> anyhow::Result<()> {
     let Some(python) = find_python() else {
