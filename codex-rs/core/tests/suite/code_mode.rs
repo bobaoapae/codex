@@ -2374,13 +2374,43 @@ async fn code_mode_wait_timeout_reconnects_on_next_exec() -> Result<()> {
     Ok(())
 }
 
+#[derive(Default)]
+struct GuardianTicketObserver {
+    tickets: Mutex<Vec<(String, Option<String>)>>,
+    wait_started: tokio::sync::Notify,
+}
+
+impl ToolLifecycleContributor for GuardianTicketObserver {
+    fn on_tool_start<'a>(&'a self, input: ToolStartInput<'a>) -> ToolLifecycleFuture<'a> {
+        Box::pin(async move {
+            if matches!(input.tool_name.name.as_str(), "exec_command" | "wait") {
+                self.tickets.lock().unwrap().push((
+                    input.tool_name.name.clone(),
+                    input
+                        .turn_store
+                        .get::<codex_protocol::guardian_ticket::GuardianTicket>()
+                        .map(|ticket| ticket.as_str().to_owned()),
+                ));
+                if input.tool_name.name == "wait" {
+                    self.wait_started.notify_one();
+                }
+            }
+        })
+    }
+}
+
 #[cfg_attr(windows, ignore = "no exec_command on Windows")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_can_yield_and_resume_with_wait() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
-    let mut builder = test_codex().with_config(move |config| {
+    let observer = Arc::new(GuardianTicketObserver::default());
+    let mut extensions = ExtensionRegistryBuilder::<Config>::new();
+    extensions.tool_lifecycle_contributor(observer.clone());
+    let mut builder = test_codex()
+        .with_extensions(Arc::new(extensions.build()))
+        .with_config(move |config| {
         let _ = config.features.enable(Feature::CodeMode);
     });
     let test = builder.build(&server).await?;
@@ -2394,16 +2424,16 @@ async fn code_mode_can_yield_and_resume_with_wait() -> Result<()> {
 text("phase 1");
 yield_control();
 {phase_2_wait}
-text("phase 2");
+text((await tools.exec_command({{cmd: "printf 'phase 2'"}})).output);
 {phase_3_wait}
-text("phase 3");
+text((await tools.exec_command({{cmd: "printf 'phase 3'"}})).output);
 "#
     );
 
     responses::mount_sse_once(
         &server,
         sse(vec![
-            ev_response_created("resp-1"),
+            serde_json::json!({"type": "response.created", "response": {"id": "resp-1", "headers": {"x-codex-guardian-ticket": "p".repeat(43)}}}),
             ev_custom_tool_call("call-1", "exec", &code),
             ev_completed("resp-1"),
         ]),
@@ -2436,7 +2466,7 @@ text("phase 3");
     responses::mount_sse_once(
         &server,
         sse(vec![
-            ev_response_created("resp-3"),
+            serde_json::json!({"type": "response.created", "response": {"id": "resp-3", "headers": {"x-codex-guardian-ticket": "q".repeat(43)}}}),
             responses::ev_function_call(
                 "call-2",
                 "wait",
@@ -2458,8 +2488,11 @@ text("phase 3");
     )
     .await;
 
+    tokio::try_join!(test.submit_turn("wait again"), async {
+        observer.wait_started.notified().await;
     fs::write(&phase_2_gate, "ready")?;
-    test.submit_turn("wait again").await?;
+        anyhow::Ok(())
+    })?;
 
     let second_request = second_completion.single_request();
     let second_items = function_tool_output_items(&second_request, "call-2");
@@ -2480,7 +2513,7 @@ text("phase 3");
     responses::mount_sse_once(
         &server,
         sse(vec![
-            ev_response_created("resp-5"),
+            serde_json::json!({"type": "response.created", "response": {"id": "resp-5", "headers": {"x-codex-guardian-ticket": "r".repeat(43)}}}),
             responses::ev_function_call(
                 "call-3",
                 "wait",
@@ -2502,8 +2535,11 @@ text("phase 3");
     )
     .await;
 
+    tokio::try_join!(test.submit_turn("wait for completion"), async {
+        observer.wait_started.notified().await;
     fs::write(&phase_3_gate, "ready")?;
-    test.submit_turn("wait for completion").await?;
+        anyhow::Ok(())
+    })?;
 
     let third_request = third_completion.single_request();
     let third_items = function_tool_output_items(&third_request, "call-3");
@@ -2517,6 +2553,26 @@ text("phase 3");
     );
     assert_eq!(text_item(&third_items, /*index*/ 1), "phase 3");
 
+    let observed = observer.tickets.lock().unwrap();
+    let mut nested_tickets = observed
+        .iter()
+        .filter(|(tool, _)| tool == "exec_command")
+        .filter_map(|(_, ticket)| ticket.clone())
+        .skip_while(|ticket| ticket != &"q".repeat(43))
+        .collect::<Vec<_>>();
+    nested_tickets.dedup();
+    assert_eq!(nested_tickets, vec!["q".repeat(43), "r".repeat(43)]);
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|(tool, _)| tool == "wait")
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec![
+            ("wait".to_owned(), Some("q".repeat(43))),
+            ("wait".to_owned(), Some("r".repeat(43))),
+        ]
+    );
     Ok(())
 }
 

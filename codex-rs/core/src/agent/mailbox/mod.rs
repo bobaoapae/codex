@@ -115,6 +115,9 @@ impl From<&TurnStartOptions> for DurableTurnStartOptions {
 impl From<DurableTurnStartOptions> for TurnStartOptions {
     fn from(value: DurableTurnStartOptions) -> Self {
         Self {
+            // A Guardian ticket is a receipt for one live server response and is
+            // never persisted, so a rehydrated mailbox turn carries none.
+            guardian_ticket: None,
             turn_trigger: value.turn_trigger,
             final_output_json_schema: value.final_output_json_schema,
             service_tier: value.service_tier,

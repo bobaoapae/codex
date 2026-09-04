@@ -166,7 +166,11 @@ impl Session {
         truncation_policy: TruncationPolicy,
         rollout_items: &[RolloutItem],
     ) -> RolloutReconstruction {
-        reconstruct_history_from_rollout_items_with_policy(truncation_policy, rollout_items)
+        reconstruct_history_from_rollout_items_with_policy(
+            truncation_policy,
+            rollout_items,
+            self.enabled(Feature::GuardianThreadContext),
+        )
     }
 }
 
@@ -174,6 +178,9 @@ impl Session {
 pub(crate) fn reconstruct_history_from_rollout_items_with_policy(
     truncation_policy: TruncationPolicy,
     rollout_items: &[RolloutItem],
+    // FORK: upstream reads this off `self`; this function is also reached from
+    // detached context inspection, which has no session to ask.
+    guardian_thread_context: bool,
 ) -> RolloutReconstruction {
     // Replay metadata should already match the shape of the future lazy reverse loader, even
     // while history materialization still uses an eager bridge. Scan newest-to-oldest,
@@ -388,15 +395,16 @@ pub(crate) fn reconstruct_history_from_rollout_items_with_policy(
     .unwrap_or(u64::MAX);
 
     let mut history = ContextManager::new();
+    if guardian_thread_context {
+        history.enable_user_message_retention();
+    }
     let mut saw_legacy_compaction_without_replacement_history = false;
     if let Some(checkpoint) = base_compaction
         && let Some(items) = &checkpoint.compacted.replacement_history
     {
         history.replace_annotated(items.clone());
         history.restore_guardian_history(checkpoint.compacted.guardian_history.as_ref());
-        if let Some(retained) = &checkpoint.compacted.retained_context {
-            history.restore_retained_context(retained);
-        }
+            history.restore_retained_context(checkpoint.compacted.retained_context.as_ref());
     }
     // Materialize exact history semantics from the replay-derived suffix. The eventual lazy
     // design should keep this same replay shape, but drive it from a resumable reverse source
@@ -430,8 +438,15 @@ pub(crate) fn reconstruct_history_from_rollout_items_with_policy(
                     // prompt shape.
                     // TODO(ccunningham): if we drop support for None replacement_history compaction items,
                     // we can get rid of this second loop entirely and just build `history` directly in the first loop.
-                    let user_messages =
-                        compact::collect_annotated_user_messages(history.annotated_items());
+                    let identity = if guardian_thread_context {
+                        compact::CompactedMessageIdentity::Preserve
+                    } else {
+                        compact::CompactedMessageIdentity::Regenerate
+                    };
+                    let user_messages = compact::collect_annotated_user_messages(
+                        history.annotated_items(),
+                        identity,
+                    );
                     let rebuilt = compact::build_compacted_history(
                         Vec::new(),
                         &user_messages,
@@ -439,7 +454,7 @@ pub(crate) fn reconstruct_history_from_rollout_items_with_policy(
                     );
                     let retained_context = history.retained_context().clone();
                     history.replace_annotated(rebuilt);
-                    history.restore_retained_context(&retained_context);
+                        history.restore_retained_context(Some(&retained_context));
                 }
             }
             RolloutItem::EventMsg(EventMsg::ThreadRolledBack(rollback)) => {

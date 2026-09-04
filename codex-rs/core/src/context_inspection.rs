@@ -30,6 +30,7 @@ use crate::context_manager::ContextManager;
 use crate::session::rollout_reconstruction::reconstruct_history_from_rollout_items_with_policy;
 use crate::session::session::Session;
 use crate::session::turn::build_prompt;
+use codex_features::Feature;
 use codex_models_manager::ModelsManagerConfig;
 use codex_models_manager::manager::ModelsManager;
 use codex_protocol::ThreadId;
@@ -163,8 +164,13 @@ pub(crate) async fn inspect_stored_context(
         .as_ref()
         .map(|model| model.truncation_policy.into())
         .unwrap_or(TruncationPolicy::Bytes(usize::MAX));
-    let reconstruction =
-        reconstruct_history_from_rollout_items_with_policy(truncation_policy, &stored.items);
+    let reconstruction = reconstruct_history_from_rollout_items_with_policy(
+        truncation_policy,
+        &stored.items,
+        // FORK: detached inspection has no session to read the feature off, so
+        // it takes the feature's own default.
+        Feature::GuardianThreadContext.default_enabled(),
+    );
     let mut history = ContextManager::new();
     history.replace_annotated(reconstruction.history);
     let default_modalities;

@@ -936,6 +936,7 @@ async fn steer_only_enforces_expected_turn_id() {
         .spawn_task(
             Arc::clone(&turn_context),
             vec![TurnInput::UserInput {
+                acceptance_order: None,
                 content: vec![UserInput::Text {
                     text: "hello".to_string(),
                     text_elements: Vec::new(),
@@ -1025,6 +1026,7 @@ async fn rejects_non_regular_turns() {
             .spawn_task(
                 Arc::clone(&turn_context),
                 vec![TurnInput::UserInput {
+                    acceptance_order: None,
                     content: vec![UserInput::Text {
                         text: "hello".to_string(),
                         text_elements: Vec::new(),
@@ -1080,19 +1082,28 @@ fn approved_user_request(text: &str, id: &str, revision: u32, body: &str) -> Tur
     .with_approved_plan(id, revision, body)
 }
 
-#[test]
-fn approved_plan_input_is_immediately_before_user_input() {
+#[tokio::test]
+async fn approved_plan_input_is_immediately_before_user_input() {
+    // `pending_turn_input` reserves the user-input acceptance order off the
+    // session, so this needs a real one even though the assertion is ordering.
+    let (session, _turn_context, _rx) = make_session_and_context_with_rx().await;
     let plan = PlanLoaded::new(ApprovedPlanRef::new("plan-order", 1), "approved body")
         .expect("approved plan should fit");
     let mut task_input = Vec::new();
     append_approved_plan_input(&mut task_input, &plan);
-    task_input.push(pending_turn_input(SubmittedTurnInput::UserInput {
-        content: vec![UserInput::Text {
-            text: "user input".to_string(),
-            text_elements: Vec::new(),
-        }],
-        client_id: None,
-    }));
+    task_input.push(
+        pending_turn_input(
+            &session,
+            SubmittedTurnInput::UserInput {
+                content: vec![UserInput::Text {
+                    text: "user input".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                client_id: None,
+            },
+        )
+        .await,
+    );
 
     assert_eq!(task_input.len(), 2);
     assert!(matches!(

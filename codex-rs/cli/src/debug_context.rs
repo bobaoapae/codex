@@ -263,6 +263,7 @@ async fn build_thread_manager(config: &Config) -> anyhow::Result<ThreadManager> 
         extensions,
         user_instructions_provider,
         /*analytics_events_client*/ None,
+        codex_core::passthrough_image_store(),
         thread_store,
         /*agent_graph_store*/ None,
         installation_id,

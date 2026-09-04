@@ -388,7 +388,7 @@ fn response_event_records_turn_ttft(event: &ResponseEvent) -> bool {
         // FORK: a tool the provider already ran is real output arriving, so it
         // counts as time-to-first-token exactly like a streamed item does.
         ResponseEvent::ProviderExecutedTool(_) => true,
-        ResponseEvent::Created
+        ResponseEvent::Created { .. }
         | ResponseEvent::ServerModel(_)
         | ResponseEvent::ModelVerifications(_)
         | ResponseEvent::TurnModerationMetadata(_)

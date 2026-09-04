@@ -15,6 +15,7 @@ fn generated_message_id_is_uuid_v7_and_payload_round_trips() {
     assert_eq!(uuid.get_version_num(), 7);
 
     let start_options = TurnStartOptions {
+        guardian_ticket: None,
         turn_trigger: Some("mailbox".to_string()),
         final_output_json_schema: Some(serde_json::json!({"type": "object"})),
         service_tier: Some("fast".to_string()),

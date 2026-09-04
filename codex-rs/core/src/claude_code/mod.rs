@@ -736,7 +736,9 @@ async fn run_turn(
     tx_event: mpsc::Sender<Result<ResponseEvent>>,
     consumer_dropped: CancellationToken,
 ) {
-    if tx_event.send(Ok(ResponseEvent::Created)).await.is_err() {
+    if tx_event.send(Ok(ResponseEvent::Created {
+        guardian_ticket: None,
+    })).await.is_err() {
         return;
     }
 
