@@ -9,3 +9,19 @@ rustflags = ["-C", "link-arg=/STACK:8388608", "-C", "link-arg=/arm64hazardfree"]
 
 [target.'cfg(all(windows, target_env = "gnu"))']
 rustflags = ["-C", "link-arg=-Wl,--stack,8388608"]
+
+# FORK: one fixed profile for every local release build. The manifest's
+# `lto = "thin"` / `codegen-units = 4` release took 30-35 min on this machine
+# and every switch between LTO and non-LTO flags doubled `target/release`.
+# These values match the fast build (~18 min from a cold cache, ~3 min warm)
+# and keep the artifact set stable, so the cache stops growing.
+[profile.release]
+lto = "off"
+codegen-units = 32
+debug = "none"
+
+# FORK: incremental compilation state was 225 GB of the 418 GB `target` on
+# 03/09/2026 (one cache per test binary, never pruned). Dev-loop rebuilds get
+# slower on small edits; the disk stops filling. Flip to `true` to trade back.
+[build]
+incremental = false
