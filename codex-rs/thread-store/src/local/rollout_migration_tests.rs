@@ -1459,8 +1459,11 @@ async fn assert_migrated_evidence_order(steer_order: Option<u64>) {
         ],
     );
     let store = indexed_store(home.path()).await;
-    store
-        .migrate_rollouts(apply_options())
+    // FORK: `migrate_rollouts` refuses Apply mode outright — an apply has to go
+    // through a frozen preview. Upstream's new tests (#42762) call it directly
+    // because upstream has no such guard; `apply_rollouts` is the fork's
+    // preview-then-apply equivalent and is what every other test here uses.
+    apply_rollouts(&store, apply_options())
         .await
         .expect("migrate same-turn rollback");
     let migrated = read_rollout(&path);
