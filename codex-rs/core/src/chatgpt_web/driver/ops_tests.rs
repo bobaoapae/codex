@@ -449,6 +449,7 @@ fn resolve_model_passes_an_exact_slug_through() {
         ResolvedModel {
             slug: Some("gpt-4-1".to_string()),
             menu_level: None,
+            menu_index: None,
             expect_label: None,
         }
     );
@@ -463,7 +464,8 @@ fn resolve_model_maps_instant_thinking_and_pro_to_family_slugs() {
         ResolvedModel {
             slug: Some("gpt-5-6-instant".to_string()),
             menu_level: None,
-            expect_label: Some(LEVEL_LABEL_INSTANT.to_string()),
+            menu_index: None,
+            expect_label: Some(level_spec("instant").expect("instant").loose()),
         }
     );
     assert_eq!(
@@ -471,6 +473,7 @@ fn resolve_model_maps_instant_thinking_and_pro_to_family_slugs() {
         ResolvedModel {
             slug: Some("gpt-5-6-thinking".to_string()),
             menu_level: None,
+            menu_index: None,
             expect_label: None,
         }
     );
@@ -479,7 +482,8 @@ fn resolve_model_maps_instant_thinking_and_pro_to_family_slugs() {
         ResolvedModel {
             slug: Some("gpt-5-6-pro".to_string()),
             menu_level: None,
-            expect_label: Some(LEVEL_LABEL_PRO.to_string()),
+            menu_index: None,
+            expect_label: Some(level_spec("pro").expect("pro").loose()),
         }
     );
 }
@@ -487,17 +491,21 @@ fn resolve_model_maps_instant_thinking_and_pro_to_family_slugs() {
 #[test]
 fn resolve_model_picks_the_thinking_slug_plus_a_menu_level_for_effort_specs() {
     let models = models_info();
-    for (spec, label) in [
-        (ModelSpec::Medium, LEVEL_LABEL_MEDIUM),
-        (ModelSpec::High, LEVEL_LABEL_HIGH),
-        (ModelSpec::ExtraHigh, LEVEL_LABEL_EXTRA_HIGH),
+    for (spec, key, index) in [
+        (ModelSpec::Medium, "medium", 2),
+        (ModelSpec::High, "high", 3),
+        (ModelSpec::ExtraHigh, "extra-high", 4),
     ] {
+        let level = level_spec(key).expect("level");
         assert_eq!(
             resolve_model_with(Some(&spec), &models).expect("effort"),
             ResolvedModel {
                 slug: Some("gpt-5-6-thinking".to_string()),
-                menu_level: Some(label.to_string()),
-                expect_label: Some(label.to_string()),
+                // Selecting is anchored, verifying is not: the composer button
+                // reads "GPT-5.6 Alta", not "Alta".
+                menu_level: Some(level.anchored()),
+                menu_index: Some(index),
+                expect_label: Some(level.loose()),
             },
             "{spec:?}"
         );
@@ -525,7 +533,10 @@ fn resolve_model_falls_back_to_any_slug_with_the_suffix() {
     // No pro slug anywhere: `slug: None` (account default), label still expected.
     let resolved = resolve_model_with(Some(&ModelSpec::Pro), &models).expect("pro");
     assert_eq!(resolved.slug, None);
-    assert_eq!(resolved.expect_label.as_deref(), Some(LEVEL_LABEL_PRO));
+    assert_eq!(
+        resolved.expect_label,
+        Some(level_spec("pro").expect("pro").loose())
+    );
 }
 
 #[test]
@@ -565,28 +576,48 @@ fn model_spec_parses_names_and_slugs() {
     assert_eq!(ModelSpec::ExtraHigh.as_str(), "extra-high");
 }
 
+/// FORK: the picker's labels have moved once already (04/09: "Leve"/"Alta"),
+/// so the table carries every spelling seen so far — and the *ordinal* is what
+/// the selection is actually written against.
 #[test]
 fn level_labels_match_the_pt_and_en_menu_entries() {
-    let matches = |label: &str, text: &str| {
-        Regex::new(&format!("(?i){label}"))
+    let selects = |key: &str, text: &str| {
+        let spec = level_spec(key).expect("level");
+        Regex::new(&format!("(?i){}", spec.anchored()))
             .expect("label regex")
             .is_match(text)
     };
-    assert!(matches(LEVEL_LABEL_INSTANT, "Instantâneo"));
-    assert!(matches(LEVEL_LABEL_INSTANT, "Instantaneo"));
-    assert!(matches(LEVEL_LABEL_INSTANT, "Instant"));
-    assert!(matches(LEVEL_LABEL_MEDIUM, "Médio"));
-    assert!(matches(LEVEL_LABEL_MEDIUM, "Medium"));
-    assert!(matches(LEVEL_LABEL_HIGH, "Alto"));
-    assert!(matches(LEVEL_LABEL_HIGH, "High"));
-    assert!(!matches(LEVEL_LABEL_HIGH, "Extra alto"));
-    assert!(!matches(LEVEL_LABEL_HIGH, "Extra high"));
-    assert!(matches(LEVEL_LABEL_EXTRA_HIGH, "Extra alto"));
-    assert!(matches(LEVEL_LABEL_EXTRA_HIGH, "Extra high"));
-    assert!(matches(LEVEL_LABEL_PRO, "Pro"));
-    assert!(!matches(LEVEL_LABEL_PRO, "Pro Max"));
-    assert_eq!(level_label("high"), Some(LEVEL_LABEL_HIGH));
+
+    for text in ["Instantâneo", "Instantaneo", "Instant", "Leve"] {
+        assert!(selects("instant", text), "{text}");
+    }
+    for text in ["Médio", "Media", "Medium"] {
+        assert!(selects("medium", text), "{text}");
+    }
+    for text in ["Alto", "Alta", "High"] {
+        assert!(selects("high", text), "{text}");
+    }
+    // Anchoring is what keeps "Alta" from also selecting "Extra alta".
+    for text in ["Extra alto", "Extra alta", "Extra high"] {
+        assert!(!selects("high", text), "{text}");
+        assert!(selects("extra-high", text), "{text}");
+    }
+    assert!(selects("pro", "Pro"));
+    assert!(!selects("pro", "Pro Max"));
+
+    // The ordinals are the slider's own positions, 1..=5 in order.
+    assert_eq!(level_spec("instant").expect("instant").index, 1);
+    assert_eq!(level_spec("medium").expect("medium").index, 2);
+    assert_eq!(level_spec("high").expect("high").index, 3);
+    assert_eq!(level_spec("extra-high").expect("extra-high").index, 4);
+    assert_eq!(level_spec("pro").expect("pro").index, 5);
+
+    assert_eq!(
+        level_label("high"),
+        Some(level_spec("high").expect("high").anchored())
+    );
     assert_eq!(level_label("thinking"), None);
+    assert_eq!(level_spec("thinking"), None);
 }
 
 // ---- pure helpers ------------------------------------------------------------
@@ -1315,11 +1346,14 @@ async fn send_selects_the_level_via_the_menu_for_effort_specs() {
     );
     let menu = h.daemon.evals_of("menu_select");
     assert_eq!(menu.len(), 1);
+    // FORK: the label table carries every spelling the picker has used, and
+    // the ordinal is what the script actually navigates by.
     assert!(
-        menu[0].contains("const TARGET = new RegExp(\"^Alto$|^High$\", 'i');"),
+        menu[0].contains("const TARGET = new RegExp(\"^Alto$|^Alta$|^High$\", 'i');"),
         "{}",
         menu[0]
     );
+    assert!(menu[0].contains("const INDEX = 3;"), "{}", menu[0]);
     // with_activated_on: activate → menu → reload.
     let activations = h
         .daemon
@@ -1335,8 +1369,8 @@ async fn send_selects_the_level_via_the_menu_for_effort_specs() {
         .filter(|args| args["action"] == "reload")
         .count();
     assert_eq!(reloads, 1);
-    // The picker reports what it selected, and the label "Instant" from the
-    // fake composer does not match the requested level.
+    // The picker reports what it selected, and neither the label "Instant" from
+    // the fake composer nor any pill matches the requested level.
     assert_eq!(sent.notes.len(), 2, "{:?}", sent.notes);
     assert!(
         sent.notes[0].contains("effort level set through the picker"),
@@ -1344,7 +1378,7 @@ async fn send_selects_the_level_via_the_menu_for_effort_specs() {
         sent.notes[0]
     );
     assert!(
-        sent.notes[1].contains("composer label is 'Instant'"),
+        sent.notes[1].contains("Instant"),
         "{}",
         sent.notes[1]
     );
@@ -1593,8 +1627,9 @@ mod live {
             if !text.to_uppercase().contains("PONG") {
                 return Err(format!("reply does not contain PONG: {text}"));
             }
+            let instant = level_spec("instant").expect("instant").loose();
             if let Some(label) = sent.model_label.as_deref()
-                && !Regex::new(&format!("(?i){LEVEL_LABEL_INSTANT}"))
+                && !Regex::new(&format!("(?i){instant}"))
                     .expect("regex")
                     .is_match(label)
             {
@@ -1770,4 +1805,90 @@ mod live {
         live.finish().await;
         outcome.expect("live_pro_resolves");
     }
+}
+
+// ---------------------------------------------------------------------------
+// FORK: the effort picker is an ordinal, and the labels only report it back.
+
+/// The picker's labels moved on 04/09 ("Leve", "Alta"), and every
+/// `medium|high|extra-high` selection silently fell back to the account
+/// default. The `<n> de 5` ordinal is the part that does not move.
+#[test]
+fn an_unknown_picker_label_is_reported_but_the_ordinal_selection_stands() {
+    // What the page script answers when the slider landed on stop 3 but the
+    // label there is not one Codex knows.
+    let selection: MenuSelection = serde_json::from_value(serde_json::json!({
+        "ok": true,
+        "selected": "Alta",
+        "index": 3,
+        "total": 5,
+        "labelMatched": false,
+        "triggerLabel": "GPT-5.6 Alta",
+        "slider": true,
+    }))
+    .expect("decodes");
+
+    assert!(selection.ok, "the ordinal selection still succeeded");
+    assert_eq!(selection.index, Some(3));
+    assert_eq!(selection.total, Some(5));
+    assert_eq!(selection.label_matched, Some(false));
+    assert_eq!(selection.selected.as_deref(), Some("Alta"));
+}
+
+#[test]
+fn a_slider_selection_decodes_its_position() {
+    let selection: MenuSelection = serde_json::from_value(serde_json::json!({
+        "ok": true,
+        "selected": "Alta",
+        "index": 3,
+        "total": 5,
+        "labelMatched": true,
+    }))
+    .expect("decodes");
+    assert_eq!(
+        (selection.index, selection.total, selection.label_matched),
+        (Some(3), Some(5), Some(true))
+    );
+
+    // A failure carries what the walk saw, so the note can say what was there.
+    let failed: MenuSelection = serde_json::from_value(serde_json::json!({
+        "ok": false,
+        "error": "option not found",
+        "available": ["Leve (1)", "Média (2)", "Alta (3)"],
+        "slider": true,
+    }))
+    .expect("decodes");
+    assert!(!failed.ok);
+    assert_eq!(failed.available.len(), 3);
+    assert_eq!(failed.index, None);
+}
+
+/// FORK: the level moved into its own composer pill, so a check that only
+/// looked at the model button reported a mismatch for a level that had in fact
+/// been applied.
+#[test]
+fn the_level_is_verified_against_any_composer_pill() {
+    let state: page_scripts::ComposerState = serde_json::from_value(serde_json::json!({
+        "hasComposer": true,
+        "url": "https://chatgpt.com/",
+        "modelLabel": "ChatGPT 5.6 Thinking",
+        "pills": ["Potência: Alta", "Busca"],
+        "sendVisible": true,
+        "sendEnabled": true,
+        "generating": false,
+        "attachments": 0,
+    }))
+    .expect("decodes");
+
+    let expect = level_spec("high").expect("high").loose();
+    let re = Regex::new(&format!("(?i){expect}")).expect("regex");
+    assert!(
+        !re.is_match(state.model_label.as_deref().unwrap_or("")),
+        "the model button alone does not carry the level"
+    );
+    assert!(
+        state.pills.iter().any(|pill| re.is_match(pill)),
+        "the level is in a pill: {:?}",
+        state.pills
+    );
 }

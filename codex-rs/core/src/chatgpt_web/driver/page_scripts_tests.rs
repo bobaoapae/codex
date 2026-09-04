@@ -41,7 +41,7 @@ fn all_scripts() -> Vec<(&'static str, String)> {
         ),
         ("dom_turns", dom_turns(12)),
         ("menu_discover", menu_discover()),
-        ("menu_select", menu_select(MenuKind::Level, NASTY)),
+        ("menu_select", menu_select(MenuKind::Level, NASTY, Some(3))),
     ]
 }
 
@@ -114,11 +114,15 @@ fn string_parameters_are_inserted_as_json_literals() {
     assert!(src.contains("b64.slice(4, 12);"));
     assert!(src.contains("if (true) delete cache["));
 
-    let src = menu_select(MenuKind::Model, NASTY);
+    let src = menu_select(MenuKind::Model, NASTY, None);
     assert!(src.contains(&format!("new RegExp({literal}, 'i')")));
     assert!(src.contains("new RegExp(\"^Modelo|^Model\", 'i')"));
-    let src = menu_select(MenuKind::Level, "^Alto$|^High$");
+    // FORK: no ordinal for the model submenu; the level picker gets one.
+    assert!(src.contains("const INDEX = null;"));
+    let src = menu_select(MenuKind::Level, "^Alto$|^Alta$|^High$", Some(3));
     assert!(src.contains("new RegExp(\"N[íi]vel de racioc[íi]nio|Reasoning\", 'i')"));
+    assert!(src.contains("const TARGET = new RegExp(\"^Alto$|^Alta$|^High$\", 'i');"));
+    assert!(src.contains("const INDEX = 3;"));
 }
 
 #[test]
@@ -221,6 +225,7 @@ fn composer_state_decodes_the_script_result_shape() {
             has_composer: true,
             url: "https://chatgpt.com/c/abc".to_string(),
             model_label: Some("Pro".to_string()),
+            pills: Vec::new(),
             send_visible: false,
             send_enabled: false,
             generating: true,
@@ -258,10 +263,68 @@ fn dom_progress_is_a_synchronous_function_expression_without_fetch() {
 /// submenu path as the fallback.
 #[test]
 fn menu_select_handles_the_slider_picker_and_the_legacy_submenu() {
-    let script = menu_select(MenuKind::Level, "^Alto$|^High$");
+    let script = menu_select(MenuKind::Level, "^Alto$|^Alta$|^High$", Some(3));
     assert!(script.contains("aria-keyshortcuts"));
     assert!(script.contains("ArrowLeft"));
     assert!(script.contains("ArrowRight"));
     assert!(script.contains("submenu not found"));
     assert!(!script.contains("async "));
+    // FORK: the ordinal is the instruction — `"<label>, <n> de 5."` is read
+    // off the slider and the walk stops on the position, not the wording.
+    assert!(script.contains("const INDEX = 3;"));
+    assert!(script.contains("(?:de|of)"));
+    assert!(script.contains("labelMatched"));
+    // The label walk survives as the fallback for a slider with no position.
+    assert!(script.contains("byLabel"));
+}
+
+/// FORK: the picker discovery has to describe the slider by position, since
+/// that is what the selection is written against.
+#[test]
+fn menu_discover_walks_the_slider_and_reports_every_stop() {
+    let script = menu_discover();
+    assert!(script.contains("aria-keyshortcuts"));
+    assert!(script.contains("(?:de|of)"));
+    assert!(script.contains("levels"));
+    assert!(script.contains("current"));
+    assert!(script.contains("slider: true"));
+    // The legacy submenu path is still there for a picker that is not a slider.
+    assert!(script.contains("N[íi]vel de racioc[íi]nio|Reasoning"));
+    assert!(!script.contains("async "));
+}
+
+/// FORK: the effort level renders as its own composer pill now.
+#[test]
+fn composer_state_decodes_the_script_result_shape_with_pills() {
+    let script = composer_state();
+    assert!(script.contains("composer-pill"));
+    assert!(script.contains("pills,"));
+
+    let value = serde_json::json!({
+        "hasComposer": true,
+        "url": "https://chatgpt.com/",
+        "modelLabel": "ChatGPT 5.6 Thinking",
+        "pills": ["Potência: Alta"],
+        "sendVisible": true,
+        "sendEnabled": true,
+        "generating": false,
+        "attachments": 0,
+        "text": null,
+    });
+    let state: ComposerState = serde_json::from_value(value).expect("decodes");
+    assert_eq!(state.pills, vec!["Potência: Alta".to_string()]);
+
+    // A page that predates the pills still decodes.
+    let older: ComposerState = serde_json::from_value(serde_json::json!({
+        "hasComposer": true,
+        "url": "https://chatgpt.com/",
+        "modelLabel": null,
+        "sendVisible": false,
+        "sendEnabled": false,
+        "generating": false,
+        "attachments": 0,
+        "text": null,
+    }))
+    .expect("decodes without pills");
+    assert!(older.pills.is_empty());
 }

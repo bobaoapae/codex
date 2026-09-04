@@ -111,6 +111,12 @@ pub(crate) struct ComposerState {
     pub(crate) has_composer: bool,
     pub(crate) url: String,
     pub(crate) model_label: Option<String>,
+    /// FORK: every pill in the composer, not just the model button. The effort
+    /// level moved out of the model button into a pill of its own
+    /// (`button.__composer-pill`), so checking only `model_label` reported a
+    /// mismatch for a level that had in fact been applied.
+    #[serde(default)]
+    pub(crate) pills: Vec<String>,
     pub(crate) send_visible: bool,
     pub(crate) send_enabled: bool,
     pub(crate) generating: bool,
@@ -138,10 +144,17 @@ pub(super) fn composer_state() -> String {
       ).length;
       if (!attachments) attachments = form.querySelectorAll('img:not([alt=""])').length;
     }
+    // FORK: the effort level now renders as its own composer pill.
+    const pills = form
+      ? Array.from(form.querySelectorAll('button.__composer-pill, [class*="composer-pill"]'))
+          .map((el) => (el.textContent || '').replace(/\s+/g, ' ').trim())
+          .filter((text) => text.length > 0)
+      : [];
     return JSON.stringify({
       hasComposer: !!ed,
       url: location.href,
       modelLabel: modelBtn ? (modelBtn.textContent || '').trim() : null,
+      pills,
       sendVisible: !!send,
       sendEnabled: !!send && !send.disabled,
       generating: !!stop,
@@ -566,6 +579,66 @@ pub(super) fn menu_discover() -> String {
       return menus.find((m) => m.querySelectorAll('[role^="menuitem"]').length > 0) || null;
     }, 4000).then((root) => {
       if (!root) return JSON.stringify({ ok: false, error: 'menu content did not mount (tab must be visible)', visibility: document.visibilityState });
+      // FORK: the level picker is a slider now. Walk it end to end and record
+      // `<label>, <n> de <total>` for every stop — that table is what the
+      // ordinal selection is written against, and its labels keep moving.
+      const sliderItem = () => root.querySelector('[role="menuitem"][aria-keyshortcuts]');
+      if (sliderItem()) {
+        const stateOf = () => {
+          const it = sliderItem();
+          const text = it && it.parentElement ? (it.parentElement.innerText || '') : '';
+          const flat = text.replace(/\s+/g, ' ').trim();
+          const m = flat.match(/,\s*(\d+)\s*(?:de|of)\s*(\d+)/);
+          return {
+            label: flat.split(',')[0].trim(),
+            index: m ? parseInt(m[1], 10) : null,
+            total: m ? parseInt(m[2], 10) : null,
+          };
+        };
+        const press = (k) => {
+          const it = sliderItem();
+          if (!it) return false;
+          it.focus();
+          const o = { key: k, code: k, bubbles: true, cancelable: true };
+          it.dispatchEvent(new KeyboardEvent('keydown', o));
+          it.dispatchEvent(new KeyboardEvent('keyup', o));
+          return true;
+        };
+        const settle = () => new Promise((r) => setTimeout(r, 250));
+        const current = stateOf();
+        const levels = [];
+        const record = (state) => {
+          if (state.index !== null && !levels.some((l) => l.index === state.index)) {
+            levels.push({ index: state.index, label: state.label });
+          }
+        };
+        // Left wall first, then right, so the walk covers every stop once.
+        const walk = (k, steps) => {
+          const state = stateOf();
+          record(state);
+          if (steps >= 12 || !press(k)) return Promise.resolve(state);
+          return settle().then(() => {
+            const next = stateOf();
+            if (next.index === state.index && next.label === state.label) {
+              return Promise.resolve(next);
+            }
+            return walk(k, steps + 1);
+          });
+        };
+        return walk('ArrowLeft', 0)
+          .then(() => walk('ArrowRight', 0))
+          .then(() => {
+            levels.sort((a, b) => a.index - b.index);
+            return JSON.stringify({
+              ok: true,
+              slider: true,
+              triggerLabel: (trigger.textContent || '').trim(),
+              current: current,
+              levels: levels,
+              models: null,
+            });
+          });
+      }
       const subs = Array.from(root.querySelectorAll('[role="menuitem"][aria-haspopup="menu"]')).map((it) => (it.textContent || '').trim());
       const openSub = (re) => {
         const it = Array.from(root.querySelectorAll('[role="menuitem"][aria-haspopup="menu"]'))
@@ -609,13 +682,25 @@ impl MenuKind {
     }
 }
 
-/// Select a reasoning level or model by label regex through the composer menu.
-/// Requires a VISIBLE tab; caller reloads afterwards.
-pub(super) fn menu_select(kind: MenuKind, label_regex_source: &str) -> String {
+/// Select a reasoning level or model through the composer menu.
+///
+/// FORK: the level picker is a slider, and its labels move — on 04/09 the five
+/// stops read "Leve … Alta" rather than "Instantâneo … Alto", and every
+/// `medium|high|extra-high` request fell through to whatever the account had
+/// last used, silently. The accessible text of the slider is
+/// `"<label>, <n> de 5."`, so `level_index` (1-based) is the instruction and
+/// the label is only how the result is reported back. Without an index the
+/// script still walks by label, which is what the model submenu needs.
+pub(super) fn menu_select(
+    kind: MenuKind,
+    label_regex_source: &str,
+    level_index: Option<u32>,
+) -> String {
     fill(
         r#"() => {
     const TARGET = new RegExp(@@TARGET@@, 'i');
     const SUB = new RegExp(@@SUB@@, 'i');
+    const INDEX = @@INDEX@@;
     const synthClick = (el) => {
       const r = el.getBoundingClientRect();
       const o = { bubbles: true, cancelable: true, clientX: r.x + r.width / 2, clientY: r.y + r.height / 2, button: 0, pointerId: 1, isPrimary: true };
@@ -630,41 +715,73 @@ pub(super) fn menu_select(kind: MenuKind, label_regex_source: &str) -> String {
         if (v || Date.now() - t0 > ms) { clearInterval(iv); res(v || null); }
       }, 150);
     });
-    const findTrigger = () => {
+    const composerForm = () => {
       const ed = document.querySelector('#prompt-textarea');
-      const form = ed ? ed.closest('form') : null;
-      const t = form ? form.querySelector('button[aria-haspopup="menu"]:not([data-testid="composer-plus-btn"]):not(#composer-plus-btn)') : null;
-      // The picker mounts a beat after the composer and renders its label
-      // later still; an unlabeled trigger opens an empty menu.
-      return t && (t.textContent || '').trim() ? t : null;
+      return ed ? ed.closest('form') : null;
     };
+    // Every menu trigger in the composer, minus the "+" button. Which of them
+    // owns the level picker has changed before, so try each in turn rather
+    // than pinning the first.
+    const triggers = () => {
+      const form = composerForm();
+      if (!form) return [];
+      return Array.from(form.querySelectorAll('button[aria-haspopup="menu"]'))
+        .filter((t) => t.dataset.testid !== 'composer-plus-btn' && t.id !== 'composer-plus-btn')
+        // The picker mounts a beat after the composer and renders its label
+        // later still; an unlabeled trigger opens an empty menu.
+        .filter((t) => (t.textContent || '').trim().length > 0);
+    };
+    const openMenu = (trigger) => {
+      const seen = new Set(Array.from(document.querySelectorAll('[role="menu"]')).map((m) => m.id));
+      synthClick(trigger);
+      return wait(() => {
+        const menus = Array.from(document.querySelectorAll('[role="menu"]')).filter((m) => !seen.has(m.id));
+        return menus.find((m) => m.querySelectorAll('[role^="menuitem"]').length > 0) || null;
+      }, 4000);
+    };
+    const closeMenu = () => {
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true }));
+      return new Promise((r) => setTimeout(r, 200));
+    };
+    const sliderItemIn = (root) => root.querySelector('[role="menuitem"][aria-keyshortcuts]');
+    const usable = (root) => !!(sliderItemIn(root) || root.querySelector('[role="menuitemradio"]'));
+
     // FORK (verified live): right after a navigation the trigger is not there
     // yet; failing at once inherited whatever level the account last used.
-    return wait(findTrigger, 6000).then((trigger) => {
-    if (!trigger) return JSON.stringify({ ok: false, error: 'model menu trigger not found' });
-    const seen = new Set(Array.from(document.querySelectorAll('[role="menu"]')).map((m) => m.id));
-    synthClick(trigger);
-    return wait(() => {
-      const menus = Array.from(document.querySelectorAll('[role="menu"]')).filter((m) => !seen.has(m.id));
-      return menus.find((m) => m.querySelectorAll('[role^="menuitem"]').length > 0) || null;
-    }, 4000).then((root) => {
-      if (!root) return JSON.stringify({ ok: false, error: 'menu did not mount (tab must be visible)', visibility: document.visibilityState });
-      // FORK (verified live 2026-08-27): the current picker is a slider
-      // (`data-animated-slider-trigger`): one `menuitem` with
-      // `aria-keyshortcuts="ArrowLeft ArrowRight"` whose sibling text reads
-      // "<label>, <n> de 5." (Instantâneo, Médio, Alto, Extra alto, Pro).
-      // Synthetic ArrowLeft/ArrowRight keydowns on the focused item move it
-      // and the trigger label follows; the selection persists across the
-      // reload the caller performs.
-      const sliderItem = () => root.querySelector('[role="menuitem"][aria-keyshortcuts]');
-      if (sliderItem()) {
-        const labelOf = () => {
-          const it = sliderItem();
+    return wait(() => (triggers().length ? triggers() : null), 6000).then((found) => {
+    if (!found) return JSON.stringify({ ok: false, error: 'model menu trigger not found' });
+    const tryTrigger = (rest) => {
+      if (!rest.length) return Promise.resolve(null);
+      const trigger = rest[0];
+      return openMenu(trigger).then((root) => {
+        if (root && usable(root)) return { trigger: trigger, root: root };
+        return closeMenu().then(() => tryTrigger(rest.slice(1)));
+      });
+    };
+    return tryTrigger(found.slice(0, 3)).then((opened) => {
+      if (!opened) return JSON.stringify({ ok: false, error: 'menu did not mount (tab must be visible)', visibility: document.visibilityState });
+      const trigger = opened.trigger;
+      const root = opened.root;
+      // FORK (verified live 2026-08-27, labels re-verified 2026-09-04): the
+      // picker is a slider (`data-animated-slider-trigger`): one `menuitem`
+      // with `aria-keyshortcuts="ArrowLeft ArrowRight"` whose sibling text
+      // reads "<label>, <n> de 5.". Synthetic Arrow keydowns move it and the
+      // trigger label follows; the selection survives the caller's reload.
+      if (sliderItemIn(root)) {
+        // "Alta, 3 de 5." -> { label: 'Alta', index: 3, total: 5 }
+        const stateOf = () => {
+          const it = sliderItemIn(root);
           const text = it && it.parentElement ? (it.parentElement.innerText || '') : '';
-          return text.split(',')[0].replace(/\s+/g, ' ').trim();
+          const flat = text.replace(/\s+/g, ' ').trim();
+          const m = flat.match(/,\s*(\d+)\s*(?:de|of)\s*(\d+)/);
+          return {
+            label: flat.split(',')[0].trim(),
+            index: m ? parseInt(m[1], 10) : null,
+            total: m ? parseInt(m[2], 10) : null,
+          };
         };
         const press = (k) => {
-          const it = sliderItem();
+          const it = sliderItemIn(root);
           if (!it) return false;
           it.focus();
           const o = { key: k, code: k, bubbles: true, cancelable: true };
@@ -673,29 +790,52 @@ pub(super) fn menu_select(kind: MenuKind, label_regex_source: &str) -> String {
           return true;
         };
         const settle = () => new Promise((r) => setTimeout(r, 250));
+        const done = (state) => settle().then(() => JSON.stringify({
+          ok: true,
+          selected: state.label,
+          index: state.index,
+          total: state.total,
+          labelMatched: TARGET.test(state.label),
+          triggerLabel: (trigger.textContent || '').trim(),
+          slider: true,
+        }));
         const seenLabels = [];
-        const walk = (k, steps) => {
-          const label = labelOf();
-          if (seenLabels.indexOf(label) < 0) seenLabels.push(label);
-          if (TARGET.test(label)) {
-            return settle().then(() => JSON.stringify({
-              ok: true,
-              selected: labelOf(),
-              triggerLabel: (trigger.textContent || '').trim(),
-              slider: true,
-            }));
-          }
-          if (steps >= 12) return Promise.resolve(JSON.stringify({ ok: false, error: 'option not found', available: seenLabels, slider: true }));
-          if (!press(k)) return Promise.resolve(JSON.stringify({ ok: false, error: 'slider item vanished', slider: true }));
+        const remember = (state) => {
+          const entry = state.index ? state.label + ' (' + state.index + ')' : state.label;
+          if (seenLabels.indexOf(entry) < 0) seenLabels.push(entry);
+        };
+        // Ordinal navigation: the stable instruction. Step |INDEX - current|
+        // times in the right direction and stop.
+        const byIndex = (steps) => {
+          const state = stateOf();
+          remember(state);
+          if (state.index === INDEX) return done(state);
+          if (steps >= 12 || state.index === null) return byLabel('ArrowLeft', 0);
+          const key = state.index < INDEX ? 'ArrowRight' : 'ArrowLeft';
+          if (!press(key)) return Promise.resolve(JSON.stringify({ ok: false, error: 'slider item vanished', available: seenLabels, slider: true }));
           return settle().then(() => {
-            const next = labelOf();
-            // Hitting the left end: turn around and scan rightwards.
-            if (next === label && k === 'ArrowLeft') return walk('ArrowRight', steps + 1);
-            if (next === label && k === 'ArrowRight') return Promise.resolve(JSON.stringify({ ok: false, error: 'option not found', available: seenLabels, slider: true }));
-            return walk(k, steps + 1);
+            const next = stateOf();
+            // Wall at either end: the slider has fewer stops than we thought.
+            if (next.index === state.index) return Promise.resolve(JSON.stringify({ ok: false, error: 'slider will not move past ' + state.index, available: seenLabels, slider: true }));
+            return byIndex(steps + 1);
           });
         };
-        return walk('ArrowLeft', 0);
+        // Fallback for a slider that does not announce its position: walk by
+        // label, the way this worked before the ordinal was available.
+        const byLabel = (k, steps) => {
+          const state = stateOf();
+          remember(state);
+          if (TARGET.test(state.label)) return done(state);
+          if (steps >= 12) return Promise.resolve(JSON.stringify({ ok: false, error: 'option not found', available: seenLabels, slider: true }));
+          if (!press(k)) return Promise.resolve(JSON.stringify({ ok: false, error: 'slider item vanished', available: seenLabels, slider: true }));
+          return settle().then(() => {
+            const next = stateOf();
+            if (next.label === state.label && k === 'ArrowLeft') return byLabel('ArrowRight', steps + 1);
+            if (next.label === state.label && k === 'ArrowRight') return Promise.resolve(JSON.stringify({ ok: false, error: 'option not found', available: seenLabels, slider: true }));
+            return byLabel(k, steps + 1);
+          });
+        };
+        return INDEX === null ? byLabel('ArrowLeft', 0) : byIndex(0);
       }
       const sub = Array.from(root.querySelectorAll('[role="menuitem"][aria-haspopup="menu"]'))
         .find((x) => SUB.test((x.textContent || '').trim()));
@@ -722,6 +862,7 @@ pub(super) fn menu_select(kind: MenuKind, label_regex_source: &str) -> String {
         return new Promise((r) => setTimeout(r, 600)).then(() => JSON.stringify({
           ok: true,
           selected: (target.textContent || '').trim(),
+          labelMatched: true,
           triggerLabel: (trigger.textContent || '').trim(),
         }));
       });
@@ -731,6 +872,10 @@ pub(super) fn menu_select(kind: MenuKind, label_regex_source: &str) -> String {
         &[
             ("TARGET", j(&label_regex_source)),
             ("SUB", j(&kind.submenu_regex_source())),
+            (
+                "INDEX",
+                level_index.map_or_else(|| "null".to_string(), |index| index.to_string()),
+            ),
         ],
     )
 }

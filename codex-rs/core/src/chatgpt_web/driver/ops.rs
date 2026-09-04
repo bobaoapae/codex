@@ -91,24 +91,77 @@ const DOWNLOAD_CHUNK_B64: u64 = 4_000_000;
 /// `waitReply` poll interval (`await sleep(2500)`).
 pub(crate) const REPLY_POLL_INTERVAL: Duration = Duration::from_millis(2500);
 
-/// Level labels as they render in the composer's reasoning menu (PT/EN).
-/// `ops.ts:31-37`.
-pub(crate) const LEVEL_LABEL_INSTANT: &str = "Instant[âa]neo|Instant";
-pub(crate) const LEVEL_LABEL_MEDIUM: &str = "M[ée]dio|Medium";
-pub(crate) const LEVEL_LABEL_HIGH: &str = "^Alto$|^High$";
-pub(crate) const LEVEL_LABEL_EXTRA_HIGH: &str = "Extra alto|Extra high";
-pub(crate) const LEVEL_LABEL_PRO: &str = "^Pro$";
+/// FORK: one effort level as the composer's picker knows it.
+///
+/// The picker is a slider whose accessible text reads `"<label>, <n> de 5."`
+/// (`"of 5"` in English). Its labels have already moved once — 04/09 the
+/// levels rendered "Leve" and "Alta" rather than "Instantâneo" and "Alto", and
+/// every `medium|high|extra-high` selection silently fell back to whatever the
+/// account had last used. The **ordinal** is the stable part, so that is what
+/// drives the selection and the labels are only how we recognise where the
+/// slider currently sits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LevelSpec {
+    /// The name Codex uses (`instant`, `medium`, …).
+    pub(crate) key: &'static str,
+    /// 1-based position on the slider.
+    pub(crate) index: u32,
+    /// Alternatives, `|`-separated and unanchored.
+    pub(crate) aliases: &'static str,
+}
 
-/// Port of `LEVEL_LABELS[key]`.
-pub(crate) fn level_label(level: &str) -> Option<&'static str> {
-    match level {
-        "instant" => Some(LEVEL_LABEL_INSTANT),
-        "medium" => Some(LEVEL_LABEL_MEDIUM),
-        "high" => Some(LEVEL_LABEL_HIGH),
-        "extra-high" => Some(LEVEL_LABEL_EXTRA_HIGH),
-        "pro" => Some(LEVEL_LABEL_PRO),
-        _ => None,
+impl LevelSpec {
+    /// Anchored form, for *selecting*: "Alta" must not also match "Extra alta".
+    pub(crate) fn anchored(self) -> String {
+        self.aliases
+            .split('|')
+            .map(|alias| format!("^{alias}$"))
+            .collect::<Vec<_>>()
+            .join("|")
     }
+
+    /// Unanchored form, for *verifying* a label we already have.
+    pub(crate) fn loose(self) -> String {
+        self.aliases.to_string()
+    }
+}
+
+/// The slider, in order. `pro` is the fifth stop on the same control.
+pub(crate) const LEVELS: [LevelSpec; 5] = [
+    LevelSpec {
+        key: "instant",
+        index: 1,
+        aliases: "Instant[âa]neo|Instant|Leve",
+    },
+    LevelSpec {
+        key: "medium",
+        index: 2,
+        aliases: "M[ée]dio|M[ée]dia|Medium",
+    },
+    LevelSpec {
+        key: "high",
+        index: 3,
+        aliases: "Alto|Alta|High",
+    },
+    LevelSpec {
+        key: "extra-high",
+        index: 4,
+        aliases: "Extra alto|Extra alta|Extra high",
+    },
+    LevelSpec {
+        key: "pro",
+        index: 5,
+        aliases: "Pro",
+    },
+];
+
+pub(crate) fn level_spec(level: &str) -> Option<LevelSpec> {
+    LEVELS.into_iter().find(|spec| spec.key == level)
+}
+
+/// The label regex used to *select* a level through the picker.
+pub(crate) fn level_label(level: &str) -> Option<String> {
+    level_spec(level).map(LevelSpec::anchored)
 }
 
 /// Timing knobs of the send/wait flows. Production values are the TS
@@ -216,8 +269,13 @@ pub(crate) struct ResolvedModel {
     /// Slug for the `?model=` URL parameter (`None` = leave account default).
     pub(crate) slug: Option<String>,
     /// When set, the exact level must additionally be picked via the UI menu.
+    /// Anchored, so "Alta" does not also select "Extra alta".
     pub(crate) menu_level: Option<String>,
+    /// FORK: the level's 1-based position on the slider. This is what actually
+    /// drives the selection; the label only says where the slider sits now.
+    pub(crate) menu_index: Option<u32>,
     /// Regex source the composer label should match afterwards (sanity check).
+    /// Unanchored: the composer button carries the model name around the level.
     pub(crate) expect_label: Option<String>,
 }
 
@@ -293,27 +351,35 @@ pub(crate) fn resolve_model_with(
             .map(|slug| (*slug).to_string())
     };
 
-    let label = |key: &str| level_label(key).map(str::to_string);
+    // Selecting is anchored ("Alta" must not select "Extra alta"); verifying is
+    // not, because the composer button reads "GPT-5.6 Alta", not "Alta".
+    let select = |key: &str| level_spec(key).map(LevelSpec::anchored);
+    let verify = |key: &str| level_spec(key).map(LevelSpec::loose);
+    let index = |key: &str| level_spec(key).map(|spec| spec.index);
     let resolved = match spec {
         ModelSpec::Instant => ResolvedModel {
             slug: pick("instant"),
             menu_level: None,
-            expect_label: label("instant"),
+            menu_index: None,
+            expect_label: verify("instant"),
         },
         ModelSpec::Thinking => ResolvedModel {
             slug: pick("thinking"),
             menu_level: None,
+            menu_index: None,
             expect_label: None,
         },
         ModelSpec::Pro => ResolvedModel {
             slug: pick("pro"),
             menu_level: None,
-            expect_label: label("pro"),
+            menu_index: None,
+            expect_label: verify("pro"),
         },
         ModelSpec::Medium | ModelSpec::High | ModelSpec::ExtraHigh => ResolvedModel {
             slug: pick("thinking"),
-            menu_level: label(spec.as_str()),
-            expect_label: label(spec.as_str()),
+            menu_level: select(spec.as_str()),
+            menu_index: index(spec.as_str()),
+            expect_label: verify(spec.as_str()),
         },
         ModelSpec::Auto | ModelSpec::Slug(_) => {
             return Err(DriverError::other(format!(
@@ -529,6 +595,13 @@ pub(crate) struct MenuSelection {
     pub(crate) error: Option<String>,
     pub(crate) trigger_label: Option<String>,
     pub(crate) available: Vec<String>,
+    /// FORK: where the slider ended up, 1-based, and how many stops it has.
+    pub(crate) index: Option<u32>,
+    pub(crate) total: Option<u32>,
+    /// FORK: whether the label at that stop matched what we expected. A `false`
+    /// here is worth reporting but is not a failure: the ordinal is what we
+    /// asked for, and the labels are the part that keeps moving.
+    pub(crate) label_matched: Option<bool>,
 }
 
 /// `stageDownload` result.
@@ -1125,10 +1198,11 @@ impl ChatGptOps {
     pub(crate) async fn set_level_via_menu(
         &self,
         level_regex: &str,
+        level_index: Option<u32>,
     ) -> DriverResult<MenuSelection> {
         self.tabs
             .with_tab_for(None, |tab_id| {
-                self.set_level_via_menu_on(tab_id, level_regex)
+                self.set_level_via_menu_on(tab_id, level_regex, level_index)
             })
             .await
     }
@@ -1138,6 +1212,7 @@ impl ChatGptOps {
         &self,
         tab_id: TabId,
         level_regex: &str,
+        level_index: Option<u32>,
     ) -> DriverResult<MenuSelection> {
         // Validate here so a bad pattern fails with a clear message instead of
         // exploding inside the page script (which would bypass its JSON contract).
@@ -1152,7 +1227,7 @@ impl ChatGptOps {
             .with_activated_on(tab_id, |id| {
                 self.eval_as::<MenuSelection>(
                     id,
-                    page_scripts::menu_select(MenuKind::Level, level_regex),
+                    page_scripts::menu_select(MenuKind::Level, level_regex, level_index),
                     DEFAULT_TOOL_TIMEOUT_MS,
                 )
             })
@@ -1346,15 +1421,35 @@ impl ChatGptOps {
             };
             self.tabs.goto_on(tab_id, &url).await?;
             if let Some(level) = resolved.menu_level.as_deref() {
-                let selection = self.set_level_via_menu_on(tab_id, level).await?;
+                let selection = self
+                    .set_level_via_menu_on(tab_id, level, resolved.menu_index)
+                    .await?;
                 if selection.ok {
+                    // FORK: report the ordinal alongside the label. The labels
+                    // move (04/09 they read "Leve"/"Alta"), the ordinal does
+                    // not, so "Alta (3/5)" is the part worth reading.
+                    let position = match (selection.index, selection.total) {
+                        (Some(index), Some(total)) => format!(" ({index}/{total})"),
+                        _ => String::new(),
+                    };
                     notes.push(format!(
-                        "effort level set through the picker: {}",
+                        "effort level set through the picker: {}{position}",
                         selection.selected.as_deref().unwrap_or("?")
                     ));
+                    if selection.label_matched == Some(false) {
+                        notes.push(format!(
+                            "the picker labelled that stop '{}', which is not a name Codex knows — the ordinal selection stands, but the label table is out of date",
+                            selection.selected.as_deref().unwrap_or("?")
+                        ));
+                    }
                 } else {
+                    let available = if selection.available.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; available: {}", selection.available.join(", "))
+                    };
                     notes.push(format!(
-                        "exact level selection via menu failed ({}); continuing with the model slug default",
+                        "exact level selection via menu failed ({}{available}); continuing with the model slug default",
                         selection.error.as_deref().unwrap_or("unknown")
                     ));
                 }
@@ -1364,12 +1459,25 @@ impl ChatGptOps {
             }
             if let Some(expect) = resolved.expect_label.as_deref() {
                 let state = self.composer_state_with_label_on(tab_id).await?;
-                if let Some(label) = state.model_label.as_deref()
-                    && Regex::new(&format!("(?i){expect}")).is_ok_and(|re| !re.is_match(label))
-                {
-                    notes.push(format!(
-                        "composer label is '{label}' which does not match the requested model — the picker UI may have changed"
-                    ));
+                // FORK: check every composer pill, not only the model button.
+                // The effort level moved into a pill of its own, so matching
+                // `model_label` alone reported a mismatch for a level that had
+                // in fact been applied.
+                if let Ok(expect) = Regex::new(&format!("(?i){expect}")) {
+                    let candidates: Vec<&str> = state
+                        .model_label
+                        .as_deref()
+                        .into_iter()
+                        .chain(state.pills.iter().map(String::as_str))
+                        .collect();
+                    if !candidates.is_empty()
+                        && !candidates.iter().any(|label| expect.is_match(label))
+                    {
+                        notes.push(format!(
+                            "composer shows {:?}, none of which matches the requested model — the picker UI may have changed",
+                            candidates
+                        ));
+                    }
                 }
             }
         }
