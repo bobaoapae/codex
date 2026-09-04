@@ -256,6 +256,11 @@ pub async fn start(config: DaemonRunConfig) -> anyhow::Result<RunningDaemon> {
         }
     };
 
+    tracing::info!(
+        "chatgpt_web daemon: lock acquired for {}",
+        config.codex_home.display()
+    );
+
     let cancel = CancellationToken::new();
     let token = state::new_token();
     state::write_secret(&paths.token, &token).context("writing daemon.token")?;
@@ -276,11 +281,16 @@ pub async fn start(config: DaemonRunConfig) -> anyhow::Result<RunningDaemon> {
     )
     .await
     .context("starting the public MCP server")?;
+    tracing::info!(
+        "chatgpt_web daemon: public MCP server on {}",
+        public.local_mcp_url()
+    );
 
     let adapter = match config.tunnel_override {
         Some(adapter) => adapter,
         None => build_tunnel_adapter(settings, &paths).await,
     };
+    tracing::info!("chatgpt_web daemon: tunnel adapter starting ({adapter:?})");
     let tunnel = tunnel::start(adapter, public.local_mcp_url());
 
     let has_registry = config.reconcile.is_some() || config.live_registry;
@@ -329,6 +339,7 @@ pub async fn start(config: DaemonRunConfig) -> anyhow::Result<RunningDaemon> {
     )
     .await
     .context("starting the control API")?;
+    tracing::info!("chatgpt_web daemon: control API on http://{control_addr}");
 
     let mut tasks = vec![control_task];
     if let Some(service) = registry_service.as_ref() {

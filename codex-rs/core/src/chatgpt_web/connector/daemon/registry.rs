@@ -873,6 +873,8 @@ pub struct RegistryService {
     status: Arc<Mutex<RegistryStatus>>,
     gate: Semaphore,
     failures: AtomicUsize,
+    /// FORK: the last failure message, so an identical repeat logs at `debug`.
+    last_failure: Mutex<Option<String>>,
 }
 
 impl std::fmt::Debug for RegistryService {
@@ -902,6 +904,7 @@ impl RegistryService {
             status,
             gate: Semaphore::new(1),
             failures: AtomicUsize::new(0),
+            last_failure: Mutex::new(None),
         })
     }
 
@@ -912,11 +915,21 @@ impl RegistryService {
             .clone()
     }
 
+    /// FORK: every status change is one `info!` line, so `daemon.log` shows the
+    /// registry's whole trajectory rather than only its failures.
     fn set_status(&self, status: RegistryStatus) {
-        *self
+        let mut current = self
             .status
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = status;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *current != status {
+            tracing::info!(
+                "chatgpt_web registry: {} -> {}",
+                current.label(),
+                status.label()
+            );
+        }
+        *current = status;
     }
 
     /// The connector for the tunnel's current endpoint, if it is ready.
@@ -970,6 +983,10 @@ impl RegistryService {
         let status = match reconcile(self.api.as_ref(), &desired, &self.connector_path).await {
             Ok(record) => {
                 self.failures.store(0, Ordering::SeqCst);
+                *self
+                    .last_failure
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
                 tracing::info!(
                     "chatgpt_web registry: connector `{}` verified ({} actions)",
                     record.name,
@@ -983,10 +1000,27 @@ impl RegistryService {
             }
             Err(failure) => {
                 let attempt = self.failures.fetch_add(1, Ordering::SeqCst);
-                tracing::warn!(
-                    "chatgpt_web registry: reconcile failed: {}",
-                    failure.message
-                );
+                // FORK: a stuck cause repeats every backoff tick; say it once
+                // at `warn` and keep the repeats at `debug` so a real new
+                // failure still stands out. (04/09 produced 379 identical
+                // lines in one afternoon.)
+                let repeated = self
+                    .last_failure
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .replace(failure.message.clone())
+                    .is_some_and(|previous| previous == failure.message);
+                if repeated {
+                    tracing::debug!(
+                        "chatgpt_web registry: reconcile failed again: {}",
+                        failure.message
+                    );
+                } else {
+                    tracing::warn!(
+                        "chatgpt_web registry: reconcile failed: {}",
+                        failure.message
+                    );
+                }
                 match failure.status {
                     RegistryStatus::Failed { reason, .. } => RegistryStatus::Failed {
                         reason,
@@ -1029,6 +1063,10 @@ impl RegistryService {
                     RegistryStatus::DeveloperModeOff => FAILURE_BACKOFF_CAP,
                     _ => Duration::from_secs(3600),
                 };
+                tracing::debug!(
+                    "chatgpt_web registry: next reconcile in {}s",
+                    wait.as_secs()
+                );
                 tokio::select! {
                     _ = cancel.cancelled() => break,
                     changed = tunnel.changed() => {

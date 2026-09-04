@@ -138,11 +138,34 @@ fn open_daemon_log(path: &Path) -> Result<std::fs::File> {
         .with_context(|| format!("opening {}", path.display()))
 }
 
+/// FORK: the daemon owns its log level.
+///
+/// It used to read `RUST_LOG`, which is the Desktop's variable, not the user's:
+/// the app launches the app-server with `RUST_LOG=warn`, the daemon inherits it
+/// through the spawn, and `daemon.log` ends up with warnings only — which is
+/// why the "daemon did not come up within 15s" failures left no trace at all.
+/// `CODEX_CHATGPT_WEB_LOG` (the `CODEX_CHATGPT_WEB_TUNNEL_KEY` family) is the
+/// knob; the default is `info` regardless of `RUST_LOG`.
+fn daemon_log_filter(requested: Option<&str>) -> tracing_subscriber::EnvFilter {
+    const DEFAULT: &str = "info";
+    match requested.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => match tracing_subscriber::EnvFilter::try_new(value) {
+            Ok(filter) => filter,
+            Err(error) => {
+                eprintln!(
+                    "chatgpt-web daemon: ignoring CODEX_CHATGPT_WEB_LOG={value:?} ({error}); using {DEFAULT}"
+                );
+                tracing_subscriber::EnvFilter::new(DEFAULT)
+            }
+        },
+        None => tracing_subscriber::EnvFilter::new(DEFAULT),
+    }
+}
+
 async fn run_daemon(config: &Config, args: DaemonArgs) -> Result<()> {
     let codex_home = config.codex_home.to_path_buf();
     let paths = chatgpt_web_daemon::state::DaemonPaths::new(&codex_home);
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let filter = daemon_log_filter(std::env::var("CODEX_CHATGPT_WEB_LOG").ok().as_deref());
     if args.foreground {
         let _ = tracing_subscriber::fmt()
             .with_env_filter(filter)
@@ -166,7 +189,15 @@ async fn run_daemon(config: &Config, args: DaemonArgs) -> Result<()> {
             .with_live_registry();
     run_config.foreground = args.foreground;
     run_config.idle_shutdown = idle_shutdown;
-    chatgpt_web_daemon::run(run_config).await
+    // FORK: a background daemon has a null stderr, so an error returned from
+    // here used to vanish. Record it where the log can be read.
+    match chatgpt_web_daemon::run(run_config).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            tracing::error!("chatgpt-web daemon exited with an error: {error:#}");
+            Err(error)
+        }
+    }
 }
 
 async fn run_status(codex_home: &Path) -> Result<()> {
@@ -372,5 +403,28 @@ async fn run_doctor(config: &Config) -> Result<()> {
         Ok(())
     } else {
         anyhow::bail!("{problems} check(s) failed")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::daemon_log_filter;
+
+    /// FORK: the Desktop launches the app-server with `RUST_LOG=warn` and the
+    /// daemon inherits it, which is how `daemon.log` ended up with warnings
+    /// only. The daemon reads its own variable and defaults to `info`.
+    #[test]
+    fn the_daemon_log_filter_defaults_to_info_and_accepts_its_own_variable() {
+        // SAFETY: single-threaded test; nothing else reads RUST_LOG here.
+        unsafe { std::env::set_var("RUST_LOG", "warn") };
+
+        assert_eq!(daemon_log_filter(None).to_string(), "info");
+        assert_eq!(daemon_log_filter(Some("   ")).to_string(), "info");
+        assert_eq!(daemon_log_filter(Some("debug")).to_string(), "debug");
+        // An unusable value falls back rather than silencing the daemon.
+        assert_eq!(daemon_log_filter(Some("=;=not a filter")).to_string(), "info");
+
+        // SAFETY: as above.
+        unsafe { std::env::remove_var("RUST_LOG") };
     }
 }
