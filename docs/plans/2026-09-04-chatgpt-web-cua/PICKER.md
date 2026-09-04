@@ -57,3 +57,38 @@ O nível deixou de viver no botão do modelo: renderiza como uma *pill* própria
 verificação pós-seleção testa o rótulo esperado contra o botão do modelo **e**
 contra todas as pills — antes disso, um nível corretamente aplicado produzia um
 aviso de mismatch.
+
+## Confirmação ao vivo (04/09, 20:5x)
+
+Com o binário 0.153.3 já em uso, o pill do composer em `chatgpt.com/` lê:
+
+```
+GPT-5.6 SolLeve       (nível 1)
+GPT-5.6 SolMédia      (nível 2, depois de um reload)
+```
+
+Confirma as duas premissas desta correção: o nível vive mesmo em
+`button.__composer-pill` (por isso o `composer_state` passou a devolver
+`pills`), e os rótulos novos são «Leve» e «Média» — ambos já na tabela `LEVELS`.
+
+## Bloqueador aberto: o composer não submete (pré-existente)
+
+A nota «Alta (3/5)» **não pôde ser observada num turno real**: desde já — e
+independentemente destas alterações — o composer do chatgpt.com deixou de
+submeter. Provado com:
+
+- `codex exec -m chatgpt-web/instant` (que nem abre o picker) falha igual, em
+  `[send phase: submit] send failed`;
+- o binário **anterior** (`codex-cli 0.153.1`, sem nada disto) falha
+  exatamente da mesma maneira;
+- na página, com o separador **visível** e acabado de recarregar, nenhuma destas
+  vias submete: `MouseEvent('click')` sintético, sequência
+  `pointerdown/pointerup/click`, `HTMLElement.click()` nativo,
+  `form.requestSubmit(sendButton)`, `Enter` no editor, e um clique **confiável**
+  via CDP (`Input.dispatchMouseEvent`). O botão
+  `[data-testid="send-button"]` existe, não está `disabled`, e o texto fica no
+  composer; a URL nunca passa a `/c/<id>` e o stop button nunca aparece.
+
+Ou seja: o seletor está certo e o clique chega — o handler de submit é que
+recusa. É uma quebra do caminho de envio, à parte do picker, e fora do âmbito
+deste plano. Enquanto durar, o provider `chatgpt_web` não completa turnos.

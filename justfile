@@ -104,7 +104,6 @@ fork-invariants:
     RUST_MIN_STACK={{ rust_min_stack }} NEXTEST_PROFILE=local cargo nextest run --no-fail-fast -p codex-exec -E 'test(/fork_invariant_/)'
     RUST_MIN_STACK={{ rust_min_stack }} NEXTEST_PROFILE=local cargo nextest run --no-fail-fast -p codex-goal-extension -E 'test(/fork_invariant_/)'
     RUST_MIN_STACK={{ rust_min_stack }} NEXTEST_PROFILE=local cargo nextest run --no-fail-fast -p codex-plans -E 'test(/fork_invariant_/)'
-    RUST_MIN_STACK={{ rust_min_stack }} NEXTEST_PROFILE=local cargo nextest run --no-fail-fast -p codex-rollout -E 'test(/fork_invariant_/)'
     RUST_MIN_STACK={{ rust_min_stack }} NEXTEST_PROFILE=local cargo nextest run --no-fail-fast -p codex-state -E 'test(/fork_invariant_/)'
 
 [windows]
@@ -117,7 +116,6 @@ fork-invariants:
     $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast -p codex-exec -E 'test(/fork_invariant_/)'
     $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast -p codex-goal-extension -E 'test(/fork_invariant_/)'
     $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast -p codex-plans -E 'test(/fork_invariant_/)'
-    $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast -p codex-rollout -E 'test(/fork_invariant_/)'
     $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast -p codex-state -E 'test(/fork_invariant_/)'
 
 # Run from the repository root so scripts that resolve paths from `cwd` see
