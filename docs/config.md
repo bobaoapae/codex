@@ -107,3 +107,41 @@ through the `plan/list` and `plan/read` methods.
 
 Plans are kept indefinitely; delete files from `$CODEX_HOME/plans/` to remove
 them.
+
+## Plugin MCP server policy (fork)
+
+`[plugins."<plugin>@<marketplace>".mcp_servers.<server>]` is upstream's place to
+overrule a plugin's own MCP manifest. The fork adds three keys there.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `root_only_tools` | unset | Tools only the root thread may see. They stay visible (and `Direct`) for the user's own thread and become `Hidden` for every spawned agent. `disabled_tools` is all-or-nothing, which is the wrong shape for a server like the Desktop's `codex_app`: the user genuinely wants `send_message_to_thread` from their own thread and genuinely does not want a subagent reaching for it. |
+| `tool_approval_overrides` | unset | Per-tool approval decisions that outrank whatever the plugin manifest declared. Every other approval knob can only *tighten*; this one is the user's own config saying "I have decided about this tool", so it may also loosen. |
+| `native_computer_surface` | unset (on) | Windows only. Set `false` to turn off the pass that adds the `computer` surface to the bundled `unified-computer-use` plugin's `cua_repl` server. |
+
+### `native_computer_surface`
+
+The Codex Desktop app writes that plugin's `.mcp.json` itself and, on Windows,
+stamps `CUA_REPL_ENABLED_SURFACES = "browser"` in the very same file that
+advertises a live Computer Use kernel (`SKY_CUA_NATIVE_PIPE = "1"` plus the
+pipe directory the app owns). The plugin's `launch.mjs` only registers the `sky`
+service when that list contains `computer`, so the direct `js` tool the model
+reaches for has no `sky.*` at all and Computer Use reports itself as "not
+configured" — even though the same kernel keeps working through the `node_repl`
+code-mode path.
+
+Codex therefore appends `computer` to that list **in memory** while loading the
+plugin. Nothing on disk is touched: the app owns the file and rewrites it at
+every startup, and the loader re-reads it on every load. The pass only fires
+when all of these hold: the target is Windows, the server is named `cua_repl`,
+its transport is stdio with an `env` table, `SKY_CUA_NATIVE_PIPE` is `"1"`,
+`SKY_CUA_NATIVE_PIPE_DIRECTORY` is non-empty, and `CUA_REPL_ENABLED_SURFACES`
+is present but does not already list `computer`. Existing entries are preserved
+(`browser` becomes `browser,computer`).
+
+To turn it off:
+
+```toml
+[plugins."unified-computer-use@openai-bundled".mcp_servers.cua_repl]
+native_computer_surface = false
+```

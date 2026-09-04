@@ -1183,6 +1183,67 @@ output_token_limit = 12000
     );
 }
 
+/// FORK: `native_computer_surface` survives the TOML round-trip into the
+/// per-server policy the loader consults.
+#[tokio::test]
+async fn load_plugins_carries_the_native_computer_surface_hatch() {
+    let codex_home = TempDir::new().unwrap();
+    let plugin_root = codex_home
+        .path()
+        .join("plugins/cache")
+        .join("openai-bundled/unified-computer-use/local");
+
+    write_file(
+        &plugin_root.join(".codex-plugin/plugin.json"),
+        r#"{
+  "name": "unified-computer-use"
+}"#,
+    );
+    write_file(
+        &plugin_root.join(".mcp.json"),
+        r#"{
+  "mcpServers": {
+    "cua_repl": {
+      "command": "node.exe",
+      "args": ["launch.mjs"],
+      "env": {
+        "SKY_CUA_NATIVE_PIPE": "1",
+        "SKY_CUA_NATIVE_PIPE_DIRECTORY": "\\\\.\\pipe\\codex-computer-use",
+        "CUA_REPL_ENABLED_SURFACES": "browser"
+      }
+    }
+  }
+}"#,
+    );
+    let config_toml = r#"
+[features]
+plugins = true
+
+[plugins."unified-computer-use@openai-bundled"]
+enabled = true
+
+[plugins."unified-computer-use@openai-bundled".mcp_servers.cua_repl]
+native_computer_surface = false
+"#;
+
+    let outcome =
+        load_plugins_from_config(config_toml, codex_home.path(), /*auth_mode*/ None).await;
+    let server = outcome.plugins()[0]
+        .mcp_servers
+        .get("cua_repl")
+        .expect("cua_repl server");
+
+    let codex_config::McpServerTransportConfig::Stdio { env, .. } = &server.transport else {
+        panic!("cua_repl is a stdio server");
+    };
+    assert_eq!(
+        env.as_ref()
+            .and_then(|env| env.get("CUA_REPL_ENABLED_SURFACES"))
+            .map(String::as_str),
+        Some("browser"),
+    );
+}
+
 #[tokio::test]
 async fn remote_installed_plugin_preserves_configured_mcp_server_policy() {
     let codex_home = TempDir::new().unwrap();

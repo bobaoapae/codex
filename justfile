@@ -98,6 +98,7 @@ test *args:
 fork-invariants:
     RUST_MIN_STACK={{ rust_min_stack }} NEXTEST_PROFILE=local cargo nextest run --no-fail-fast -p codex-features -E 'test(/fork_invariant_/)'
     RUST_MIN_STACK={{ rust_min_stack }} NEXTEST_PROFILE=local cargo nextest run --no-fail-fast -p codex-core -E 'test(/fork_invariant_/)'
+    RUST_MIN_STACK={{ rust_min_stack }} NEXTEST_PROFILE=local cargo nextest run --no-fail-fast -p codex-core-plugins -E 'test(/fork_invariant_/)'
     RUST_MIN_STACK={{ rust_min_stack }} NEXTEST_PROFILE=local cargo nextest run --no-fail-fast -p codex-app-server-protocol -E 'test(/fork_invariant_/)'
     RUST_MIN_STACK={{ rust_min_stack }} NEXTEST_PROFILE=local cargo nextest run --no-fail-fast -p codex-app-server -E 'test(/fork_invariant_/)'
     RUST_MIN_STACK={{ rust_min_stack }} NEXTEST_PROFILE=local cargo nextest run --no-fail-fast -p codex-exec -E 'test(/fork_invariant_/)'
@@ -110,6 +111,7 @@ fork-invariants:
 fork-invariants:
     $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast -p codex-features -E 'test(/fork_invariant_/)'
     $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast -p codex-core -E 'test(/fork_invariant_/)'
+    $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast -p codex-core-plugins -E 'test(/fork_invariant_/)'
     $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast -p codex-app-server-protocol -E 'test(/fork_invariant_/)'
     $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast -p codex-app-server -E 'test(/fork_invariant_/)'
     $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast -p codex-exec -E 'test(/fork_invariant_/)'

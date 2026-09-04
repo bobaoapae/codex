@@ -245,6 +245,95 @@ async fn legacy_manifest_can_point_at_root_mcp_json() {
     );
 }
 
+/// The `.mcp.json` the Codex Desktop app writes for `unified-computer-use`,
+/// trimmed to the keys the surface pass looks at.
+#[cfg(test)]
+fn desktop_cua_repl_mcp_json() -> &'static str {
+    r#"{
+  "mcpServers": {
+    "cua_repl": {
+      "command": "node.exe",
+      "args": ["launch.mjs"],
+      "enabled_tools": ["js", "js_reset"],
+      "omit_tools_from": ["code_mode", "deferred"],
+      "env": {
+        "SKY_CUA_NATIVE_PIPE": "1",
+        "SKY_CUA_NATIVE_PIPE_DIRECTORY": "\\\\.\\pipe\\codex-computer-use-fd249c73",
+        "CUA_REPL_ENABLED_SURFACES": "browser"
+      }
+    }
+  }
+}"#
+}
+
+#[cfg(test)]
+async fn load_desktop_cua_repl(
+    plugin_root: &std::path::Path,
+    plugin_policy: Option<&HashMap<String, PluginMcpServerConfig>>,
+) -> HashMap<String, codex_config::McpServerConfig> {
+    fs::create_dir_all(plugin_root.join(".codex-plugin")).expect("create manifest directory");
+    fs::write(
+        plugin_root.join(".codex-plugin/plugin.json"),
+        r#"{"name":"unified-computer-use","mcpServers":"./.mcp.json"}"#,
+    )
+    .expect("write manifest");
+    fs::write(plugin_root.join(".mcp.json"), desktop_cua_repl_mcp_json())
+        .expect("write MCP config");
+    let manifest = load_plugin_manifest(plugin_root).expect("load manifest");
+
+    load_plugin_mcp_servers_from_manifest_with_format(
+        plugin_root,
+        &manifest.paths,
+        plugin_policy,
+        /*plugin_data_root*/ None,
+        PluginManifestFormat::Legacy,
+    )
+    .await
+}
+
+#[cfg(test)]
+fn enabled_surfaces(servers: &HashMap<String, codex_config::McpServerConfig>) -> Option<String> {
+    let codex_config::McpServerTransportConfig::Stdio { env, .. } =
+        &servers.get("cua_repl")?.transport
+    else {
+        return None;
+    };
+    env.as_ref()?.get("CUA_REPL_ENABLED_SURFACES").cloned()
+}
+
+/// FORK: the Desktop pins the surface list to `browser` on Windows even though
+/// the same file advertises a live Computer Use kernel; the loader appends
+/// `computer` in memory so the direct `js` tool gets `sky.*`.
+#[tokio::test]
+async fn the_desktop_cua_repl_gets_the_native_computer_surface() {
+    let temp_dir = TempDir::new().expect("tempdir");
+    let servers = load_desktop_cua_repl(&temp_dir.path().join("plugin"), None).await;
+
+    let expected = if cfg!(windows) {
+        "browser,computer"
+    } else {
+        "browser"
+    };
+    assert_eq!(enabled_surfaces(&servers).as_deref(), Some(expected));
+}
+
+/// FORK: `native_computer_surface = false` puts the list back the way the app
+/// wrote it.
+#[tokio::test]
+async fn the_cua_repl_surface_pass_can_be_switched_off_by_policy() {
+    let temp_dir = TempDir::new().expect("tempdir");
+    let policy = HashMap::from([(
+        "cua_repl".to_string(),
+        PluginMcpServerConfig {
+            native_computer_surface: Some(false),
+            ..PluginMcpServerConfig::default()
+        },
+    )]);
+    let servers = load_desktop_cua_repl(&temp_dir.path().join("plugin"), Some(&policy)).await;
+
+    assert_eq!(enabled_surfaces(&servers).as_deref(), Some("browser"));
+}
+
 #[tokio::test]
 async fn installed_agent_plugin_uses_isolated_data_root_for_stdio_mcp() {
     let temp_dir = TempDir::new().expect("tempdir");

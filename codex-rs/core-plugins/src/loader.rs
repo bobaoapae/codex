@@ -52,6 +52,7 @@ use codex_utils_plugins::PluginSkillRoot;
 use codex_utils_plugins::SkillDiscoveryMode;
 use codex_utils_plugins::find_plugin_manifest_path;
 use codex_utils_plugins::migrated_command_skills_root;
+use crate::cua_native_surface;
 use serde_json::Value as JsonValue;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
@@ -59,6 +60,8 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
+use tracing::debug;
+use tracing::info;
 use tracing::instrument;
 use tracing::warn;
 
@@ -968,6 +971,8 @@ async fn load_plugin(
 }
 
 fn apply_plugin_mcp_server_policy(config: &mut McpServerConfig, policy: &PluginMcpServerConfig) {
+    // FORK: `native_computer_surface` is deliberately absent here; it is
+    // consumed in `cua_native_surface`, after every policy has been applied.
     config.enabled = policy.enabled;
     if let Some(approval_mode) = policy.default_tools_approval_mode {
         config.default_tools_approval_mode = Some(approval_mode);
@@ -1443,6 +1448,8 @@ pub fn apply_configured_plugin_mcp_server_policies(
     policies: &HashMap<String, PluginMcpServerConfig>,
     servers: &mut HashMap<String, McpServerConfig>,
 ) {
+    // FORK: `native_computer_surface` is deliberately absent here; it is
+    // consumed in `cua_native_surface`, after every policy has been applied.
     for (name, server) in servers {
         if let Some(policy) = policies.get(name) {
             let declared_approval_mode = server.default_tools_approval_mode.unwrap_or_default();
@@ -1597,6 +1604,44 @@ pub(crate) async fn load_plugin_mcp_servers_from_manifest_with_format(
                             "plugin MCP file overwrote an earlier server definition"
                         );
                     }
+                }
+            }
+        }
+    }
+
+    // FORK: the Desktop ships `cua_repl` with the native Computer Use surface
+    // switched off on Windows even when its own env advertises a live kernel.
+    // Normalize here, once every policy has been applied and before the
+    // AgentPlugin overlay, so the session catalog, `codex mcp list`, plugin
+    // info and the executor all see the same list. `.mcp.json` is re-read on
+    // every load, so this survives the app rewriting the file at startup.
+    for (name, config) in &mut mcp_servers {
+        let escape_hatch = plugin_policy
+            .and_then(|policy| policy.get(name))
+            .and_then(|policy| policy.native_computer_surface);
+        match cua_native_surface::enable_cua_native_surface(
+            name,
+            config,
+            cfg!(windows),
+            escape_hatch,
+        ) {
+            cua_native_surface::CuaNativeSurfaceOutcome::Applied { before, after } => {
+                info!(
+                    plugin = %plugin_root.display(),
+                    server = name,
+                    before,
+                    after,
+                    "FORK: enabled the native computer surface for cua_repl (SKY_CUA_NATIVE_PIPE advertised)"
+                );
+            }
+            outcome => {
+                if name == "cua_repl" {
+                    debug!(
+                        plugin = %plugin_root.display(),
+                        server = name,
+                        ?outcome,
+                        "FORK: left the cua_repl computer surface as configured"
+                    );
                 }
             }
         }

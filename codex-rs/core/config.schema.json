@@ -3397,6 +3397,10 @@
           },
           "type": "array"
         },
+        "native_computer_surface": {
+          "description": "FORK: Windows only. Set `false` to stop Codex from adding the `computer` surface to the bundled `unified-computer-use` plugin's `cua_repl` server. The Desktop writes `CUA_REPL_ENABLED_SURFACES = \"browser\"` into the same `.mcp.json` that advertises a live Computer Use kernel, and the plugin's launcher only registers the `sky` service when the list has `computer`, so the direct `js` tool loses Computer Use entirely. Codex appends it in memory at load; this turns that off.",
+          "type": "boolean"
+        },
         "root_only_tools": {
           "description": "FORK: tools only the root thread may see. See `McpServerConfig::root_only_tools`.",
           "items": {

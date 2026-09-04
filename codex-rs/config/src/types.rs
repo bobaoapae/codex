@@ -931,6 +931,16 @@ pub struct PluginMcpServerConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub tool_approval_overrides: HashMap<String, AppToolApproval>,
 
+    /// FORK: Windows only. Set `false` to stop Codex from adding the `computer`
+    /// surface to the bundled `unified-computer-use` plugin's `cua_repl`
+    /// server. The Desktop writes `CUA_REPL_ENABLED_SURFACES = "browser"` into
+    /// the same `.mcp.json` that advertises a live Computer Use kernel, and the
+    /// plugin's launcher only registers the `sky` service when the list has
+    /// `computer`, so the direct `js` tool loses Computer Use entirely. Codex
+    /// appends it in memory at load; this turns that off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_computer_surface: Option<bool>,
+
     /// Per-tool policy settings keyed by tool name.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub tools: HashMap<String, McpServerToolConfig>,
@@ -945,6 +955,7 @@ impl Default for PluginMcpServerConfig {
             disabled_tools: None,
             root_only_tools: None,
             tool_approval_overrides: HashMap::new(),
+            native_computer_surface: None,
             tools: HashMap::new(),
         }
     }

@@ -1,6 +1,8 @@
 mod app_mcp_routing;
 mod artifact_operation;
 mod command_migration;
+// FORK: normalizes the bundled Computer Use plugin's Windows surface list.
+mod cua_native_surface;
 mod discoverable;
 mod error_subtype;
 mod executor_hooks;

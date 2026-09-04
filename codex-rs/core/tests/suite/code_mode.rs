@@ -6251,6 +6251,105 @@ async fn code_mode_only_keeps_mcp_tools_direct_when_nested_exposure_is_omitted()
     Ok(())
 }
 
+/// FORK: the Desktop declares `cua_repl` with `omit_tools_from = ["code_mode",
+/// "deferred"]`, which is what makes its `js` the tool the model reaches for
+/// directly rather than through `exec`. That shape is the reason the surface
+/// list in its env has to be right — pin it so a Code Mode change cannot
+/// quietly move `cua_repl` behind `exec` and mask the Computer Use fix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cua_repl_js_stays_direct_model_only() -> Result<()> {
+    skip_if_wine_exec!(
+        Ok(()),
+        "requires a Windows test_stdio_server in the Wine-exec environment"
+    );
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let rmcp_test_server_bin = remote_aware_stdio_server_bin()?;
+    let environment_id = remote_aware_environment_id();
+    let mut builder = test_codex()
+        .with_model_info_override("gpt-5.4", |model| {
+            model.supports_search_tool = false;
+        })
+        .with_config(move |config| {
+            let _ = config.features.enable(Feature::CodeMode);
+            let mut servers = config.mcp_servers.get().clone();
+            servers.insert(
+                "cua_repl".to_string(),
+                serde_json::from_value(serde_json::json!({
+                    "command": rmcp_test_server_bin,
+                    "environment_id": environment_id,
+                    "cwd": config.cwd,
+                    // The Desktop's own shape, with `echo` standing in for `js`.
+                    "enabled_tools": ["echo"],
+                    "omit_tools_from": ["code_mode", "deferred"],
+                }))
+                .expect("test MCP server config should be valid"),
+            );
+            config
+                .mcp_servers
+                .set(servers)
+                .expect("test config should allow MCP servers");
+        });
+    let test = builder.build_with_auto_env(&server).await?;
+    wait_for_mcp_server(&test.codex, "cua_repl").await?;
+
+    let first_mock = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            responses::ev_function_call_with_namespace(
+                "call-1",
+                "mcp__cua_repl",
+                "echo",
+                r#"{"message":"ping"}"#,
+            ),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let second_mock = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("msg-1", "done"),
+            ev_completed("resp-2"),
+        ]),
+    )
+    .await;
+
+    test.submit_turn("call the cua_repl tool directly").await?;
+
+    let first_request = first_mock.single_request().body_json();
+    assert!(
+        namespace_child_tool(&first_request, "mcp__cua_repl", "echo").is_some(),
+        "cua_repl must stay directly callable by the model"
+    );
+    let exec_description = first_request["tools"]
+        .as_array()
+        .expect("request should contain tools")
+        .iter()
+        .find_map(|tool| {
+            (tool["name"].as_str() == Some("exec"))
+                .then(|| tool["description"].as_str())
+                .flatten()
+        })
+        .expect("Code Mode exec should remain available");
+    assert!(
+        !exec_description.contains("mcp__cua_repl"),
+        "cua_repl is omitted from Code Mode and must not appear in the exec declaration"
+    );
+
+    let output = second_mock.single_request().function_call_output("call-1");
+    assert!(
+        output["output"]
+            .as_str()
+            .is_some_and(|output| output.contains("ECHOING: ping")),
+        "the directly exposed cua_repl tool must execute: {output:?}"
+    );
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_only_can_call_mcp_tools_hidden_from_direct_and_deferred_exposure() -> Result<()>
 {

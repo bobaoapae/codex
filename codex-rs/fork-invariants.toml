@@ -128,3 +128,8 @@ tests = [
     "fork_invariant_context_requests_are_experimental_and_thread_scoped",
     "fork_invariant_experimental_capability_gate_is_unambiguous",
 ]
+
+[[invariant]]
+id = "plugins.cua_native_surface"
+owner = "codex-core-plugins"
+tests = ["fork_invariant_cua_repl_native_surface_is_enabled_on_windows"]
