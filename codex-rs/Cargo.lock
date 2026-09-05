@@ -2185,6 +2185,7 @@ dependencies = [
  "tempfile",
  "test-case",
  "thiserror 2.0.18",
+ "tikv-jemallocator",
  "time",
  "tokio",
  "tokio-tungstenite",
@@ -2539,7 +2540,6 @@ dependencies = [
  "codex-install-context",
  "codex-login",
  "codex-mcp",
- "codex-mcp-server",
  "codex-memories-write",
  "codex-model-provider",
  "codex-models-manager",
@@ -2580,6 +2580,7 @@ dependencies = [
  "sys-locale",
  "tar",
  "tempfile",
+ "tikv-jemallocator",
  "tokio",
  "tokio-tungstenite",
  "toml 0.9.11+spec-1.1.0",
@@ -2881,6 +2882,7 @@ version = "0.153.3"
 dependencies = [
  "codex-protocol",
  "codex-utils-string",
+ "pretty_assertions",
 ]
 
 [[package]]
@@ -3827,46 +3829,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "codex-mcp-server"
-version = "0.153.3"
-dependencies = [
- "anyhow",
- "app_test_support",
- "codex-arg0",
- "codex-build-info",
- "codex-config",
- "codex-core",
- "codex-exec-server",
- "codex-extension-api",
- "codex-features",
- "codex-git-attribution",
- "codex-home",
- "codex-image-generation-extension",
- "codex-login",
- "codex-otel",
- "codex-protocol",
- "codex-shell-command",
- "codex-skills-extension",
- "codex-utils-absolute-path",
- "codex-utils-cli",
- "codex-utils-json-to-toml",
- "core_test_support",
- "mcp_test_support",
- "os_info",
- "pretty_assertions",
- "rmcp",
- "schemars 0.8.22",
- "serde",
- "serde_json",
- "shlex",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "wiremock",
-]
-
-[[package]]
 name = "codex-memories-extension"
 version = "0.153.3"
 dependencies = [
@@ -4000,13 +3962,24 @@ dependencies = [
  "codex-otel",
  "codex-protocol",
  "codex-utils-output-truncation",
- "codex-utils-template",
  "pretty_assertions",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "codex-mxc-sandbox"
+version = "0.153.3"
+dependencies = [
+ "anyhow",
+ "appcontainer_common",
+ "codex-protocol",
+ "learning_mode_windows",
+ "tracelogging",
+ "wxc_common",
 ]
 
 [[package]]
@@ -4367,7 +4340,7 @@ name = "codex-sandboxing"
 version = "0.153.3"
 dependencies = [
  "anyhow",
- "appcontainer_common",
+ "codex-mxc-sandbox",
  "codex-network-proxy",
  "codex-otel",
  "codex-protocol",
@@ -4383,7 +4356,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
- "tracelogging",
  "tracing",
  "url",
  "which 8.0.0",
@@ -4646,6 +4618,7 @@ dependencies = [
  "codex-cloud-config",
  "codex-config",
  "codex-connectors",
+ "codex-context-fragments",
  "codex-core-plugins",
  "codex-exec-server",
  "codex-features",
@@ -9700,25 +9673,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mcp_test_support"
-version = "0.153.3"
-dependencies = [
- "anyhow",
- "codex-login",
- "codex-mcp-server",
- "codex-terminal-detection",
- "codex-utils-cargo-bin",
- "core_test_support",
- "os_info",
- "pretty_assertions",
- "rmcp",
- "serde_json",
- "shlex",
- "tokio",
- "wiremock",
-]
-
-[[package]]
 name = "md-5"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11471,8 +11425,15 @@ checksum = "76979bea66e7875e7509c4ec5300112b316af87fa7a252ca91c448b32dfe3993"
 dependencies = [
  "bitflags 2.13.1",
  "memchr",
+ "pulldown-cmark-escape",
  "unicase",
 ]
+
+[[package]]
+name = "pulldown-cmark-escape"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd348ff538bc9caeda7ee8cad2d1d48236a1f443c1fa3913c6a02fe0043b1dd3"
 
 [[package]]
 name = "pxfm"
@@ -14862,6 +14823,26 @@ dependencies = [
  "quick-error",
  "weezl",
  "zune-jpeg 0.4.21",
+]
+
+[[package]]
+name = "tikv-jemalloc-sys"
+version = "0.7.1+5.3.1-0-g81034ce1f1373e37dc865038e1bc8eeecf559ce8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a2825c78386b4ae0314074867860ba9577875de945f05992c38815cbec327f0"
+dependencies = [
+ "cc",
+ "libc",
+]
+
+[[package]]
+name = "tikv-jemallocator"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "249f09e49ab1609436f34c776e84231bead18d6a955f119f939bdc1d847561bd"
+dependencies = [
+ "libc",
+ "tikv-jemalloc-sys",
 ]
 
 [[package]]

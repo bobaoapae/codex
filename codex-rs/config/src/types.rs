@@ -731,6 +731,11 @@ pub struct Tui {
     #[serde(default = "default_true")]
     pub animations: bool,
 
+    /// Enable decorative effects such as Astra composer stars. Also requires animations.
+    /// Defaults to `true`.
+    #[serde(default = "default_true")]
+    pub whimsy: bool,
+
     /// Show startup tooltips in the TUI welcome screen.
     /// Defaults to `true`.
     #[serde(default = "default_true")]
@@ -751,6 +756,10 @@ pub struct Tui {
     /// Defaults to `false`.
     #[serde(default)]
     pub vim_mode_default: bool,
+
+    /// Escape returns from async questions to the composer, preserving the answer draft.
+    #[serde(default = "default_true")]
+    pub question_esc_back: bool,
 
     /// Start the TUI in raw scrollback mode for copy-friendly transcript output.
     /// Defaults to `false`.

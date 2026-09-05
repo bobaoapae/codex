@@ -313,11 +313,6 @@ async fn start_or_steer(
             ));
         }
     };
-    let can_start_root_turn = start.parent_turn_id.is_none() && start.root_turn_id.is_none();
-    let incoming_root_turn_id = start
-        .parent_turn_id
-        .as_ref()
-        .map(|_| start.root_turn_id.clone());
     let settings = PreparedTurnInputSettings::prepare(session, thread_settings, start).await?;
     match session
         .steer_input(
@@ -326,7 +321,6 @@ async fn start_or_steer(
             /*expected_turn_id*/ None,
             settings.required_active_final_output_json_schema(),
             responsesapi_client_metadata.clone(),
-            incoming_root_turn_id,
         )
         .await
     {
@@ -341,16 +335,6 @@ async fn start_or_steer(
             else {
                 unreachable!("explicit user input can enter Plan mode");
             };
-            if can_start_root_turn
-                && has_explicit_input
-                && turn_context
-                    .turn_metadata_state
-                    .can_start_root_turn(&turn_context.session_source)
-            {
-                turn_context
-                    .turn_metadata_state
-                    .set_root_turn_id(submission_id.clone());
-            }
             if let Some(responsesapi_client_metadata) = responsesapi_client_metadata {
                 turn_context
                     .turn_metadata_state
@@ -392,7 +376,6 @@ async fn start_if_idle(
         approved_plan,
         ..
     } = request;
-    let can_start_root_turn = start.parent_turn_id.is_none() && start.root_turn_id.is_none();
     let approved_plan = prepare_approved_plan(session, approved_plan)?;
     if approved_plan.is_some()
         && (kind != TurnStartKind::User
@@ -472,16 +455,6 @@ async fn start_if_idle(
             .turn_metadata_state
             .set_responsesapi_client_metadata(responsesapi_client_metadata);
     }
-    if kind == TurnStartKind::User
-        && can_start_root_turn
-        && turn_context
-            .turn_metadata_state
-            .can_start_root_turn(&turn_context.session_source)
-    {
-        turn_context
-            .turn_metadata_state
-            .set_root_turn_id(submission_id.clone());
-    }
     session
         .maybe_emit_model_warnings_for_turn(turn_context.as_ref())
         .await;
@@ -557,10 +530,6 @@ async fn steer(
             "only user input can steer a turn".to_string(),
         ));
     }
-    let incoming_root_turn_id = start
-        .parent_turn_id
-        .as_ref()
-        .map(|_| start.root_turn_id.clone());
     let settings = PreparedTurnInputSettings::prepare(session, thread_settings, start).await?;
     match session
         .steer_input(
@@ -569,7 +538,6 @@ async fn steer(
             Some(expected_turn_id.as_str()),
             settings.required_active_final_output_json_schema(),
             responsesapi_client_metadata,
-            incoming_root_turn_id,
         )
         .await
     {
@@ -655,7 +623,6 @@ impl Session {
         expected_turn_id: Option<&str>,
         required_final_output_json_schema: Option<&Value>,
         responsesapi_client_metadata: Option<HashMap<String, String>>,
-        incoming_root_turn_id: Option<Option<String>>,
     ) -> Result<String, NotSubmittedReason> {
         let mut active = self.active_turn.lock().await;
         let Some(active_turn) = active.as_mut() else {
@@ -725,18 +692,6 @@ impl Session {
             input => pending_turn_input(self, input.clone()).await,
         };
         pending_input.push(input);
-        if active_task
-            .turn_context
-            .turn_metadata_state
-            .root_turn_id()
-            .is_none()
-            && let Some(Some(incoming_root_turn_id)) = incoming_root_turn_id
-        {
-            active_task
-                .turn_context
-                .turn_metadata_state
-                .set_root_turn_id(incoming_root_turn_id);
-        }
         self.input_queue
             .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
                 active_turn.turn_state.as_ref(),

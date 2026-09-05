@@ -8790,7 +8790,10 @@ where
         session_configuration.session_source.clone(),
     );
 
-    let state = SessionState::new(session_configuration.clone());
+    let mut state = SessionState::new(session_configuration.clone());
+    if config.features.enabled(Feature::GuardianThreadContext) {
+        state.history.enable_user_message_retention();
+    }
     let (environment_manager, resolved_turn_environments) =
         resolved_environments_for_configuration(&session_configuration, &default_environments)
             .await;
@@ -12083,20 +12086,14 @@ async fn trigger_turn_mailbox_mail_waits_for_next_turn_after_answer_boundary() {
     assert!(sess.input_queue.has_trigger_turn_mailbox_items().await);
 }
 
+#[test_case(None; "independent root")]
+#[test_case(Some("root-a"); "inherited root")]
 #[tokio::test]
-async fn active_turn_keeps_first_root_when_mail_coalesces() {
+async fn active_turn_keeps_first_root_when_mail_coalesces(inherited_root: Option<&str>) {
     let (sess, tc, _rx) = make_session_and_context_with_rx().await;
-    tc.turn_metadata_state
-        .set_root_turn_id("root-a".to_string());
-    sess.spawn_task(
-        Arc::clone(&tc),
-        Vec::new(),
-        NeverEndingTask {
-            kind: TaskKind::Regular,
-            listen_to_cancellation_token: true,
-        },
-    )
-    .await;
+    if let Some(root) = inherited_root {
+        tc.turn_metadata_state.set_root_turn_id(root.to_string());
+    }
     let first = InterAgentCommunication::new(
         AgentPath::try_from("/root/worker_a").expect("worker path should parse"),
         AgentPath::root(),
@@ -12111,10 +12108,13 @@ async fn active_turn_keeps_first_root_when_mail_coalesces() {
         "second".to_string(),
         /*trigger_turn*/ true,
     );
-    for (communication, parent_turn_id, root_turn_id) in [
+    for (index, (communication, parent_turn_id, root_turn_id)) in [
         (first.clone(), "parent-a", "root-a"),
         (second.clone(), "parent-b", "root-b"),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         sess.input_queue
             .enqueue_mailbox_communication(
                 communication,
@@ -12125,6 +12125,19 @@ async fn active_turn_keeps_first_root_when_mail_coalesces() {
                 },
             )
             .await;
+        if index == 0 {
+            // The first message is already queued when this independent task
+            // starts; the second arrives after its root is established.
+            sess.spawn_task(
+                Arc::clone(&tc),
+                Vec::new(),
+                NeverEndingTask {
+                    kind: TaskKind::Regular,
+                    listen_to_cancellation_token: true,
+                },
+            )
+            .await;
+        }
     }
 
     assert_eq!(
@@ -12136,7 +12149,7 @@ async fn active_turn_keeps_first_root_when_mail_coalesces() {
     );
     assert_eq!(
         tc.turn_metadata_state.root_turn_id().as_deref(),
-        Some("root-a")
+        Some(inherited_root.unwrap_or(&tc.sub_id))
     );
     assert!(!sess.input_queue.has_pending_mailbox_items().await);
 

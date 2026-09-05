@@ -46,6 +46,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use supports_color::Stream;
 
+#[cfg(all(
+    target_os = "linux",
+    target_env = "musl",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[global_allocator]
+static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 // FORK: multi-account management (`codex account`).
 mod account_cmd;
 // FORK: `codex chatgpt-web …` — the shared connector daemon for the chatgpt_web provider.
@@ -169,9 +177,6 @@ enum Subcommand {
 
     /// Manage Codex plugins.
     Plugin(PluginCli),
-
-    /// Start Codex as an MCP server (stdio).
-    McpServer(McpServerCommand),
 
     /// [experimental] Run the app server or related tooling.
     AppServer(AppServerCommand),
@@ -333,13 +338,6 @@ struct ReviewCommand {
 
     #[clap(flatten)]
     args: ReviewArgs,
-}
-
-#[derive(Debug, Parser)]
-struct McpServerCommand {
-    /// Error out when config.toml contains fields that are not recognized by this version of Codex.
-    #[arg(long = "strict-config", default_value_t = false)]
-    strict_config: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -1282,22 +1280,6 @@ async fn cli_main(
                 root_config_overrides.clone(),
             );
             codex_exec::run_main(exec_cli, arg0_paths.clone()).await?;
-        }
-        Some(Subcommand::McpServer(McpServerCommand { strict_config })) => {
-            eprintln!(
-                "warning: `codex mcp-server` is deprecated and will be removed in a future release."
-            );
-            reject_remote_mode_for_subcommand(
-                root_remote.as_deref(),
-                root_remote_auth_token_env.as_deref(),
-                "mcp-server",
-            )?;
-            codex_mcp_server::run_main(
-                arg0_paths.clone(),
-                root_config_overrides,
-                strict_config || root_strict_config,
-            )
-            .await?;
         }
         Some(Subcommand::Mcp(mut mcp_cli)) => {
             reject_remote_mode_for_subcommand(
@@ -2617,7 +2599,6 @@ fn unsupported_subcommand_name_for_strict_config(
         | Some(Subcommand::Agents(_))
         | Some(Subcommand::Exec(_))
         | Some(Subcommand::Review(_))
-        | Some(Subcommand::McpServer(_))
         | Some(Subcommand::ExecServer(_))
         | Some(Subcommand::Resume(_))
         | Some(Subcommand::Queue(_))
@@ -4502,15 +4483,6 @@ mod tests {
     fn strict_config_parses_for_supported_commands() {
         let cli = MultitoolCli::try_parse_from(["codex", "--strict-config"]).expect("parse");
         assert!(cli.interactive.strict_config);
-
-        let cli = MultitoolCli::try_parse_from(["codex", "mcp-server", "--strict-config"])
-            .expect("parse");
-        assert_matches!(
-            cli.subcommand,
-            Some(Subcommand::McpServer(McpServerCommand {
-                strict_config: true,
-            }))
-        );
 
         let cli =
             MultitoolCli::try_parse_from(["codex", "review", "--strict-config", "--uncommitted"])

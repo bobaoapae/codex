@@ -254,6 +254,7 @@ fn sample_thread_with_metadata(
         section: None,
         section_entered_at: None,
         project_id: None,
+        daybreak_enabled: None,
         history_mode: Default::default(),
         model_provider: "openai".to_string(),
         model: None,
@@ -3273,7 +3274,7 @@ async fn guardian_completed_notification_publishes_review_event_with_thread_meta
                 GuardianApprovalReviewAction::Command {
                     source: AppServerGuardianCommandSource::Shell,
                     command: "echo hi".to_string(),
-                    cwd: test_path_buf("/tmp").abs(),
+                    cwd: test_path_buf("/tmp").abs().into(),
                 },
             ))),
             &mut events,

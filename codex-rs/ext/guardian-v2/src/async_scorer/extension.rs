@@ -324,7 +324,13 @@ impl ApprovalReviewContributor for GuardianV2Extension {
             let history = thread.conversation_history_snapshot().await;
             if thread_context_enabled {
                 let sampler = thread_store.get::<LunaSampler>()?;
-                if requires_sync_for_compaction(&guardian_config, history.as_ref(), &sampler) {
+                if requires_sync_for_compaction(&guardian_config, history.as_ref(), &sampler)
+                    || encrypted_parent_compaction(
+                        history.items(),
+                        guardian_config.max_parent_compaction_tokens,
+                    )
+                    .is_err()
+                {
                     thread_store.insert(StrictReviewReason::IncompatibleCompaction);
                     record_fast_decision(
                         extension_metrics.as_deref(),
@@ -635,6 +641,7 @@ impl GuardianV2Extension {
                 guardian_config.max_parent_compaction_tokens,
             ) {
                 Ok(compaction) => compaction,
+                Err(ParentCompactionError::Unusable) if !thread_context_enabled => None,
                 Err(_) => {
                     Self::record_fail_closed_score(input.thread_store, sampled_at);
                     record_classification(
@@ -684,6 +691,13 @@ impl GuardianV2Extension {
         let rendered_images = guardian_config
             .transcript
             .images(input.conversation_history.review_items(), node_repl_images);
+        // Capture root evidence before background metadata resolution or model I/O.
+        // Later root changes invalidate this sample through its captured authorization version.
+        let root_snapshot = if thread_context_enabled {
+            thread.guardian_root_snapshot().await
+        } else {
+            None
+        };
 
         let score_authorization = ScoreAuthorization::current(&thread).await;
         tokio::spawn(async move {
@@ -694,7 +708,11 @@ impl GuardianV2Extension {
                 }
                 None => None,
             };
-            let root_snapshot = thread.guardian_root_snapshot().await;
+            let root_snapshot = if thread_context_enabled {
+                root_snapshot
+            } else {
+                thread.guardian_root_snapshot().await
+            };
             let mut trusted_skills = TrustedSkillInvocations::default();
             for path in local_trusted_skill_paths.iter().chain(
                 root_snapshot
@@ -956,6 +974,7 @@ impl GuardianV2Extension {
 enum ParentCompactionError {
     Serialization,
     Oversized,
+    Unusable,
 }
 
 // Sampling and fast approval must apply the same checkpoint eligibility policy.
@@ -964,18 +983,17 @@ pub(super) fn requires_sync_for_compaction(
     history: &dyn ConversationHistorySnapshot,
     sampler: &LunaSampler,
 ) -> bool {
-    config.reuse_parent_compaction
-        && history.items().any(|item| {
-            matches!(
-                item,
-                ResponseItem::Compaction { .. } | ResponseItem::ContextCompaction { .. }
-            )
-        })
-        && !sampler.supports_parent_compaction(history.latest_compaction_model_hash())
+    history.items().any(|item| {
+        matches!(
+            item,
+            ResponseItem::Compaction { .. } | ResponseItem::ContextCompaction { .. }
+        )
+    }) && (!config.reuse_parent_compaction
+        || !sampler.supports_parent_compaction(history.latest_compaction_model_hash()))
 }
 
 // An unusable latest compaction must never fall back to an older one. Missing
-// encrypted content can be omitted; content that cannot be bounded rejects the sample.
+// encrypted content is rejected here; only legacy callers may omit that checkpoint.
 fn encrypted_parent_compaction<'a>(
     items: impl Iterator<Item = &'a ResponseItem>,
     max_parent_compaction_tokens: usize,
@@ -1004,10 +1022,10 @@ fn encrypted_parent_compaction<'a>(
             encrypted_content: Some(encrypted_content),
             ..
         } => encrypted_content,
-        _ => return Ok(None),
+        _ => return Err(ParentCompactionError::Unusable),
     };
     if encrypted_content.is_empty() {
-        return Ok(None);
+        return Err(ParentCompactionError::Unusable);
     }
     let serialized = serde_json::to_vec(item).map_err(|_| ParentCompactionError::Serialization)?;
     if serialized.len() > max_compaction_bytes {

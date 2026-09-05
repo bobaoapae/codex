@@ -231,6 +231,7 @@ mod tests {
             token_usage: None,
             first_user_message: None,
             history: None,
+            daybreak_enabled: None,
         }
     }
 

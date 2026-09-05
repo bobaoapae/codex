@@ -358,6 +358,7 @@ async fn projects_persist_and_assign_threads() -> Result<()> {
             params: ThreadMetadataUpdateParams {
                 thread_id: started.thread.id.clone(),
                 project_id: Some(String::new()),
+                daybreak_enabled: None,
                 git_info: None,
             },
         })
@@ -407,6 +408,7 @@ async fn projects_persist_and_assign_threads() -> Result<()> {
             params: ThreadMetadataUpdateParams {
                 thread_id: started.thread.id.clone(),
                 project_id: Some(created.project.id.clone()),
+                daybreak_enabled: None,
                 git_info: None,
             },
         })
@@ -458,6 +460,7 @@ async fn projects_persist_and_assign_threads() -> Result<()> {
             params: ThreadMetadataUpdateParams {
                 thread_id: started.thread.id.clone(),
                 project_id: Some(created.project.id.clone()),
+                daybreak_enabled: None,
                 git_info: None,
             },
         })
@@ -955,6 +958,7 @@ async fn projects_validate_filters_cursors_and_sqlite_less_assignment() -> Resul
         .send_thread_metadata_update_request(ThreadMetadataUpdateParams {
             thread_id: started.thread.id.clone(),
             project_id: Some(Uuid::now_v7().to_string()),
+            daybreak_enabled: None,
             git_info: Some(ThreadMetadataGitInfoUpdateParams {
                 sha: Some(Some("abc123".to_string())),
                 branch: None,

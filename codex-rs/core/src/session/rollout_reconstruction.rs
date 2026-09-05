@@ -403,8 +403,10 @@ pub(crate) fn reconstruct_history_from_rollout_items_with_policy(
         && let Some(items) = &checkpoint.compacted.replacement_history
     {
         history.replace_annotated(items.clone());
-        history.restore_guardian_history(checkpoint.compacted.guardian_history.as_ref());
-            history.restore_retained_context(checkpoint.compacted.retained_context.as_ref());
+        history.restore_review_context(
+            checkpoint.compacted.retained_context.as_ref(),
+            checkpoint.compacted.guardian_history.as_ref(),
+        );
     }
     // Materialize exact history semantics from the replay-derived suffix. The eventual lazy
     // design should keep this same replay shape, but drive it from a resumable reverse source
