@@ -165,8 +165,8 @@ resolver = "2"
 # understates rather than overstates what the build contains. Never 0.0.0 (the
 # Desktop rejects it) and never `-alpha`. `codex-cli/package.json` stays at
 # 0.0.0-dev. Fork-only commits from here on are
-# `git log --no-merges main ^origin/main ^rust-v0.153.3`.
-version = "0.153.3"
+# `git log --no-merges main ^origin/main ^rust-v0.153.4`.
+version = "0.153.4"
 # Track the edition for all workspace crates in one place. Individual
 # crates can still override this value, but keeping it here means new
 # crates created with `cargo new -w ...` automatically inherit the 2024
