@@ -6,6 +6,7 @@ use crate::context::world_state::WorldStateSection;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_history::CodexHarnessMetadata;
+use codex_history::ImageDescription;
 use codex_history::ResponseItemEnvelope;
 use codex_protocol::AgentPath;
 use codex_protocol::ResponseItemId;
@@ -2915,4 +2916,199 @@ fn text_only_items_unchanged() {
     let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
 
     assert_eq!(estimated, raw_len);
+}
+
+// FORK: images the reader model already described leave the prompt as text.
+
+fn described_image_message(
+    descriptions: Vec<ImageDescription>,
+    raw_pinned: bool,
+) -> ResponseItemEnvelope {
+    ResponseItemEnvelope {
+        item: ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![
+                ContentItem::InputText {
+                    text: "look".to_string(),
+                },
+                ContentItem::InputImage {
+                    image_url: "data:image/png;base64,AAA".to_string(),
+                    detail: Some(DEFAULT_IMAGE_DETAIL),
+                },
+            ],
+            phase: None,
+            internal_chat_message_metadata_passthrough: Some(
+                InternalChatMessageMetadataPassthrough {
+                    content_item_kinds: Some(vec![
+                        ContentItemKind("user.text".to_string()),
+                        ContentItemKind("user.image".to_string()),
+                    ]),
+                    ..Default::default()
+                },
+            ),
+        },
+        metadata: Some(CodexHarnessMetadata {
+            image_descriptions: descriptions,
+            raw_pinned,
+            ..Default::default()
+        }),
+    }
+}
+
+fn history_with_envelopes(items: Vec<ResponseItemEnvelope>) -> ContextManager {
+    let mut history = ContextManager::new();
+    history.record_annotated_items(&items, TruncationPolicy::Tokens(10_000));
+    history
+}
+
+#[test]
+fn for_prompt_replaces_described_message_image_with_text() {
+    let history = history_with_envelopes(vec![described_image_message(
+        vec![ImageDescription {
+            content_index: 1,
+            text: "a red pixel".to_string(),
+            model: "gpt-5.6-luna".to_string(),
+        }],
+        /*raw_pinned*/ false,
+    )]);
+
+    let prompt = history.for_prompt(&default_input_modalities());
+
+    let ResponseItem::Message {
+        content,
+        internal_chat_message_metadata_passthrough,
+        ..
+    } = &prompt[0]
+    else {
+        panic!("expected Message");
+    };
+    assert_eq!(content.len(), 2);
+    let ContentItem::InputText { text } = &content[1] else {
+        panic!("expected the image to become text, got {:?}", content[1]);
+    };
+    assert!(text.contains("gpt-5.6-luna"), "{text}");
+    assert!(text.contains("view_image"), "{text}");
+    assert!(text.ends_with("a red pixel"), "{text}");
+    // The classification survives so later passes still see a user image slot.
+    assert_eq!(
+        internal_chat_message_metadata_passthrough
+            .as_ref()
+            .and_then(|metadata| metadata.content_item_kinds.clone()),
+        Some(vec![
+            ContentItemKind("user.text".to_string()),
+            ContentItemKind("user.image".to_string()),
+        ])
+    );
+}
+
+#[test]
+fn for_prompt_keeps_image_without_a_description() {
+    let history = history_with_envelopes(vec![described_image_message(
+        Vec::new(),
+        /*raw_pinned*/ false,
+    )]);
+
+    let prompt = history.for_prompt(&default_input_modalities());
+
+    let ResponseItem::Message { content, .. } = &prompt[0] else {
+        panic!("expected Message");
+    };
+    assert!(matches!(content[1], ContentItem::InputImage { .. }));
+}
+
+#[test]
+fn for_prompt_keeps_image_pinned_raw_by_the_model() {
+    let history = history_with_envelopes(vec![described_image_message(
+        vec![ImageDescription {
+            content_index: 1,
+            text: "a red pixel".to_string(),
+            model: "gpt-5.6-luna".to_string(),
+        }],
+        /*raw_pinned*/ true,
+    )]);
+
+    let prompt = history.for_prompt(&default_input_modalities());
+
+    let ResponseItem::Message { content, .. } = &prompt[0] else {
+        panic!("expected Message");
+    };
+    assert!(matches!(content[1], ContentItem::InputImage { .. }));
+}
+
+#[test]
+fn for_prompt_replaces_described_tool_output_image_with_text() {
+    let history = history_with_envelopes(vec![
+        ResponseItemEnvelope::new(ResponseItem::FunctionCall {
+            id: None,
+            name: "view_image".to_string(),
+            namespace: None,
+            arguments: "{}".to_string(),
+            encrypted_function_args: None,
+            call_id: "call-1".to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        }),
+        ResponseItemEnvelope {
+            item: ResponseItem::FunctionCallOutput {
+                id: None,
+                name: None,
+                namespace: None,
+                call_id: Some("call-1".to_string()),
+                output: FunctionCallOutputPayload::from_content_items(vec![
+                    FunctionCallOutputContentItem::InputText {
+                        text: "cell output".to_string(),
+                    },
+                    FunctionCallOutputContentItem::InputImage {
+                        image_url: "data:image/png;base64,AAA".to_string(),
+                        detail: Some(DEFAULT_IMAGE_DETAIL),
+                    },
+                ]),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            metadata: Some(CodexHarnessMetadata {
+                image_descriptions: vec![ImageDescription {
+                    content_index: 1,
+                    text: "a settings dialog".to_string(),
+                    model: "gpt-5.6-luna".to_string(),
+                }],
+                ..Default::default()
+            }),
+        },
+    ]);
+
+    let prompt = history.for_prompt(&default_input_modalities());
+
+    let ResponseItem::FunctionCallOutput { output, .. } = &prompt[1] else {
+        panic!("expected FunctionCallOutput");
+    };
+    let FunctionCallOutputBody::ContentItems(items) = &output.body else {
+        panic!("expected content items");
+    };
+    assert_eq!(items.len(), 2);
+    let FunctionCallOutputContentItem::InputText { text } = &items[1] else {
+        panic!("expected the image to become text, got {:?}", items[1]);
+    };
+    assert!(text.ends_with("a settings dialog"), "{text}");
+}
+
+#[test]
+fn for_prompt_substitutes_before_stripping_on_a_text_only_model() {
+    let history = history_with_envelopes(vec![described_image_message(
+        vec![ImageDescription {
+            content_index: 1,
+            text: "a red pixel".to_string(),
+            model: "gpt-5.6-luna".to_string(),
+        }],
+        /*raw_pinned*/ false,
+    )]);
+
+    let prompt = history.for_prompt(&[InputModality::Text]);
+
+    let ResponseItem::Message { content, .. } = &prompt[0] else {
+        panic!("expected Message");
+    };
+    let ContentItem::InputText { text } = &content[1] else {
+        panic!("expected text");
+    };
+    assert!(text.ends_with("a red pixel"), "{text}");
 }

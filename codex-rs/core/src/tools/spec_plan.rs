@@ -1058,6 +1058,7 @@ fn add_core_tool_sources(context: &CoreToolPlanContext<'_>, registry: &mut ToolR
                         context.model_info,
                     ),
                     include_environment_id,
+                    delegate: turn_context.config.tools_view_image.is_some(),
                 }));
             }
         }
@@ -1321,6 +1322,7 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, registry: &mut Tool
                 context.model_info,
             ),
             include_environment_id,
+            delegate: turn_context.config.tools_view_image.is_some(),
         }));
     }
 }

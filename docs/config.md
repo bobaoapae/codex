@@ -69,6 +69,107 @@ Every key is optional. Durations are milliseconds. The driver also honors
 | `connector_mention_strategy` | `"auto"` | How the connector is attached to the composer: `auto` (mention in the background, activate the tab only if the menu never mounts), `background_only`, or `activate`. |
 | `manual_mcp_url` | unset | Public MCP URL of the daemon when `tunnel = "manual"`. |
 
+## `[tools.view_image]` (fork)
+
+Fork-only. Delegates reading image pixels to a cheap, configurable model so the
+main model receives text instead.
+
+Every image that reaches model history stays there for the rest of the thread —
+there is no eviction — so one screenshot is re-sent on every later request. With
+delegation on, the reader model describes the image once, at the moment it is
+appended, and the description replaces the pixels in the prompt from then on.
+The image itself is untouched: it still appears in the thread and is still
+persisted in the rollout, so resume replays the stored description rather than
+calling the reader again.
+
+```toml
+[tools.view_image]
+delegate = true                # kill-switch; false (default) = upstream behavior
+model = "gpt-5.6-luna"         # reader model
+model_provider = "openai"      # provider of the READER, independent of the session's
+reasoning_effort = "medium"    # reader effort; "max" is slow and can time out
+```
+
+| key | default | meaning |
+|---|---|---|
+| `delegate` | `false` | Turn delegation on. With it off, nothing else in this table applies. |
+| `model` | `"gpt-5.6-luna"` | Slug of the model that reads the pixels. It must accept image input. |
+| `model_provider` | `"openai"` | Provider the reader runs on. Deliberately independent of the session's provider: a session pinned to `claude_code` or `chatgpt_web` would otherwise route an OpenAI slug to the wrong backend. An unconfigured id fails config load. |
+| `reasoning_effort` | `"medium"` | Reasoning effort for the reader. `max` is measurably slower without being reliably more accurate, and times out on dense screenshots; see below. |
+
+Covers all three paths images arrive by: the `view_image` tool, pasted
+attachments, and tool outputs such as MCP browser screenshots.
+
+The main model keeps two ways back to the pixels, both advertised in the
+`view_image` tool description while delegation is on:
+
+- `view_image(path, question = "…")` — the reader answers the question and the
+  tool returns `text` instead of an image. The image is still shown in the thread.
+- `view_image(path, raw = true)` — the pixels go into the main model's context
+  and stay there, exactly as they do upstream. Refused when the main model does
+  not accept image input. In code mode this pins every image the enclosing cell
+  returns, since that cell's output is where the pixels reach history.
+
+With delegation on, `view_image` checks the **reader's** modalities rather than
+the main model's, so it also works in a session running on a text-only model
+(a Claude session, for example). `raw = true` still needs the main model's own
+image support.
+
+A reader failure or timeout (300 s) is not fatal: the item keeps its raw pixels,
+which is the upstream behavior.
+
+### Cost of the reader call
+
+The reader runs on the turn's critical path, between the tool output and the
+next model request, so its latency is added to the turn. Measured on real
+`gpt-6-astra` turns with `gpt-5.6-luna` as the reader:
+
+| image | `low` | `medium` | `max` |
+|---|---|---|---|
+| SuperTuxKart frame, 1.6 MB 3D render with HUD | 11 s | 15 s | 95 s |
+| BookBrowse homepage, 332 KB | 18 s | 29 s | 186 s |
+| LibreOffice Calc, 169 KB, 30x11 cells of decimals | 50 s | 83 s | **timed out (>300 s)** |
+| synthetic dashboard, 74 KB, 120 numbers | 31 s | — | 74 s |
+| terminal screenshot, 818 KB | 19 s | — | 158 s |
+| 1.6 KB, one line of text | — | — | 5 s |
+
+Effort dominates; payload size matters much less. This is why the default is
+`medium` and not `max`: on the densest image `max` blew the 300 s ceiling and
+produced nothing at all, falling back to sending the raw pixels — the exact
+outcome delegation exists to avoid.
+
+Fidelity, scored against the original images:
+
+- **Small or stylised text is where efforts differ.** On the game frame only
+  `max` read the `TUX` plate on the kart; `low` and `medium` saw the plate but
+  reported "indistinct lettering" rather than guessing. On the website `low`
+  listed 4 of 6 book-cover titles and hedged ("titles include"), `medium` and
+  `max` listed 5 and 6.
+- **Higher effort is not uniformly safer.** All three misread the cover reading
+  `FOUL DAYS` — `medium` and `max` confidently transcribed `FOUR DAYS`, while
+  `low` omitted it. Every effort misread the column header `Will_clip` as
+  `Win_clip`. More effort buys completeness, not immunity to a confident misread.
+- **Dense tables survive well below `max`.** `low` and `medium` both transcribed
+  all 30 rows and 11 columns of the spreadsheet; between them `medium` also
+  caught the toolbar (`Liberation Sans`, `10 pt`, `Merge and Centre Cells`) and
+  fixed one six-digit value `low` got wrong. Two digit-level errors survived at
+  both levels.
+- On text-only synthetic content both `low` and `max` scored 105/105 numeric
+  cells, all rows, statuses, and hard tokens (invoice ids, a hex transaction id,
+  an epoch timestamp, a trace id).
+
+Nothing here was measured on photographs or on charts where a value must be read
+off an unlabelled axis. When a description is not enough, the main model still
+has `view_image(path, question = "...")` and `view_image(path, raw = true)`.
+
+The 300 s ceiling exists so a hung reader cannot hold a turn open forever — it is
+not a target.
+
+For scale, an 818 KB screenshot went from 1,117,931 bytes / 1,949 estimated
+tokens as a raw tool output to 3,162 bytes / 791 estimated tokens as a
+description, and stays that size on every later request instead of being re-sent
+whole.
+
 ## Plan mode (fork)
 
 Fork-only additions to Plan mode.

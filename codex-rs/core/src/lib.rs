@@ -103,6 +103,8 @@ mod guardian;
 mod hook_mcp_executor;
 mod hook_runtime;
 mod image_preparation;
+/// FORK: delegate image reading to a cheap model.
+mod image_reader;
 mod installation_id;
 pub(crate) mod mcp;
 mod mcp_skill_dependencies;

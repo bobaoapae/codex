@@ -376,6 +376,76 @@ pub(crate) fn strip_images_when_unsupported(
     }
 }
 
+/// FORK: header prefixed to every substituted image so the main model knows the
+/// pixels are one tool call away.
+fn image_description_header(model: &str) -> String {
+    format!(
+        "[image read by {model} — call view_image(path, question=\"…\") for more detail, or view_image(path, raw=true) for the pixels themselves]"
+    )
+}
+
+/// FORK: renders an image-reader description as the text that replaces the pixels.
+fn image_description_text(model: &str, description: &str) -> String {
+    format!("{}\n{description}", image_description_header(model))
+}
+
+/// FORK: swap images the reader model already described for that description.
+///
+/// Runs on the prompt view only, so the thread, the rollout and resume keep the
+/// original pixels while every request after the first drops them.
+pub(crate) fn substitute_images_with_descriptions(items: &mut [ResponseItemEnvelope]) {
+    for envelope in items.iter_mut() {
+        let Some(metadata) = envelope.metadata.as_ref() else {
+            continue;
+        };
+        if metadata.raw_pinned || metadata.image_descriptions.is_empty() {
+            continue;
+        }
+        let descriptions = metadata.image_descriptions.clone();
+        match &mut envelope.item {
+            ResponseItem::Message { .. } => {
+                let Some(mut content) = to_annotated_content(&mut envelope.item) else {
+                    continue;
+                };
+                for description in &descriptions {
+                    let Some(content_item) = content.get_mut(description.content_index) else {
+                        continue;
+                    };
+                    if !matches!(content_item.content(), ContentItem::InputImage { .. }) {
+                        continue;
+                    }
+                    *content_item.content_mut() = ContentItem::InputText {
+                        text: image_description_text(&description.model, &description.text),
+                    };
+                }
+                let _ = set_annotated_content(&mut envelope.item, content);
+            }
+            ResponseItem::FunctionCallOutput { output, .. }
+            | ResponseItem::CustomToolCallOutput { output, .. } => {
+                let Some(content_items) = output.content_items_mut() else {
+                    continue;
+                };
+                for description in &descriptions {
+                    let Some(content_item) = content_items.get_mut(description.content_index)
+                    else {
+                        continue;
+                    };
+                    if !matches!(
+                        content_item,
+                        FunctionCallOutputContentItem::InputImage { .. }
+                    ) {
+                        continue;
+                    }
+                    *content_item = FunctionCallOutputContentItem::InputText {
+                        text: image_description_text(&description.model, &description.text),
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Strip audio content from messages and tool outputs when the model does not support audio.
 /// When `input_modalities` contains `InputModality::Audio`, no stripping is performed.
 pub(crate) fn strip_audio_when_unsupported(

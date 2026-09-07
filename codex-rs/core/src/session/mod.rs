@@ -117,6 +117,9 @@ use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::BaseInstructionsProvenance;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
+use codex_protocol::models::FunctionCallOutputBody;
+use codex_protocol::models::FunctionCallOutputContentItem;
+use codex_protocol::models::ImageDetail;
 use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::SandboxEnforcement;
@@ -330,6 +333,7 @@ use codex_core_plugins::RecommendedPluginCandidatesInput;
 use codex_git_utils::get_git_repo_root;
 use codex_history::CodexHarnessMetadata;
 use codex_history::CompactedItem;
+use codex_history::ImageDescription;
 use codex_history::InitialHistory;
 use codex_history::ResponseItemEnvelope;
 use codex_mcp::McpConfig;
@@ -3554,12 +3558,117 @@ impl Session {
             .await;
     }
 
+    /// FORK: read every new image once, with the configured reader model.
+    ///
+    /// This is the single async funnel all three image paths pass through
+    /// (pasted attachments, `view_image`, and tool outputs such as MCP
+    /// screenshots), and the images arrive already resized by
+    /// `prepare_image_response_items`, so the reader sees the same pixels the
+    /// main model would have. The description lands in history metadata; the
+    /// substitution happens later, per request, in `normalize_history`.
+    async fn describe_images_for_history(
+        &self,
+        turn_context: &TurnContext,
+        items: &mut [ResponseItemEnvelope],
+    ) {
+        let Some(reader) = turn_context.config.tools_view_image.as_ref() else {
+            return;
+        };
+
+        struct PendingImage {
+            item_index: usize,
+            content_index: usize,
+            image_url: String,
+            detail: Option<ImageDetail>,
+        }
+
+        let mut pending: Vec<PendingImage> = Vec::new();
+        for (item_index, envelope) in items.iter().enumerate() {
+            if envelope
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.raw_pinned)
+            {
+                continue;
+            }
+            match &envelope.item {
+                ResponseItem::Message { content, .. } => {
+                    for (content_index, content_item) in content.iter().enumerate() {
+                        if let ContentItem::InputImage { image_url, detail } = content_item {
+                            pending.push(PendingImage {
+                                item_index,
+                                content_index,
+                                image_url: image_url.clone(),
+                                detail: *detail,
+                            });
+                        }
+                    }
+                }
+                ResponseItem::FunctionCallOutput { output, .. }
+                | ResponseItem::CustomToolCallOutput { output, .. } => {
+                    let FunctionCallOutputBody::ContentItems(content_items) = &output.body else {
+                        continue;
+                    };
+                    for (content_index, content_item) in content_items.iter().enumerate() {
+                        if let FunctionCallOutputContentItem::InputImage { image_url, detail } =
+                            content_item
+                        {
+                            pending.push(PendingImage {
+                                item_index,
+                                content_index,
+                                image_url: image_url.clone(),
+                                detail: *detail,
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if pending.is_empty() {
+            return;
+        }
+
+        let descriptions = futures::future::join_all(pending.iter().map(|image| {
+            crate::image_reader::read_image(
+                self,
+                turn_context,
+                reader,
+                crate::image_reader::ImageReadRequest {
+                    image_url: image.image_url.clone(),
+                    detail: image.detail,
+                    question: None,
+                },
+            )
+        }))
+        .await;
+
+        for (image, description) in pending.into_iter().zip(descriptions) {
+            // A failed read leaves the raw pixels in place, which is today's behavior.
+            let Some(text) = description else {
+                continue;
+            };
+            items[image.item_index]
+                .metadata
+                .get_or_insert_default()
+                .image_descriptions
+                .push(ImageDescription {
+                    content_index: image.content_index,
+                    text,
+                    model: reader.model.clone(),
+                });
+        }
+    }
+
     async fn record_prepared_conversation_items(
         &self,
         turn_context: &TurnContext,
-        items: Vec<ResponseItemEnvelope>,
+        mut items: Vec<ResponseItemEnvelope>,
         image_preparations: Vec<ImagePreparationMetadata>,
     ) {
+        // FORK: generated once here so the pixels never reach a second request.
+        self.describe_images_for_history(turn_context, &mut items)
+            .await;
         let response_items = items
             .iter()
             .map(|envelope| envelope.item.clone())
@@ -4969,7 +5078,7 @@ impl Session {
                 }),
             }],
         )
-            .await;
+        .await;
         let mut user_message_item = UserMessageItem::new(input);
         user_message_item.client_id = client_id;
         let turn_item = TurnItem::UserMessage(user_message_item);

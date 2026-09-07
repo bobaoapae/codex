@@ -35,6 +35,7 @@ use codex_config::config_toml::ProjectConfig;
 use codex_config::config_toml::RealtimeAudioConfig;
 use codex_config::config_toml::RealtimeConfig;
 use codex_config::config_toml::ThreadStoreToml;
+use codex_config::config_toml::ViewImageToolConfigToml;
 use codex_config::config_toml::validate_model_providers;
 use codex_config::loader::load_config_layers_state;
 use codex_config::loader::project_trust_key;
@@ -1283,6 +1284,10 @@ pub struct Config {
     /// FORK: carry the `update_plan` checklist across a compaction.
     pub tools_update_plan_survives_compaction: bool,
 
+    /// FORK: read images with a cheaper model and send the main model text.
+    /// `None` disables delegation and restores upstream behavior.
+    pub tools_view_image: Option<ViewImageDelegation>,
+
     /// Policy for collecting and validating tool runtimes.
     pub tool_registry: ToolRegistryConfig,
 
@@ -1359,6 +1364,20 @@ pub struct ToolRegistryConfig {
 }
 
 const DEFAULT_CODE_MODE_EXEC_YIELD_TIME_MS: u64 = 30_000;
+
+/// FORK: default reader model when `[tools.view_image] delegate = true`.
+pub const DEFAULT_VIEW_IMAGE_READER_MODEL: &str = "gpt-5.6-luna";
+/// FORK: default reader provider. Deliberately not the session's provider.
+pub const DEFAULT_VIEW_IMAGE_READER_PROVIDER: &str = "openai";
+
+/// FORK: resolved settings for the model that reads images for the main model.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ViewImageDelegation {
+    pub model: String,
+    pub provider_id: String,
+    pub provider: ModelProviderInfo,
+    pub reasoning_effort: ReasoningEffort,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CodeModeConfig {
@@ -2926,6 +2945,48 @@ fn resolve_update_plan_survives_compaction(config_toml: &ConfigToml) -> bool {
         .is_none_or(|config| config.survives_compaction)
 }
 
+/// FORK: resolve the model that reads images on the main model's behalf.
+///
+/// The reader gets its own provider: a session pinned to `claude_code` or
+/// `chatgpt_web` would otherwise send an OpenAI slug to the wrong backend.
+fn resolve_view_image_delegation(
+    view_image: Option<&ViewImageToolConfigToml>,
+    model_providers: &HashMap<String, ModelProviderInfo>,
+) -> std::io::Result<Option<ViewImageDelegation>> {
+    let Some(view_image) = view_image else {
+        return Ok(None);
+    };
+    if !view_image.delegate {
+        return Ok(None);
+    }
+    let provider_id = view_image
+        .model_provider
+        .clone()
+        .unwrap_or_else(|| DEFAULT_VIEW_IMAGE_READER_PROVIDER.to_string());
+    let provider = model_providers.get(&provider_id).cloned().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("tools.view_image.model_provider `{provider_id}` is not configured"),
+        )
+    })?;
+    Ok(Some(ViewImageDelegation {
+        model: view_image
+            .model
+            .clone()
+            .unwrap_or_else(|| DEFAULT_VIEW_IMAGE_READER_MODEL.to_string()),
+        provider_id,
+        provider,
+        // FORK: `medium`, not `max`. Measured on real screenshots, `max` takes
+        // 95-185 s and exceeds the 300 s ceiling outright on a dense
+        // spreadsheet, while `medium` finished every case in 15-83 s with
+        // near-identical transcription. See `docs/config.md`.
+        reasoning_effort: view_image
+            .reasoning_effort
+            .clone()
+            .unwrap_or(ReasoningEffort::Medium),
+    }))
+}
+
 fn resolve_update_plan_enabled(config_toml: &ConfigToml) -> bool {
     config_toml
         .tools
@@ -3976,6 +4037,12 @@ impl Config {
             resolve_experimental_request_user_input_enabled(&cfg);
         let update_plan_enabled = resolve_update_plan_enabled(&cfg);
         let tools_update_plan_survives_compaction = resolve_update_plan_survives_compaction(&cfg);
+        // FORK: captured before `cfg` is partially moved; the reader's provider is
+        // resolved further down, once `model_providers` exists.
+        let view_image_toml = cfg
+            .tools
+            .as_ref()
+            .and_then(|tools| tools.view_image.clone());
         let tool_registry = ToolRegistryConfig {
             error_on_tool_collisions: cfg
                 .features
@@ -4032,6 +4099,11 @@ impl Config {
                 std::io::Error::new(std::io::ErrorKind::NotFound, message)
             })?
             .clone();
+
+        // FORK: resolved here because the reader's provider is looked up in the
+        // same map as the session's, but independently of it.
+        let tools_view_image =
+            resolve_view_image_delegation(view_image_toml.as_ref(), &model_providers)?;
 
         let shell_environment_policy = cfg.shell_environment_policy.into();
         let allow_login_shell = cfg.allow_login_shell.unwrap_or(true);
@@ -4637,6 +4709,7 @@ impl Config {
             experimental_request_user_input_enabled,
             update_plan_enabled,
             tools_update_plan_survives_compaction,
+            tools_view_image,
             tool_registry,
             code_mode,
             background_terminal_max_timeout,

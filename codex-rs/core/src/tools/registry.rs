@@ -198,14 +198,19 @@ impl AnyToolResult {
             result,
             ..
         } = self;
+        let fallback_token_limit_override = result.fallback_token_limit_override();
+        // FORK: the model asked for the pixels, so history must not swap them
+        // for the image reader's description.
+        let raw_pinned = result.pins_raw_image();
         ResponseItemEnvelope {
             item: result.to_response_item(&call_id, &payload).into(),
-            metadata: result
-                .fallback_token_limit_override()
-                .map(|limit| CodexHarnessMetadata {
-                    fallback_token_limit_override: Some(limit),
+            metadata: (fallback_token_limit_override.is_some() || raw_pinned).then(|| {
+                CodexHarnessMetadata {
+                    fallback_token_limit_override,
+                    raw_pinned,
                     ..Default::default()
-                }),
+                }
+            }),
         }
     }
 
@@ -233,6 +238,10 @@ impl ToolOutput for PostToolUseFeedbackOutput {
 
     fn fallback_token_limit_override(&self) -> Option<usize> {
         self.original.fallback_token_limit_override()
+    }
+
+    fn pins_raw_image(&self) -> bool {
+        self.original.pins_raw_image()
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {

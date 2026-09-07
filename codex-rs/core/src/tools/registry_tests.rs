@@ -802,3 +802,80 @@ fn test_invocation(
         },
     }
 }
+
+/// FORK: a tool that pins its raw image must say so in history metadata,
+/// otherwise the image reader's description would replace it in the prompt.
+#[test]
+fn into_response_records_a_raw_image_pin() {
+    let result = AnyToolResult {
+        call_id: "call-1".to_string(),
+        payload: ToolPayload::Function {
+            arguments: "{}".to_string(),
+        },
+        result: Box::new(
+            crate::tools::context::FunctionToolOutput::from_text("pixels".to_string(), Some(true))
+                .with_raw_image_pin(true),
+        ),
+        post_tool_use_payload: None,
+    };
+
+    assert_eq!(
+        result.into_response().metadata,
+        Some(CodexHarnessMetadata {
+            raw_pinned: true,
+            ..Default::default()
+        })
+    );
+}
+
+/// FORK: without a pin the envelope stays metadata-free, as it was upstream.
+#[test]
+fn into_response_leaves_metadata_absent_without_a_raw_image_pin() {
+    let result = AnyToolResult {
+        call_id: "call-1".to_string(),
+        payload: ToolPayload::Function {
+            arguments: "{}".to_string(),
+        },
+        result: Box::new(crate::tools::context::FunctionToolOutput::from_text(
+            "pixels".to_string(),
+            Some(true),
+        )),
+        post_tool_use_payload: None,
+    };
+
+    assert_eq!(result.into_response().metadata, None);
+}
+
+/// FORK: the pin has to survive a `PostToolUse` hook rewriting the model-visible
+/// output, the same way the token-limit override does.
+#[test]
+fn post_tool_use_feedback_output_forwards_a_raw_image_pin() {
+    let result = AnyToolResult {
+        call_id: "call-1".to_string(),
+        payload: ToolPayload::Function {
+            arguments: "{}".to_string(),
+        },
+        result: Box::new(PostToolUseFeedbackOutput {
+            original: Box::new(
+                crate::tools::context::FunctionToolOutput::from_text(
+                    "pixels".to_string(),
+                    Some(true),
+                )
+                .with_raw_image_pin(true),
+            ),
+            model_visible: crate::tools::context::FunctionToolOutput::from_text(
+                "hook feedback".to_string(),
+                /*success*/ None,
+            ),
+        }),
+        post_tool_use_payload: None,
+    };
+
+    assert_eq!(
+        result.into_response().metadata,
+        Some(CodexHarnessMetadata {
+            raw_pinned: true,
+            ..Default::default()
+        })
+    );
+}

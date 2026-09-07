@@ -656,6 +656,12 @@ impl Session {
         state.session_configuration.originator.clone()
     }
 
+    /// FORK: needed by the image reader, which builds its own model client.
+    pub(crate) async fn session_source(&self) -> SessionSource {
+        let state = self.state.lock().await;
+        state.session_configuration.session_source.clone()
+    }
+
     pub(crate) async fn responses_metadata(
         &self,
         turn_context: &TurnContext,

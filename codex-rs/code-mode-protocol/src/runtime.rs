@@ -119,6 +119,15 @@ pub enum RuntimeResponse {
 }
 
 impl RuntimeResponse {
+    /// Returns the cell this response came from.
+    pub fn cell_id(&self) -> &CellId {
+        match self {
+            Self::Yielded { cell_id, .. }
+            | Self::Terminated { cell_id, .. }
+            | Self::Result { cell_id, .. } => cell_id,
+        }
+    }
+
     /// Returns timing for this observation, excluding background work between requests.
     pub fn code_mode_host_duration(&self) -> Option<Duration> {
         match self {

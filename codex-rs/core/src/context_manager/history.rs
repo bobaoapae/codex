@@ -742,6 +742,10 @@ impl ContextManager {
         // Paired outputs must have a corresponding call; named external outputs stand alone.
         normalize::remove_orphan_outputs(items);
 
+        // FORK: images the reader already described leave the prompt as text.
+        // Before stripping, so a description survives on a text-only model.
+        normalize::substitute_images_with_descriptions(items);
+
         // strip images when model does not support them
         normalize::strip_images_when_unsupported(input_modalities, items);
 

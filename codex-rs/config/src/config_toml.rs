@@ -854,6 +854,29 @@ pub struct ToolsToml {
     pub web_search: Option<WebSearchToolConfig>,
     pub experimental_request_user_input: Option<ExperimentalRequestUserInput>,
     pub update_plan: Option<UpdatePlanToolConfig>,
+    /// FORK: delegate image reading to a cheaper model.
+    pub view_image: Option<ViewImageToolConfigToml>,
+}
+
+/// FORK: settings for the model that reads images on the main model's behalf.
+///
+/// Images stay in the thread and in the rollout; only the model-visible prompt
+/// swaps the pixels for the reader's description.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct ViewImageToolConfigToml {
+    /// Kill-switch. `false` restores the unmodified upstream behavior.
+    #[serde(default)]
+    pub delegate: bool,
+
+    /// Slug of the model that reads the pixels.
+    pub model: Option<String>,
+
+    /// Provider the reader runs on, independent of the session's provider.
+    pub model_provider: Option<String>,
+
+    /// Reasoning effort for the reader.
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]

@@ -702,3 +702,75 @@ fn multi_agent_version_uses_newest_present_session_meta_value() -> Result<()> {
     );
     Ok(())
 }
+
+/// FORK: image-reader descriptions must survive a rollout round trip, so a
+/// resumed thread replays the text instead of calling the reader again.
+#[test]
+fn response_item_envelope_preserves_image_descriptions_and_raw_pin() -> Result<()> {
+    let response_item = ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputImage {
+            image_url: "data:image/png;base64,AAA".to_string(),
+            detail: None,
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let metadata = CodexHarnessMetadata {
+        image_descriptions: vec![ImageDescription {
+            content_index: 0,
+            text: "a red pixel".to_string(),
+            model: "gpt-5.6-luna".to_string(),
+        }],
+        raw_pinned: true,
+        ..Default::default()
+    };
+    let rollout_item = RolloutItem::ResponseItem(ResponseItemEnvelope {
+        item: response_item.clone(),
+        metadata: Some(metadata.clone()),
+    });
+
+    let serialized = serde_json::to_value(&rollout_item)?;
+    assert_eq!(
+        serialized["metadata"],
+        json!({
+            "client_authored": false,
+            "image_descriptions": [{
+                "content_index": 0,
+                "text": "a red pixel",
+                "model": "gpt-5.6-luna",
+            }],
+            "raw_pinned": true,
+        })
+    );
+
+    let restored = serde_json::from_value::<RolloutItem>(serialized)?;
+    let RolloutItem::ResponseItem(envelope) = restored else {
+        panic!("expected response item");
+    };
+    assert_eq!(
+        envelope,
+        ResponseItemEnvelope {
+            item: response_item,
+            metadata: Some(metadata),
+        }
+    );
+    Ok(())
+}
+
+/// FORK: an envelope without descriptions must not grow the persisted metadata.
+#[test]
+fn response_item_envelope_omits_empty_image_descriptions() -> Result<()> {
+    let serialized = serde_json::to_value(RolloutItem::ResponseItem(ResponseItemEnvelope {
+        item: ResponseItem::ConfigurationUpdate {
+            reasoning: ConfigurationReasoning {
+                effort: ReasoningEffort::High,
+            },
+        },
+        metadata: Some(CodexHarnessMetadata::default()),
+    }))?;
+
+    assert_eq!(serialized["metadata"], json!({ "client_authored": false }));
+    Ok(())
+}

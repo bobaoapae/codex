@@ -70,6 +70,28 @@ pub struct CodexHarnessMetadata {
     /// Copied parent context stays model-visible but must not become child-local authorization.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub inherited_user_message: bool,
+
+    /// FORK: descriptions produced by the image-reader model, by content index.
+    ///
+    /// The pixels stay in the thread and in the rollout; the prompt sent to the
+    /// main model swaps the indexed content item for this text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub image_descriptions: Vec<ImageDescription>,
+
+    /// FORK: the model asked for the pixels themselves, so substitution skips this item.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub raw_pinned: bool,
+}
+
+/// FORK: one image-reader description, bound to the content item it replaces.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+pub struct ImageDescription {
+    /// Index into the message content items or the tool output content items.
+    pub content_index: usize,
+    /// Text the main model reads instead of the pixels.
+    pub text: String,
+    /// Model that produced the text, surfaced in the substitution header.
+    pub model: String,
 }
 
 impl ResponseItemEnvelope {

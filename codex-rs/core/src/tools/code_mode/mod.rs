@@ -6,7 +6,9 @@ mod telemetry;
 mod wait_handler;
 pub(crate) mod wait_spec;
 
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -68,6 +70,12 @@ pub(crate) struct ExecContext {
 
 pub(crate) struct CodeModeService {
     session: OnceCell<Arc<dyn CodeModeSession>>,
+    /// FORK: cells whose `view_image` call asked for the raw pixels.
+    ///
+    /// `view_image` inside a cell returns its image through the cell's own
+    /// function output, so the pin has to travel with the cell rather than with
+    /// the tool result.
+    raw_image_cells: StdMutex<HashSet<CellId>>,
     session_provider: Arc<dyn CodeModeSessionProvider>,
     availability: Result<(), String>,
     dispatch_broker: Arc<CodeModeDispatchBroker>,
@@ -86,6 +94,7 @@ impl CodeModeService {
         let availability = session_provider.availability();
         Self {
             session: OnceCell::new(),
+            raw_image_cells: StdMutex::new(HashSet::new()),
             session_provider,
             availability,
             dispatch_broker,
@@ -193,6 +202,21 @@ impl CodeModeService {
         self.dispatch_broker.cell_originating_item_id(cell_id)
     }
 
+    /// FORK: records that a cell's `view_image` call requested the raw pixels.
+    pub(crate) fn pin_raw_image_cell(&self, cell_id: CellId) {
+        if let Ok(mut cells) = self.raw_image_cells.lock() {
+            cells.insert(cell_id);
+        }
+    }
+
+    /// FORK: consumes the pin so it applies to exactly one cell output.
+    fn take_raw_image_cell(&self, cell_id: &CellId) -> bool {
+        self.raw_image_cells
+            .lock()
+            .map(|mut cells| cells.remove(cell_id))
+            .unwrap_or(false)
+    }
+
     pub(crate) fn finish_cell_dispatch(&self, cell_id: &CellId) {
         self.dispatch_broker.close_cell(cell_id);
     }
@@ -254,6 +278,13 @@ pub(super) async fn handle_runtime_response(
     wall_time: Duration,
 ) -> Result<FunctionToolOutput, String> {
     let script_status = format_script_status(&response);
+    // FORK: a `view_image(raw=true)` inside this cell pins every image the cell
+    // returns, because the cell output is where those pixels reach history.
+    let pins_raw_image = exec
+        .session
+        .services
+        .code_mode_service
+        .take_raw_image_cell(response.cell_id());
 
     match response {
         RuntimeResponse::Yielded { content_items, .. } => {
@@ -261,14 +292,16 @@ pub(super) async fn handle_runtime_response(
             sanitize_runtime_image_detail(exec.turn.as_ref(), &mut content_items);
             content_items = truncate_code_mode_result(content_items, max_output_tokens);
             prepend_script_status(&mut content_items, &script_status, wall_time);
-            Ok(FunctionToolOutput::from_content(content_items, Some(true)))
+            Ok(FunctionToolOutput::from_content(content_items, Some(true))
+                .with_raw_image_pin(pins_raw_image))
         }
         RuntimeResponse::Terminated { content_items, .. } => {
             let mut content_items = into_function_call_output_content_items(content_items);
             sanitize_runtime_image_detail(exec.turn.as_ref(), &mut content_items);
             content_items = truncate_code_mode_result(content_items, max_output_tokens);
             prepend_script_status(&mut content_items, &script_status, wall_time);
-            Ok(FunctionToolOutput::from_content(content_items, Some(true)))
+            Ok(FunctionToolOutput::from_content(content_items, Some(true))
+                .with_raw_image_pin(pins_raw_image))
         }
         RuntimeResponse::Result {
             content_items,
@@ -285,10 +318,10 @@ pub(super) async fn handle_runtime_response(
             }
             content_items = truncate_code_mode_result(content_items, max_output_tokens);
             prepend_script_status(&mut content_items, &script_status, wall_time);
-            Ok(FunctionToolOutput::from_content(
-                content_items,
-                Some(success),
-            ))
+            Ok(
+                FunctionToolOutput::from_content(content_items, Some(success))
+                    .with_raw_image_pin(pins_raw_image),
+            )
         }
     }
 }

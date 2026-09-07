@@ -29,6 +29,14 @@ pub trait ToolOutput: Send {
         None
     }
 
+    /// FORK: whether images in this output must reach the model as pixels.
+    ///
+    /// Set when the model explicitly asked for the raw image, so the delegated
+    /// image reader's description does not replace it in the prompt.
+    fn pins_raw_image(&self) -> bool {
+        false
+    }
+
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem;
 
     /// Returns the tool call id exposed to `PostToolUse` hooks for this output.
@@ -80,6 +88,10 @@ where
 
     fn fallback_token_limit_override(&self) -> Option<usize> {
         (**self).fallback_token_limit_override()
+    }
+
+    fn pins_raw_image(&self) -> bool {
+        (**self).pins_raw_image()
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {

@@ -225,6 +225,8 @@ pub struct FunctionToolOutput {
     pub body: Vec<FunctionCallOutputContentItem>,
     pub success: Option<bool>,
     pub post_tool_use_response: Option<JsonValue>,
+    /// FORK: keep any images in `body` as pixels, bypassing the image reader.
+    pub pins_raw_image: bool,
 }
 
 impl FunctionToolOutput {
@@ -233,6 +235,7 @@ impl FunctionToolOutput {
             body: vec![FunctionCallOutputContentItem::InputText { text }],
             success,
             post_tool_use_response: None,
+            pins_raw_image: false,
         }
     }
 
@@ -244,7 +247,14 @@ impl FunctionToolOutput {
             body: content,
             success,
             post_tool_use_response: None,
+            pins_raw_image: false,
         }
+    }
+
+    /// FORK: marks this output's images as explicitly requested by the model.
+    pub fn with_raw_image_pin(mut self, pins_raw_image: bool) -> Self {
+        self.pins_raw_image = pins_raw_image;
+        self
     }
 
     pub fn into_text(self) -> String {
@@ -259,6 +269,10 @@ impl ToolOutput for FunctionToolOutput {
 
     fn success_for_logging(&self) -> bool {
         self.success.unwrap_or(true)
+    }
+
+    fn pins_raw_image(&self) -> bool {
+        self.pins_raw_image
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {

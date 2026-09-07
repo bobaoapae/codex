@@ -4174,6 +4174,14 @@
         "update_plan": {
           "$ref": "#/definitions/UpdatePlanToolConfig"
         },
+        "view_image": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ViewImageToolConfigToml"
+            }
+          ],
+          "description": "FORK: delegate image reading to a cheaper model."
+        },
         "web_search": {
           "allOf": [
             {
@@ -6103,6 +6111,34 @@
         "high"
       ],
       "type": "string"
+    },
+    "ViewImageToolConfigToml": {
+      "additionalProperties": false,
+      "description": "FORK: settings for the model that reads images on the main model's behalf.\n\nImages stay in the thread and in the rollout; only the model-visible prompt swaps the pixels for the reader's description.",
+      "properties": {
+        "delegate": {
+          "default": false,
+          "description": "Kill-switch. `false` restores the unmodified upstream behavior.",
+          "type": "boolean"
+        },
+        "model": {
+          "description": "Slug of the model that reads the pixels.",
+          "type": "string"
+        },
+        "model_provider": {
+          "description": "Provider the reader runs on, independent of the session's provider.",
+          "type": "string"
+        },
+        "reasoning_effort": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ReasoningEffort"
+            }
+          ],
+          "description": "Reasoning effort for the reader."
+        }
+      },
+      "type": "object"
     },
     "WebSearchContextSize": {
       "enum": [

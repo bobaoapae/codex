@@ -9,11 +9,13 @@ use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ImageDetail;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::openai_models::InputModality;
+use codex_utils_image::PromptImageMode;
 use codex_utils_image::data_url_from_bytes;
 use serde::Deserialize;
 
 use crate::function_tool::FunctionCallError;
 use crate::original_image_detail::can_request_original_image_detail;
+use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
@@ -24,6 +26,7 @@ use crate::tools::handlers::view_image_spec::ViewImageToolOptions;
 use crate::tools::handlers::view_image_spec::create_view_image_tool;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
+use crate::tools::router::ToolCallSource;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 
@@ -38,6 +41,7 @@ impl Default for ViewImageHandler {
                 can_request_original_image_detail: false,
                 unified_image_budget: false,
                 include_environment_id: false,
+                delegate: false,
             },
         }
     }
@@ -53,6 +57,10 @@ const VIEW_IMAGE_UNSUPPORTED_MESSAGE: &str =
     "view_image is not allowed because you do not support image inputs";
 const VIEW_IMAGE_INVALID_MESSAGE: &str =
     "unable to process image: invalid or unsupported image data";
+/// FORK: `raw` bypasses the reader model, so it needs the main model's own eyes.
+const VIEW_IMAGE_RAW_UNSUPPORTED_MESSAGE: &str = "view_image raw=true is not allowed because you do not support image inputs; omit `raw` to get the reader model's description instead";
+/// FORK: `question` only exists because a reader model answers it.
+const VIEW_IMAGE_QUESTION_UNSUPPORTED_MESSAGE: &str = "view_image.question requires `[tools.view_image] delegate = true`; omit `question` to load the image itself";
 
 #[derive(Deserialize)]
 struct ViewImageArgs {
@@ -60,6 +68,12 @@ struct ViewImageArgs {
     #[serde(default)]
     environment_id: Option<String>,
     detail: Option<String>,
+    /// FORK: ask the reader model about the image instead of loading it.
+    #[serde(default)]
+    question: Option<String>,
+    /// FORK: keep the pixels in context instead of the reader's description.
+    #[serde(default)]
+    raw: bool,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -94,23 +108,13 @@ impl ViewImageHandler {
         &self,
         invocation: ToolInvocation,
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
-        if !invocation
-            .turn
-            .model_info()
-            .input_modalities
-            .contains(&InputModality::Image)
-        {
-            return Err(FunctionCallError::RespondToModel(
-                VIEW_IMAGE_UNSUPPORTED_MESSAGE.to_string(),
-            ));
-        }
-
         let ToolInvocation {
             session,
             turn,
             step_context,
             payload,
             call_id,
+            source,
             ..
         } = invocation;
 
@@ -127,7 +131,54 @@ impl ViewImageHandler {
             path,
             environment_id,
             detail,
+            question,
+            raw,
         } = parse_arguments(&arguments)?;
+        // FORK: with delegation on, the pixels only have to reach the reader
+        // model, so `view_image` also works on a text-only main model.
+        let delegation = turn.config.tools_view_image.clone();
+        let main_supports_images = turn
+            .model_info()
+            .input_modalities
+            .contains(&InputModality::Image);
+        if question.is_some() && delegation.is_none() {
+            return Err(FunctionCallError::RespondToModel(
+                VIEW_IMAGE_QUESTION_UNSUPPORTED_MESSAGE.to_string(),
+            ));
+        }
+        if question.is_some() && raw {
+            return Err(FunctionCallError::RespondToModel(
+                "view_image cannot take `question` and `raw` together: `question` returns the reader model's answer as text, `raw` returns the image itself".to_string(),
+            ));
+        }
+        if raw && !main_supports_images {
+            // `raw` puts the pixels in the main model's context, so it is the
+            // main model that has to be able to read them.
+            return Err(FunctionCallError::RespondToModel(
+                VIEW_IMAGE_RAW_UNSUPPORTED_MESSAGE.to_string(),
+            ));
+        }
+        match delegation.as_ref() {
+            Some(reader) if !raw => {
+                let reader_info = session
+                    .services
+                    .models_manager
+                    .get_model_info(&reader.model, &turn.config.to_models_manager_config())
+                    .await;
+                if !reader_info.input_modalities.contains(&InputModality::Image) {
+                    return Err(FunctionCallError::RespondToModel(format!(
+                        "view_image is not allowed because the configured image reader `{}` does not support image inputs",
+                        reader.model
+                    )));
+                }
+            }
+            _ if !main_supports_images => {
+                return Err(FunctionCallError::RespondToModel(
+                    VIEW_IMAGE_UNSUPPORTED_MESSAGE.to_string(),
+                ));
+            }
+            _ => {}
+        }
         // Keep accepting previously supported detail hints after they disappear from the schema.
         let detail = match detail.as_deref() {
             None => None,
@@ -204,10 +255,54 @@ impl ViewImageHandler {
         session.emit_turn_item_started(turn.as_ref(), &item).await;
         session.emit_turn_item_completed(turn.as_ref(), item).await;
 
+        // FORK: a question is answered by the reader model, so the tool result
+        // is text and the pixels never enter the main model's context.
+        if let (Some(reader), Some(question)) = (delegation.as_ref(), question) {
+            // The reader gets the same resized bytes the history path would
+            // have produced, not the raw file.
+            let prepared_image_url = codex_utils_image::load_data_url_for_prompt(
+                &image_url,
+                PromptImageMode::HIGH_DETAIL,
+            )
+            .map(codex_utils_image::EncodedImage::into_data_url)
+            .unwrap_or_else(|_| image_url.clone());
+            let answer = crate::image_reader::read_image(
+                session.as_ref(),
+                turn.as_ref(),
+                reader,
+                crate::image_reader::ImageReadRequest {
+                    image_url: prepared_image_url,
+                    detail: None,
+                    question: Some(question),
+                },
+            )
+            .await;
+            return match answer {
+                Some(text) => Ok(boxed_tool_output(ViewImageTextOutput { text })),
+                None => Err(FunctionCallError::RespondToModel(format!(
+                    "the image reader `{}` failed to answer; call view_image again without `question` to load the image itself",
+                    reader.model
+                ))),
+            };
+        }
+
+        // FORK: in code mode the image reaches history through the cell's own
+        // output, so the pin has to travel with the cell instead of this result.
+        // Without delegation the pixels already reach the model unchanged, so a
+        // pin would only add metadata nothing reads.
+        let pins_raw_image = raw && delegation.is_some();
+        if pins_raw_image && let ToolCallSource::CodeMode { cell_id, .. } = &source {
+            session
+                .services
+                .code_mode_service
+                .pin_raw_image_cell(codex_code_mode::CellId::new(cell_id.clone()));
+        }
+
         Ok(boxed_tool_output(ViewImageOutput {
             image_url,
             image_detail,
             unified_image_budget: self.options.unified_image_budget,
+            pins_raw_image,
         }))
     }
 }
@@ -222,6 +317,8 @@ pub struct ViewImageOutput {
     image_url: String,
     image_detail: ImageDetail,
     unified_image_budget: bool,
+    /// FORK: the model asked for the pixels, so history keeps them.
+    pins_raw_image: bool,
 }
 
 impl ToolOutput for ViewImageOutput {
@@ -231,6 +328,10 @@ impl ToolOutput for ViewImageOutput {
 
     fn success_for_logging(&self) -> bool {
         true
+    }
+
+    fn pins_raw_image(&self) -> bool {
+        self.pins_raw_image
     }
 
     fn to_response_item(&self, call_id: &str, _payload: &ToolPayload) -> ResponseInputItem {
@@ -259,6 +360,32 @@ impl ToolOutput for ViewImageOutput {
                 "detail": self.image_detail
             })
         }
+    }
+}
+
+/// FORK: the reader model's answer to a `view_image` question.
+pub struct ViewImageTextOutput {
+    text: String,
+}
+
+impl ToolOutput for ViewImageTextOutput {
+    fn log_output(&self) -> String {
+        self.text.clone()
+    }
+
+    fn success_for_logging(&self) -> bool {
+        true
+    }
+
+    fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
+        // Reuse the shared shape so the answer looks like any other text tool
+        // output on the wire.
+        FunctionToolOutput::from_text(self.text.clone(), Some(true))
+            .to_response_item(call_id, payload)
+    }
+
+    fn code_mode_result(&self, _payload: &ToolPayload) -> serde_json::Value {
+        serde_json::json!({ "text": self.text })
     }
 }
 
@@ -324,6 +451,7 @@ mod tests {
             image_url: "data:image/png;base64,AAA".to_string(),
             image_detail: DEFAULT_IMAGE_DETAIL,
             unified_image_budget: false,
+            pins_raw_image: false,
         };
 
         assert_eq!(output.log_output(), "<image data URL omitted: 25 bytes>");
@@ -335,6 +463,7 @@ mod tests {
             image_url: "data:image/png;base64,AAA".to_string(),
             image_detail: DEFAULT_IMAGE_DETAIL,
             unified_image_budget: false,
+            pins_raw_image: false,
         };
 
         let result = output.code_mode_result(&ToolPayload::Function {

@@ -457,6 +457,7 @@ web_search = true
             web_search: None,
             experimental_request_user_input: None,
             update_plan: None,
+            view_image: None,
         })
     );
 }
@@ -477,6 +478,7 @@ web_search = false
             web_search: None,
             experimental_request_user_input: None,
             update_plan: None,
+            view_image: None,
         })
     );
 }
@@ -496,6 +498,7 @@ fn tools_experimental_request_user_input_defaults_to_enabled() {
             web_search: None,
             experimental_request_user_input: Some(ExperimentalRequestUserInput { enabled: true }),
             update_plan: None,
+            view_image: None,
         })
     );
 }
@@ -516,6 +519,7 @@ enabled = false
             web_search: None,
             experimental_request_user_input: Some(ExperimentalRequestUserInput { enabled: false }),
             update_plan: None,
+            view_image: None,
         })
     );
 }
@@ -531,6 +535,7 @@ async fn load_config_resolves_experimental_request_user_input_enabled() -> std::
                     enabled: false,
                 }),
                 update_plan: None,
+                view_image: None,
             }),
             ..ConfigToml::default()
         },
@@ -13094,4 +13099,85 @@ tunnel = "cloudflared"
         settings.tools,
         codex_config::config_toml::ChatGptWebTools::None
     );
+}
+
+// FORK: `[tools.view_image]` delegation.
+
+#[tokio::test]
+async fn load_config_leaves_view_image_delegation_off_by_default() -> anyhow::Result<()> {
+    let codex_home = tempdir()?;
+    for toml in [
+        "",
+        "[tools.view_image]\ndelegate = false\nmodel = \"gpt-5.6-luna\"\n",
+    ] {
+        let config = Config::load_from_base_config_with_overrides(
+            toml::from_str(toml)?,
+            ConfigOverrides::default(),
+            codex_home.abs(),
+        )
+        .await?;
+        assert!(config.tools_view_image.is_none(), "{toml}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn load_config_resolves_view_image_delegation_defaults() -> anyhow::Result<()> {
+    let codex_home = tempdir()?;
+    let config = Config::load_from_base_config_with_overrides(
+        toml::from_str("[tools.view_image]\ndelegate = true\n")?,
+        ConfigOverrides::default(),
+        codex_home.abs(),
+    )
+    .await?;
+
+    let delegation = config
+        .tools_view_image
+        .expect("delegation should be resolved");
+    assert_eq!(delegation.model, DEFAULT_VIEW_IMAGE_READER_MODEL);
+    assert_eq!(delegation.provider_id, DEFAULT_VIEW_IMAGE_READER_PROVIDER);
+    assert_eq!(delegation.reasoning_effort, ReasoningEffort::Medium);
+    Ok(())
+}
+
+#[tokio::test]
+async fn load_config_keeps_the_reader_provider_independent_of_the_session_provider()
+-> anyhow::Result<()> {
+    let codex_home = tempdir()?;
+    let config = Config::load_from_base_config_with_overrides(
+        toml::from_str(
+            "model_provider = \"claude_code\"\n\n[tools.view_image]\ndelegate = true\n",
+        )?,
+        ConfigOverrides::default(),
+        codex_home.abs(),
+    )
+    .await?;
+
+    assert_eq!(config.model_provider_id, "claude_code");
+    let delegation = config
+        .tools_view_image
+        .expect("delegation should be resolved");
+    assert_eq!(delegation.provider_id, DEFAULT_VIEW_IMAGE_READER_PROVIDER);
+    Ok(())
+}
+
+#[tokio::test]
+async fn load_config_rejects_an_unknown_view_image_provider() -> anyhow::Result<()> {
+    let codex_home = tempdir()?;
+    let error = Config::load_from_base_config_with_overrides(
+        toml::from_str(
+            "[tools.view_image]\ndelegate = true\nmodel_provider = \"not-a-provider\"\n",
+        )?,
+        ConfigOverrides::default(),
+        codex_home.abs(),
+    )
+    .await
+    .expect_err("an unconfigured reader provider must fail config load");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(
+        error.to_string(),
+        "tools.view_image.model_provider `not-a-provider` is not configured"
+    );
+    Ok(())
 }
