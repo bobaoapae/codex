@@ -1,0 +1,15 @@
+# sqlx hashes each migration file exactly as it sits in the working tree, and
+# stores that sha384 in `_sqlx_migrations`. A Windows checkout with
+# core.autocrlf=true rewrites LF to CRLF, which changes the hash and makes an
+# already-migrated database abort startup with
+# "migration N was previously applied but has been modified".
+#
+# The fork-authored migrations below were first applied with LF endings (they
+# were written straight into the working tree, never checked out), so every
+# checkout must reproduce LF or the resulting binary cannot open an existing
+# CODEX_HOME. Upstream migrations are deliberately left alone: they were first
+# applied from a CRLF checkout and must keep whatever the platform produces.
+#
+# Any new fork migration has to be pinned here too.
+migrations/0053_thread_tombstones.sql text eol=lf
+workflow_migrations/*.sql text eol=lf

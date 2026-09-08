@@ -8,6 +8,7 @@ use std::borrow::Cow;
 
 use super::STATE_MIGRATOR;
 use super::THREAD_HISTORY_MIGRATOR;
+use super::WORKFLOW_MIGRATOR;
 use super::repair_legacy_recency_migration_version;
 use crate::PINNED_THREAD_SECTION_ID;
 use crate::PINNED_THREAD_SECTION_NAME;
@@ -862,4 +863,91 @@ async fn repair_recency_migration_succeeds_while_another_connection_holds_writer
     read_pool.close().await;
     pool.close().await;
     repair_result.expect("current migration history should not need the writer slot");
+}
+
+/// sqlx hashes every migration file byte for byte and records the digest in
+/// `_sqlx_migrations`, so a checkout that rewrites line endings yields a binary
+/// that refuses to open a database an earlier build already migrated. These are
+/// the fork-authored migrations, pinned to the digests that are applied in the
+/// wild; `codex-rs/state/.gitattributes` keeps their line endings stable.
+const FORK_STATE_MIGRATION_CHECKSUMS: &[(i64, &str)] = &[(
+    53,
+    "1d8935d7603ceaf40bdef717c64674d9be98f781215fe54c2b4e5f27646de90a75ff0c3a1d8163ad41d61543136aa8d5",
+)];
+
+const FORK_WORKFLOW_MIGRATION_CHECKSUMS: &[(i64, &str)] = &[
+    (
+        1,
+        "560f9b5c2a10626278c1c8099b9510b30f478bed2c89df624d7ed7a0d419d4597a0c98db1826659e9f5ed9adf6df05c4",
+    ),
+    (
+        2,
+        "bf41e4fe7de7312b163796126a116fefabee92acc59a85fb8614af51197fd13f3843b45a0462af9cd501cce831067e7c",
+    ),
+    (
+        3,
+        "290761f5e6f4a3307e9fb1e87f1175372745906b6b5becadbb7b4a217efb1e695cf199995e2de97018f35561d01fac17",
+    ),
+    (
+        4,
+        "2560f75167e2c1a6838f3eb3c28f962a98b51470840ec3aeb3026b6d05b1080e3fcda71738dce21bfcb574e4cbb3223b",
+    ),
+    (
+        5,
+        "b5c919bfda090445e641778c603e493b7428faf356692f07ce3a7023b627a8f4953266eeb2bd61cae4e4d6ae0a3dd751",
+    ),
+    (
+        6,
+        "d8589300eb5f4d20e9b47176f2a83919d509e853d5053e4eb0badc008e12a6b84db7924451539b96670f3bb786c9e151",
+    ),
+    (
+        7,
+        "b936dd71871fdd6bc369abaf1f4dfc7bcb60264b7c74981c1b081cb7bd24ce3e9ecedff2d116d1fe22ff4d6d49609acd",
+    ),
+    (
+        8,
+        "fc0b0205e9866e8c4edd9dd4dc57feffbba9eacf340b0d7f5e303f6102e134ed95f8c8e5b09acc5171716e38c7d806b7",
+    ),
+    (
+        9,
+        "c90e92c28ecd796a57c7b36037cb89e31c1a2c1d803bde85353d7206755527a2f92473b9b5647c489006ab900ef7e87e",
+    ),
+    (
+        10,
+        "a66e75a4db4cd5b5dbf9270133168d306cb7f674ab6be17cad7372b46ae0729d55e29d07259dbbe2cbcd2743a5b790cc",
+    ),
+];
+
+fn assert_pinned_checksums(migrator: &Migrator, pinned: &[(i64, &str)]) {
+    for (version, expected) in pinned {
+        let migration = migrator
+            .migrations
+            .iter()
+            .find(|migration| migration.version == *version)
+            .unwrap_or_else(|| panic!("migration {version} should be embedded"));
+        let actual: String = migration
+            .checksum
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(
+            &actual, expected,
+            "migration {version} ({}) changed on disk; if this is a line-ending \
+             rewrite, fix .gitattributes instead of the pin, because every \
+             already-migrated database records the old digest",
+            migration.description
+        );
+    }
+}
+
+#[test]
+fn fork_migration_checksums_are_pinned() {
+    assert_pinned_checksums(&STATE_MIGRATOR, FORK_STATE_MIGRATION_CHECKSUMS);
+    assert_pinned_checksums(&WORKFLOW_MIGRATOR, FORK_WORKFLOW_MIGRATION_CHECKSUMS);
+    assert_eq!(
+        WORKFLOW_MIGRATOR.migrations.len(),
+        FORK_WORKFLOW_MIGRATION_CHECKSUMS.len(),
+        "every workflow migration is fork-authored, so a new one has to be \
+         pinned here and in .gitattributes"
+    );
 }
