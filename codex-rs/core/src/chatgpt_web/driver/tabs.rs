@@ -399,10 +399,6 @@ impl PoolTab {
             .last_used = Instant::now();
     }
 
-    fn idle_for(&self) -> Duration {
-        self.last_used().elapsed()
-    }
-
     /// Run `f` holding this tab's exclusive lock, in FIFO order.
     async fn run<T, Fut>(
         self: &Arc<Self>,
@@ -424,6 +420,34 @@ impl PoolTab {
         self.touch();
         drop(armed);
         result
+    }
+
+    /// Run a maintenance operation in FIFO order without making an idle tab
+    /// look recently used. The reservation in `armed` keeps new work from
+    /// treating the tab as idle while the maintenance gate is pending.
+    async fn run_maintenance<T, Fut>(
+        self: &Arc<Self>,
+        armed: Armed,
+        f: impl FnOnce(TabId) -> Fut,
+    ) -> DriverResult<T>
+    where
+        Fut: Future<Output = DriverResult<T>>,
+    {
+        let permit = self
+            .lock
+            .gate
+            .acquire()
+            .await
+            .map_err(|_| gate_closed("tab queue"))?;
+        let result = f(self.id).await;
+        drop(permit);
+        drop(armed);
+        result
+    }
+
+    fn unbound_and_idle_for(&self, idle: Duration) -> bool {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.bound_conversation.is_none() && state.last_used.elapsed() >= idle
     }
 }
 
@@ -593,6 +617,21 @@ impl TabPool {
             } else if conversation_id.is_some()
                 && state.bound_conversation.as_deref() == conversation_id
             {
+                state.bound_conversation = None;
+            }
+        }
+    }
+
+    /// Release an ended conversation's affinity so the owned tab can be
+    /// reclaimed by the idle sweeper. Live or queued work keeps its binding;
+    /// recoverable turns therefore remain attached to their conversation.
+    pub(crate) fn release_conversation(&self, conversation_id: &str) {
+        for tab in self.inner.snapshot() {
+            if tab.pending() != 0 {
+                continue;
+            }
+            let mut state = tab.state.lock().unwrap_or_else(PoisonError::into_inner);
+            if state.bound_conversation.as_deref() == Some(conversation_id) {
                 state.bound_conversation = None;
             }
         }
@@ -1228,24 +1267,23 @@ impl PoolInner {
         }
     }
 
-    /// Shrink the pool back down: any tab beyond the first that has sat idle
-    /// for `idle` gets closed. The close runs holding the tab's lock and
+    /// Shrink the pool back down: any unbound tab that has sat idle for `idle`
+    /// gets closed. Bound conversations stay attached for recovery. The pool
+    /// may become empty; `primary()` and `with_tab_for()` lazily recreate a tab
+    /// before the next operation. The close runs holding the tab's lock and
     /// aborts if anything queued behind it meanwhile, so a send can never land
-    /// on a tab that is being closed.
+    /// on a tab being closed.
     async fn sweep_idle(&self) {
         for tab in self.snapshot() {
-            if self.len() <= 1 {
-                return;
-            }
-            if tab.pending() > 0 || tab.idle_for() < self.idle {
+            if tab.pending() > 0 || !tab.unbound_and_idle_for(self.idle) {
                 continue;
             }
             let armed = tab.arm();
             let tab_ref = Arc::clone(&tab);
             let _ = tab
-                .run(armed, |tab_id| async move {
+                .run_maintenance(armed, |tab_id| async move {
                     // A caller queued behind us — abort.
-                    if tab_ref.pending() > 1 || tab_ref.idle_for() < self.idle || self.len() <= 1 {
+                    if tab_ref.pending() > 1 || !tab_ref.unbound_and_idle_for(self.idle) {
                         return Ok(());
                     }
                     self.close_tab(tab_id, "idle").await;

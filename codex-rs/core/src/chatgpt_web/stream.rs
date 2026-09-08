@@ -6,6 +6,7 @@
 //! part (snapshot in, deltas out; tested on real captures) and `PollLoop` is
 //! the async driver around it (timing, interrupts, the stall watchdog).
 
+use super::AgentActivityHandle;
 use super::driver::DriverError;
 use super::driver::DriverErrorKind;
 use super::driver::DriverResult;
@@ -101,13 +102,10 @@ pub(crate) const ASYNC_ACTIVE_SETTLE: Duration = Duration::from_secs(120);
 /// FORK (verified live on Pro): an upper bound on that wait, for the case
 /// where both signals are stale at once.
 ///
-/// A hidden, throttled tab keeps rendering the stop button long after the run
-/// ended, and `async_status` was seen still reading `3` more than an hour after
-/// the final message landed — a turn holding out for either of them would hang
-/// until the stall watchdog failed it and threw the answer away. Nothing at all
-/// moving in the conversation for this long, with a finished message standing,
-/// is the run being over: inside a live Pro run something lands at least every
-/// ~95 s.
+/// A hidden, throttled tab can keep rendering the stop button long after the
+/// run ended, and `async_status` can remain non-zero after the final message
+/// landed. At this boundary the poller activates the owned tab and reads the
+/// conversation again; the timer alone never completes or cancels a live run.
 pub(crate) const ASYNC_ACTIVE_STILL_CAP: Duration = Duration::from_secs(600);
 
 /// FORK: what the page says about the reply, as far as completion goes.
@@ -152,6 +150,17 @@ pub(crate) struct ReplyTracker {
     /// FORK: when the conversation itself last changed, whatever the page says
     /// (see [`ASYNC_ACTIVE_STILL_CAP`]).
     changed_at: Option<Instant>,
+    /// Whether the latest unchanged active snapshot has already been
+    /// checked after the stillness cap. A numeric `async_status` can outlive
+    /// the current node, so the first cap hit must force an activated DOM/API
+    /// recheck before it can settle the reply.
+    async_rechecked: bool,
+    async_running: bool,
+    /// FORK: handle to renew this agent's observable activity while the
+    /// conversation is confirmed running (generating or holding a pending
+    /// tool step). `None` outside a turn wired to an agent (see
+    /// [`AgentActivityHandle`]).
+    activity: Option<AgentActivityHandle>,
     /// Characters of answer text emitted so far (for the usage estimate).
     text_chars: usize,
     done: bool,
@@ -168,9 +177,19 @@ impl ReplyTracker {
             stable_polls: 0,
             async_quiet_since: None,
             changed_at: None,
+            async_rechecked: false,
+            async_running: false,
+            activity: None,
             text_chars: 0,
             done: false,
         }
+    }
+
+    /// FORK: wires this turn's handle back into Codex's cross-agent activity
+    /// registry. A no-op call when the caller has none (e.g. a disposable
+    /// workspace) leaves activity reporting skipped.
+    pub(crate) fn set_activity(&mut self, activity: Option<AgentActivityHandle>) {
+        self.activity = activity;
     }
 
     pub(crate) fn text_chars(&self) -> usize {
@@ -180,6 +199,35 @@ impl ReplyTracker {
     /// The (normalized) user text this tracker anchors on.
     pub(crate) fn anchor(&self) -> &str {
         &self.anchor
+    }
+
+    /// Whether the latest unchanged active snapshot has crossed the stale
+    /// signal cap and needs a fresh read on the conversation's owned tab.
+    pub(crate) fn async_recheck_due(&self, now: Instant) -> bool {
+        let Some(changed_at) = self.changed_at else {
+            return false;
+        };
+        if !self.async_running || self.async_rechecked {
+            return false;
+        }
+        let still_for = now.saturating_duration_since(changed_at);
+        let cap_due = still_for >= ASYNC_ACTIVE_STILL_CAP;
+        let quiet_due = self
+            .async_quiet_since
+            .is_some_and(|since| now.saturating_duration_since(since) >= ASYNC_ACTIVE_SETTLE);
+        cap_due || quiet_due
+    }
+
+    pub(crate) fn async_running(&self) -> bool {
+        self.async_running
+    }
+
+    /// Reset the stale-signal window after the caller has activated the
+    /// conversation and completed a fresh DOM/API read.
+    pub(crate) fn mark_async_rechecked(&mut self, now: Instant) {
+        self.changed_at = Some(now);
+        self.async_quiet_since = None;
+        self.async_rechecked = true;
     }
 
     /// FORK: forgets which item is open, without forgetting what was emitted.
@@ -257,6 +305,7 @@ impl ReplyTracker {
             self.stable_polls = 0;
             self.async_quiet_since = None;
             self.changed_at = Some(now);
+            self.async_rechecked = false;
         } else {
             self.stable_polls = self.stable_polls.saturating_add(1);
             self.changed_at.get_or_insert(now);
@@ -279,8 +328,25 @@ impl ReplyTracker {
         let ended = newest_text.is_some_and(|turn| {
             turn.end_turn == Some(true) && turn.status == "finished_successfully"
         });
-        let async_running = !matches!(conv.async_status, None | Some(0));
-        let idle = !conv.is_generating && (!async_running || ended);
+        // Before the first cap recheck, retain the server-side async flag so
+        // an interim Pro message cannot finish early. Once the owned tab and
+        // API have been re-read, the current chain is authoritative: a stale
+        // async flag must not hold a completed answer forever.
+        let chain_running = conv.is_generating || conv.any_in_progress;
+        let page_running = dom == DomHint::Generating;
+        let async_running = chain_running
+            || page_running
+            || (!self.async_rechecked && !matches!(conv.async_status, None | Some(0)));
+        self.async_running = async_running;
+        // FORK: a confirmed-running conversation (generating, or holding a
+        // pending tool step) is positive provider activity; renew this
+        // agent's last-seen activity so a long silent Pro wait does not read
+        // as idle to `list_agents`/`wait_agent`. No text is added to the
+        // model's context.
+        if async_running && let Some(activity) = &self.activity {
+            activity.mark("chatgpt_web: waiting on an active ChatGPT response");
+        }
+        let idle = !conv.is_generating && !page_running && (!async_running || ended);
         if !idle {
             self.async_quiet_since = None;
             return deltas;
@@ -312,7 +378,9 @@ impl ReplyTracker {
             let still_for = self
                 .changed_at
                 .map_or(Duration::ZERO, |at| now.saturating_duration_since(at));
-            if still_for >= ASYNC_ACTIVE_STILL_CAP {
+            if !self.async_rechecked && self.async_recheck_due(now) {
+                false
+            } else if still_for >= ASYNC_ACTIVE_STILL_CAP {
                 true
             } else if dom == DomHint::Generating {
                 self.async_quiet_since = None;
@@ -538,6 +606,16 @@ pub(crate) trait DomSource: Send + Sync {
         &'a self,
         conversation_id: &'a str,
     ) -> BoxFuture<'a, DriverResult<Option<DomProgress>>>;
+
+    /// Re-read the same conversation after activating its owned tab. Test
+    /// sources may use the regular DOM read; production sources use this hook
+    /// to avoid deciding from a throttled or background tab.
+    fn refresh_dom<'a>(
+        &'a self,
+        conversation_id: &'a str,
+    ) -> BoxFuture<'a, DriverResult<Option<DomProgress>>> {
+        self.read_dom(conversation_id)
+    }
 }
 
 /// FORK (verified live): API reads are the scarce resource. While the reply
@@ -713,7 +791,9 @@ impl PollLoop<'_> {
         let mut scheduler = PollScheduler::new(self.sent_at);
         let anchor = anchor_of(&self.anchor);
         let mut dom_hint = DomHint::Unknown;
+        let mut watchdog_recheck = false;
         loop {
+            let mut force_recheck = self.tracker.async_recheck_due(Instant::now());
             let idle_deadline = self
                 .idle_timeout
                 .map(|timeout| last_progress + timeout)
@@ -721,17 +801,24 @@ impl PollLoop<'_> {
             tokio::select! {
                 biased;
                 _ = consumer_dropped.cancelled() => return PollOutcome::Interrupted,
-                _ = tokio::time::sleep_until(idle_deadline) => {
-                    let seconds = self.idle_timeout.map(|timeout| timeout.as_secs()).unwrap_or_default();
-                    return PollOutcome::Stalled { seconds };
+                _ = tokio::time::sleep_until(idle_deadline), if !force_recheck => {
+                    // A watchdog expiry is also a recovery point. Refresh
+                    // the owned conversation before deciding it stalled.
+                    force_recheck = true;
+                    watchdog_recheck = true;
                 }
                 _ = tokio::time::sleep(effective_poll_interval(self.poll_interval, last_rate_limit)) => {}
             }
 
             // FORK: the page is the cheap source of progress; the API is read
             // only when the scheduler says so (see `PollScheduler`).
+            let mut recheck_confirmed = self.dom.is_none();
             if let Some(dom) = self.dom {
-                let progress = match dom.read_dom(&self.conversation_id).await {
+                let progress = match if force_recheck {
+                    dom.refresh_dom(&self.conversation_id).await
+                } else {
+                    dom.read_dom(&self.conversation_id).await
+                } {
                     Ok(progress) => progress,
                     Err(err) => {
                         tracing::debug!("chatgpt_web: DOM progress read failed: {err}");
@@ -740,10 +827,11 @@ impl PollLoop<'_> {
                 };
                 let step = scheduler.on_dom(progress, &anchor, Instant::now());
                 dom_hint = step.hint;
+                recheck_confirmed = !force_recheck || step.hint != DomHint::Unknown;
                 if step.changed {
                     last_progress = Instant::now();
                 }
-                if !step.read_api {
+                if !step.read_api && !force_recheck {
                     continue;
                 }
             }
@@ -790,6 +878,15 @@ impl PollLoop<'_> {
                 }
             };
 
+            if force_recheck && !recheck_confirmed {
+                return PollOutcome::Failed(DriverError::other(
+                    "chatgpt_web: could not confirm the owned conversation during recovery",
+                ));
+            }
+            if force_recheck {
+                self.tracker.mark_async_rechecked(Instant::now());
+            }
+
             let deltas = self
                 .tracker
                 .observe_at(&conv, self.mode, dom_hint, Instant::now());
@@ -805,6 +902,16 @@ impl PollLoop<'_> {
                         };
                     }
                 }
+            }
+            if force_recheck && self.tracker.async_running() {
+                last_progress = Instant::now();
+            }
+            if watchdog_recheck && !self.tracker.async_running() {
+                let seconds = self
+                    .idle_timeout
+                    .map(|timeout| timeout.as_secs())
+                    .unwrap_or_default();
+                return PollOutcome::Stalled { seconds };
             }
         }
     }

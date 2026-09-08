@@ -391,12 +391,11 @@ async fn a_dropped_consumer_interrupts_the_poll_loop() {
 #[tokio::test]
 async fn no_progress_past_the_idle_timeout_stalls() {
     let conv = fixture("in_progress");
-    let anchor = last_user_text(&conv);
     let source = Snapshots(Mutex::new(vec![Ok(conv)]));
     let (tx, _rx) = tokio::sync::mpsc::channel(64);
     let mut assembler = StreamAssembler::new(&tx);
     let consumer_dropped = CancellationToken::new();
-    let mut looped = poll_loop(&source, &anchor);
+    let mut looped = poll_loop(&source, "a different user message");
     looped.idle_timeout = Some(Duration::from_millis(60));
 
     let outcome = looped.run(&mut assembler, &consumer_dropped).await;
@@ -686,6 +685,15 @@ fn a_finished_pro_reply_completes_despite_a_lingering_async_status() {
     let t0 = Instant::now();
     let early = tracker.observe_at(&finished, TrackMode::None, DomHint::Quiet, t0);
     assert!(!kinds(&early).contains(&"done"), "{early:?}");
+    let pending = tracker.observe_at(
+        &finished,
+        TrackMode::None,
+        DomHint::Quiet,
+        t0 + ASYNC_ACTIVE_SETTLE,
+    );
+    assert!(!kinds(&pending).contains(&"done"), "{pending:?}");
+    assert!(tracker.async_recheck_due(t0 + ASYNC_ACTIVE_SETTLE));
+    tracker.mark_async_rechecked(t0 + ASYNC_ACTIVE_SETTLE);
     let deltas = tracker.observe_at(
         &finished,
         TrackMode::None,
@@ -738,11 +746,10 @@ fn a_pro_interim_end_turn_is_not_the_answer_while_the_page_shows_a_run() {
 
 /// FORK (verified live): both signals can be stale at once — the run ended at
 /// 03:46, yet an hour later the throttled tab still rendered the stop button
-/// and the API still reported `async_status: 3`. Holding out for either would
-/// hang until the stall watchdog and lose the answer, so total stillness for
-/// [`ASYNC_ACTIVE_STILL_CAP`] wins over both.
+/// and the API still reported `async_status: 3`. The old cap must request a
+/// fresh read rather than accepting the stale answer by elapsed time.
 #[test]
-fn a_conversation_that_stops_moving_completes_even_with_both_signals_stuck() {
+fn a_conversation_that_stops_moving_requires_a_fresh_recheck() {
     let conv = fixture("pro_interim");
     let mut tracker = ReplyTracker::new(&last_user_text(&conv));
     let t0 = Instant::now();
@@ -760,15 +767,80 @@ fn a_conversation_that_stops_moving_completes_even_with_both_signals_stuck() {
         DomHint::Generating,
         t0 + ASYNC_ACTIVE_STILL_CAP,
     );
+    assert!(!kinds(&deltas).contains(&"done"), "{deltas:?}");
+    assert!(tracker.async_recheck_due(t0 + ASYNC_ACTIVE_STILL_CAP));
+
+    tracker.mark_async_rechecked(t0 + ASYNC_ACTIVE_STILL_CAP);
+    let refreshed = tracker.observe_at(
+        &conv,
+        TrackMode::None,
+        DomHint::Quiet,
+        t0 + ASYNC_ACTIVE_STILL_CAP,
+    );
     assert!(
         matches!(
-            deltas.last(),
+            refreshed.last(),
             Some(Delta::Done {
                 reason: DoneReason::EndTurn
             })
         ),
-        "{deltas:?}"
+        "{refreshed:?}"
     );
+}
+
+/// FORK: a long Pro wait must renew this agent's observable activity (for
+/// `list_agents`/`wait_agent`) purely against the wired
+/// [`AgentActivityHandle`] — no delta, and so no text, ever reaches the
+/// model's context because of it.
+#[test]
+fn observe_at_renews_agent_activity_while_the_conversation_is_running() {
+    let conv = fixture("pro_interim");
+    let mut tracker = ReplyTracker::new(&last_user_text(&conv));
+    let control = crate::agent::AgentControl::default();
+    let thread_id = codex_protocol::ThreadId::new();
+    tracker.set_activity(Some(AgentActivityHandle::new(control.clone(), thread_id)));
+
+    let deltas = tracker.observe_at(&conv, TrackMode::None, DomHint::Generating, Instant::now());
+
+    assert!(!kinds(&deltas).contains(&"done"), "{deltas:?}");
+    let activity = control
+        .agent_activity(thread_id)
+        .expect("activity recorded while the conversation is confirmed running");
+    assert!(activity.label.contains("ChatGPT"), "{activity:?}");
+}
+
+/// Every production call site outside a live, wired turn (e.g. the
+/// image-reader's disposable workspace) leaves the tracker's handle `None`;
+/// that must stay a plain no-op, not a panic.
+#[test]
+fn observe_at_is_a_no_op_without_a_wired_activity_handle() {
+    let conv = fixture("pro_interim");
+    let mut tracker = ReplyTracker::new(&last_user_text(&conv));
+    let deltas = tracker.observe_at(&conv, TrackMode::None, DomHint::Generating, Instant::now());
+    assert!(!kinds(&deltas).contains(&"done"), "{deltas:?}");
+}
+
+#[test]
+fn a_generating_page_never_completes_from_the_stale_signal_clock() {
+    let conv = fixture("pro_interim");
+    let mut tracker = ReplyTracker::new(&last_user_text(&conv));
+    let t0 = Instant::now();
+    let _ = tracker.observe_at(&conv, TrackMode::None, DomHint::Generating, t0);
+    let cap = tracker.observe_at(
+        &conv,
+        TrackMode::None,
+        DomHint::Generating,
+        t0 + ASYNC_ACTIVE_STILL_CAP,
+    );
+    assert!(!kinds(&cap).contains(&"done"), "{cap:?}");
+    tracker.mark_async_rechecked(t0 + ASYNC_ACTIVE_STILL_CAP);
+    let refreshed = tracker.observe_at(
+        &conv,
+        TrackMode::None,
+        DomHint::Generating,
+        t0 + ASYNC_ACTIVE_STILL_CAP,
+    );
+    assert!(!kinds(&refreshed).contains(&"done"), "{refreshed:?}");
 }
 
 /// The cap measures stillness, not the turn's age: a run that keeps producing
@@ -807,6 +879,15 @@ fn a_pro_interim_end_turn_is_accepted_once_the_page_is_quiet_and_nothing_moves()
         t0 + ASYNC_ACTIVE_SETTLE - Duration::from_secs(1),
     );
     assert!(!kinds(&almost).contains(&"done"), "{almost:?}");
+    let pending = tracker.observe_at(
+        &conv,
+        TrackMode::None,
+        DomHint::Quiet,
+        t0 + ASYNC_ACTIVE_SETTLE,
+    );
+    assert!(!kinds(&pending).contains(&"done"), "{pending:?}");
+    assert!(tracker.async_recheck_due(t0 + ASYNC_ACTIVE_SETTLE));
+    tracker.mark_async_rechecked(t0 + ASYNC_ACTIVE_SETTLE);
     let deltas = tracker.observe_at(
         &conv,
         TrackMode::None,
@@ -853,6 +934,15 @@ fn the_settle_window_restarts_when_the_run_moves_again() {
         t0 + ASYNC_ACTIVE_SETTLE,
     );
     assert!(!kinds(&old_window).contains(&"done"), "{old_window:?}");
+    let pending = tracker.observe_at(
+        &grown,
+        TrackMode::None,
+        DomHint::Quiet,
+        t0 + Duration::from_secs(100) + ASYNC_ACTIVE_SETTLE,
+    );
+    assert!(!kinds(&pending).contains(&"done"), "{pending:?}");
+    assert!(tracker.async_recheck_due(t0 + Duration::from_secs(100) + ASYNC_ACTIVE_SETTLE));
+    tracker.mark_async_rechecked(t0 + Duration::from_secs(100) + ASYNC_ACTIVE_SETTLE);
     let deltas = tracker.observe_at(
         &grown,
         TrackMode::None,

@@ -31,6 +31,7 @@ use crate::chatgpt_web::connector::contract::CallTarget;
 use crate::chatgpt_web::connector::contract::ExecTool;
 use crate::chatgpt_web::connector::contract::ToolSummary;
 use crate::chatgpt_web::connector::tool_summaries;
+use crate::chatgpt_web::stream::DomSource;
 use crate::claude_code::assembler::StreamAssembler;
 use crate::claude_code::history::item_fingerprint;
 use crate::client_common::Prompt;
@@ -120,6 +121,11 @@ pub(crate) struct ChatGptWebWorkspace {
     /// provider can recognise that turn and answer it from a disposable
     /// conversation.
     pub(crate) compact_prompt: String,
+    /// FORK: this turn's handle back into Codex's cross-agent activity
+    /// registry, set once per turn by `session/turn.rs`. `None` where no
+    /// turn-level agent exists (e.g. the image-reader's disposable
+    /// workspace), in which case activity reporting is simply skipped.
+    pub(crate) agent_activity: Option<AgentActivityHandle>,
 }
 
 impl ChatGptWebWorkspace {
@@ -150,6 +156,7 @@ impl ChatGptWebWorkspace {
                 .compact_prompt
                 .clone()
                 .unwrap_or_else(|| crate::compact::SUMMARIZATION_PROMPT.to_string()),
+            agent_activity: None,
         }
     }
 
@@ -172,7 +179,15 @@ impl ChatGptWebWorkspace {
             sessions_state_path: None,
             connector: None,
             compact_prompt: crate::compact::SUMMARIZATION_PROMPT.to_string(),
+            agent_activity: None,
         })
+    }
+
+    /// FORK: wires this turn's handle back into Codex's cross-agent activity
+    /// registry (see [`AgentActivityHandle`]).
+    pub(crate) fn with_agent_activity(mut self, activity: AgentActivityHandle) -> Self {
+        self.agent_activity = Some(activity);
+        self
     }
 }
 
@@ -196,6 +211,42 @@ struct SessionStore {
     thread_key: String,
 }
 
+/// FORK: minimal handle back into Codex's cross-agent activity registry
+/// (`AgentControl::record_agent_activity`), so a long-running Pro wait
+/// renews this agent's observable activity for `list_agents`/`wait_agent`
+/// without injecting text into the model's context. Cheap to clone:
+/// `AgentControl` wraps shared state and `ThreadId` is a small value type.
+#[derive(Clone)]
+pub(crate) struct AgentActivityHandle {
+    control: crate::agent::AgentControl,
+    thread_id: codex_protocol::ThreadId,
+}
+
+impl AgentActivityHandle {
+    pub(crate) fn new(
+        control: crate::agent::AgentControl,
+        thread_id: codex_protocol::ThreadId,
+    ) -> Self {
+        Self { control, thread_id }
+    }
+
+    /// Renews this agent's last-seen activity with `label`.
+    pub(crate) fn mark(&self, label: &str) {
+        self.control
+            .record_agent_activity(self.thread_id, label.to_string());
+    }
+}
+
+// Manual impl: `AgentControl` does not derive `Debug`, and this handle only
+// needs to be inspectable enough for `ChatGptWebThreadState`'s own `Debug`.
+impl std::fmt::Debug for AgentActivityHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentActivityHandle")
+            .field("thread_id", &self.thread_id)
+            .finish()
+    }
+}
+
 /// Cross-turn state of one Codex thread served by ChatGPT Web.
 ///
 /// Lives in the client state (not the per-turn session) so consecutive turns
@@ -208,6 +259,11 @@ pub(crate) struct ChatGptWebThreadState {
     /// tool outputs Codex is producing. `None` outside connector mode and
     /// between turns.
     live_turn: StdMutex<Option<LiveTurn>>,
+    /// FORK: this turn's handle back into Codex's cross-agent activity
+    /// registry, wired once per turn by `session/turn.rs`. `None` outside a
+    /// live turn (e.g. the image-reader's disposable workspace), in which
+    /// case activity reporting is simply skipped.
+    activity: StdMutex<Option<AgentActivityHandle>>,
 }
 
 impl ChatGptWebThreadState {
@@ -242,6 +298,23 @@ impl ChatGptWebThreadState {
                 *continuity = recorded;
             }
         }
+    }
+
+    /// FORK: refreshes this turn's activity handle, read by the poll
+    /// trackers this call sets up (see [`AgentActivityHandle`]).
+    fn set_activity(&self, activity: Option<AgentActivityHandle>) {
+        *self
+            .activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = activity;
+    }
+
+    /// FORK: the activity handle wired for the current turn, if any.
+    fn activity(&self) -> Option<AgentActivityHandle> {
+        self.activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     fn persist(&self, continuity: &ConversationContinuity) {
@@ -315,6 +388,7 @@ pub(crate) async fn stream(
         Some(workspace) => workspace.clone(),
         None => ChatGptWebWorkspace::fallback()?,
     };
+    state.set_activity(workspace.agent_activity.clone());
     if let Some(path) = workspace.sessions_state_path.clone() {
         state.hydrate(&path, thread_id.to_string());
     }
@@ -494,13 +568,40 @@ impl stream::ConversationSource for OpsSource<'_> {
     }
 }
 
-impl stream::DomSource for OpsSource<'_> {
+impl DomSource for OpsSource<'_> {
     fn read_dom<'a>(
         &'a self,
         conversation_id: &'a str,
     ) -> BoxFuture<'a, driver::DriverResult<Option<driver::page_scripts::DomProgress>>> {
         Box::pin(async move { self.0.dom_progress(conversation_id).await })
     }
+
+    fn refresh_dom<'a>(
+        &'a self,
+        conversation_id: &'a str,
+    ) -> BoxFuture<'a, driver::DriverResult<Option<driver::page_scripts::DomProgress>>> {
+        Box::pin(async move {
+            let Some(tab_id) = self.0.tabs().bound_tab_id(conversation_id) else {
+                return self.0.dom_progress(conversation_id).await;
+            };
+            self.0
+                .tabs()
+                .with_activated_on_keep(tab_id, |_tab_id| async { Ok(()) })
+                .await?;
+            self.0.dom_progress(conversation_id).await
+        })
+    }
+}
+
+/// FORK: whether a driver failure means the conversation is confirmed gone
+/// (a 404 from the backend) — the only condition allowed to release its
+/// tab's affinity. Every other failure (a transient read, a recovery
+/// recheck that could not be confirmed, a disconnected daemon, a login
+/// wall) leaves the conversation possibly still live server-side, so its
+/// owned tab must stay bound for recovery rather than handed to the idle
+/// sweeper.
+fn conversation_confirmed_gone(kind: &DriverErrorKind) -> bool {
+    matches!(kind, DriverErrorKind::ConversationNotFound)
 }
 
 /// Maps a driver failure onto the Codex error that decides retry vs. stop.
@@ -568,9 +669,13 @@ async fn run_turn(
     tx_event: mpsc::Sender<Result<ResponseEvent>>,
     consumer_dropped: CancellationToken,
 ) {
-    if tx_event.send(Ok(ResponseEvent::Created {
-        guardian_ticket: None,
-    })).await.is_err() {
+    if tx_event
+        .send(Ok(ResponseEvent::Created {
+            guardian_ticket: None,
+        }))
+        .await
+        .is_err()
+    {
         return;
     }
     let fail = |err: CodexErr| {
@@ -738,11 +843,13 @@ async fn run_turn(
         });
     }
 
+    let mut tracker = stream::ReplyTracker::new(&rendered.text);
+    tracker.set_activity(state.activity());
     let source = OpsSource(&driver.ops);
     let outcome = stream::PollLoop {
         source: &source,
         conversation_id: conversation_id.clone(),
-        tracker: stream::ReplyTracker::new(&rendered.text),
+        tracker,
         mode: stream::TrackMode::None,
         poll_interval: settings.poll_interval,
         idle_timeout: settings.idle_timeout,
@@ -769,6 +876,7 @@ async fn run_turn(
                     message_landed_unanswered: false,
                 });
             }
+            driver.tabs.release_conversation(&conversation_id);
             let _ = tx_event
                 .send(Ok(ResponseEvent::Completed {
                     response_id: conversation_id,
@@ -780,12 +888,14 @@ async fn run_turn(
         }
         stream::PollOutcome::Interrupted => {
             stop_generation(&driver.ops, &conversation_id).await;
+            driver.tabs.release_conversation(&conversation_id);
             if !plan.is_compaction {
                 state.mark_unanswered(authored);
             }
         }
         stream::PollOutcome::Stalled { seconds } => {
             stop_generation(&driver.ops, &conversation_id).await;
+            driver.tabs.release_conversation(&conversation_id);
             if !plan.is_compaction {
                 state.mark_unanswered(authored);
             }
@@ -795,6 +905,7 @@ async fn run_turn(
             .await;
         }
         stream::PollOutcome::PartialCompletion => {
+            driver.tabs.release_conversation(&conversation_id);
             if !plan.is_compaction {
                 state.mark_unanswered(authored);
             }
@@ -804,8 +915,9 @@ async fn run_turn(
             .await;
         }
         stream::PollOutcome::Failed(err) => {
-            if err.kind == DriverErrorKind::ConversationNotFound {
+            if conversation_confirmed_gone(&err.kind) {
                 state.invalidate();
+                driver.tabs.release_conversation(&conversation_id);
             } else if !plan.is_compaction {
                 state.mark_unanswered(authored);
             }
@@ -997,6 +1109,7 @@ async fn run_connector_turn(
             .end_turn(&live.turn_token, "the Codex turn was replaced")
             .await;
         stop_generation(&driver.ops, &live.conversation_id).await;
+        driver.tabs.release_conversation(&live.conversation_id);
     }
 
     // Fresh connector turn.
@@ -1172,13 +1285,15 @@ async fn run_connector_turn(
         message_landed_unanswered: true,
     });
 
+    let mut tracker = stream::ReplyTracker::new(&rendered.text);
+    tracker.set_activity(state.activity());
     let live = LiveTurn {
         conversation_id,
         connector_name,
         turn_token,
         requests,
         pending: Vec::new(),
-        tracker: stream::ReplyTracker::new(&rendered.text),
+        tracker,
         echoed: Vec::new(),
         model_slug,
         delivered_items: plan.delivered_items,
@@ -1216,8 +1331,13 @@ async fn connector_loop(
     // when the scheduler says so (see `stream::PollScheduler`).
     let mut scheduler = stream::PollScheduler::new(live.sent_at);
     let anchor = live.tracker.anchor().to_string();
+    let mut force_recheck = false;
+    let mut watchdog_recheck = false;
 
     loop {
+        if live.tracker.async_recheck_due(tokio::time::Instant::now()) {
+            force_recheck = true;
+        }
         let stall_deadline = idle_timeout
             .map(|timeout| last_progress + timeout)
             .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(365 * 24 * 3600));
@@ -1226,6 +1346,7 @@ async fn connector_loop(
             _ = consumer_dropped.cancelled() => {
                 live.broker.end_turn(&live.turn_token, "the Codex turn was interrupted").await;
                 stop_generation(&driver.ops, &live.conversation_id).await;
+                driver.tabs.release_conversation(&live.conversation_id);
                 state.mark_unanswered(live.echoed);
                 return;
             }
@@ -1237,6 +1358,7 @@ async fn connector_loop(
                 };
                 let batch = collect_batch(first, &mut live.requests).await;
                 if !assembler.close(MessagePhase::Commentary).await {
+                    driver.tabs.release_conversation(&live.conversation_id);
                     return;
                 }
                 let mut pending = Vec::new();
@@ -1246,6 +1368,7 @@ async fn connector_loop(
                     if !assembler.send(ResponseEvent::OutputItemAdded(item.clone())).await
                         || !assembler.send(ResponseEvent::OutputItemDone(item)).await
                     {
+                        driver.tabs.release_conversation(&live.conversation_id);
                         return;
                     }
                     pending.push(PendingCall {
@@ -1280,7 +1403,12 @@ async fn connector_loop(
                         last_progress = tokio::time::Instant::now();
                     }
                 }
-                let progress = match driver.ops.dom_progress(&live.conversation_id).await {
+            let dom_source = OpsSource(&driver.ops);
+            let progress = match if force_recheck {
+                dom_source.refresh_dom(&live.conversation_id).await
+            } else {
+                driver.ops.dom_progress(&live.conversation_id).await
+            } {
                     Ok(progress) => progress,
                     Err(err) => {
                         tracing::debug!("chatgpt_web connector: DOM progress read failed: {err}");
@@ -1288,12 +1416,14 @@ async fn connector_loop(
                     }
                 };
                 let step = scheduler.on_dom(progress, &anchor, tokio::time::Instant::now());
+                let recheck_confirmed =
+                    !force_recheck || step.hint != stream::DomHint::Unknown;
                 if step.changed {
                     last_progress = tokio::time::Instant::now();
                 }
-                if !step.read_api {
-                    continue;
-                }
+            if !step.read_api && !force_recheck {
+                continue;
+            }
                 scheduler.on_api_read(tokio::time::Instant::now());
                 let conv = match driver.ops.read_conversation(&live.conversation_id, true).await {
                     Ok(conv) => {
@@ -1314,6 +1444,7 @@ async fn connector_loop(
                             _ = consumer_dropped.cancelled() => {
                                 live.broker.end_turn(&live.turn_token, "the Codex turn was interrupted").await;
                                 stop_generation(&driver.ops, &live.conversation_id).await;
+                                driver.tabs.release_conversation(&live.conversation_id);
                                 state.mark_unanswered(live.echoed);
                                 return;
                             }
@@ -1347,8 +1478,9 @@ async fn connector_loop(
                     }
                     Err(err) => {
                         live.broker.end_turn(&live.turn_token, "the conversation could not be read").await;
-                        if err.kind == DriverErrorKind::ConversationNotFound {
+                        if conversation_confirmed_gone(&err.kind) {
                             state.invalidate();
+                            driver.tabs.release_conversation(&live.conversation_id);
                         } else {
                             state.mark_unanswered(live.echoed.clone());
                         }
@@ -1356,7 +1488,28 @@ async fn connector_loop(
                         return;
                     }
                 };
-                let deltas = live.tracker.observe_at(
+        if force_recheck && !recheck_confirmed {
+            live
+                .broker
+                .end_turn(&live.turn_token, "the conversation could not be rechecked")
+                .await;
+            // Do not release affinity here: the recheck itself failed to
+            // confirm state, not the conversation being gone, so the owned
+            // tab must stay bound for recovery — matching the message below.
+            state.mark_unanswered(live.echoed.clone());
+            let _ = tx_event
+                .send(Err(CodexErr::Stream(
+                    "ChatGPT conversation could not be refreshed for recovery; the conversation was preserved"
+                        .to_string(),
+                )))
+                .await;
+            return;
+        }
+        if force_recheck {
+            live.tracker
+                .mark_async_rechecked(tokio::time::Instant::now());
+        }
+        let deltas = live.tracker.observe_at(
                     &conv,
                     stream::TrackMode::Connector,
                     step.hint,
@@ -1367,11 +1520,13 @@ async fn connector_loop(
                         stream::DeltaStep::Continue => {}
                         stream::DeltaStep::Interrupted => {
                             live.broker.end_turn(&live.turn_token, "interrupted").await;
+                            driver.tabs.release_conversation(&live.conversation_id);
                             state.mark_unanswered(live.echoed);
                             return;
                         }
                         stream::DeltaStep::Partial => {
                             live.broker.end_turn(&live.turn_token, "partial completion").await;
+                            driver.tabs.release_conversation(&live.conversation_id);
                             state.mark_unanswered(live.echoed.clone());
                             let _ = tx_event
                                 .send(Err(CodexErr::Stream(
@@ -1391,6 +1546,9 @@ async fn connector_loop(
                                 echoed: live.echoed.clone(),
                                 message_landed_unanswered: false,
                             });
+                            driver
+                                .tabs
+                                .release_conversation(&live.conversation_id);
                             let _ = tx_event
                                 .send(Ok(ResponseEvent::Completed {
                                     response_id: live.conversation_id.clone(),
@@ -1405,18 +1563,34 @@ async fn connector_loop(
                     }
                 }
             }
-            _ = tokio::time::sleep_until(stall_deadline) => {
-                let seconds = idle_timeout.map(|timeout| timeout.as_secs()).unwrap_or_default();
-                live.broker.end_turn(&live.turn_token, "no progress").await;
-                stop_generation(&driver.ops, &live.conversation_id).await;
-                state.mark_unanswered(live.echoed);
+        _ = tokio::time::sleep_until(stall_deadline) => {
+            // A quiet Pro turn needs one activated DOM/API recheck before the
+            // watchdog is allowed to stop it. The next iteration performs the
+            // read on this same conversation and preserves its turn token.
+            force_recheck = true;
+            watchdog_recheck = true;
+            last_progress = tokio::time::Instant::now();
+            continue;
+        }
+        }
+        if force_recheck {
+            if live.tracker.async_running() {
+                last_progress = tokio::time::Instant::now();
+                watchdog_recheck = false;
+            } else if watchdog_recheck {
+                live.broker
+                    .end_turn(&live.turn_token, "the conversation remained quiet")
+                    .await;
+                driver.tabs.release_conversation(&live.conversation_id);
+                state.mark_unanswered(live.echoed.clone());
                 let _ = tx_event
-                    .send(Err(CodexErr::UnsupportedOperation(format!(
-                        "chatgpt_web connector: no progress for {seconds}s; generation stopped"
-                    ))))
+                    .send(Err(CodexErr::Stream(
+                        "ChatGPT made no progress after a fresh conversation check".to_string(),
+                    )))
                     .await;
                 return;
             }
+            force_recheck = false;
         }
     }
 }
@@ -1473,11 +1647,13 @@ async fn run_compaction_turn(
         }
     };
     let conversation_id = sent.conversation_id.clone();
+    let mut tracker = stream::ReplyTracker::new(&rendered.text);
+    tracker.set_activity(workspace.agent_activity.clone());
     let source = OpsSource(&driver.ops);
     let outcome = stream::PollLoop {
         source: &source,
         conversation_id: conversation_id.clone(),
-        tracker: stream::ReplyTracker::new(&rendered.text),
+        tracker,
         mode: stream::TrackMode::None,
         poll_interval: workspace.settings.poll_interval,
         idle_timeout: workspace.settings.idle_timeout,
@@ -1649,6 +1825,24 @@ mod tests {
                 .to_string()
                 .contains("compose")
         );
+    }
+
+    /// FORK: a sweeper closing a tab still owned by a live/recoverable
+    /// generation was the exact bug this guards — only a confirmed 404
+    /// (the conversation is actually gone) may release its tab's affinity.
+    #[test]
+    fn only_a_confirmed_gone_conversation_releases_tab_affinity() {
+        assert!(conversation_confirmed_gone(
+            &DriverErrorKind::ConversationNotFound
+        ));
+        assert!(!conversation_confirmed_gone(&DriverErrorKind::Other));
+        assert!(!conversation_confirmed_gone(&DriverErrorKind::DaemonDown));
+        assert!(!conversation_confirmed_gone(&DriverErrorKind::Timeout));
+        assert!(!conversation_confirmed_gone(&DriverErrorKind::Busy));
+        assert!(!conversation_confirmed_gone(&DriverErrorKind::Upstream));
+        assert!(!conversation_confirmed_gone(
+            &DriverErrorKind::LoginRequired
+        ));
     }
 
     #[test]

@@ -39,6 +39,14 @@ fn approval_script_is_pure_and_matches_pt_and_en_buttons() {
     assert!(script.contains("permitir uma vez|allow once"));
     assert!(script.contains(r#"[data-testid="tool-approval-card"]"#));
     assert!(script.contains("const PREFER_ALWAYS = true"));
+    assert!(script.contains("target.click()"));
+    assert!(script.contains("confirmed: true"));
+    assert!(script.contains("state,"));
+    assert!(script.contains("'pending'"));
+    assert!(script.contains("details(live[live.length - 1], 'rerendered'"));
+    assert!(script.contains("const ABSENCE_STABLE_MS = 300"));
+    assert!(script.contains("let absentSince = null"));
+    assert!(!script.contains("dispatchEvent"));
 }
 
 #[test]
@@ -48,4 +56,29 @@ fn an_approval_click_decodes() {
             .expect("decode");
     assert!(result.clicked);
     assert_eq!(result.button.as_deref(), Some("Sempre permitir"));
+}
+
+#[test]
+fn an_approval_requires_a_postcondition_before_confirmation() {
+    let pending: ApprovalResult = serde_json::from_str(
+        r#"{"found": true, "clicked": true, "confirmed": false, "state": "pending", "button": "Allow once"}"#,
+    )
+    .expect("pending decode");
+    assert_eq!(pending.state, ApprovalState::Pending);
+    assert!(pending.clicked);
+    assert!(!pending.confirmed);
+
+    let rerendered: ApprovalResult = serde_json::from_str(
+        r#"{"found": true, "clicked": true, "confirmed": false, "state": "rerendered", "button": "Allow once"}"#,
+    )
+    .expect("rerendered decode");
+    assert_eq!(rerendered.state, ApprovalState::Rerendered);
+    assert!(!rerendered.confirmed);
+
+    let confirmed: ApprovalResult = serde_json::from_str(
+        r#"{"found": true, "clicked": true, "confirmed": true, "state": "confirmed", "button": "Allow once"}"#,
+    )
+    .expect("confirmed decode");
+    assert_eq!(confirmed.state, ApprovalState::Confirmed);
+    assert!(confirmed.confirmed);
 }

@@ -54,6 +54,7 @@ use super::api::normalize_with;
 use super::daemon::DEFAULT_TOOL_TIMEOUT_MS;
 use super::daemon::DaemonClient;
 use super::page_scripts;
+use super::page_scripts::ChatModeSelection;
 use super::page_scripts::ComposerState;
 use super::page_scripts::DomProgress;
 use super::page_scripts::MenuKind;
@@ -279,18 +280,6 @@ pub(crate) struct ResolvedModel {
     pub(crate) expect_label: Option<String>,
 }
 
-/// `(defaultSlug ?? "gpt-5-6").replace(/-(instant|thinking|pro|mini|t-mini)$/i, "")`.
-pub(crate) fn model_family_base(default_slug: Option<&str>) -> String {
-    static SUFFIX: OnceLock<Regex> = OnceLock::new();
-    let suffix = SUFFIX.get_or_init(|| {
-        #[expect(clippy::expect_used, reason = "the pattern is a compile-time literal")]
-        Regex::new("(?i)-(instant|thinking|pro|mini|t-mini)$").expect("suffix regex must compile")
-    });
-    suffix
-        .replace(default_slug.unwrap_or("gpt-5-6"), "")
-        .into_owned()
-}
-
 /// FORK: an exact slug needs no fresh catalog. If the cached list already
 /// names it, answer from the cache and skip the `GET /backend-api/models`
 /// entirely; anything else falls through to the fetch.
@@ -324,6 +313,31 @@ pub(crate) fn resolve_model_with(
     if *spec == ModelSpec::Auto {
         return Ok(ResolvedModel::default());
     }
+
+    // Named lines are effort requests. Resolve them entirely from the
+    // current picker so an old `/backend-api/models` family cannot silently
+    // turn `chatgpt-web/pro` into a stale GPT-5.6 URL.
+    let select = |key: &str| level_spec(key).map(LevelSpec::anchored);
+    let verify = |key: &str| level_spec(key).map(LevelSpec::loose);
+    let index = |key: &str| level_spec(key).map(|spec| spec.index);
+    let named = |key: &str| ResolvedModel {
+        slug: None,
+        menu_level: select(key),
+        menu_index: index(key),
+        expect_label: verify(key),
+    };
+    let named = match spec {
+        ModelSpec::Instant => Some(named("instant")),
+        ModelSpec::Thinking | ModelSpec::Medium => Some(named("medium")),
+        ModelSpec::High => Some(named("high")),
+        ModelSpec::ExtraHigh => Some(named("extra-high")),
+        ModelSpec::Pro => Some(named("pro")),
+        ModelSpec::Auto | ModelSpec::Slug(_) => None,
+    };
+    if let Some(resolved) = named {
+        return Ok(resolved);
+    }
+
     let slugs: Vec<&str> = models.models.iter().map(|m| m.slug.as_str()).collect();
     // `if (slugs.has(spec)) return { slug: spec, menuLevel: null, expectLabel: null };`
     if let ModelSpec::Slug(slug) = spec
@@ -335,61 +349,15 @@ pub(crate) fn resolve_model_with(
         });
     }
 
-    // Derive the current family base (e.g. "gpt-5-6") from the default slug.
-    let base = model_family_base(models.default_slug.as_deref());
-    // `const pick = (suffix) => { const cand = `${base}-${suffix}`; if (slugs.has(cand)) return cand;
-    //   const any = models.find((m) => m.slug.endsWith(`-${suffix}`)); return any ? any.slug : null; };`
-    let pick = |suffix: &str| -> Option<String> {
-        let candidate = format!("{base}-{suffix}");
-        if slugs.contains(&candidate.as_str()) {
-            return Some(candidate);
-        }
-        let ending = format!("-{suffix}");
-        slugs
-            .iter()
-            .find(|slug| slug.ends_with(&ending))
-            .map(|slug| (*slug).to_string())
-    };
+    if let ModelSpec::Slug(_) = spec {
+        return Err(DriverError::other(format!(
+            "Unknown model '{}'. Use auto|instant|thinking|medium|high|extra-high|pro or an exact slug. Known slugs: {}",
+            spec.as_str(),
+            slugs.join(", ")
+        )));
+    }
 
-    // Selecting is anchored ("Alta" must not select "Extra alta"); verifying is
-    // not, because the composer button reads "GPT-5.6 Alta", not "Alta".
-    let select = |key: &str| level_spec(key).map(LevelSpec::anchored);
-    let verify = |key: &str| level_spec(key).map(LevelSpec::loose);
-    let index = |key: &str| level_spec(key).map(|spec| spec.index);
-    let resolved = match spec {
-        ModelSpec::Instant => ResolvedModel {
-            slug: pick("instant"),
-            menu_level: None,
-            menu_index: None,
-            expect_label: verify("instant"),
-        },
-        ModelSpec::Thinking => ResolvedModel {
-            slug: pick("thinking"),
-            menu_level: None,
-            menu_index: None,
-            expect_label: None,
-        },
-        ModelSpec::Pro => ResolvedModel {
-            slug: pick("pro"),
-            menu_level: None,
-            menu_index: None,
-            expect_label: verify("pro"),
-        },
-        ModelSpec::Medium | ModelSpec::High | ModelSpec::ExtraHigh => ResolvedModel {
-            slug: pick("thinking"),
-            menu_level: select(spec.as_str()),
-            menu_index: index(spec.as_str()),
-            expect_label: verify(spec.as_str()),
-        },
-        ModelSpec::Auto | ModelSpec::Slug(_) => {
-            return Err(DriverError::other(format!(
-                "Unknown model '{}'. Use auto|instant|thinking|medium|high|extra-high|pro or an exact slug. Known slugs: {}",
-                spec.as_str(),
-                slugs.join(", ")
-            )));
-        }
-    };
-    Ok(resolved)
+    Ok(ResolvedModel::default())
 }
 
 // ---------------------------------------------------------------------------
@@ -466,7 +434,8 @@ pub(crate) struct SendRequest {
     /// `None` = new chat (with the optional model spec).
     pub(crate) conversation_id: Option<String>,
     pub(crate) text: String,
-    /// Ignored (with a note) when continuing an existing conversation.
+    /// Named effort is applied in the current conversation; an exact backend
+    /// slug can only select the model while starting a new conversation.
     pub(crate) model: Option<ModelSpec>,
     /// Attached before the text.
     pub(crate) files: Vec<PathBuf>,
@@ -602,6 +571,9 @@ pub(crate) struct MenuSelection {
     /// here is worth reporting but is not a failure: the ordinal is what we
     /// asked for, and the labels are the part that keeps moving.
     pub(crate) label_matched: Option<bool>,
+    /// `aria-checked` postcondition for the current model radio in the
+    /// unified picker. `None` is the legacy picker shape.
+    pub(crate) model_checked: Option<bool>,
 }
 
 /// `stageDownload` result.
@@ -1169,6 +1141,9 @@ impl ChatGptOps {
         if spec.is_none_or(|spec| *spec == ModelSpec::Auto) {
             return Ok(ResolvedModel::default());
         }
+        if !matches!(spec, Some(ModelSpec::Slug(_))) {
+            return resolve_model_with(spec, &ModelsInfo::default());
+        }
         let api = self.api_for(None).await?;
         if let Some(resolved) = resolved_from_cached_models(&api, spec) {
             return Ok(resolved);
@@ -1185,6 +1160,9 @@ impl ChatGptOps {
     ) -> DriverResult<ResolvedModel> {
         if spec.is_none_or(|spec| *spec == ModelSpec::Auto) {
             return Ok(ResolvedModel::default());
+        }
+        if !matches!(spec, Some(ModelSpec::Slug(_))) {
+            return resolve_model_with(spec, &ModelsInfo::default());
         }
         let api = self.api_on(tab_id);
         if let Some(resolved) = resolved_from_cached_models(&api, spec) {
@@ -1234,6 +1212,19 @@ impl ChatGptOps {
             .await
     }
 
+    /// Ensure the optional Chat/Work banner is in Chat mode on this tab.
+    async fn select_chat_mode_on(&self, tab_id: TabId) -> DriverResult<ChatModeSelection> {
+        self.tabs
+            .with_activated_on(tab_id, |id| {
+                self.eval_as(
+                    id,
+                    page_scripts::select_chat_mode(),
+                    DEFAULT_TOOL_TIMEOUT_MS,
+                )
+            })
+            .await
+    }
+
     /// Port of `discoverMenu`: dump the composer model/level menu (activates a tab).
     pub(crate) async fn discover_menu(&self) -> DriverResult<Value> {
         self.tabs
@@ -1268,6 +1259,72 @@ impl ChatGptOps {
             DEFAULT_TOOL_TIMEOUT_MS,
         )
         .await
+    }
+
+    /// Select and verify a named effort in the current tab. The unified
+    /// picker must prove both the requested slider position and the checked
+    /// `Recente` model radio before a send is allowed to proceed.
+    async fn select_effort_on(
+        &self,
+        tab_id: TabId,
+        resolved: &ResolvedModel,
+    ) -> DriverResult<Option<MenuSelection>> {
+        let Some(level) = resolved.menu_level.as_deref() else {
+            return Ok(None);
+        };
+        let selection = self
+            .set_level_via_menu_on(tab_id, level, resolved.menu_index)
+            .await?;
+        if !selection.ok {
+            let available = if selection.available.is_empty() {
+                String::new()
+            } else {
+                format!("; available: {}", selection.available.join(", "))
+            };
+            return Err(DriverError::ui_changed(format!(
+                "could not confirm requested effort level before send: {}{available}",
+                selection
+                    .error
+                    .as_deref()
+                    .unwrap_or("picker selection was ambiguous")
+            )));
+        }
+
+        let level_confirmed = match (selection.index, resolved.menu_index) {
+            (Some(actual), Some(expected)) => actual == expected,
+            (None, _) => selection.label_matched == Some(true),
+            _ => false,
+        };
+        if !level_confirmed {
+            return Err(DriverError::ui_changed(format!(
+                "effort picker did not confirm requested position (wanted {:?}, got {:?})",
+                resolved.menu_index, selection.index
+            )));
+        }
+        if selection.model_checked != Some(true) {
+            return Err(DriverError::ui_changed(
+                "current model radio Recente was not confirmed checked before send",
+            ));
+        }
+
+        Ok(Some(selection))
+    }
+
+    fn record_effort_selection(notes: &mut Vec<String>, selection: &MenuSelection) {
+        let position = match (selection.index, selection.total) {
+            (Some(index), Some(total)) => format!(" ({index}/{total})"),
+            _ => String::new(),
+        };
+        notes.push(format!(
+            "effort level set through picker: {}{position}",
+            selection.selected.as_deref().unwrap_or("?")
+        ));
+        if selection.label_matched == Some(false) {
+            notes.push(format!(
+                "the picker labelled stop '{}', not name Codex knows — ordinal selection stands, but label table out date",
+                selection.selected.as_deref().unwrap_or("?")
+            ));
+        }
     }
 
     /// `composerState`, retrying briefly until the model label renders — the
@@ -1405,10 +1462,38 @@ impl ChatGptOps {
             self.tabs
                 .show_conversation_on(tab_id, Some(conversation_id))
                 .await?;
-            if request.model.is_some() {
-                notes.push(
-                    "model spec is ignored when continuing an existing conversation".to_string(),
-                );
+            if let Some(spec) = request.model.as_ref() {
+                phase.set(FailurePhase::Model);
+                let resolved = self.resolve_model_on(tab_id, Some(spec)).await?;
+                if resolved.slug.is_some() {
+                    return Err(DriverError::ui_changed(
+                        "an exact backend model slug cannot be changed on an existing conversation",
+                    ));
+                }
+                if let Some(selection) = self.select_effort_on(tab_id, &resolved).await? {
+                    Self::record_effort_selection(&mut notes, &selection);
+                }
+                self.tabs
+                    .wait_ready_on(tab_id, Duration::from_secs(20))
+                    .await?;
+                if let Some(expect) = resolved.expect_label.as_deref() {
+                    let state = self.composer_state_with_label_on(tab_id).await?;
+                    if let Ok(expect) = Regex::new(&format!("(?i){expect}")) {
+                        let candidates: Vec<&str> = state
+                            .model_label
+                            .as_deref()
+                            .into_iter()
+                            .chain(state.pills.iter().map(String::as_str))
+                            .collect();
+                        if !candidates.is_empty()
+                            && !candidates.iter().any(|label| expect.is_match(label))
+                        {
+                            notes.push(format!(
+                                "composer shows {candidates:?}, none matches requested model — the picker UI may have changed"
+                            ));
+                        }
+                    }
+                }
             }
         } else {
             phase.set(FailurePhase::Model);
@@ -1420,38 +1505,10 @@ impl ChatGptOps {
                 None => format!("{}/", self.base_url),
             };
             self.tabs.goto_on(tab_id, &url).await?;
-            if let Some(level) = resolved.menu_level.as_deref() {
-                let selection = self
-                    .set_level_via_menu_on(tab_id, level, resolved.menu_index)
-                    .await?;
-                if selection.ok {
-                    // FORK: report the ordinal alongside the label. The labels
-                    // move (04/09 they read "Leve"/"Alta"), the ordinal does
-                    // not, so "Alta (3/5)" is the part worth reading.
-                    let position = match (selection.index, selection.total) {
-                        (Some(index), Some(total)) => format!(" ({index}/{total})"),
-                        _ => String::new(),
-                    };
-                    notes.push(format!(
-                        "effort level set through the picker: {}{position}",
-                        selection.selected.as_deref().unwrap_or("?")
-                    ));
-                    if selection.label_matched == Some(false) {
-                        notes.push(format!(
-                            "the picker labelled that stop '{}', which is not a name Codex knows — the ordinal selection stands, but the label table is out of date",
-                            selection.selected.as_deref().unwrap_or("?")
-                        ));
-                    }
-                } else {
-                    let available = if selection.available.is_empty() {
-                        String::new()
-                    } else {
-                        format!("; available: {}", selection.available.join(", "))
-                    };
-                    notes.push(format!(
-                        "exact level selection via menu failed ({}{available}); continuing with the model slug default",
-                        selection.error.as_deref().unwrap_or("unknown")
-                    ));
+            if resolved.menu_level.is_some() {
+                let selection = self.select_effort_on(tab_id, &resolved).await?;
+                if let Some(selection) = selection {
+                    Self::record_effort_selection(&mut notes, &selection);
                 }
                 self.tabs
                     .wait_ready_on(tab_id, Duration::from_secs(20))
@@ -1474,13 +1531,36 @@ impl ChatGptOps {
                         && !candidates.iter().any(|label| expect.is_match(label))
                     {
                         notes.push(format!(
-                            "composer shows {:?}, none of which matches the requested model — the picker UI may have changed",
-                            candidates
+                            "composer shows {candidates:?}, none of which matches the requested model — the picker UI may have changed"
                         ));
                     }
                 }
             }
         }
+
+        let mode = self.select_chat_mode_on(tab_id).await?;
+        if !mode.ok || (mode.present && mode.confirmed != Some(true)) {
+            return Err(DriverError::ui_changed(format!(
+                "could not confirm Chat mode before send: {}",
+                mode.error
+                    .as_deref()
+                    .unwrap_or("mode selection was ambiguous")
+            )));
+        }
+        if !mode.present {
+            notes.push(
+                "Chat/Work mode control absent; using the legacy page shape without inferring Work"
+                    .to_string(),
+            );
+        }
+
+        // Selecting Chat can make React remount the composer after the radio
+        // reports checked. Wait for the replacement node to stay mounted
+        // before the compose script captures it; a missing composer still
+        // fails at the bounded readiness deadline.
+        self.tabs
+            .wait_ready_on(tab_id, Duration::from_secs(20))
+            .await?;
 
         // Block sending into a conversation that is still generating. The DOM
         // lags the API by a beat after a reply completes (the stop button

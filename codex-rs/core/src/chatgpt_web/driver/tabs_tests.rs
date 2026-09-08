@@ -809,3 +809,69 @@ async fn pool_prunes_tabs_chrome_no_longer_has() {
     assert_eq!(pool.pool_info().len(), 1);
     assert_eq!(pool.primary_id(), Some(second));
 }
+
+#[tokio::test]
+async fn idle_sweeper_preserves_recoverable_bindings_until_released() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = registry_path(&dir);
+    let daemon = FakeDaemon::new(vec![tab(1, "https://example.com/", true)]);
+    let pool = Arc::new(pool_with(&daemon, &path, 3));
+    let first = pool.ensure().await.expect("ensure");
+    pool.bind(first, Some("conv-a"));
+
+    let release = Arc::new(Notify::new());
+    let holder = {
+        let pool = Arc::clone(&pool);
+        let release = Arc::clone(&release);
+        tokio::spawn(async move {
+            pool.with_tab_for(Some("conv-a"), |tab_id| async move {
+                release.notified().await;
+                Ok(tab_id)
+            })
+            .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if pool
+                .pool_info()
+                .iter()
+                .any(|info| info.tab_id == first && info.queued == 1)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("holder must own the bound tab");
+
+    let second = pool
+        .with_tab_for(Some("conv-b"), |tab_id| async move { Ok(tab_id) })
+        .await
+        .expect("grow pool");
+    pool.bind(second, Some("conv-b"));
+    release.notify_one();
+    holder.await.expect("holder task").expect("holder result");
+
+    for tab in pool.inner.snapshot() {
+        tab.state.lock().expect("tab state").last_used =
+            Instant::now() - pool.inner.idle - Duration::from_secs(1);
+    }
+    pool.inner.sweep_idle().await;
+    assert!(
+        pool.pool_info().iter().any(|info| info.tab_id == second),
+        "a bound conversation must remain recoverable"
+    );
+
+    pool.release_conversation("conv-b");
+    pool.inner.sweep_idle().await;
+    assert!(!pool.pool_info().iter().any(|info| info.tab_id == second));
+
+    pool.release_conversation("conv-a");
+    pool.inner.sweep_idle().await;
+    assert!(
+        pool.pool_info().is_empty(),
+        "the last unbound idle tab must be reclaimable"
+    );
+}

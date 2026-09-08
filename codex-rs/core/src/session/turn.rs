@@ -207,10 +207,16 @@ pub(crate) async fn run_turn(
     client_session.set_claude_code_workspace(crate::claude_code::ClaudeCodeWorkspace::from_config(
         turn_context.config.as_ref(),
     ));
-    // FORK: the `chatgpt_web` provider reads the same per-turn layout.
-    client_session.set_chatgpt_web_workspace(crate::chatgpt_web::ChatGptWebWorkspace::from_config(
-        turn_context.config.as_ref(),
-    ));
+    // FORK: the `chatgpt_web` provider reads the same per-turn layout, plus a
+    // handle back into this agent's activity registry so a long-running Pro
+    // wait can renew observable activity (see `AgentActivityHandle`).
+    client_session.set_chatgpt_web_workspace(
+        crate::chatgpt_web::ChatGptWebWorkspace::from_config(turn_context.config.as_ref())
+            .with_agent_activity(crate::chatgpt_web::AgentActivityHandle::new(
+                sess.services.agent_control.clone(),
+                sess.thread_id,
+            )),
+    );
     // TODO(ccunningham): Pre-turn compaction runs before context updates and the
     // new user message are recorded. Estimate pending incoming items (context
     // diffs/full reinjection + user input) and trigger compaction preemptively

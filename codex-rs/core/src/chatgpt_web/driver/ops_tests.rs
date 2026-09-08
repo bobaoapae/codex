@@ -115,6 +115,8 @@ fn script_kind(expr: &str) -> &'static str {
         "api_models"
     } else if expr.contains("/backend-api/conversation/") {
         "api_conversation"
+    } else if expr.contains("selecionar modo chat") || expr.contains("select chat mode") {
+        "chat_mode"
     } else if expr.contains("const TARGET =") {
         "menu_select"
     } else if expr.contains("pageErrorProbe") {
@@ -215,7 +217,7 @@ impl FakeDaemon {
             .and_then(|t| t.url.clone())
     }
 
-    fn default_for(&self, kind: &str) -> DriverResult<Value> {
+    fn default_for(&self, kind: &str, expression: Option<&str>) -> DriverResult<Value> {
         let uploaded = self.uploaded.lock().expect("uploaded").clone();
         let current_url = self
             .tabs
@@ -246,11 +248,33 @@ impl FakeDaemon {
                 "url": format!("{BASE_URL}/c/{NEW_ID}")
             })),
             "click_stop" => Ok(json!({"ok": true, "stillGenerating": false})),
+            "menu_select" => {
+                let index = expression
+                    .and_then(|expression| {
+                        [1_u32, 2, 3, 4, 5]
+                            .into_iter()
+                            .find(|index| expression.contains(&format!("const INDEX = {index};")))
+                    })
+                    .unwrap_or(3);
+                Ok(json!({
+                    "ok": true,
+                    "selected": "Recente",
+                    "labelMatched": true,
+                    "index": index,
+                    "total": 5,
+                    "modelChecked": true,
+                }))
+            }
             "api_models" => Ok(models_payload()),
             "api_conversation" => {
                 Ok(json!({"status": 200, "json": fixture("finished"), "text": null}))
             }
-            "menu_select" => Ok(json!({"ok": true, "selected": "Alto", "triggerLabel": "Alto"})),
+            "chat_mode" => Ok(json!({
+                "ok": true,
+                "present": false,
+                "selected": null,
+                "confirmed": null,
+            })),
             "page_errors" => Ok(json!({"texts": []})),
             _ => Ok(json!({})),
         }
@@ -349,7 +373,7 @@ impl TabDaemon for FakeDaemon {
         self.evals
             .lock()
             .expect("evals")
-            .push((kind, tab_id, expression));
+            .push((kind, tab_id, expression.clone()));
         let scripted = self
             .scripted
             .lock()
@@ -360,7 +384,7 @@ impl TabDaemon for FakeDaemon {
             Some(response) => response,
             None => match self.defaults.lock().expect("defaults").get(kind) {
                 Some(response) => response.clone(),
-                None => self.default_for(kind),
+                None => self.default_for(kind, Some(&expression)),
             },
         };
         Box::pin(async move { response })
@@ -456,40 +480,29 @@ fn resolve_model_passes_an_exact_slug_through() {
 }
 
 #[test]
-fn resolve_model_maps_instant_thinking_and_pro_to_family_slugs() {
-    // The default slug is `gpt-5-6-thinking`; the family base is `gpt-5-6`.
+fn resolve_model_routes_named_lines_through_the_current_picker() {
     let models = models_info();
-    assert_eq!(
-        resolve_model_with(Some(&ModelSpec::Instant), &models).expect("instant"),
-        ResolvedModel {
-            slug: Some("gpt-5-6-instant".to_string()),
-            menu_level: None,
-            menu_index: None,
-            expect_label: Some(level_spec("instant").expect("instant").loose()),
-        }
-    );
-    assert_eq!(
-        resolve_model_with(Some(&ModelSpec::Thinking), &models).expect("thinking"),
-        ResolvedModel {
-            slug: Some("gpt-5-6-thinking".to_string()),
-            menu_level: None,
-            menu_index: None,
-            expect_label: None,
-        }
-    );
-    assert_eq!(
-        resolve_model_with(Some(&ModelSpec::Pro), &models).expect("pro"),
-        ResolvedModel {
-            slug: Some("gpt-5-6-pro".to_string()),
-            menu_level: None,
-            menu_index: None,
-            expect_label: Some(level_spec("pro").expect("pro").loose()),
-        }
-    );
+    for (spec, key) in [
+        (ModelSpec::Instant, "instant"),
+        (ModelSpec::Thinking, "medium"),
+        (ModelSpec::Pro, "pro"),
+    ] {
+        let level = level_spec(key).expect("level");
+        assert_eq!(
+            resolve_model_with(Some(&spec), &models).expect("named line"),
+            ResolvedModel {
+                slug: None,
+                menu_level: Some(level.anchored()),
+                menu_index: Some(level.index),
+                expect_label: Some(level.loose()),
+            },
+            "{spec:?}"
+        );
+    }
 }
 
 #[test]
-fn resolve_model_picks_the_thinking_slug_plus_a_menu_level_for_effort_specs() {
+fn resolve_model_uses_the_picker_for_each_effort_spec() {
     let models = models_info();
     for (spec, key, index) in [
         (ModelSpec::Medium, "medium", 2),
@@ -500,9 +513,7 @@ fn resolve_model_picks_the_thinking_slug_plus_a_menu_level_for_effort_specs() {
         assert_eq!(
             resolve_model_with(Some(&spec), &models).expect("effort"),
             ResolvedModel {
-                slug: Some("gpt-5-6-thinking".to_string()),
-                // Selecting is anchored, verifying is not: the composer button
-                // reads "GPT-5.6 Alta", not "Alta".
+                slug: None,
                 menu_level: Some(level.anchored()),
                 menu_index: Some(index),
                 expect_label: Some(level.loose()),
@@ -513,8 +524,9 @@ fn resolve_model_picks_the_thinking_slug_plus_a_menu_level_for_effort_specs() {
 }
 
 #[test]
-fn resolve_model_falls_back_to_any_slug_with_the_suffix() {
-    // Default family `gpt-5-7` has no instant slug; the only `-instant` wins.
+fn resolve_model_does_not_fall_back_to_a_family_slug_for_named_levels() {
+    // Named levels do not fall back to a stale family slug when the catalog
+    // changes; the current UI model choice remains authoritative.
     let models = ModelsInfo {
         default_slug: Some("gpt-5-7".to_string()),
         models: vec![
@@ -529,8 +541,8 @@ fn resolve_model_falls_back_to_any_slug_with_the_suffix() {
         ],
     };
     let resolved = resolve_model_with(Some(&ModelSpec::Instant), &models).expect("instant");
-    assert_eq!(resolved.slug.as_deref(), Some("gpt-5-6-instant"));
-    // No pro slug anywhere: `slug: None` (account default), label still expected.
+    assert_eq!(resolved.slug, None);
+    assert_eq!(resolved.menu_index, Some(1));
     let resolved = resolve_model_with(Some(&ModelSpec::Pro), &models).expect("pro");
     assert_eq!(resolved.slug, None);
     assert_eq!(
@@ -550,17 +562,6 @@ fn resolve_model_rejects_an_unknown_name_listing_known_slugs() {
         error.message
     );
     assert!(error.message.contains("gpt-5-6-pro"), "{}", error.message);
-}
-
-#[test]
-fn model_family_base_strips_known_suffixes() {
-    assert_eq!(model_family_base(Some("gpt-5-6-thinking")), "gpt-5-6");
-    assert_eq!(model_family_base(Some("gpt-5-6-instant")), "gpt-5-6");
-    assert_eq!(model_family_base(Some("gpt-5-6-PRO")), "gpt-5-6");
-    assert_eq!(model_family_base(Some("gpt-5-6-t-mini")), "gpt-5-6");
-    assert_eq!(model_family_base(Some("gpt-5-6-mini")), "gpt-5-6");
-    assert_eq!(model_family_base(Some("gpt-5-6")), "gpt-5-6");
-    assert_eq!(model_family_base(None), "gpt-5-6");
 }
 
 #[test]
@@ -892,7 +893,7 @@ fn check_reply_watches_asset_tool_turns() {
 // ---- send phase machine (fake daemon + real pool) -------------------------------
 
 #[tokio::test]
-async fn send_new_chat_navigates_to_the_model_url_and_returns_the_conversation_id() {
+async fn send_new_chat_selects_effort_in_the_current_picker() {
     let h = harness();
     let sent = h
         .ops
@@ -902,11 +903,17 @@ async fn send_new_chat_navigates_to_the_model_url_and_returns_the_conversation_i
     assert_eq!(sent.conversation_id, NEW_ID);
     assert_eq!(sent.phase_reached, FailurePhase::Confirm);
     assert_eq!(sent.model_label.as_deref(), Some("Instant"));
-    assert_eq!(sent.notes, Vec::<String>::new());
-    assert_eq!(
-        h.daemon.navigations(),
-        vec![format!("{BASE_URL}/?model=gpt-5-6-instant")]
+    assert!(
+        sent.notes
+            .iter()
+            .any(|note| note.contains("effort level set through picker"))
     );
+    assert!(
+        sent.notes
+            .iter()
+            .any(|note| note.contains("Chat/Work mode control absent"))
+    );
+    assert_eq!(h.daemon.navigations(), vec![format!("{BASE_URL}/")]);
     let kinds = h.daemon.eval_kinds();
     let compose = kinds
         .iter()
@@ -926,15 +933,56 @@ async fn send_new_chat_navigates_to_the_model_url_and_returns_the_conversation_i
 }
 
 #[tokio::test]
-async fn send_continuation_ignores_the_model_spec_with_a_note() {
+async fn send_rechecks_a_stable_composer_after_chat_mode_remount() {
+    let h = harness();
+    h.daemon.script(
+        "chat_mode",
+        Ok(json!({
+            "ok": true,
+            "present": true,
+            "selected": "Chat",
+            "confirmed": true,
+        })),
+    );
+
+    h.ops
+        .send(new_chat("wait for the composer", None))
+        .await
+        .expect("send after the composer remount");
+
+    let kinds = h.daemon.eval_kinds();
+    let mode = kinds
+        .iter()
+        .position(|kind| *kind == "chat_mode")
+        .expect("Chat mode preflight");
+    let readiness = kinds[mode + 1..]
+        .iter()
+        .position(|kind| *kind == "wait_ready")
+        .map(|offset| mode + 1 + offset)
+        .expect("composer readiness after Chat mode");
+    let compose = kinds
+        .iter()
+        .position(|kind| *kind == "set_composer_text")
+        .expect("compose");
+    assert!(mode < readiness && readiness < compose);
+}
+
+#[tokio::test]
+async fn send_continuation_applies_named_effort_on_the_same_conversation_tab() {
     let h = harness();
     let mut request = continuation(FINISHED_ID, "Continue.");
     request.model = Some(ModelSpec::Pro);
     let sent = h.ops.send(request).await.expect("send");
     assert_eq!(sent.conversation_id, NEW_ID, "the click result's id wins");
-    assert_eq!(
-        sent.notes,
-        vec!["model spec is ignored when continuing an existing conversation".to_string()]
+    assert!(
+        sent.notes
+            .iter()
+            .any(|note| { note.contains("effort level set through picker") })
+    );
+    assert!(
+        sent.notes
+            .iter()
+            .any(|note| note.contains("Chat/Work mode control absent"))
     );
     assert_eq!(
         h.daemon.navigations(),
@@ -942,8 +990,11 @@ async fn send_continuation_ignores_the_model_spec_with_a_note() {
     );
     assert!(
         h.daemon.evals_of("api_models").is_empty(),
-        "no model lookup"
+        "named effort uses the picker"
     );
+    let menu = h.daemon.evals_of("menu_select");
+    assert_eq!(menu.len(), 1);
+    assert!(menu[0].contains("const INDEX = 5;"), "{}", menu[0]);
 }
 
 #[tokio::test]
@@ -1224,7 +1275,12 @@ async fn send_with_files_uploads_images_and_documents_on_their_inputs() {
         .await
         .expect("send with files");
     assert_eq!(sent.conversation_id, NEW_ID);
-    assert_eq!(sent.notes, Vec::<String>::new());
+    assert_eq!(sent.notes.len(), 1, "{:?}", sent.notes);
+    assert!(
+        sent.notes
+            .iter()
+            .any(|note| note.contains("Chat/Work mode control absent"))
+    );
 
     let uploads = h.daemon.calls_named("browser_upload");
     let described: Vec<(String, Vec<String>)> = uploads
@@ -1340,10 +1396,7 @@ async fn send_selects_the_level_via_the_menu_for_effort_specs() {
         .await
         .expect("send");
     assert_eq!(sent.conversation_id, NEW_ID);
-    assert_eq!(
-        h.daemon.navigations(),
-        vec![format!("{BASE_URL}/?model=gpt-5-6-thinking")]
-    );
+    assert_eq!(h.daemon.navigations(), vec![format!("{BASE_URL}/")]);
     let menu = h.daemon.evals_of("menu_select");
     assert_eq!(menu.len(), 1);
     // FORK: the label table carries every spelling the picker has used, and
@@ -1354,33 +1407,156 @@ async fn send_selects_the_level_via_the_menu_for_effort_specs() {
         menu[0]
     );
     assert!(menu[0].contains("const INDEX = 3;"), "{}", menu[0]);
-    // with_activated_on: activate → menu → reload.
+    // The level picker and the Chat/Work preflight each use with_activated_on:
+    // activate → menu → reload, twice.
     let activations = h
         .daemon
         .calls_named("browser_tabs")
         .into_iter()
         .filter(|args| args["action"] == "activate")
         .count();
-    assert_eq!(activations, 1);
+    assert_eq!(activations, 2);
     let reloads = h
         .daemon
         .calls_named("browser_navigate")
         .into_iter()
         .filter(|args| args["action"] == "reload")
         .count();
-    assert_eq!(reloads, 1);
+    assert_eq!(reloads, 2);
     // The picker reports what it selected, and neither the label "Instant" from
     // the fake composer nor any pill matches the requested level.
-    assert_eq!(sent.notes.len(), 2, "{:?}", sent.notes);
+    assert!(sent.notes.len() >= 3, "{:?}", sent.notes);
     assert!(
-        sent.notes[0].contains("effort level set through the picker"),
+        sent.notes[0].contains("effort level set through picker"),
         "{}",
         sent.notes[0]
     );
     assert!(
-        sent.notes[1].contains("Instant"),
-        "{}",
-        sent.notes[1]
+        sent.notes.iter().any(|note| note.contains("Instant")),
+        "{:?}",
+        sent.notes
+    );
+    assert!(
+        sent.notes
+            .iter()
+            .any(|note| note.contains("Chat/Work mode control absent"))
+    );
+}
+
+#[tokio::test]
+async fn send_fails_before_click_send_when_effort_selection_is_not_confirmed() {
+    let h = harness();
+    h.daemon.script(
+        "menu_select",
+        Ok(json!({
+            "ok": false,
+            "error": "current model option Recente did not become checked",
+            "modelChecked": false,
+        })),
+    );
+
+    let error = h
+        .ops
+        .send(new_chat("hello", Some(ModelSpec::High)))
+        .await
+        .expect_err("ambiguous effort selection must block send");
+
+    assert_eq!(error.kind, DriverErrorKind::UiChanged);
+    assert_eq!(error.phase, Some(FailurePhase::Model));
+    assert_eq!(error.message_landed, Some(false));
+    assert!(h.daemon.evals_of("click_send").is_empty());
+}
+
+#[tokio::test]
+async fn send_fails_before_click_send_when_model_checked_is_missing() {
+    let h = harness();
+    h.daemon.script(
+        "menu_select",
+        Ok(json!({
+            "ok": true,
+            "selected": "Alta",
+            "labelMatched": true,
+            "index": 3,
+            "total": 5,
+        })),
+    );
+
+    let error = h
+        .ops
+        .send(new_chat("hello", Some(ModelSpec::High)))
+        .await
+        .expect_err("missing modelChecked must block send");
+
+    assert_eq!(error.kind, DriverErrorKind::UiChanged);
+    assert_eq!(error.phase, Some(FailurePhase::Model));
+    assert_eq!(error.message_landed, Some(false));
+    assert!(h.daemon.evals_of("click_send").is_empty());
+}
+
+#[tokio::test]
+async fn send_fails_before_click_send_when_chat_mode_cannot_be_confirmed() {
+    let h = harness();
+    h.daemon.script(
+        "chat_mode",
+        Ok(json!({
+            "ok": false,
+            "present": true,
+            "selected": "Work",
+            "confirmed": false,
+            "error": "Chat mode radio did not become checked",
+        })),
+    );
+
+    let error = h
+        .ops
+        .send(new_chat("hello", None))
+        .await
+        .expect_err("unconfirmed Chat mode must block send");
+
+    assert_eq!(error.kind, DriverErrorKind::UiChanged);
+    assert_eq!(error.phase, Some(FailurePhase::Model));
+    assert_eq!(error.message_landed, Some(false));
+    assert!(h.daemon.evals_of("click_send").is_empty());
+}
+
+#[tokio::test]
+async fn send_preserves_an_exact_backend_slug_in_the_navigation_url() {
+    let h = harness();
+    let sent = h
+        .ops
+        .send(new_chat(
+            "hello",
+            Some(ModelSpec::Slug("gpt-5-6-pro".to_string())),
+        ))
+        .await
+        .expect("send");
+
+    assert_eq!(sent.conversation_id, NEW_ID);
+    assert_eq!(
+        h.daemon.navigations(),
+        vec![format!("{BASE_URL}/?model=gpt-5-6-pro")]
+    );
+}
+
+#[tokio::test]
+async fn continuation_rejects_an_exact_backend_slug_before_click_send() {
+    let h = harness();
+    let mut request = continuation(FINISHED_ID, "hello");
+    request.model = Some(ModelSpec::Slug("gpt-5-6-pro".to_string()));
+
+    let error = h
+        .ops
+        .send(request)
+        .await
+        .expect_err("a backend slug cannot change an existing conversation");
+
+    assert_eq!(error.kind, DriverErrorKind::UiChanged);
+    assert_eq!(error.phase, Some(FailurePhase::Model));
+    assert_eq!(error.message_landed, Some(false));
+    assert!(h.daemon.evals_of("click_send").is_empty());
+    assert_eq!(
+        h.daemon.navigations(),
+        vec![format!("{BASE_URL}/c/{FINISHED_ID}")]
     );
 }
 
@@ -1464,16 +1640,16 @@ async fn wait_reply_reports_generating_when_the_wait_runs_out() {
 }
 
 #[tokio::test]
-async fn resolve_model_fetches_the_model_list_through_a_read_tab() {
+async fn resolve_model_keeps_named_lines_in_the_ui_picker() {
     let h = harness();
     let resolved = h
         .ops
         .resolve_model(Some(&ModelSpec::Pro))
         .await
         .expect("pro");
-    assert_eq!(resolved.slug.as_deref(), Some("gpt-5-6-pro"));
-    // (The process-wide models cache may already be warm from a sibling test,
-    // so the fetch count is not asserted.) Auto never fetches:
+    assert_eq!(resolved.slug, None);
+    assert_eq!(resolved.menu_index, Some(5));
+    // Named levels and Auto do not fetch a stale backend catalog.
     let before = h.daemon.evals_of("api_models").len();
     let auto = h
         .ops
@@ -1796,9 +1972,10 @@ mod live {
                 .await
                 .map_err(|e| format!("resolve failed: {e}"))?;
             eprintln!("[live] pro → {resolved:?}");
-            match resolved.slug.as_deref() {
-                Some(slug) if slug.ends_with("-pro") => Ok(()),
-                other => Err(format!("expected a -pro slug, got {other:?}")),
+            if resolved.slug.is_none() && resolved.menu_index == Some(5) {
+                Ok(())
+            } else {
+                Err(format!("expected UI Pro position, got {resolved:?}"))
             }
         }
         .await;

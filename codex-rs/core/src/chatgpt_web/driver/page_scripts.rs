@@ -85,15 +85,30 @@ pub(super) fn wait_ready(timeout_ms: u64) -> String {
     fill(
         r#"() => new Promise((res) => {
     const t0 = Date.now();
+    let lastEd = null;
+    let lastForm = null;
+    let stableSince = 0;
     const iv = setInterval(() => {
       const ed = document.querySelector('#prompt-textarea');
       const form = ed ? ed.closest('form') : null;
       const login = !!document.querySelector('[data-testid*="login"], a[href*="/auth/login"]');
-      if ((ed && form) || login || Date.now() - t0 > @@TIMEOUT_MS@@) {
+      if (ed && form) {
+        if (ed !== lastEd || form !== lastForm) {
+          lastEd = ed;
+          lastForm = form;
+          stableSince = Date.now();
+        }
+      } else {
+        lastEd = null;
+        lastForm = null;
+        stableSince = 0;
+      }
+      const stable = stableSince > 0 && Date.now() - stableSince >= 250;
+      if (stable || login || Date.now() - t0 > @@TIMEOUT_MS@@) {
         clearInterval(iv);
         res(JSON.stringify({
-          ready: !!(ed && form),
-          loginRequired: !(ed && form) && login,
+          ready: stable,
+          loginRequired: !stable && login,
           url: location.href,
           ms: Date.now() - t0,
         }));
@@ -122,6 +137,92 @@ pub(crate) struct ComposerState {
     pub(crate) generating: bool,
     pub(crate) attachments: u64,
     pub(crate) text: Option<String>,
+}
+
+/// Result of the optional Chat/Work mode control. Newer ChatGPT pages expose
+/// this as a labelled radio group; older pages do not render the control.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(default, rename_all = "camelCase")]
+pub(crate) struct ChatModeSelection {
+    pub(crate) ok: bool,
+    pub(crate) present: bool,
+    pub(crate) selected: Option<String>,
+    pub(crate) confirmed: Option<bool>,
+    pub(crate) error: Option<String>,
+}
+
+/// Select Chat and verify the radio postcondition when the Chat/Work banner
+/// exists. Its absence is a legacy page shape and is reported as successful
+/// so callers do not infer Work from a missing control.
+pub(super) fn select_chat_mode() -> String {
+    r#"() => {
+        const groups = Array.from(document.querySelectorAll('[role="radiogroup"]'));
+        const group = groups.find((candidate) => {
+            const text = `${candidate.getAttribute('aria-label') || ''} ${candidate.textContent || ''}`;
+            return /selecionar modo chat|select chat mode|chat mode/i.test(text);
+        });
+        if (!group) {
+            return JSON.stringify({ ok: true, present: false, selected: null, confirmed: null });
+        }
+ const radios = Array.from(group.querySelectorAll('[role="radio"]'));
+ const labelOf = (radio) => (radio.getAttribute('aria-label') || radio.textContent || '')
+ .replace(/\s+/g, ' ')
+ .trim();
+ const findChat = () => {
+ const currentGroups = Array.from(document.querySelectorAll('[role="radiogroup"]'));
+ const currentGroup = currentGroups.find((candidate) => {
+ const text = `${candidate.getAttribute('aria-label') || ''} ${candidate.textContent || ''}`;
+ return /selecionar modo chat|select chat mode|chat mode/i.test(text);
+ });
+ return currentGroup
+ ? Array.from(currentGroup.querySelectorAll('[role="radio"]')).find((radio) => /^Chat$/i.test(labelOf(radio)))
+ : null;
+ };
+ const chat = findChat() || radios.find((radio) => /^Chat$/i.test(labelOf(radio)));
+        if (!chat) {
+            return JSON.stringify({
+                ok: false,
+                present: true,
+                selected: null,
+                confirmed: false,
+                error: 'Chat mode radio not found',
+            });
+        }
+ const checked = () => {
+ const current = findChat();
+ return !!current && current.getAttribute('aria-checked') === 'true';
+ };
+ if (checked()) {
+ const current = findChat() || chat;
+ return JSON.stringify({ ok: true, present: true, selected: labelOf(current), confirmed: true });
+ }
+ const current = findChat() || chat;
+ current.focus();
+ if (typeof current.click === 'function') {
+ current.click();
+ } else {
+ current.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }));
+ current.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', bubbles: true }));
+ }
+ const t0 = Date.now();
+ return new Promise((resolve) => {
+ const interval = setInterval(() => {
+ const current = findChat();
+ const isChecked = checked();
+ if (isChecked || Date.now() - t0 > 4000) {
+ clearInterval(interval);
+ resolve(JSON.stringify({
+ ok: checked(),
+ present: true,
+ selected: labelOf(current || chat),
+ confirmed: isChecked,
+ error: isChecked ? null : 'Chat mode radio did not become checked',
+                    }));
+                }
+            }, 150);
+        });
+    }"#
+    .to_string()
 }
 
 /// One-shot view of the composer: current model label, send/stop, attachments.
@@ -551,13 +652,15 @@ pub(super) fn dom_progress() -> String {
 /// caller reloads the tab afterwards.
 pub(super) fn menu_discover() -> String {
     r#"() => {
-    const synthClick = (el) => {
-      const r = el.getBoundingClientRect();
-      const o = { bubbles: true, cancelable: true, clientX: r.x + r.width / 2, clientY: r.y + r.height / 2, button: 0, pointerId: 1, isPrimary: true };
-      el.dispatchEvent(new PointerEvent('pointerdown', o));
-      el.dispatchEvent(new PointerEvent('pointerup', o));
-      el.dispatchEvent(new MouseEvent('click', o));
-    };
+ const synthClick = (el) => {
+ el.focus();
+ if (typeof el.click === 'function') {
+ el.click();
+ } else {
+ el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }));
+ el.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', bubbles: true }));
+ }
+ };
     const wait = (pred, ms) => new Promise((res) => {
       const t0 = Date.now();
       const iv = setInterval(() => {
@@ -565,8 +668,8 @@ pub(super) fn menu_discover() -> String {
         if (v || Date.now() - t0 > ms) { clearInterval(iv); res(v || null); }
       }, 150);
     });
-    const itemsOf = (menu) => Array.from(menu.querySelectorAll('[role="menuitemradio"]')).map((it) => ({
-      label: (it.textContent || '').trim(),
+    const itemsOf = (menu) => Array.from(menu.querySelectorAll('[role="menuitemradio"], [role="radio"]')).map((it) => ({
+      label: (it.getAttribute('aria-label') || it.textContent || '').trim(),
       checked: it.getAttribute('aria-checked') === 'true',
     }));
     const form = document.querySelector('#prompt-textarea') ? document.querySelector('#prompt-textarea').closest('form') : null;
@@ -576,7 +679,7 @@ pub(super) fn menu_discover() -> String {
     synthClick(trigger);
     return wait(() => {
       const menus = Array.from(document.querySelectorAll('[role="menu"]')).filter((m) => !seen.has(m.id));
-      return menus.find((m) => m.querySelectorAll('[role^="menuitem"]').length > 0) || null;
+      return menus.find((m) => m.querySelectorAll('[role^="menuitem"], [role="radio"]').length > 0) || null;
     }, 4000).then((root) => {
       if (!root) return JSON.stringify({ ok: false, error: 'menu content did not mount (tab must be visible)', visibility: document.visibilityState });
       // FORK: the level picker is a slider now. Walk it end to end and record
@@ -635,7 +738,7 @@ pub(super) fn menu_discover() -> String {
               triggerLabel: (trigger.textContent || '').trim(),
               current: current,
               levels: levels,
-              models: null,
+                    models: itemsOf(root),
             });
           });
       }
@@ -698,9 +801,11 @@ pub(super) fn menu_select(
 ) -> String {
     fill(
         r#"() => {
-    const TARGET = new RegExp(@@TARGET@@, 'i');
-    const SUB = new RegExp(@@SUB@@, 'i');
-    const INDEX = @@INDEX@@;
+        const TARGET = new RegExp(@@TARGET@@, 'i');
+        const SUB = new RegExp(@@SUB@@, 'i');
+        const INDEX = @@INDEX@@;
+        const IS_MODEL = @@IS_MODEL@@;
+        const RECENT = /^(?:Recente|Recent|Latest)$/i;
     const synthClick = (el) => {
       const r = el.getBoundingClientRect();
       const o = { bubbles: true, cancelable: true, clientX: r.x + r.width / 2, clientY: r.y + r.height / 2, button: 0, pointerId: 1, isPrimary: true };
@@ -732,11 +837,13 @@ pub(super) fn menu_select(
         .filter((t) => (t.textContent || '').trim().length > 0);
     };
     const openMenu = (trigger) => {
-      const seen = new Set(Array.from(document.querySelectorAll('[role="menu"]')).map((m) => m.id));
       synthClick(trigger);
       return wait(() => {
-        const menus = Array.from(document.querySelectorAll('[role="menu"]')).filter((m) => !seen.has(m.id));
-        return menus.find((m) => m.querySelectorAll('[role^="menuitem"]').length > 0) || null;
+        // React may reuse the same menu id when a radio click rerenders the
+        // picker. The current usable menu, rather than a new id, is the
+        // postcondition that matters here.
+        const menus = Array.from(document.querySelectorAll('[role="menu"]'));
+        return menus.reverse().find((m) => m.querySelectorAll('[role^="menuitem"], [role="radio"]').length > 0) || null;
       }, 4000);
     };
     const closeMenu = () => {
@@ -744,7 +851,9 @@ pub(super) fn menu_select(
       return new Promise((r) => setTimeout(r, 200));
     };
     const sliderItemIn = (root) => root.querySelector('[role="menuitem"][aria-keyshortcuts]');
-    const usable = (root) => !!(sliderItemIn(root) || root.querySelector('[role="menuitemradio"]'));
+    const usable = (root) => !!(
+      sliderItemIn(root) || root.querySelector('[role="menuitemradio"], [role="radio"]')
+    );
 
     // FORK (verified live): right after a navigation the trigger is not there
     // yet; failing at once inherited whatever level the account last used.
@@ -760,17 +869,113 @@ pub(super) fn menu_select(
     };
     return tryTrigger(found.slice(0, 3)).then((opened) => {
       if (!opened) return JSON.stringify({ ok: false, error: 'menu did not mount (tab must be visible)', visibility: document.visibilityState });
-      const trigger = opened.trigger;
-      const root = opened.root;
+ const trigger = opened.trigger;
+      let root = opened.root;
+      const modelOptions = Array.from(root.querySelectorAll('[role="menuitemradio"], [role="radio"]'));
+      const modelLabel = (option) => (option.getAttribute('aria-label') || option.textContent || '')
+        .replace(/\s+/g, ' ')
+        .trim();
+      // Selecting a model radio can replace the menu subtree, and some page
+      // builds close the menu while React commits the selection. Re-query the
+      // live menu before every post-click read and reopen this same trigger if
+      // the menu was closed.
+      const currentMenu = () => {
+        const menus = Array.from(document.querySelectorAll('[role="menu"]'));
+        return menus.reverse().find((candidate) => usable(candidate)) || null;
+      };
+      const triggerKey = {
+        id: trigger.id || '',
+        testid: trigger.dataset.testid || '',
+        label: (trigger.textContent || '').trim(),
+      };
+      const liveTrigger = () => {
+        const candidates = triggers();
+        return candidates.find((candidate) =>
+          (triggerKey.id && candidate.id === triggerKey.id)
+          || (triggerKey.testid && candidate.dataset.testid === triggerKey.testid)
+          || (triggerKey.label && (candidate.textContent || '').trim() === triggerKey.label)
+        ) || candidates[0] || trigger;
+      };
+      const ensureMenu = () => {
+        const current = currentMenu();
+        if (current) {
+          root = current;
+          return Promise.resolve(current);
+        }
+        return openMenu(liveTrigger()).then((current) => {
+          if (current && usable(current)) root = current;
+          return current;
+        });
+      };
+      const optionsInCurrentMenu = () => {
+        const current = currentMenu();
+        if (!current) return [];
+        root = current;
+        return Array.from(current.querySelectorAll('[role="menuitemradio"], [role="radio"]'));
+      };
+      const waitForCheckedOption = (matcher) => ensureMenu().then(() => wait(() => {
+        const current = optionsInCurrentMenu().find(matcher);
+        return current && current.getAttribute('aria-checked') === 'true' ? current : null;
+      }, 4000));
+
+ // The current unified picker has model radios in the same menu as the
+ // effort slider. Select the requested model radio and wait for its
+ // aria-checked postcondition before touching the slider.
+ if (IS_MODEL && modelOptions.length) {
+ const target = modelOptions.find((option) => TARGET.test(modelLabel(option)));
+ if (!target) {
+ return JSON.stringify({
+ ok: false,
+ error: 'model option not found',
+ available: modelOptions.map(modelLabel),
+ });
+ }
+ if (target.getAttribute('aria-checked') !== 'true') {
+ synthClick(target);
+ }
+        return waitForCheckedOption((option) => TARGET.test(modelLabel(option)))
+ .then((checked) => JSON.stringify({
+ ok: !!checked,
+ selected: modelLabel(checked || target),
+ checked: !!checked,
+ labelMatched: true,
+ triggerLabel: (trigger.textContent || '').trim(),
+ error: checked ? null : 'model option did not become checked',
+ }));
+ }
+
+ let modelChecked = null;
+ let modelError = null;
+ const modelReady = (() => {
+ if (IS_MODEL) return Promise.resolve();
+ if (!modelOptions.length) return ensureMenu();
+ const currentRecent = () => optionsInCurrentMenu().find((option) => RECENT.test(modelLabel(option)));
+ const recent = currentRecent() || modelOptions.find((option) => RECENT.test(modelLabel(option)));
+ if (!recent) {
+ modelError = 'current model option Recente was not found';
+ return Promise.resolve();
+ }
+ if (recent.getAttribute('aria-checked') !== 'true') {
+ synthClick(recent);
+ }
+        return waitForCheckedOption((option) => RECENT.test(modelLabel(option)))
+ .then((checked) => {
+ modelChecked = !!checked;
+ if (!checked) modelError = 'current model option Recente did not become checked';
+ return ensureMenu();
+ });
+ })();
       // FORK (verified live 2026-08-27, labels re-verified 2026-09-04): the
       // picker is a slider (`data-animated-slider-trigger`): one `menuitem`
       // with `aria-keyshortcuts="ArrowLeft ArrowRight"` whose sibling text
       // reads "<label>, <n> de 5.". Synthetic Arrow keydowns move it and the
       // trigger label follows; the selection survives the caller's reload.
-      if (sliderItemIn(root)) {
+ if (!IS_MODEL && sliderItemIn(root)) {
         // "Alta, 3 de 5." -> { label: 'Alta', index: 3, total: 5 }
         const stateOf = () => {
-          const it = sliderItemIn(root);
+          const current = currentMenu();
+          if (current) root = current;
+          const it = sliderItemIn(current || root);
           const text = it && it.parentElement ? (it.parentElement.innerText || '') : '';
           const flat = text.replace(/\s+/g, ' ').trim();
           const m = flat.match(/,\s*(\d+)\s*(?:de|of)\s*(\d+)/);
@@ -781,7 +986,9 @@ pub(super) fn menu_select(
           };
         };
         const press = (k) => {
-          const it = sliderItemIn(root);
+          const current = currentMenu();
+          if (current) root = current;
+          const it = sliderItemIn(current || root);
           if (!it) return false;
           it.focus();
           const o = { key: k, code: k, bubbles: true, cancelable: true };
@@ -791,13 +998,14 @@ pub(super) fn menu_select(
         };
         const settle = () => new Promise((r) => setTimeout(r, 250));
         const done = (state) => settle().then(() => JSON.stringify({
-          ok: true,
-          selected: state.label,
-          index: state.index,
-          total: state.total,
-          labelMatched: TARGET.test(state.label),
-          triggerLabel: (trigger.textContent || '').trim(),
-          slider: true,
+            ok: true,
+            selected: state.label,
+            index: state.index,
+            total: state.total,
+            labelMatched: TARGET.test(state.label),
+            triggerLabel: (trigger.textContent || '').trim(),
+            slider: true,
+            modelChecked,
         }));
         const seenLabels = [];
         const remember = (state) => {
@@ -835,8 +1043,20 @@ pub(super) fn menu_select(
             return byLabel(k, steps + 1);
           });
         };
-        return INDEX === null ? byLabel('ArrowLeft', 0) : byIndex(0);
+        return modelReady.then(() => {
+            if (modelError) {
+                return JSON.stringify({
+                    ok: false,
+                    error: modelError,
+                    available: modelOptions.map(modelLabel),
+                    slider: true,
+                    modelChecked,
+                });
+            }
+            return ensureMenu().then(() => INDEX === null ? byLabel('ArrowLeft', 0) : byIndex(0));
+        });
       }
+      return modelReady.then(() => ensureMenu().then(() => {
       const sub = Array.from(root.querySelectorAll('[role="menuitem"][aria-haspopup="menu"]'))
         .find((x) => SUB.test((x.textContent || '').trim()));
       if (!sub) return JSON.stringify({
@@ -859,13 +1079,19 @@ pub(super) fn menu_select(
           available: options.map((o) => (o.textContent || '').trim()),
         });
         synthClick(target);
-        return new Promise((r) => setTimeout(r, 600)).then(() => JSON.stringify({
-          ok: true,
-          selected: (target.textContent || '').trim(),
-          labelMatched: true,
-          triggerLabel: (trigger.textContent || '').trim(),
-        }));
+            return new Promise((r) => setTimeout(r, 600)).then(() => {
+                const checked = target.getAttribute('aria-checked') === 'true';
+                return JSON.stringify({
+                    ok: checked,
+                    selected: (target.textContent || '').trim(),
+                    labelMatched: true,
+                    triggerLabel: (trigger.textContent || '').trim(),
+                    checked,
+                    error: checked ? null : 'option did not become checked',
+                });
+            });
       });
+      }));
     });
     });
   }"#,
@@ -876,6 +1102,7 @@ pub(super) fn menu_select(
                 "INDEX",
                 level_index.map_or_else(|| "null".to_string(), |index| index.to_string()),
             ),
+            ("IS_MODEL", matches!(kind, MenuKind::Model).to_string()),
         ],
     )
 }

@@ -11,6 +11,7 @@ fn all_scripts() -> Vec<(&'static str, String)> {
     vec![
         ("wait_ready", wait_ready(5000)),
         ("composer_state", composer_state()),
+        ("select_chat_mode", select_chat_mode()),
         ("set_composer_text", set_composer_text(NASTY)),
         ("attachment_tiles", attachment_tiles()),
         ("dismiss_upload_dialog", dismiss_upload_dialog()),
@@ -81,6 +82,8 @@ fn wait_ready_interpolates_the_timeout() {
     let src = wait_ready(1234);
     assert!(src.contains("1234"));
     assert!(src.contains("Date.now() - t0 > 1234)"));
+    assert!(src.contains("lastEd") && src.contains("lastForm"));
+    assert!(src.contains("stableSince") && src.contains(">= 250"));
     assert!(src.contains("}, 250);"), "polling interval must stay 250ms");
 }
 
@@ -276,6 +279,36 @@ fn menu_select_handles_the_slider_picker_and_the_legacy_submenu() {
     assert!(script.contains("labelMatched"));
     // The label walk survives as the fallback for a slider with no position.
     assert!(script.contains("byLabel"));
+}
+
+#[test]
+fn menu_select_reads_the_current_model_radio_before_effort_selection() {
+    let script = menu_select(MenuKind::Level, "^Alta$", Some(3));
+    assert!(script.contains("const IS_MODEL = false;"));
+    assert!(script.contains("Recente|Recent|Latest"));
+    assert!(script.contains("aria-checked"));
+    assert!(script.contains("modelChecked"));
+    assert!(script.contains("currentMenu"));
+    assert!(script.contains("ensureMenu"));
+    assert!(script.contains("liveTrigger"));
+    assert!(script.contains("optionsInCurrentMenu"));
+    assert!(script.contains("synthClick(target)"));
+
+    let model_script = menu_select(MenuKind::Model, "^Recente$", None);
+    assert!(model_script.contains("const IS_MODEL = true;"));
+    assert!(model_script.contains("model option not found"));
+}
+
+#[test]
+fn chat_mode_script_requires_a_checked_chat_radio_when_present() {
+    let script = select_chat_mode();
+    assert!(script.contains("radiogroup"));
+    assert!(script.contains("selecionar modo chat"));
+    assert!(script.contains("findChat"));
+    assert!(script.contains("aria-checked"));
+    assert!(script.contains("current.click()"));
+    assert!(script.contains("key: 'Enter'"));
+    assert!(script.contains("present: false"));
 }
 
 /// FORK: the picker discovery has to describe the slider by position, since

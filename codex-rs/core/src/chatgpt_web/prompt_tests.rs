@@ -17,6 +17,7 @@ fn workspace(root: &Path) -> ChatGptWebWorkspace {
         sessions_state_path: None,
         connector: None,
         compact_prompt: "Summarize.".to_string(),
+        agent_activity: None,
     }
 }
 
