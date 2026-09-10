@@ -18,6 +18,7 @@
 - Fast release recipe is work/sync-release-20260909/release-build.ps1: release, jobs=2, LTO=false, debug=0, codegen-units=16, opt-level=3, incremental=false, existing target. Build and hot swap have not started.
 - Validation budget decision: the broad gate is being ended gracefully under the repository's one-third effort rule and the owner's fast-compilation instruction. Latest completed gate slices: features 1, core 28, core-plugins 1, protocol 9 passed; remaining broad-gate slices are incomplete, never PASS. Keep the known state query-plan failure. Finish scoped source cleanup/formatting and use the required release build as the next compilation authority.
 - Final source cleanup: app-server ThreadStartMode delimiter and memories-write Extension filtering are fixed. `just fmt` final exit code 0; nightly-only import grouping warnings are nonfatal. Root diff check passed; old migration SQL remains unchanged. No tests were rerun after final formatting. Release build is now the next step, with remaining broad tests and full clippy not declared passed.
+- First fast release build at a05b4b594c ended after 45m12s with E0061 in thread_recovery_processor.rs: the old seven-argument fork_thread_from_history call needed StartThreadOptions. No binaries were installed. The bounded fix preserves config, recovery source, parent trace, MCP extensions and reserved recovered ID; just fmt returned 0. Retry will reuse the completed release dependency/core cache with the same fast flags.
 
 ### Unity plugin setup — 2026-09-09 (in progress)
 

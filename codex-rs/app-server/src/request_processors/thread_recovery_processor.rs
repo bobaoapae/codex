@@ -14,6 +14,7 @@ use codex_app_server_protocol::ThreadRecoveryPreviewParams;
 use codex_app_server_protocol::ThreadRecoveryPreviewResponse;
 use codex_app_server_protocol::ThreadRecoveryWatermark;
 use codex_core::ForkSnapshot;
+use codex_core::StartThreadOptions;
 use codex_core::ThreadManager;
 use codex_core::config::Config;
 use codex_core::config::ConfigOverrides;
@@ -498,16 +499,19 @@ impl ThreadRecoveryRequestProcessor {
         let source_thread_id = prepared.source_thread_id;
         let recovered_thread_id = prepared.recovered_thread_id;
         let history = Arc::unwrap_or_clone(Arc::clone(&prepared.model_context));
+        let fork_options = StartThreadOptions {
+            thread_source: Some(ThreadSource::Feature("recovery".to_string())),
+            parent_trace,
+            client_mcp_extensions,
+            reserved_thread_id: Some(recovered_thread_id),
+            ..StartThreadOptions::new(source_config.as_ref().clone())
+        };
         let new_thread = self
             .thread_manager
             .fork_thread_from_history(
                 ForkSnapshot::Interrupted,
-                source_config.as_ref().clone(),
+                fork_options,
                 InitialHistory::Forked(history),
-                Some(ThreadSource::Feature("recovery".to_string())),
-                parent_trace,
-                client_mcp_extensions,
-                Some(recovered_thread_id),
             )
             .await
             .map_err(|error| recovery_start_error(source_thread_id, error))?;
