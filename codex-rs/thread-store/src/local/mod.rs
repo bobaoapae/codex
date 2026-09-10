@@ -64,10 +64,10 @@ use tokio::sync::OwnedRwLockReadGuard;
 use tokio::sync::OwnedRwLockWriteGuard;
 use tokio::sync::RwLock;
 
-use crate::AppendReceiptOutcome;
-use crate::AppendReceiptParams;
 use crate::AddThreadAttachmentOutcome;
 use crate::AddThreadAttachmentParams;
+use crate::AppendReceiptOutcome;
+use crate::AppendReceiptParams;
 use crate::AppendThreadItemsParams;
 use crate::ArchiveThreadParams;
 use crate::ArchiveThreadsParams;

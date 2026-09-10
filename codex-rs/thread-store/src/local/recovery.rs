@@ -20,10 +20,10 @@ use tokio::sync::OwnedMutexGuard;
 use tokio::sync::OwnedRwLockWriteGuard;
 
 use super::LocalThreadStore;
+use super::WriterLockGuard;
 use super::recovery_scan::RecoveryRecord;
 use super::recovery_scan::scan_rollout;
 use super::thread_rollout_resolver;
-use super::writer_lock::WriterLockGuard;
 use crate::ExistingRecovery;
 use crate::PreparedRecovery;
 use crate::RecoveryBlockReason;
@@ -273,7 +273,7 @@ async fn prepare_source_access(
                 ),
             });
         }
-        return store.writer_lock_coordinator.acquire(thread_id).map(Some);
+        return store.acquire_writer_lock(thread_id).map(Some);
     };
 
     if attestation.thread_id != thread_id || attestation.turn_state != RecoveryTurnState::Idle {

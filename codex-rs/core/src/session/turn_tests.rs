@@ -212,6 +212,8 @@ async fn count_plan_mode_reminders(session: &Session) -> usize {
             _ => false,
         })
         .count()
+}
+
 #[test]
 fn realtime_user_verification_notice_excludes_request_payload() {
     let event = EventMsg::ElicitationRequest(codex_protocol::approvals::ElicitationRequestEvent {

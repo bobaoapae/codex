@@ -579,6 +579,8 @@ pub(crate) struct ThreadRequestProcessor {
 enum ThreadStartMode {
     Client,
     Job { reserved_thread_id: ThreadId },
+}
+
 /// Whether resume attaches a client or restores a cold runtime during daemon startup.
 pub(crate) enum ThreadResumeTarget {
     Client(ConnectionRequestId),

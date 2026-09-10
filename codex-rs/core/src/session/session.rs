@@ -7,8 +7,8 @@ use super::step_settings::StepSettingsUpdate;
 use super::*;
 use crate::agents_md_manager::AgentsMdManager;
 use crate::config::ConstraintError;
-use crate::context::PlanLoaded;
 use crate::context::GuardianContextMode;
+use crate::context::PlanLoaded;
 use crate::environment_selection::ThreadEnvironments;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::hook_mcp_executor::CoreHookMcpExecutor;
@@ -1094,11 +1094,10 @@ impl Session {
             tokio::join!(thread_persistence_fut, state_db_fut, auth_and_mcp_fut);
         agent_control.install_workflow_store(state_db_ctx.as_ref());
 
-        let mut live_thread_init =
-            LiveThreadInitGuard::new(thread_persistence_result.map_err(|e| {
-                error!("failed to initialize thread persistence: {e:#}");
-                e
-            })?);
+        let mut live_thread_init = thread_persistence_result.map_err(|e| {
+            error!("failed to initialize thread persistence: {e:#}");
+            e
+        })?;
         let session_result: anyhow::Result<Arc<Self>> = Box::pin(async {
             let rollout_path = if let Some(live_thread) = live_thread_init.as_ref() {
                 live_thread.local_rollout_path().await?

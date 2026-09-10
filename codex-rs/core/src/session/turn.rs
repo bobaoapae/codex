@@ -2927,7 +2927,7 @@ async fn try_run_sampling_request(
                 for item in &history_items {
                     record_completed_response_item_with_finalized_facts(
                         &sess,
-                        &turn_context,
+                        step_context.as_ref(),
                         item,
                         /*finalized_facts*/ None,
                     )

@@ -670,9 +670,7 @@ async fn run_turn(
     consumer_dropped: CancellationToken,
 ) {
     if tx_event
-        .send(Ok(ResponseEvent::Created {
-            guardian_ticket: None,
-        }))
+        .send(Ok(ResponseEvent::Created { response_id: None }))
         .await
         .is_err()
     {

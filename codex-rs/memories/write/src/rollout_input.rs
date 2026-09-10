@@ -54,6 +54,7 @@ pub(crate) fn serialize_tiered_input(
             | RolloutItem::SecurityRiskScore(_)
             | RolloutItem::TokenUsageRecord(_)
             | RolloutItem::RetainedContext(_)
+            | RolloutItem::Extension(_)
             | RolloutItem::EventMsg(_) => None,
         };
         let Some(mut item) = item else { continue };
