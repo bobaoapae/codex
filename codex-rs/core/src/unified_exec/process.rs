@@ -35,6 +35,7 @@ use super::UNIFIED_EXEC_OUTPUT_MAX_TOKENS;
 use super::UnifiedExecError;
 use super::head_tail_buffer::HeadTailBuffer;
 use super::process_state::ProcessState;
+use crate::shell_snapshot::ShellSnapshotFile;
 
 const EARLY_EXIT_GRACE_PERIOD: Duration = Duration::from_millis(150);
 pub(crate) trait SpawnLifecycle: std::fmt::Debug + Send + Sync {
@@ -101,6 +102,8 @@ pub(crate) struct UnifiedExecProcess {
     timed_out: AtomicBool,
     _spawn_lifecycle: Option<SpawnLifecycleHandle>,
     build_admission: Option<Arc<BuildAdmissionGuard>>,
+    // The shell may still need to replay this file after process startup returns.
+    pub(crate) _shell_snapshot: Option<Arc<ShellSnapshotFile>>,
 }
 
 impl std::fmt::Debug for UnifiedExecProcess {
@@ -144,6 +147,7 @@ impl UnifiedExecProcess {
             timed_out: AtomicBool::new(false),
             _spawn_lifecycle: spawn_lifecycle,
             build_admission,
+            _shell_snapshot: None,
         }
     }
 

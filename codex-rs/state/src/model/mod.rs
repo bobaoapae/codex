@@ -6,6 +6,7 @@ mod project;
 mod queued_item;
 mod rollout_migration_state;
 mod thread_artifact;
+mod thread_attachment;
 mod thread_goal;
 mod thread_metadata;
 
@@ -44,6 +45,10 @@ pub use thread_artifact::ThreadArtifactReadEncoding;
 pub use thread_artifact::ThreadArtifactReadPage;
 pub use thread_artifact::ThreadArtifactReadResult;
 pub use thread_artifact::ThreadArtifactRemovalOutcome;
+pub use thread_attachment::AddThreadAttachmentOutcome;
+pub use thread_attachment::RemoveThreadAttachmentOutcome;
+pub use thread_attachment::ThreadAttachment;
+pub use thread_attachment::ThreadAttachmentPage;
 pub use thread_goal::ThreadGoal;
 pub use thread_goal::ThreadGoalStatus;
 pub use thread_metadata::Anchor;

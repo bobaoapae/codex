@@ -204,8 +204,6 @@ pub enum CyberAccessProgram {
 /// child input, Core also compares root lineage to detect ambiguity.
 #[derive(Clone, Debug, Default)]
 pub struct TurnStartOptions {
-    /// Parent inference receipt for an internal Guardian turn. Never persisted.
-    pub guardian_ticket: Option<crate::guardian_ticket::GuardianTicket>,
     /// Source classification for the caller that starts a new turn.
     /// Ignored when the submitted input steers an active turn.
     pub turn_trigger: Option<String>,
@@ -263,6 +261,9 @@ pub enum SteerSubmission {
 /// Why Core did not accept submitted turn input for turn processing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NotSubmittedReason {
+    /// The host is draining and no longer permits new regular turns.
+    ServerDraining,
+
     /// `start_turn_if_idle` found an active turn.
     NotIdle,
 

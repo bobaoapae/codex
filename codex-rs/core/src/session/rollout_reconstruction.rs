@@ -1,6 +1,7 @@
 use super::plan_reconstruction;
 use super::*;
 use crate::context::PlanLoaded;
+use crate::context::GuardianContextMode;
 use crate::context::world_state::WorldStateSnapshot;
 use crate::context_manager::is_user_turn_boundary;
 use codex_history::ResponseItemEnvelope;
@@ -153,6 +154,7 @@ impl Session {
         self.reconstruct_history_from_rollout_with_policy(
             turn_context.model_info().truncation_policy.into(),
             rollout_items,
+            &turn_context.session_source,
         )
     }
 
@@ -165,11 +167,13 @@ impl Session {
         &self,
         truncation_policy: TruncationPolicy,
         rollout_items: &[RolloutItem],
+        session_source: &SessionSource,
     ) -> RolloutReconstruction {
         reconstruct_history_from_rollout_items_with_policy(
             truncation_policy,
             rollout_items,
-            self.enabled(Feature::GuardianThreadContext),
+            self.guardian_context_mode,
+            session_source,
         )
     }
 }
@@ -178,9 +182,8 @@ impl Session {
 pub(crate) fn reconstruct_history_from_rollout_items_with_policy(
     truncation_policy: TruncationPolicy,
     rollout_items: &[RolloutItem],
-    // FORK: upstream reads this off `self`; this function is also reached from
-    // detached context inspection, which has no session to ask.
-    guardian_thread_context: bool,
+    guardian_context_mode: GuardianContextMode,
+    session_source: &SessionSource,
 ) -> RolloutReconstruction {
     // Replay metadata should already match the shape of the future lazy reverse loader, even
     // while history materialization still uses an eager bridge. Scan newest-to-oldest,
@@ -395,10 +398,8 @@ pub(crate) fn reconstruct_history_from_rollout_items_with_policy(
     )
     .unwrap_or(u64::MAX);
 
-    let mut history = ContextManager::new();
-    if guardian_thread_context {
-        history.enable_user_message_retention();
-    }
+    let mut history =
+        ContextManager::with_guardian_context_mode(guardian_context_mode, session_source);
     let mut saw_legacy_compaction_without_replacement_history = false;
     if let Some(checkpoint) = base_compaction
         && let Some(items) = &checkpoint.compacted.replacement_history
@@ -441,7 +442,7 @@ pub(crate) fn reconstruct_history_from_rollout_items_with_policy(
                     // prompt shape.
                     // TODO(ccunningham): if we drop support for None replacement_history compaction items,
                     // we can get rid of this second loop entirely and just build `history` directly in the first loop.
-                    let identity = if guardian_thread_context {
+                    let identity = if guardian_context_mode == GuardianContextMode::ThreadOwned {
                         compact::CompactedMessageIdentity::Preserve
                     } else {
                         compact::CompactedMessageIdentity::Regenerate

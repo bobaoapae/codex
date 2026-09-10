@@ -10,8 +10,6 @@ use codex_client::ByteStream;
 use codex_client::StreamResponse;
 use codex_protocol::ResponseUsageMetadata;
 use codex_protocol::error::ENCRYPTED_FUNCTION_OUTPUT_CONTENT_ERROR_MESSAGE;
-use codex_protocol::guardian_ticket::GUARDIAN_TICKET_HEADER;
-use codex_protocol::guardian_ticket::GuardianTicket;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::MisalignmentErrorDetails;
 use codex_protocol::protocol::ModelVerification;
@@ -410,17 +408,11 @@ pub fn process_responses_event(
         }
         "response.created" => {
             if let Some(response) = event.response {
-                let guardian_ticket = response
-                    .get("headers")
-                    .and_then(Value::as_object)
-                    .and_then(|headers| {
-                        headers
-                            .iter()
-                            .find(|(name, _)| name.eq_ignore_ascii_case(GUARDIAN_TICKET_HEADER))
-                    })
-                    .and_then(|(_, value)| value.as_str())
-                    .and_then(GuardianTicket::from_server);
-                return Ok(Some(ResponseEvent::Created { guardian_ticket }));
+                let response_id = response
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                return Ok(Some(ResponseEvent::Created { response_id }));
             }
         }
         "response.failed" => {
@@ -596,7 +588,11 @@ async fn process_sse_with_treatment(
 
     loop {
         let start = Instant::now();
-        let response = timeout(idle_timeout, stream.next()).await;
+        let response = tokio::select! {
+            biased;
+            _ = tx_event.closed() => return,
+            response = timeout(idle_timeout, stream.next()) => response,
+        };
         if let Some(t) = telemetry.as_ref() {
             t.on_sse_poll(&response, start.elapsed());
         }
@@ -1684,9 +1680,7 @@ mod tests {
         );
         assert_matches!(
             &events[1],
-            ResponseEvent::Created {
-                guardian_ticket: None
-            }
+            ResponseEvent::Created { response_id: Some(id) } if id == "resp-1"
         );
         assert_matches!(
             &events[2],

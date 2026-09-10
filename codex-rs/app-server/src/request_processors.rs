@@ -557,6 +557,7 @@ mod job_processor_support;
 mod marketplace_processor;
 mod mcp_event_stream;
 mod mcp_processor;
+mod memory_status;
 mod persisted_resume_settings;
 /// FORK extension: `plan/list`, `plan/read`, and `plan/approve`.
 mod plan_processor;
@@ -604,6 +605,7 @@ pub(crate) use remote_control_processor::RemoteControlRequestProcessor;
 pub(crate) use search::SearchRequestProcessor;
 pub(crate) use thread_goal_processor::ThreadGoalRequestProcessor;
 pub(crate) use thread_processor::ThreadRequestProcessor;
+pub(crate) use thread_processor::ThreadResumeTarget;
 pub(crate) use thread_queue_processor::ThreadQueueRequestProcessor;
 pub(crate) use thread_recovery_processor::ThreadRecoveryRequestProcessor;
 pub(crate) use thread_recovery_processor::ThreadRecoveryRequestProcessorArgs;

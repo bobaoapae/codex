@@ -276,6 +276,9 @@ pub(crate) fn build_agent_resume_config(turn: &TurnContext) -> Result<Config, Fu
 fn build_agent_shared_config(turn: &TurnContext) -> Result<Config, FunctionCallError> {
     let base_config = turn.config.clone();
     let mut config = (*base_config).clone();
+    // Preserve activation for history forks without freezing the parent's model-owned prompts.
+    // Fresh child startup restores configured preferences from the retained snapshot.
+    config.token_budget = turn.configured_token_budget.clone();
     config.model = Some(turn.model_info().slug.clone());
     config.model_provider = turn.provider.info().clone();
     config.model_reasoning_effort = turn
@@ -936,7 +939,7 @@ mod tests {
             .await;
         assert_eq!(regular_turn.multi_agent_version, MultiAgentVersion::V2);
         assert_eq!(
-            crate::session::multi_agents::effective_multi_agent_mode(&regular_turn),
+            crate::session::multi_agents::effective_multi_agent_mode_for_turn(&regular_turn),
             Some(MultiAgentMode::ExplicitRequestOnly)
         );
 
@@ -952,7 +955,7 @@ mod tests {
             .await;
         assert_eq!(ultra_turn.multi_agent_version, MultiAgentVersion::V2);
         assert_eq!(
-            crate::session::multi_agents::effective_multi_agent_mode(&ultra_turn),
+            crate::session::multi_agents::effective_multi_agent_mode_for_turn(&ultra_turn),
             Some(MultiAgentMode::Proactive)
         );
     }

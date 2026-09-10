@@ -32,7 +32,7 @@ use crate::original_image_detail::sanitize_original_image_detail as sanitize_ima
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
-use crate::tools::ExecutedToolCallRecorder;
+use crate::tools::ExecutedToolCalls;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::context::ToolPayload;
@@ -88,7 +88,7 @@ impl CodeModeService {
     pub(crate) fn new(
         session_provider: Arc<dyn CodeModeSessionProvider>,
         config: &CodeModeConfig,
-        executed_tool_calls: Option<Arc<ExecutedToolCallRecorder>>,
+        executed_tool_calls: ExecutedToolCalls,
     ) -> Self {
         let dispatch_broker = Arc::new(CodeModeDispatchBroker::new(executed_tool_calls));
         let availability = session_provider.availability();
@@ -278,6 +278,7 @@ pub(super) async fn handle_runtime_response(
     wall_time: Duration,
 ) -> Result<FunctionToolOutput, String> {
     let script_status = format_script_status(&response);
+    let supports_original = can_request_original_image_detail(exec.turn.model_info());
     // FORK: a `view_image(raw=true)` inside this cell pins every image the cell
     // returns, because the cell output is where those pixels reach history.
     let pins_raw_image = exec
@@ -289,7 +290,7 @@ pub(super) async fn handle_runtime_response(
     match response {
         RuntimeResponse::Yielded { content_items, .. } => {
             let mut content_items = into_function_call_output_content_items(content_items);
-            sanitize_runtime_image_detail(exec.turn.as_ref(), &mut content_items);
+            sanitize_image_detail_items(supports_original, &mut content_items);
             content_items = truncate_code_mode_result(content_items, max_output_tokens);
             prepend_script_status(&mut content_items, &script_status, wall_time);
             Ok(FunctionToolOutput::from_content(content_items, Some(true))
@@ -297,7 +298,7 @@ pub(super) async fn handle_runtime_response(
         }
         RuntimeResponse::Terminated { content_items, .. } => {
             let mut content_items = into_function_call_output_content_items(content_items);
-            sanitize_runtime_image_detail(exec.turn.as_ref(), &mut content_items);
+            sanitize_image_detail_items(supports_original, &mut content_items);
             content_items = truncate_code_mode_result(content_items, max_output_tokens);
             prepend_script_status(&mut content_items, &script_status, wall_time);
             Ok(FunctionToolOutput::from_content(content_items, Some(true))
@@ -309,7 +310,7 @@ pub(super) async fn handle_runtime_response(
             ..
         } => {
             let mut content_items = into_function_call_output_content_items(content_items);
-            sanitize_runtime_image_detail(exec.turn.as_ref(), &mut content_items);
+            sanitize_image_detail_items(supports_original, &mut content_items);
             let success = error_text.is_none();
             if let Some(error_text) = error_text {
                 content_items.push(FunctionCallOutputContentItem::InputText {
@@ -324,10 +325,6 @@ pub(super) async fn handle_runtime_response(
             )
         }
     }
-}
-
-fn sanitize_runtime_image_detail(turn: &TurnContext, items: &mut [FunctionCallOutputContentItem]) {
-    sanitize_image_detail_items(can_request_original_image_detail(turn.model_info()), items);
 }
 
 fn format_script_status(response: &RuntimeResponse) -> String {

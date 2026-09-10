@@ -152,6 +152,7 @@ async fn fork_invariant_thread_delete_tombstones_without_purging_rollouts() -> R
     );
 
     for thread_id in [parent_thread_id, child_thread_id, grandchild_thread_id] {
+        assert_eq!(state_db.get_thread(thread_id).await?, None);
         let rollout_path = find_thread_path_by_id_str(
             codex_home.path(),
             &thread_id.to_string(),

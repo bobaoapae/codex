@@ -200,7 +200,7 @@ build-for-release:
 write-config-schema:
     cargo run -p codex-config-schema --bin codex-write-config-schema
 
-# Regenerate vendored app-server protocol schema artifacts.
+# Regenerate app-server protocol schemas and the Python SDK derived from them.
 write-app-server-schema *args:
     python "{{ justfile_directory() }}/codex-rs/app-server-protocol/scripts/write_schema_fixtures.py" {{ args }}
 

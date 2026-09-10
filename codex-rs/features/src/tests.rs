@@ -108,6 +108,30 @@ fn cwd_relative_turn_diffs_is_an_opt_in_map_feature() {
 }
 
 #[test]
+fn codex_apps_mcp_protocol_can_be_enabled_independently_of_generic_mcp() {
+    let features_toml = FeaturesToml::from(BTreeMap::from([
+        (Feature::CodexAppsMcp20260728.key().to_string(), true),
+        (Feature::Mcp20260728.key().to_string(), false),
+    ]));
+    let features = Features::from_sources(
+        FeatureConfigSource {
+            features: Some(&features_toml),
+            ..Default::default()
+        },
+        FeatureConfigSource::default(),
+        FeatureOverrides::default(),
+    );
+
+    assert_eq!(
+        (
+            features.enabled(Feature::CodexAppsMcp20260728),
+            features.enabled(Feature::Mcp20260728),
+        ),
+        (true, false),
+    );
+}
+
+#[test]
 fn default_enabled_features_are_stable() {
     for spec in crate::FEATURES {
         if spec.default_enabled {
@@ -177,19 +201,18 @@ fn guardian_v2_feature_config_preserves_boolean_toggle() {
 }
 
 #[test]
-fn guardian_thread_context_resolves_boolean_config_and_profile_overrides() {
+fn guardian_thread_context_resolves_nested_config_and_profile_overrides() {
+    let enabled_context = "[guardianv2]\nthread_context = true";
+    let disabled_context = "[guardianv2]\nthread_context = false";
     for (base, profile, enabled) in [
         ("", "", false),
-        ("guardian_thread_context = false", "", false),
-        ("guardian_thread_context = true", "", true),
+        (disabled_context, "", false),
+        (enabled_context, "", true),
+        (enabled_context, disabled_context, false),
+        (disabled_context, enabled_context, true),
         (
-            "guardian_thread_context = true",
-            "guardian_thread_context = false",
-            false,
-        ),
-        (
-            "guardian_thread_context = false",
-            "guardian_thread_context = true",
+            "[guardianv2]\nenabled = false\nthread_context = true",
+            "",
             true,
         ),
     ] {
@@ -252,6 +275,7 @@ max_recent_non_user_entries = 12
         Some(FeatureToml::Config(crate::GuardianV2ConfigToml {
             enabled: Some(true),
             free_guardian: Some(true),
+            thread_context: None,
             persist_scores: Some(true),
             classifier_instructions: Some("Review this action".to_owned()),
             review_threshold: Some(0.65),

@@ -176,7 +176,6 @@ impl ToolRouter {
     }
 
     /// Whether the model can both start and interact with a terminal process.
-    // Consumed by the follow-up live tool-plan selection.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn has_terminal_controls(&self) -> bool {
         self.exposes_tool(&ToolName::plain("exec_command"))
@@ -184,7 +183,6 @@ impl ToolRouter {
     }
 
     /// Whether the configured collaboration backend's child-management tools remain exposed.
-    // Consumed by the follow-up live tool-plan selection.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn can_manage_children(&self) -> bool {
         self.can_manage_children

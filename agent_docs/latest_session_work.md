@@ -6,6 +6,10 @@
 - Starting HEAD: 9019cd8439; live fork/main: 3a72cbc159. Latest upstream stable release resolved via GitHub API: rust-v0.154.0.
 - Preserve the migration LF pins and compatibility test from 9019cd8439. Existing upstream migrations retain their established line-ending policy; do not rewrite applied SQL or database checksums.
 - Initial source changes have prior focused validation recorded below. Local usage ledgers and work/ artifacts remain local. Release build must include the CLI, code-mode host and both Windows sandbox sidecars, with -j1 after the prior LLVM OOM.
+- Initial commits 899c9e5063 (source) and 9653bf2659 (simulation/status) were pushed successfully to fork/main, including the prior migration-fix commit. Upstream fetched at a62e98d18c; its merge is being resolved in this checkout.
+- Concrete migration collision: upstream adds 0055_thread_attachments.sql while the fork already applied 0055_threads_daybreak_enabled.sql. Keep all applied fork IDs/bytes and assign the new attachments migration 0056. No database mutation or checksum rewriting is authorized.
+- Latest release has two exclusive commits: cb3a5e4202 is equivalent to upstream 3d3df0a0ca (Guardian limit), and 6b9826e3aa updates the workspace version to 0.154.0. Integrate release ancestry without duplicating the equivalent patch.
+- The single selective integration review found an invalid session_source reference and an early image-capability guard that disabled delegated reading; both were corrected during integration. Its remaining blocker is the new attachments migration renaming thread_artifacts while fork artifact APIs still query that table. Fix the new migration to preserve both contracts before release; do not modify applied migrations.
 
 ### Unity plugin setup — 2026-09-09 (in progress)
 

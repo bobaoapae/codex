@@ -12,4 +12,5 @@
 #
 # Any new fork migration has to be pinned here too.
 migrations/0053_thread_tombstones.sql text eol=lf
+migrations/0056_thread_attachments.sql text eol=lf
 workflow_migrations/*.sql text eol=lf

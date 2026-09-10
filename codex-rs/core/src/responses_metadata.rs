@@ -58,8 +58,7 @@ pub(crate) const WORKSPACES_KEY: &str = "workspaces";
 // App-server clients can specify additional metadata in the `responsesapi_client_metadata` param
 // when submitting a turn, but they must not override fields owned by core.
 const RESERVED_METADATA_KEYS: &[&str] = &[
-    codex_protocol::guardian_ticket::GUARDIAN_TICKET_METADATA_KEY,
-    "guardian_ticket_requested",
+    "guardian_credits_requested",
     INSTALLATION_ID_KEY,
     X_CODEX_INSTALLATION_ID_HEADER,
     SESSION_ID_KEY,
@@ -104,10 +103,9 @@ pub(crate) const MAX_EXTRA_METADATA_VALUE_BYTES: usize = 128;
 
 /// Metadata attached to model requests whose purpose is conversation compaction.
 ///
-/// This covers both local compaction requests sent through the normal `/responses` path and remote
-/// compaction requests sent through `/responses/compact`. These fields describe the operation at
-/// dispatch time. Post-response outcomes such as status, error, duration, and token deltas remain
-/// in compaction analytics events.
+/// This covers both local and remote compaction requests sent through the `/responses` path. These
+/// fields describe the operation at dispatch time. Post-response outcomes such as status, error,
+/// duration, and token deltas remain in compaction analytics events.
 #[derive(Clone, Copy, Debug, Serialize)]
 pub(crate) struct CompactionTurnMetadata {
     trigger: CompactionTrigger,
@@ -219,8 +217,8 @@ pub(crate) enum TurnToolSource {
 /// truth.
 #[derive(Clone, Debug)]
 pub struct CodexResponsesMetadata {
-    /// Opaque runtime receipt; deliberately omitted from metadata projections.
-    pub(crate) guardian_ticket: Option<codex_protocol::guardian_ticket::GuardianTicket>,
+    /// Guardian parent reference; projected only onto a Guardian request.
+    pub(crate) parent_response_id: Option<String>,
     pub(crate) installation_id: String,
     pub(crate) session_id: String,
     pub(crate) thread_id: String,
@@ -260,7 +258,7 @@ impl CodexResponsesMetadata {
         window_id: String,
     ) -> Self {
         Self {
-            guardian_ticket: None,
+            parent_response_id: None,
             installation_id,
             session_id,
             thread_id,

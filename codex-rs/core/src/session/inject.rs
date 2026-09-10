@@ -10,6 +10,7 @@ use codex_history::CodexHarnessMetadata;
 use codex_history::ResponseItemEnvelope;
 use codex_protocol::error::CodexErr;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::ModelInfo;
 
 impl Session {
     /// Inject an approved Plan-mode snapshot without opening a new user turn.
@@ -130,7 +131,7 @@ impl Session {
             return;
         }
         drop(active);
-        self.record_annotated_conversation_items(turn_context, items)
+        self.record_annotated_conversation_items(turn_context, turn_context.model_info(), items)
             .await;
     }
 
@@ -148,6 +149,7 @@ impl Session {
     pub(crate) async fn record_annotated_conversation_items(
         &self,
         turn_context: &TurnContext,
+        model_info: &ModelInfo,
         items: Vec<ResponseItemEnvelope>,
     ) {
         if items.iter().all(|item| item.metadata.is_none()) {
@@ -155,7 +157,8 @@ impl Session {
                 .into_iter()
                 .map(ResponseItemEnvelope::into_item)
                 .collect::<Vec<_>>();
-            self.record_conversation_items(turn_context, &items).await;
+            self.record_conversation_items(turn_context, model_info, &items)
+                .await;
             return;
         }
 
@@ -164,6 +167,7 @@ impl Session {
         for envelope in items {
             let (prepared_items, prepared_images) = self.prepare_conversation_items_for_history(
                 turn_context,
+                model_info,
                 std::slice::from_ref(&envelope.item),
             );
             image_preparations.extend(prepared_images);
@@ -176,8 +180,13 @@ impl Session {
                 }
             }));
         }
-        self.record_prepared_conversation_items(turn_context, annotated_items, image_preparations)
-            .await;
+        self.record_prepared_conversation_items(
+            turn_context,
+            model_info,
+            annotated_items,
+            image_preparations,
+        )
+        .await;
     }
 
     /// Injects items into active work, or records them without starting a turn.
@@ -197,7 +206,8 @@ impl Session {
                 default_turn_context.as_ref()
             }
         };
-        self.record_conversation_items(turn_context, &items).await;
+        self.record_conversation_items(turn_context, turn_context.model_info(), &items)
+            .await;
     }
 }
 

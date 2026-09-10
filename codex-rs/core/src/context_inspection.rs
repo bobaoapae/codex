@@ -28,6 +28,8 @@ use crate::client_common::Prompt;
 use crate::codex_thread::CodexThread;
 use crate::context_manager::ContextManager;
 use crate::session::rollout_reconstruction::reconstruct_history_from_rollout_items_with_policy;
+use crate::context::GuardianContextMode;
+use codex_protocol::protocol::SessionSource;
 use crate::session::session::Session;
 use crate::session::turn::build_prompt;
 use codex_features::Feature;
@@ -167,9 +169,12 @@ pub(crate) async fn inspect_stored_context(
     let reconstruction = reconstruct_history_from_rollout_items_with_policy(
         truncation_policy,
         &stored.items,
-        // FORK: detached inspection has no session to read the feature off, so
-        // it takes the feature's own default.
-        Feature::GuardianThreadContext.default_enabled(),
+        if Feature::GuardianThreadContext.default_enabled() {
+            GuardianContextMode::ThreadOwned
+        } else {
+            GuardianContextMode::Legacy
+        },
+        &SessionSource::Cli,
     );
     let mut history = ContextManager::new();
     history.replace_annotated(reconstruction.history);
@@ -382,9 +387,11 @@ async fn inspect_cold_session(
     // replay, and legacy compaction handling. Resolve only model metadata here; no turn,
     // contributor refresh, or persistence is created for a read-only cold inspection.
     let model_info = session.configured_model_info().await;
+    let session_source = session.session_source().await;
     let reconstruction = session.reconstruct_history_from_rollout_with_policy(
         model_info.truncation_policy.into(),
         &stored.items,
+        &session_source,
     );
     let mut history = ContextManager::new();
     history.replace_annotated(reconstruction.history);

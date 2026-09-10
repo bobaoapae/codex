@@ -74,11 +74,17 @@ pub(crate) fn compressed_rollout_path(path: &Path) -> PathBuf {
 }
 
 /// Materializes a compressed rollout back to plain `.jsonl` for async append paths.
-pub(crate) async fn materialize_rollout_for_append(path: &Path) -> io::Result<PathBuf> {
+pub(crate) async fn materialize_rollout_for_append(
+    path: &Path,
+    writer_lock: Option<std::sync::Arc<crate::WriterLockGuard>>,
+) -> io::Result<PathBuf> {
     let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || materialize_rollout_for_append_blocking(path.as_path()))
-        .await
-        .map_err(io::Error::other)?
+    tokio::task::spawn_blocking(move || {
+        let _writer_lock = writer_lock;
+        materialize_rollout_for_append_blocking(path.as_path())
+    })
+    .await
+    .map_err(io::Error::other)?
 }
 
 /// Materializes a compressed rollout back to plain `.jsonl` for blocking append paths.

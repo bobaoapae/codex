@@ -190,7 +190,7 @@ INSERT INTO threads (
 }
 
 #[tokio::test]
-async fn thread_artifact_migration_preserves_existing_section_metadata() {
+async fn thread_attachment_migration_preserves_existing_data() {
     let sqlite_home = crate::runtime::test_support::unique_temp_dir();
     tokio::fs::create_dir_all(&sqlite_home)
         .await
@@ -203,7 +203,7 @@ async fn thread_artifact_migration_preserves_existing_section_metadata() {
         .open_read_write_pool(&sqlite.state_db_path())
         .await
         .expect("sqlite database should open");
-    migrator_through(/*version*/ 50)
+    migrator_through(/*version*/ 51)
         .run(&pool)
         .await
         .expect("released thread migrations should apply");
@@ -214,10 +214,26 @@ async fn thread_artifact_migration_preserves_existing_section_metadata() {
         .await
         .expect("released section appearance should remain writable");
 
+    let thread_id = "00000000-0000-0000-0000-000000000051";
+    sqlx::query(
+        "INSERT INTO threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode) VALUES (?, 'rollout.jsonl', 1, 1, 'cli', 'openai', '/tmp', '', 'read-only', 'on-request')",
+    )
+    .bind(thread_id)
+    .execute(&pool)
+    .await
+    .expect("existing thread should be inserted");
+    sqlx::query(
+        "INSERT INTO thread_artifacts (id, thread_id, artifact_type, identity_key, payload, created_at) VALUES ('attachment-1', ?, 'pull_request', 'pr-123', '{}', 1)",
+    )
+    .bind(thread_id)
+    .execute(&pool)
+    .await
+    .expect("existing attachment should be inserted using the released schema");
+
     STATE_MIGRATOR
         .run(&pool)
         .await
-        .expect("artifact migration should apply without rewriting released migrations");
+        .expect("attachment migration should apply without rewriting released migrations");
     let section = sqlx::query_as::<_, (String, String, Option<String>)>(
         "SELECT id, name, appearance FROM thread_sections WHERE id = ?",
     )
@@ -234,20 +250,48 @@ async fn thread_artifact_migration_preserves_existing_section_metadata() {
         )
     );
 
-    let artifact_tables = sqlx::query_scalar::<_, String>(
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'thread_artifacts'",
+    let attachment = sqlx::query_as::<_, (String, String, String, String, String, i64)>(
+        "SELECT id, thread_id, attachment_type, identity_key, payload, created_at FROM thread_attachments",
     )
-    .fetch_all(&pool)
+    .fetch_one(&pool)
     .await
-    .expect("artifact table should exist");
-    assert_eq!(artifact_tables, vec!["thread_artifacts"]);
+    .expect("existing attachment should be copied into the new attachment table");
+    assert_eq!(
+        attachment,
+        (
+            "attachment-1".to_string(),
+            thread_id.to_string(),
+            "pull_request".to_string(),
+            "pr-123".to_string(),
+            "{}".to_string(),
+            1,
+        )
+    );
+
+    let artifact = sqlx::query_as::<_, (String, String, String, String, String, i64)>(
+        "SELECT id, thread_id, artifact_type, identity_key, payload, created_at FROM thread_artifacts",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the original artifact row should remain available to the fork API");
+    assert_eq!(
+        artifact,
+        (
+            "attachment-1".to_string(),
+            thread_id.to_string(),
+            "pull_request".to_string(),
+            "pr-123".to_string(),
+            "{}".to_string(),
+            1,
+        )
+    );
 
     let mut released_migrator = migrator_through(/*version*/ 50);
     released_migrator.ignore_missing = true;
     released_migrator
         .run(&pool)
         .await
-        .expect("released binaries should tolerate the additive artifact migration");
+        .expect("released binaries should tolerate the attachment compatibility migration");
 }
 
 #[tokio::test]
@@ -870,10 +914,16 @@ async fn repair_recency_migration_succeeds_while_another_connection_holds_writer
 /// that refuses to open a database an earlier build already migrated. These are
 /// the fork-authored migrations, pinned to the digests that are applied in the
 /// wild; `codex-rs/state/.gitattributes` keeps their line endings stable.
-const FORK_STATE_MIGRATION_CHECKSUMS: &[(i64, &str)] = &[(
-    53,
-    "1d8935d7603ceaf40bdef717c64674d9be98f781215fe54c2b4e5f27646de90a75ff0c3a1d8163ad41d61543136aa8d5",
-)];
+const FORK_STATE_MIGRATION_CHECKSUMS: &[(i64, &str)] = &[
+    (
+        53,
+        "1d8935d7603ceaf40bdef717c64674d9be98f781215fe54c2b4e5f27646de90a75ff0c3a1d8163ad41d61543136aa8d5",
+    ),
+    (
+        56,
+        "c7bc34c8ca1432c40c62ce4b8fa692c5461bbc5c642c10071ce12e02b4c4c63204052cfb524a45a797a42881167cb90b",
+    ),
+];
 
 const FORK_WORKFLOW_MIGRATION_CHECKSUMS: &[(i64, &str)] = &[
     (
