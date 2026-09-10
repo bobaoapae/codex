@@ -1439,7 +1439,8 @@ impl Session {
                     | RolloutItem::RealtimeItem(_)
                     | RolloutItem::TokenUsageRecord(_)
                     | RolloutItem::RetainedContext(_)
-                    | RolloutItem::SecurityRiskScore(_) => {}
+                    | RolloutItem::SecurityRiskScore(_)
+                    | RolloutItem::Extension(_) => {}
                 }
             }
             let session_extension_data =

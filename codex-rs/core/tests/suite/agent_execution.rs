@@ -50,6 +50,54 @@ fn has_function_call_output(request: &wiremock::Request, call_id: &str) -> bool 
     })
 }
 
+fn request_has_input_type(request: &wiremock::Request, input_type: &str) -> bool {
+    serde_json::from_slice::<serde_json::Value>(&request.body)
+        .ok()
+        .and_then(|body| {
+            body.get("input")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+        })
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                item.get("type").and_then(serde_json::Value::as_str) == Some(input_type)
+            })
+        })
+}
+
+fn namespace_child_tool_from_request_body<'a>(
+    body: &'a serde_json::Value,
+    namespace: &str,
+    tool_name: &str,
+) -> Option<&'a serde_json::Value> {
+    let tools = body
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| {
+            body.get("input")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|items| {
+                    items.iter().find(|item| {
+                        item.get("type").and_then(serde_json::Value::as_str)
+                            == Some("additional_tools")
+                    })
+                })
+                .and_then(|item| item.get("tools"))
+                .and_then(serde_json::Value::as_array)
+        })?;
+
+    tools
+        .iter()
+        .find(|tool| {
+            tool.get("name").and_then(serde_json::Value::as_str) == Some(namespace)
+                && tool.get("type").and_then(serde_json::Value::as_str) == Some("namespace")
+        })?
+        .get("tools")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .find(|tool| tool.get("name").and_then(serde_json::Value::as_str) == Some(tool_name))
+}
+
 async fn mount_root_collaboration_call(
     server: &wiremock::MockServer,
     prompt: &'static str,
@@ -201,6 +249,94 @@ async fn v2_nested_spawn_checks_shared_active_execution_capacity() -> Result<()>
         "collab spawn failed: agent thread limit reached"
     );
     assert_eq!(test.thread_manager.list_thread_ids().await.len(), 2);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v2_spawn_task_context_starts_task_only_child_with_brief_and_message() -> Result<()> {
+    const ROOT_PROMPT: &str = "spawn a worker with ROOT_HISTORY_SENTINEL";
+    const ROOT_HISTORY_SENTINEL: &str = "ROOT_HISTORY_SENTINEL";
+    const TASK_CONTEXT: &str = "TASK_CONTEXT_OBJECTIVE_SENTINEL";
+    const TASK_MESSAGE: &str = "TASK_MESSAGE_SENTINEL";
+
+    let server = start_mock_server().await;
+    let spawn_args = serde_json::to_string(&json!({
+        "message": TASK_MESSAGE,
+        "task_context": TASK_CONTEXT,
+        "task_name": "briefed"
+    }))?;
+    let root_response = mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| body_contains(request, ROOT_PROMPT),
+        sse(vec![
+            ev_response_created("briefed-spawn-response"),
+            ev_function_call_with_namespace(
+                "briefed-spawn-call",
+                MULTI_AGENT_V2_NAMESPACE,
+                "spawn_agent",
+                &spawn_args,
+            ),
+            ev_completed("briefed-spawn-response"),
+        ]),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| has_function_call_output(request, "briefed-spawn-call"),
+        sse(vec![
+            ev_response_created("briefed-followup-response"),
+            ev_assistant_message("briefed-followup-message", "worker spawned"),
+            ev_completed("briefed-followup-response"),
+        ]),
+    )
+    .await;
+    let child_response = mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            body_contains(request, TASK_CONTEXT)
+                && body_contains(request, TASK_MESSAGE)
+                && request_has_input_type(request, "agent_message")
+                && !body_contains(request, ROOT_HISTORY_SENTINEL)
+        },
+        sse(vec![
+            ev_response_created("briefed-worker-response"),
+            ev_assistant_message("briefed-worker-message", "worker completed"),
+            ev_completed("briefed-worker-response"),
+        ]),
+    )
+    .await;
+
+    let mut test = test_codex()
+        .with_model("gpt-5.6-sol")
+        .with_config(|config| {
+            for feature in [Feature::Collab, Feature::MultiAgentV2] {
+                config
+                    .features
+                    .enable(feature)
+                    .expect("test config should allow feature update");
+            }
+        });
+    let test = test.build_with_auto_env(&server).await?;
+    test.submit_turn(ROOT_PROMPT).await?;
+
+    let child_request = child_response.single_request();
+    assert!(
+        child_request.body_contains_text("<codex_spawn_task_context>Parent-provided task context:")
+    );
+    assert!(child_request.body_contains_text(TASK_CONTEXT));
+    assert!(child_request.body_contains_text(TASK_MESSAGE));
+    assert!(!child_request.body_contains_text(ROOT_HISTORY_SENTINEL));
+
+    let root_body = root_response.single_request().body_json();
+    let spawn_tool =
+        namespace_child_tool_from_request_body(&root_body, MULTI_AGENT_V2_NAMESPACE, "spawn_agent")
+            .expect("v2 spawn_agent should be exposed");
+    let task_context_description = spawn_tool
+        .pointer("/parameters/properties/task_context/description")
+        .and_then(serde_json::Value::as_str)
+        .expect("task_context should be documented in the tool schema");
+    assert!(task_context_description.contains("768 UTF-8 bytes"));
 
     Ok(())
 }

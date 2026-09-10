@@ -277,7 +277,7 @@ impl ViewImageHandler {
                 },
             )
             .await;
-            return match answer {
+            return match answer.text {
                 Some(text) => Ok(boxed_tool_output(ViewImageTextOutput { text })),
                 None => Err(FunctionCallError::RespondToModel(format!(
                     "the image reader `{}` failed to answer; call view_image again without `question` to load the image itself",

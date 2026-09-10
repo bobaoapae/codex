@@ -413,8 +413,14 @@ fn wait_agent_tool_v2_uses_timeout_only_summary_output() {
     assert!(properties.contains_key("targets"));
     assert!(properties.contains_key("timeout_ms"));
     assert!(properties.contains_key("afterRevision"));
+    assert!(properties.contains_key("mode"));
+    assert_eq!(
+        properties["mode"].enum_values.as_ref(),
+        Some(&vec![json!("bounded"), json!("until_change")])
+    );
     assert!(description.contains("Pass `targets` to wake only for specific agents"));
     assert!(description.contains("Does not return the content"));
+    assert!(description.contains("mode: \"until_change\""));
     assert_eq!(
         properties
             .get("timeout_ms")

@@ -256,7 +256,8 @@ fn history_mailbox_state(history: &[RolloutItem], message_id: &str) -> Canonical
             | RolloutItem::EventMsg(_)
             | RolloutItem::RealtimeItem(_)
             | RolloutItem::RetainedContext(_)
-            | RolloutItem::TokenUsageRecord(_) => {}
+            | RolloutItem::TokenUsageRecord(_)
+            | RolloutItem::Extension(_) => {}
         }
     }
     state

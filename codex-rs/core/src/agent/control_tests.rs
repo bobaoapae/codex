@@ -288,6 +288,7 @@ async fn persisted_originator(thread: &CodexThread) -> String {
             | RolloutItem::RetainedContext(_)
             | RolloutItem::SecurityRiskScore(_)
             | RolloutItem::TokenUsageRecord(_)
+            | RolloutItem::Extension(_)
             | RolloutItem::TurnContext(_) => None,
         })
         .expect("session metadata should be persisted")

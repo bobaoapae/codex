@@ -1,5 +1,6 @@
 use super::multi_agents_common::MAX_SPAWN_AGENT_MODEL_OVERRIDES;
 use super::multi_agents_common::model_supports_multi_agent_backend;
+use crate::context::MAX_SPAWN_TASK_CONTEXT_BYTES;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_tools::JsonSchema;
@@ -27,6 +28,12 @@ const SPAWN_AGENT_TYPE_OVERRIDE_DESCRIPTION_V1: &str = "Agent type override for 
 const SPAWN_AGENT_MODEL_OVERRIDE_DESCRIPTION: &str =
     "Model override for the new agent. Omit unless an explicit override is needed.";
 const MAX_REASONING_EFFORT_CHARS_IN_SPAWN_AGENT_DESCRIPTION: usize = 64;
+const SPAWN_AGENT_TASK_CONTEXT_GUIDANCE: &str = r#"For bounded delegation, prefer a `task_context` brief with task-only context; use inherited history when the task needs it. When `task_context` is provided, keep it to a concise brief using this template:
+Objective: ...
+Facts/decisions: ...
+References/accepted criteria: ...
+Validation: ...
+If `fork_turns` is omitted, that brief starts a task-only child; an explicit `fork_turns` value remains authoritative. Ask the child to return the result, changed files, validation, and any real blocker; put long logs in files and cite their paths."#;
 
 #[derive(Debug, Clone)]
 pub struct SpawnAgentToolOptions {
@@ -315,7 +322,7 @@ pub fn create_wait_agent_tool_v1(options: WaitAgentTimeoutOptions) -> ToolSpec {
 pub fn create_wait_agent_tool_v2(options: WaitAgentTimeoutOptions) -> ToolSpec {
     ToolSpec::Function(ResponsesApiTool {
         name: "wait_agent".to_string(),
-        description: "Wait for a causal update from a live agent, including queued messages, status changes, terminal status, and quiet terminals that need attention. Pass `targets` to wake only for specific agents; relative names and their canonical paths (for example `worker` and `/root/worker`) are equivalent and are deduplicated. The response returns canonical target paths and a root-scoped `revision`; use that path and pass `afterRevision` on a later wait instead of repeating a wait with the same revision. Without targets, any agent's update ends the wait. The wait also ends early when new user input is steered into the active turn. Does not return the content or message body. Prefer one long wait per round, and read target idle/status details before deciding an agent is stuck."
+        description: "Wait for a causal update from a live agent, including queued messages, status changes, terminal status, and quiet terminals that need attention. Pass `targets` to wake only for specific agents; relative names and their canonical paths (for example `worker` and `/root/worker`) are equivalent and are deduplicated. The response returns canonical target paths and a root-scoped `revision`; use that path and pass `afterRevision` on a later wait instead of repeating a wait with the same revision. Without targets, any agent's update ends the wait. The wait also ends early when new user input is steered into the active turn. Does not return the content or message body. Omit `mode` for the bounded compatibility wait; use `mode: \"until_change\"` for blocked work so a clean interval timeout re-arms internally until a matching change, attention/final state, steer, or the configured hard maximum. Prefer one long wait per round, and read target idle/status details before deciding an agent is stuck."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -653,7 +660,7 @@ fn wait_output_schema_v2() -> Value {
             // could not tell a working child from a wedged one.
             "agents": {
                 "type": "array",
-                "description": "Live agents and what each was last observed doing.",
+                "description": "Requested live agents and what each was last observed doing when a timeout needs attention; clean bounded timeouts keep this list empty.",
                 "items": {
                     "type": "object",
                     "properties": {
@@ -791,9 +798,15 @@ fn spawn_agent_common_properties_v2(agent_type_description: &str) -> BTreeMap<St
         (
             "fork_turns".to_string(),
             JsonSchema::string(Some(
-                "Optional number of turns to fork. Defaults to `all`. Use `none`, `all`, or a positive integer string such as `3` to fork only the most recent turns."
+                "Optional number of turns to fork. Defaults to `all`. Use `none`, `all`, or a positive integer string such as `3` to fork only the most recent turns. When `task_context` is set and `fork_turns` is omitted, the child starts with task-only context; an explicit value remains authoritative."
                     .to_string(),
             )),
+        ),
+        (
+            "task_context".to_string(),
+            JsonSchema::string(Some(format!(
+                "Optional parent-provided brief for a task-only child, capped at {MAX_SPAWN_TASK_CONTEXT_BYTES} UTF-8 bytes. Include the objective, facts or decisions, references or accepted criteria, and validation."
+            ))),
         ),
         (
             "model".to_string(),
@@ -902,6 +915,8 @@ The spawned agent will have the same tools as you and the ability to spawn its o
 Only call this tool for a concrete, bounded subtask that can run independently alongside useful local work; otherwise continue locally.
 It will be able to send you and other running agents messages, and its final answer will be provided to you when it finishes.
 The new agent's canonical task name will be provided to it along with the message.
+
+{SPAWN_AGENT_TASK_CONTEXT_GUIDANCE} The maximum `task_context` size is {MAX_SPAWN_TASK_CONTEXT_BYTES} UTF-8 bytes.
 
 Note that passing `fork_turns="none"` will not pass any surrounding context to the spawned subagent, which may cause the agent to lack the context it needs to complete its task, whereas `fork_turns="all"` will provide the subagent with all surrounding context."#
     );
@@ -1037,6 +1052,16 @@ fn wait_agent_tool_parameters_v2(options: WaitAgentTimeoutOptions) -> JsonSchema
             JsonSchema::number(Some(
                 "Only updates with a root-scoped revision greater than this value wake the wait. Use the revision returned by the previous wait.".to_string(),
             )),
+        ),
+        (
+            "mode".to_string(),
+            JsonSchema::string_enum(
+                vec![json!("bounded"), json!("until_change")],
+                Some(
+                    "Wait mode. Omit for the bounded compatibility behavior; use `until_change` for blocked work to re-arm after clean interval timeouts until a matching change or the configured hard maximum."
+                        .to_string(),
+                ),
+            ),
         ),
     ]);
 

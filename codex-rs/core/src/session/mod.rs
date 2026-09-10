@@ -40,6 +40,8 @@ use crate::image_preparation::ImagePreparationMode;
 use crate::image_preparation::ImageResizeNoticeMode;
 use crate::image_preparation::prepare_response_items as prepare_image_response_items;
 use crate::image_preparation::unified_image_budget_enabled;
+use crate::image_reader::ImageReaderCacheKey;
+use crate::image_reader::ImageReaderCacheLookup;
 use crate::parse_turn_item;
 use crate::realtime_conversation::RealtimeConversationManager;
 use crate::realtime_history::RealtimeEventOrder;
@@ -334,6 +336,7 @@ use codex_git_utils::get_git_repo_root;
 use codex_history::CodexHarnessMetadata;
 use codex_history::CompactedItem;
 use codex_history::ImageDescription;
+use codex_history::ImageReaderUsage;
 use codex_history::InitialHistory;
 use codex_history::ResponseItemEnvelope;
 use codex_mcp::McpConfig;
@@ -3558,6 +3561,31 @@ impl Session {
             .await;
     }
 
+    pub(crate) async fn image_reader_cache_begin(
+        &self,
+        key: ImageReaderCacheKey,
+    ) -> ImageReaderCacheLookup {
+        self.state.lock().await.image_reader_cache.begin(key)
+    }
+
+    pub(crate) async fn image_reader_cache_finish(
+        &self,
+        key: ImageReaderCacheKey,
+        sender: watch::Sender<Option<String>>,
+        text: Option<String>,
+    ) {
+        self.state
+            .lock()
+            .await
+            .image_reader_cache
+            .finish(key, sender, text);
+    }
+
+    pub(crate) async fn record_image_reader_usage(&self, usage: ImageReaderUsage) {
+        self.persist_rollout_items(&[RolloutItem::Extension(usage)])
+            .await;
+    }
+
     /// FORK: read every new image once, with the configured reader model.
     ///
     /// This is the single async funnel all three image paths pass through
@@ -3645,7 +3673,7 @@ impl Session {
 
         for (image, description) in pending.into_iter().zip(descriptions) {
             // A failed read leaves the raw pixels in place, which is today's behavior.
-            let Some(text) = description else {
+            let Some(text) = description.text else {
                 continue;
             };
             items[image.item_index]

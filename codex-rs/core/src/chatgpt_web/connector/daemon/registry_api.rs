@@ -669,14 +669,13 @@ impl ConnectorApi for ChromeMcpPageApi {
                 // the part that matches what the tunnel's audience lists.
                 RegistryOp::ReadAccount => {
                     let account = self
-                        .fetch_ok(
-                            "GET",
-                            "/backend-api/accounts/check/v4-2023-04-27",
-                            None,
-                        )
+                        .fetch_ok("GET", "/backend-api/accounts/check/v4-2023-04-27", None)
                         .await?;
                     let session = self.fetch_ok("GET", "/api/auth/session", None).await.ok();
-                    Ok(ApiResult::Account(parse_account(&account, session.as_ref())))
+                    Ok(ApiResult::Account(parse_account(
+                        &account,
+                        session.as_ref(),
+                    )))
                 }
                 RegistryOp::DeleteLink(link_id) => ok_or_gone(
                     self.fetch_ok(

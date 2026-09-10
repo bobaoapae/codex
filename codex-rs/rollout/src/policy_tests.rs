@@ -1,6 +1,7 @@
 use codex_extension_items::ExtensionItem;
 use codex_extension_items::receipt::ReceiptAttachedItem;
 use codex_extension_items::receipt::ReceiptStatus;
+use codex_history::ImageReaderUsage;
 use codex_protocol::ThreadId;
 use codex_protocol::items::TurnItem;
 use codex_protocol::protocol::EventMsg;
@@ -41,6 +42,26 @@ fn receipt_attached_is_persisted_in_legacy_and_paginated_history() {
         assert_eq!(
             serde_json::to_value(&persisted[0]).expect("serialize persisted receipt"),
             serde_json::to_value(&item).expect("serialize receipt"),
+        );
+    }
+}
+
+#[test]
+fn image_reader_usage_is_persisted_as_a_rollout_extension() {
+    let item = RolloutItem::Extension(ImageReaderUsage::new(
+        "gpt-5.6-luna",
+        "openai",
+        "reader-response-1",
+        None,
+    ));
+
+    for history_mode in [ThreadHistoryMode::Legacy, ThreadHistoryMode::Paginated] {
+        assert!(is_persisted_rollout_item(&item, history_mode));
+        let persisted = persisted_rollout_items(std::slice::from_ref(&item), history_mode);
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&persisted[0]).expect("serialize persisted reader usage"),
+            serde_json::to_value(&item).expect("serialize reader usage"),
         );
     }
 }

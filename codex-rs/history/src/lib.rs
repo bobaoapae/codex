@@ -21,6 +21,7 @@ use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSource;
+use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageRecord;
 use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::protocol::WorldStateItem;
@@ -94,6 +95,51 @@ pub struct ImageDescription {
     pub model: String,
 }
 
+/// Usage observed for one completed request made by the optional image reader.
+///
+/// This is deliberately a standalone rollout extension instead of a
+/// [`TokenUsageRecord`]. Reader calls are not part of the main model's turn or
+/// context accounting, so folding them into that record would inflate the
+/// main model's totals and could trigger an incorrect auto-compaction.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+pub struct ImageReaderUsage {
+    /// Stable extension discriminator for rollout consumers.
+    pub kind: String,
+    /// Reader model that handled the image.
+    pub model: String,
+    /// Provider ID used for the reader request.
+    pub provider: String,
+    /// Purpose of this request. Currently always `image_reader`.
+    pub purpose: String,
+    /// Provider response ID. A completed response always has a record even if
+    /// the provider omitted usage details.
+    pub response_id: String,
+    /// Provider-reported usage, or `None` when the response omitted it.
+    /// `null` is retained in the rollout to distinguish missing data from zero.
+    pub usage: Option<TokenUsage>,
+}
+
+impl ImageReaderUsage {
+    pub const KIND: &'static str = "image_reader.usage";
+    pub const PURPOSE: &'static str = "image_reader";
+
+    pub fn new(
+        model: impl Into<String>,
+        provider: impl Into<String>,
+        response_id: impl Into<String>,
+        usage: Option<TokenUsage>,
+    ) -> Self {
+        Self {
+            kind: Self::KIND.to_string(),
+            model: model.into(),
+            provider: provider.into(),
+            purpose: Self::PURPOSE.to_string(),
+            response_id: response_id.into(),
+            usage,
+        }
+    }
+}
+
 impl ResponseItemEnvelope {
     /// Wraps a raw Responses API item for persisted history.
     pub fn new(item: ResponseItem) -> Self {
@@ -164,6 +210,8 @@ pub enum RolloutItem {
     EventMsg(EventMsg),
     /// Sparse, model-invisible facts used to reconstruct realtime presentation.
     RealtimeItem(RealtimeItem),
+    /// Model-invisible usage from one completed optional image-reader request.
+    Extension(ImageReaderUsage),
 }
 
 impl Serialize for RolloutItem {
@@ -504,6 +552,7 @@ fn multi_agent_version_from_items(
             | RolloutItem::RetainedContext(_)
             | RolloutItem::SecurityRiskScore(_)
             | RolloutItem::RealtimeItem(_)
+            | RolloutItem::Extension(_)
             | RolloutItem::EventMsg(_) => None,
         })
     })

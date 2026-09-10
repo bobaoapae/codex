@@ -79,10 +79,7 @@ impl DaemonHandle {
     /// The `Turn` trigger is the one allowed to override a parked registry, so
     /// a user who has just fixed their tunnel gets a fresh attempt on the very
     /// next turn instead of waiting out the backoff ladder.
-    async fn refresh_registry(
-        &self,
-        timeout: Duration,
-    ) -> Result<wire::ReconcileResponse, String> {
+    async fn refresh_registry(&self, timeout: Duration) -> Result<wire::ReconcileResponse, String> {
         let response = self
             .http
             .post(format!("{}/v1/registry/refresh", self.control_url))
@@ -432,7 +429,6 @@ impl DaemonSessionBroker {
     }
 
     async fn wait_verified(&self, ready_timeout: Duration) -> Result<(), String> {
-
         let deadline = tokio::time::Instant::now() + ready_timeout;
         // FORK: ask for a reconcile up front rather than polling a status the
         // daemon's own backoff may not revisit for half an hour. This is also
@@ -536,7 +532,10 @@ fn terminal_health_error(health: &wire::HealthResponse) -> Option<String> {
         return None;
     }
     Some(render_terminal_registry_error(
-        health.registry_reason.as_deref().unwrap_or("no reason given"),
+        health
+            .registry_reason
+            .as_deref()
+            .unwrap_or("no reason given"),
         kind.label(),
         health.registry_parked,
         health.registry_retry_at_ms,

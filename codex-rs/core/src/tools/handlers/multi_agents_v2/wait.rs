@@ -5,6 +5,7 @@ use crate::tools::handlers::multi_agents_spec::WaitAgentTimeoutOptions;
 use crate::tools::handlers::multi_agents_spec::create_wait_agent_tool_v2;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
+use codex_protocol::protocol::CollabAgentRef;
 use codex_tools::ToolSpec;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -17,6 +18,7 @@ use tokio::time::timeout_at;
 use super::wait_state::ResolvedTarget;
 pub(crate) use super::wait_state::WaitAgentResult;
 use super::wait_state::WaitAgentSnapshot;
+use super::wait_state::WaitAgentTargetSnapshot;
 use super::wait_state::WaitAgentTargetStatus;
 pub(crate) use super::wait_state::WaitAgentWakeReason;
 use super::wait_state::WaitOutcome;
@@ -78,6 +80,7 @@ impl Handler {
             Some(ms) => ms.max(min_timeout_ms),
             None => default_timeout_ms,
         };
+        let mode = args.mode;
 
         let control = &session.services.agent_control;
         control.register_session_root(session.thread_id, turn.parent_thread_id);
@@ -101,6 +104,7 @@ impl Handler {
             .subscribe_activity(turn_state.as_deref())
             .await;
         let mut revision_rx = control.subscribe_revision();
+        let (receiver_thread_ids, receiver_agents) = receiver_details(control, &targets);
 
         session
             .emit_turn_item_started(
@@ -110,8 +114,8 @@ impl Handler {
                     tool: CollabAgentTool::Wait,
                     status: CollabAgentToolCallStatus::InProgress,
                     sender_thread_id: session.thread_id,
-                    receiver_thread_ids: Vec::new(),
-                    receiver_agents: Vec::new(),
+                    receiver_thread_ids: receiver_thread_ids.clone(),
+                    receiver_agents: receiver_agents.clone(),
                     prompt: None,
                     model: None,
                     reasoning_effort: None,
@@ -120,15 +124,26 @@ impl Handler {
             )
             .await;
 
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+        let total_timeout_ms = match mode {
+            WaitMode::Bounded => timeout_ms,
+            WaitMode::UntilChange => max_timeout_ms.max(timeout_ms),
+        };
+        let timeout_duration = if mode == WaitMode::UntilChange && timeout_ms <= 0 {
+            Duration::from_millis(total_timeout_ms.max(1) as u64)
+        } else {
+            Duration::from_millis(timeout_ms as u64)
+        };
+        let deadline = Instant::now() + Duration::from_millis(total_timeout_ms as u64);
         let outcome = wait_for_outcome(
             WaitParameters {
                 session: &session,
                 targets: &targets,
                 baseline,
                 include_current_terminal: after_revision.is_none(),
+                allow_stale_final_escape: mode == WaitMode::UntilChange && after_revision.is_some(),
                 accept_existing_mailbox: after_revision.is_none(),
-                timeout_duration: Duration::from_millis(timeout_ms as u64),
+                mode,
+                timeout_duration,
             },
             pending_activity,
             &mut activity_rx,
@@ -136,8 +151,36 @@ impl Handler {
             deadline,
         )
         .await;
-        let target_snapshots = target_snapshots(control, &targets).await;
-        let agents = live_agent_snapshots(&session, &turn).await;
+        let target_snapshots = result_target_snapshots(
+            control,
+            &targets,
+            after_revision,
+            baseline,
+            &outcome,
+            timeout_duration,
+            mode,
+        )
+        .await;
+        let include_agents = matches!(
+            outcome,
+            WaitOutcome::TimedOut {
+                needs_attention: true,
+                ..
+            }
+        );
+        let agents = if include_agents {
+            let target_paths = target_snapshots
+                .iter()
+                .map(|target| target.canonical_path.as_str())
+                .collect::<HashSet<_>>();
+            live_agent_snapshots(&session, &turn, &targets)
+                .await
+                .into_iter()
+                .filter(|agent| target_paths.contains(agent.agent_name.as_str()))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let result = WaitAgentResult::from_outcome(
             outcome,
             requested_timeout_ms,
@@ -154,8 +197,8 @@ impl Handler {
                     tool: CollabAgentTool::Wait,
                     status: CollabAgentToolCallStatus::Completed,
                     sender_thread_id: session.thread_id,
-                    receiver_thread_ids: Vec::new(),
-                    receiver_agents: Vec::new(),
+                    receiver_thread_ids,
+                    receiver_agents,
                     prompt: None,
                     model: None,
                     reasoning_effort: None,
@@ -179,8 +222,18 @@ struct WaitParameters<'a> {
     targets: &'a [ResolvedTarget],
     baseline: u64,
     include_current_terminal: bool,
+    allow_stale_final_escape: bool,
     accept_existing_mailbox: bool,
+    mode: WaitMode,
     timeout_duration: Duration,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum WaitMode {
+    #[default]
+    Bounded,
+    UntilChange,
 }
 
 async fn resolve_targets(
@@ -206,6 +259,40 @@ async fn resolve_targets(
     Ok(resolved)
 }
 
+fn receiver_details(
+    control: &crate::agent::AgentControl,
+    targets: &[ResolvedTarget],
+) -> (Vec<ThreadId>, Vec<CollabAgentRef>) {
+    let entries: Vec<(ThreadId, AgentPath)> = if targets.is_empty() {
+        control
+            .agent_entries_for_prefix(None)
+            .into_iter()
+            .filter(|(_, path)| !path.is_root())
+            .collect()
+    } else {
+        targets
+            .iter()
+            .map(|target| (target.thread_id, target.path.clone()))
+            .collect()
+    };
+    let mut seen = HashSet::new();
+    let mut receiver_thread_ids = Vec::with_capacity(entries.len());
+    let mut receiver_agents = Vec::with_capacity(entries.len());
+    for (thread_id, _) in entries {
+        if !seen.insert(thread_id) {
+            continue;
+        }
+        let metadata = control.get_agent_metadata(thread_id).unwrap_or_default();
+        receiver_thread_ids.push(thread_id);
+        receiver_agents.push(CollabAgentRef {
+            thread_id,
+            agent_nickname: metadata.agent_nickname,
+            agent_role: metadata.agent_role,
+        });
+    }
+    (receiver_thread_ids, receiver_agents)
+}
+
 fn agent_reference_error(error: codex_protocol::error::CodexErr) -> FunctionCallError {
     FunctionCallError::RespondToModel(error.to_string())
 }
@@ -222,7 +309,9 @@ async fn wait_for_outcome(
         targets,
         baseline,
         include_current_terminal,
+        allow_stale_final_escape,
         accept_existing_mailbox,
+        mode,
         timeout_duration,
     } = parameters;
     if matches!(pending_activity, Some(InputQueueActivity::Steer)) {
@@ -237,8 +326,15 @@ async fn wait_for_outcome(
             reason: WaitAgentWakeReason::Message,
         };
     }
-    if let Some((revision, kind)) =
-        latest_matching_change(session, targets, baseline, include_current_terminal).await
+    if let Some((revision, kind)) = latest_matching_change(
+        session,
+        targets,
+        baseline,
+        include_current_terminal,
+        allow_stale_final_escape,
+        /*include_stale_attention*/ true,
+    )
+    .await
     {
         return WaitOutcome::Progress {
             revision,
@@ -246,9 +342,13 @@ async fn wait_for_outcome(
         };
     }
 
+    let mut interval_deadline = match mode {
+        WaitMode::Bounded => deadline,
+        WaitMode::UntilChange => (Instant::now() + timeout_duration).min(deadline),
+    };
     loop {
-        tokio::select! {
-            activity = timeout_at(deadline, activity_rx.changed()) => {
+        let interval_expired = tokio::select! {
+            activity = timeout_at(interval_deadline, activity_rx.changed()) => {
                 match activity {
                     Ok(Ok(())) => {
                         let activity = *activity_rx.borrow_and_update();
@@ -270,29 +370,70 @@ async fn wait_for_outcome(
                                 return WaitOutcome::Steered { revision: baseline };
                             }
                         }
+                        false
                     }
-                    Ok(Err(_)) | Err(_) => return timeout_outcome(session, targets, baseline, timeout_duration).await,
+                    Ok(Err(_)) => return timeout_outcome(session, targets, baseline, timeout_duration).await,
+                    Err(_) => true,
                 }
             }
-            revision = timeout_at(deadline, revision_rx.changed()) => {
+            revision = timeout_at(interval_deadline, revision_rx.changed()) => {
                 match revision {
                     Ok(Ok(())) => {
                         if let Some((revision, kind)) = latest_matching_change(
                             session,
                             targets,
                             baseline,
-                            /*include_current_terminal*/ false,
+                            include_current_terminal,
+                            allow_stale_final_escape,
+                            /*include_stale_attention*/ true,
                         ).await {
                             return WaitOutcome::Progress {
                                 revision,
                                 reason: wake_reason(kind),
                             };
                         }
+                        false
                     }
-                    Ok(Err(_)) | Err(_) => return timeout_outcome(session, targets, baseline, timeout_duration).await,
+                    Ok(Err(_)) => return timeout_outcome(session, targets, baseline, timeout_duration).await,
+                    Err(_) => true,
                 }
             }
+        };
+
+        if !interval_expired {
+            continue;
         }
+
+        if let Some((revision, kind)) = latest_matching_change(
+            session,
+            targets,
+            baseline,
+            include_current_terminal,
+            allow_stale_final_escape,
+            /*include_stale_attention*/ true,
+        )
+        .await
+        {
+            return WaitOutcome::Progress {
+                revision,
+                reason: wake_reason(kind),
+            };
+        }
+
+        let outcome = timeout_outcome(session, targets, baseline, timeout_duration).await;
+        if mode == WaitMode::Bounded
+            || !matches!(
+                outcome,
+                WaitOutcome::TimedOut {
+                    needs_attention: false,
+                    ..
+                }
+            )
+            || Instant::now() >= deadline
+        {
+            return outcome;
+        }
+        interval_deadline = (Instant::now() + timeout_duration).min(deadline);
     }
 }
 
@@ -303,23 +444,136 @@ async fn timeout_outcome(
     timeout_duration: Duration,
 ) -> WaitOutcome {
     let snapshots = target_snapshots(&session.services.agent_control, targets).await;
-    let needs_attention = snapshots.iter().any(|target| {
-        target.waiting_terminal.as_ref().is_some_and(|terminal| {
-            terminal.state == crate::unified_exec::TerminalProcessState::NeedsAttention
-        }) || matches!(
-            target.status,
-            WaitAgentTargetStatus::Running
-                | WaitAgentTargetStatus::WaitingForTool
-                | WaitAgentTargetStatus::WaitingForApproval
-                | WaitAgentTargetStatus::WaitingForUser
-        ) && target
-            .idle_ms
-            .is_none_or(|idle_ms| idle_ms >= timeout_duration.as_millis() as u64)
-    });
+    let needs_attention = snapshots
+        .iter()
+        .any(|target| target_needs_attention(target, timeout_duration));
     WaitOutcome::TimedOut {
         revision: baseline,
         needs_attention,
     }
+}
+
+async fn result_target_snapshots(
+    control: &crate::agent::AgentControl,
+    targets: &[ResolvedTarget],
+    after_revision: Option<u64>,
+    baseline: u64,
+    outcome: &WaitOutcome,
+    timeout_duration: Duration,
+    mode: WaitMode,
+) -> Vec<WaitAgentTargetSnapshot> {
+    if matches!(
+        outcome,
+        WaitOutcome::Steered { .. }
+            | WaitOutcome::TimedOut {
+                needs_attention: false,
+                ..
+            }
+    ) {
+        return Vec::new();
+    }
+    let snapshots = target_snapshots(control, targets).await;
+    let result_targets = if targets.is_empty() {
+        control
+            .agent_entries_for_prefix(None)
+            .into_iter()
+            .filter(|(_, path)| !path.is_root())
+            .map(|(thread_id, path)| ResolvedTarget { thread_id, path })
+            .collect::<Vec<_>>()
+    } else {
+        targets.to_vec()
+    };
+    let has_cursor = after_revision.is_some();
+    let stale_terminal_escape = matches!(
+        outcome,
+        WaitOutcome::Progress {
+            revision,
+            reason: WaitAgentWakeReason::Terminal,
+        } if *revision <= baseline
+    );
+    let progress_reason = match outcome {
+        WaitOutcome::Progress { reason, .. } => Some(*reason),
+        WaitOutcome::Steered { .. } | WaitOutcome::TimedOut { .. } => None,
+    };
+    let timed_out_with_attention = matches!(
+        outcome,
+        WaitOutcome::TimedOut {
+            needs_attention: true,
+            ..
+        }
+    );
+
+    let all_target_snapshots_final = snapshots_are_all_final(&snapshots);
+    let mut result = Vec::new();
+    for snapshot in snapshots {
+        let Some(target) = result_targets
+            .iter()
+            .find(|target| target.path.as_str() == snapshot.canonical_path)
+        else {
+            continue;
+        };
+        let changed = target_has_new_change(control, target, baseline);
+        let attention = target_needs_attention(&snapshot, timeout_duration);
+        let stale_terminal_target = stale_terminal_escape
+            && snapshot.status.is_terminal()
+            && (!has_cursor || mode == WaitMode::UntilChange && all_target_snapshots_final);
+        let include = if timed_out_with_attention {
+            attention
+        } else if matches!(outcome, WaitOutcome::TimedOut { .. }) {
+            false
+        } else if let Some(reason) = progress_reason {
+            changed
+                || attention && reason == WaitAgentWakeReason::NeedsAttention
+                || stale_terminal_target
+                || !has_cursor && reason == WaitAgentWakeReason::Message
+        } else {
+            false
+        };
+        if include {
+            result.push(snapshot);
+        }
+    }
+    result
+}
+
+fn snapshots_are_all_final(snapshots: &[WaitAgentTargetSnapshot]) -> bool {
+    !snapshots.is_empty()
+        && snapshots
+            .iter()
+            .all(|snapshot| snapshot.status.is_terminal())
+}
+
+fn target_has_new_change(
+    control: &crate::agent::AgentControl,
+    target: &ResolvedTarget,
+    baseline: u64,
+) -> bool {
+    control
+        .agent_entries_for_prefix(Some(&target.path))
+        .into_iter()
+        .chain(std::iter::once((target.thread_id, target.path.clone())))
+        .map(|(thread_id, _)| thread_id)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .any(|thread_id| {
+            control
+                .last_agent_change(thread_id)
+                .is_some_and(|change| change.revision > baseline)
+        })
+}
+
+fn target_needs_attention(target: &WaitAgentTargetSnapshot, timeout_duration: Duration) -> bool {
+    target.waiting_terminal.as_ref().is_some_and(|terminal| {
+        terminal.state == crate::unified_exec::TerminalProcessState::NeedsAttention
+    }) || matches!(
+        target.status,
+        WaitAgentTargetStatus::Running
+            | WaitAgentTargetStatus::WaitingForTool
+            | WaitAgentTargetStatus::WaitingForApproval
+            | WaitAgentTargetStatus::WaitingForUser
+    ) && target
+        .idle_ms
+        .is_none_or(|idle_ms| idle_ms >= timeout_duration.as_millis() as u64)
 }
 
 async fn latest_matching_change(
@@ -327,6 +581,8 @@ async fn latest_matching_change(
     targets: &[ResolvedTarget],
     baseline: u64,
     include_current_terminal: bool,
+    allow_stale_final_escape: bool,
+    include_stale_attention: bool,
 ) -> Option<(u64, AgentChangeKind)> {
     let control = &session.services.agent_control;
     let entries: Vec<(ThreadId, AgentPath)> = if targets.is_empty() {
@@ -348,26 +604,52 @@ async fn latest_matching_change(
     };
     let mut seen = HashSet::new();
     let mut latest = None;
+    let mut any_final = false;
+    let mut all_final = !entries.is_empty();
+    let mut stale_final = None;
+    let mut stale_attention = None;
     for (thread_id, _) in entries {
         if !seen.insert(thread_id) {
             continue;
         }
-        if include_current_terminal && is_final(&control.get_status(thread_id).await) {
-            let change = control.last_agent_change(thread_id);
-            if change.is_none_or(|change| change.revision <= baseline) {
-                return Some((baseline, AgentChangeKind::Terminal));
-            }
+        let status = control.get_status(thread_id).await;
+        let final_status = is_final(&status);
+        any_final |= final_status;
+        all_final &= final_status;
+        let change = control.last_agent_change(thread_id);
+        if final_status && change.is_none_or(|change| change.revision <= baseline) {
+            stale_final = Some((baseline, AgentChangeKind::Terminal));
         }
-        let Some(change) = control.last_agent_change(thread_id) else {
-            continue;
-        };
-        if change.revision > baseline
+        if include_stale_attention
+            && control
+                .terminal_observability_snapshots(thread_id)
+                .await
+                .iter()
+                .any(|snapshot| {
+                    matches!(
+                        snapshot.state,
+                        crate::unified_exec::TerminalProcessState::NeedsAttention
+                    )
+                })
+        {
+            stale_attention = Some((baseline, AgentChangeKind::NeedsAttention));
+        }
+        if let Some(change) = change
+            && change.revision > baseline
             && latest.is_none_or(|(revision, _)| change.revision > revision)
         {
             latest = Some((change.revision, change.kind));
         }
     }
-    latest
+    latest.or(stale_attention).or_else(|| {
+        if include_current_terminal && any_final && stale_final.is_some() {
+            stale_final
+        } else if allow_stale_final_escape && all_final {
+            stale_final
+        } else {
+            None
+        }
+    })
 }
 
 fn wake_reason(kind: AgentChangeKind) -> WaitAgentWakeReason {
@@ -386,6 +668,7 @@ async fn matching_message_revision(
 ) -> u64 {
     latest_matching_change(
         session, targets, baseline, /*include_current_terminal*/ false,
+        /*allow_stale_final_escape*/ false, /*include_stale_attention*/ false,
     )
     .await
     .map(|(revision, _)| revision)
@@ -399,6 +682,7 @@ async fn matching_message_is_new(
 ) -> bool {
     latest_matching_change(
         session, targets, baseline, /*include_current_terminal*/ false,
+        /*allow_stale_final_escape*/ false, /*include_stale_attention*/ false,
     )
     .await
     .is_some_and(|(_, kind)| kind == AgentChangeKind::Message)
@@ -455,14 +739,36 @@ fn path_is_under(path: &AgentPath, prefix: &AgentPath) -> bool {
 async fn live_agent_snapshots(
     session: &crate::session::session::Session,
     turn: &crate::session::turn_context::TurnContext,
+    targets: &[ResolvedTarget],
 ) -> Vec<WaitAgentSnapshot> {
-    let Ok(agents) = session
-        .services
-        .agent_control
-        .list_agents(&turn.session_source, /*path_prefix*/ None)
-        .await
-    else {
-        return Vec::new();
+    let agents = if targets.is_empty() {
+        let Ok(agents) = session
+            .services
+            .agent_control
+            .list_agents(&turn.session_source, /*path_prefix*/ None)
+            .await
+        else {
+            return Vec::new();
+        };
+        agents
+    } else {
+        let mut agents = Vec::new();
+        for target in targets {
+            let Ok(target_agents) = session
+                .services
+                .agent_control
+                .list_agents(&turn.session_source, Some(target.path.as_str()))
+                .await
+            else {
+                continue;
+            };
+            agents.extend(
+                target_agents
+                    .into_iter()
+                    .filter(|agent| agent.agent_name == target.path.as_str()),
+            );
+        }
+        agents
     };
     agents
         .into_iter()
@@ -483,6 +789,9 @@ struct WaitArgs {
     /// FORK: only wake for these agents.
     #[serde(default)]
     targets: Option<Vec<String>>,
+    /// Use the bounded legacy interval or keep waiting until a causal change.
+    #[serde(default)]
+    mode: WaitMode,
     /// Causal revision after which progress is considered new.
     #[serde(default, rename = "afterRevision", alias = "after_revision")]
     after_revision: Option<u64>,

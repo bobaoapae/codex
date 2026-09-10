@@ -2101,8 +2101,8 @@ async fn started_thread_from_start_response(
         config,
         thread_params_mode,
     )
-            .await
-            .map_err(color_eyre::eyre::Report::msg)?;
+    .await
+    .map_err(color_eyre::eyre::Report::msg)?;
     Ok(AppServerStartedThread {
         session,
         turns: response.thread.turns,
@@ -2124,8 +2124,8 @@ async fn started_thread_from_resume_response(
         config,
         thread_params_mode,
     )
-            .await
-            .map_err(color_eyre::eyre::Report::msg)?;
+    .await
+    .map_err(color_eyre::eyre::Report::msg)?;
     Ok(AppServerStartedThread {
         session,
         turns: response.thread.turns,
@@ -2147,8 +2147,8 @@ async fn started_thread_from_fork_response(
         config,
         thread_params_mode,
     )
-            .await
-            .map_err(color_eyre::eyre::Report::msg)?;
+    .await
+    .map_err(color_eyre::eyre::Report::msg)?;
     Ok(AppServerStartedThread {
         session,
         turns: response.thread.turns,

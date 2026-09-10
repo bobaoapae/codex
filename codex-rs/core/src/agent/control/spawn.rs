@@ -11,6 +11,7 @@ use crate::context::ManagedDeveloperInstructions;
 use crate::context::MultiAgentModeInstructions;
 use crate::context::MultiAgentRoleInstructions;
 use crate::context::PlanModeReminder;
+use crate::context::SpawnTaskContext;
 use crate::context::world_state::PersistentModeState;
 use crate::session::multi_agents::resolve_usage_hints;
 use crate::tools::handlers::multi_agents_common::build_agent_resume_config;
@@ -40,7 +41,11 @@ struct SpawnAgentThreadInheritance {
 #[allow(clippy::large_enum_variant)]
 enum SpawnInitialInput {
     UserInput(Vec<UserInput>),
-    InterAgentCommunication(InterAgentCommunication, AgentCommunicationContext),
+    InterAgentCommunication {
+        communication: InterAgentCommunication,
+        context: AgentCommunicationContext,
+        task_context: Option<SpawnTaskContext>,
+    },
 }
 
 fn default_agent_nickname_list() -> Vec<&'static str> {
@@ -98,7 +103,8 @@ fn keep_forked_rollout_item(item: &RolloutItem, preserve_reference_context_item:
         | RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. }
         | RolloutItem::RetainedContext(_)
-        | RolloutItem::SecurityRiskScore(_) => false,
+        | RolloutItem::SecurityRiskScore(_)
+        | RolloutItem::Extension(_) => false,
         // Full-history forks preserve the cached prompt prefix and can keep diffing
         // from the parent's durable baseline. Truncated forks drop part of that prompt,
         // so they must rebuild context on their first child turn.
@@ -301,10 +307,15 @@ impl AgentControl {
         context: AgentCommunicationContext,
         session_source: Option<SessionSource>,
         options: SpawnAgentOptions,
+        task_context: Option<SpawnTaskContext>,
     ) -> CodexResult<LiveAgent> {
         Box::pin(self.spawn_agent_internal(
             config,
-            SpawnInitialInput::InterAgentCommunication(communication, context),
+            SpawnInitialInput::InterAgentCommunication {
+                communication,
+                context,
+                task_context,
+            },
             session_source,
             options,
         ))
@@ -826,7 +837,17 @@ impl AgentControl {
                 self.send_input(new_thread.thread_id, input, start_options)
                     .await?;
             }
-            SpawnInitialInput::InterAgentCommunication(communication, context) => {
+            SpawnInitialInput::InterAgentCommunication {
+                communication,
+                context,
+                task_context,
+            } => {
+                if let Some(task_context) = task_context {
+                    new_thread
+                        .thread
+                        .inject_fragment_without_turn(task_context)
+                        .await;
+                }
                 self.send_inter_agent_communication_after_capacity_check(
                     new_thread.thread_id,
                     &state,
@@ -1131,7 +1152,8 @@ impl AgentControl {
                 | RolloutItem::InterAgentCommunicationMetadata { .. } => true,
                 RolloutItem::RetainedContext(_)
                 | RolloutItem::TokenUsageRecord(_)
-                | RolloutItem::SecurityRiskScore(_) => false,
+                | RolloutItem::SecurityRiskScore(_)
+                | RolloutItem::Extension(_) => false,
             }
         });
         // Full forks reuse the parent's reference context instead of rebuilding it. If that

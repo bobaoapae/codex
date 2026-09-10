@@ -3,6 +3,7 @@ use std::borrow::Cow;
 use super::CodexHarnessMetadata;
 use super::CompactedItem;
 use super::EventMsg;
+use super::ImageReaderUsage;
 use super::InterAgentCommunication;
 use super::McpResourceOriginCheckpoint;
 use super::RealtimeItem;
@@ -60,6 +61,9 @@ pub(super) enum RolloutItemWire<'a> {
     RealtimeItem {
         payload: Cow<'a, RealtimeItem>,
     },
+    Extension {
+        payload: Cow<'a, ImageReaderUsage>,
+    },
 }
 
 impl<'a> From<&'a RolloutItem> for RolloutItemWire<'a> {
@@ -110,6 +114,9 @@ impl<'a> From<&'a RolloutItem> for RolloutItemWire<'a> {
             RolloutItem::RealtimeItem(payload) => Self::RealtimeItem {
                 payload: Cow::Borrowed(payload),
             },
+            RolloutItem::Extension(payload) => Self::Extension {
+                payload: Cow::Borrowed(payload),
+            },
         }
     }
 }
@@ -148,6 +155,7 @@ impl From<RolloutItemWire<'_>> for RolloutItem {
             }
             RolloutItemWire::EventMsg { payload } => Self::EventMsg(payload.into_owned()),
             RolloutItemWire::RealtimeItem { payload } => Self::RealtimeItem(payload.into_owned()),
+            RolloutItemWire::Extension { payload } => Self::Extension(payload.into_owned()),
         }
     }
 }

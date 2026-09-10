@@ -583,7 +583,7 @@ async fn steer_interrupts_wait_agent_and_is_sent_in_follow_up_request() {
             WAIT_CALL_ID,
             MULTI_AGENT_V2_NAMESPACE,
             "wait_agent",
-            r#"{"timeout_ms":10000}"#,
+            r#"{"timeout_ms":10,"mode":"until_change"}"#,
         )),
         chunk(ev_completed("resp-1")),
     ];
@@ -596,6 +596,9 @@ async fn steer_interrupts_wait_agent_and_is_sent_in_follow_up_request() {
                 .features
                 .enable(Feature::MultiAgentV2)
                 .expect("test config should allow feature update");
+            config.multi_agent_v2.min_wait_timeout_ms = 1;
+            config.multi_agent_v2.max_wait_timeout_ms = 200;
+            config.multi_agent_v2.default_wait_timeout_ms = 10;
         })
         .build_with_streaming_server(&server)
         .await
@@ -608,6 +611,9 @@ async fn steer_interrupts_wait_agent_and_is_sent_in_follow_up_request() {
     })
     .await;
 
+    // The 10ms interval expires before the steer arrives. Event mode must
+    // re-arm its subscriptions instead of returning a clean timeout.
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     steer_user_input(&codex, STEER_PROMPT).await;
     wait_for_turn_complete(&codex).await;
 

@@ -1404,6 +1404,7 @@ async fn multi_agent_v2_message_checks_local_receiver_and_rejects_mixed_forms() 
                 agent_role: None,
             })),
             crate::agent::control::SpawnAgentOptions::default(),
+            None,
         )
         .await
         .expect("local worker should be registered without starting a provider turn")
@@ -1523,6 +1524,7 @@ async fn multi_agent_v2_message_reloads_unloaded_openai_receiver_before_guard() 
                 agent_role: None,
             })),
             crate::agent::control::SpawnAgentOptions::default(),
+            None,
         )
         .await
         .expect("OpenAI worker should be registered")
@@ -4098,6 +4100,247 @@ async fn fork_invariant_wait_agent_deduplicates_relative_and_canonical_targets()
     );
     assert_eq!(result.targets.len(), 1);
     assert_eq!(result.targets[0].canonical_path, worker_path.to_string());
+    assert_eq!(success, None);
+}
+
+#[tokio::test]
+async fn fork_invariant_wait_agent_until_change_escapes_stale_revision_when_all_targets_are_final()
+{
+    let (manager, session, turn) = v2_wait_fixture().await;
+    let (worker_id, worker_path) = spawn_v2_wait_worker(&session, &turn, "worker").await;
+    let worker = manager
+        .get_thread(worker_id)
+        .await
+        .expect("worker should be resident");
+    let worker_turn = worker.session.new_default_turn().await;
+    worker
+        .session
+        .send_event(
+            &worker_turn,
+            EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: worker_turn.sub_id.clone(),
+                started_at: None,
+                last_agent_message: Some("done".to_string()),
+                error: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            }),
+        )
+        .await;
+    let baseline = session.services.agent_control.current_revision();
+
+    let output = WaitAgentHandlerV2::default()
+        .handle(invocation(
+            session,
+            turn,
+            "wait_agent",
+            function_payload(json!({
+                "targets": [worker_path.to_string()],
+                "afterRevision": baseline,
+                "timeout_ms": 1_000,
+                "mode": "until_change"
+            })),
+        ))
+        .await
+        .expect("stale final target should complete immediately");
+    let (content, success) = expect_text_output(output);
+    let result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
+        serde_json::from_str(&content).expect("wait result should parse");
+    assert!(!result.timed_out);
+    assert_eq!(
+        result.reason,
+        crate::tools::handlers::multi_agents_v2::wait::WaitAgentWakeReason::Terminal
+    );
+    assert_eq!(result.revision, baseline);
+    assert_eq!(result.targets.len(), 1);
+    assert_eq!(result.targets[0].canonical_path, worker_path.to_string());
+    assert_eq!(success, None);
+}
+
+#[tokio::test]
+async fn fork_invariant_wait_agent_until_change_does_not_escape_for_one_stale_final_target() {
+    let (manager, session, turn) = v2_wait_fixture().await;
+    let (final_id, final_path) = spawn_v2_wait_worker(&session, &turn, "final_worker").await;
+    let (running_id, running_path) = spawn_v2_wait_worker(&session, &turn, "running_worker").await;
+    session
+        .services
+        .agent_control
+        .record_agent_status_change(running_id, AgentStatus::Running);
+    session
+        .services
+        .agent_control
+        .record_agent_activity(running_id, "working".to_string());
+    let final_worker = manager
+        .get_thread(final_id)
+        .await
+        .expect("final worker should be resident");
+    let final_turn = final_worker.session.new_default_turn().await;
+    final_worker
+        .session
+        .send_event(
+            &final_turn,
+            EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: final_turn.sub_id.clone(),
+                started_at: None,
+                last_agent_message: Some("done".to_string()),
+                error: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            }),
+        )
+        .await;
+    let baseline = session.services.agent_control.current_revision();
+    let wait_task = tokio::spawn({
+        let session = session.clone();
+        let turn = turn.clone();
+        let final_path = final_path.to_string();
+        let running_path = running_path.to_string();
+        async move {
+            WaitAgentHandlerV2::default()
+                .handle(invocation(
+                    session,
+                    turn,
+                    "wait_agent",
+                    function_payload(json!({
+                        "targets": [final_path, running_path],
+                        "afterRevision": baseline,
+                        "timeout_ms": 200,
+                        "mode": "until_change"
+                    })),
+                ))
+                .await
+        }
+    });
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(
+        !wait_task.is_finished(),
+        "one stale final target must not wake while another target is running"
+    );
+    wait_task.abort();
+    let _ = wait_task.await;
+}
+
+#[tokio::test]
+async fn fork_invariant_wait_agent_delta_excludes_unchanged_targets() {
+    let (manager, session, turn) = v2_wait_fixture().await;
+    let (changed_id, changed_path) = spawn_v2_wait_worker(&session, &turn, "changed_worker").await;
+    let (unchanged_id, unchanged_path) =
+        spawn_v2_wait_worker(&session, &turn, "unchanged_worker").await;
+    let unchanged_worker = manager
+        .get_thread(unchanged_id)
+        .await
+        .expect("unchanged worker should be resident");
+    let unchanged_turn = unchanged_worker.session.new_default_turn().await;
+    unchanged_worker
+        .session
+        .send_event(
+            &unchanged_turn,
+            EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: unchanged_turn.sub_id.clone(),
+                started_at: None,
+                last_agent_message: Some("already done".to_string()),
+                error: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            }),
+        )
+        .await;
+    let baseline = session.services.agent_control.current_revision();
+    let changed_worker = manager
+        .get_thread(changed_id)
+        .await
+        .expect("changed worker should be resident");
+    let changed_turn = changed_worker.session.new_default_turn().await;
+    changed_worker
+        .session
+        .send_event(
+            &changed_turn,
+            EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: changed_turn.sub_id.clone(),
+                started_at: None,
+                last_agent_message: Some("newly done".to_string()),
+                error: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            }),
+        )
+        .await;
+
+    let output = WaitAgentHandlerV2::default()
+        .handle(invocation(
+            session,
+            turn,
+            "wait_agent",
+            function_payload(json!({
+                "targets": [changed_path.to_string(), unchanged_path.to_string()],
+                "afterRevision": baseline,
+                "timeout_ms": 200,
+                "mode": "until_change"
+            })),
+        ))
+        .await
+        .expect("wait_agent should complete for the changed target");
+    let (content, success) = expect_text_output(output);
+    let result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
+        serde_json::from_str(&content).expect("wait result should parse");
+    assert!(!result.timed_out);
+    assert_eq!(
+        result.reason,
+        crate::tools::handlers::multi_agents_v2::wait::WaitAgentWakeReason::Terminal
+    );
+    assert_eq!(result.targets.len(), 1);
+    assert_eq!(result.targets[0].canonical_path, changed_path.to_string());
+    assert_eq!(success, None);
+}
+
+#[tokio::test]
+async fn fork_invariant_wait_agent_clean_bounded_timeout_has_no_target_delta() {
+    let (_manager, session, turn) = v2_wait_fixture().await;
+    let (worker_id, worker_path) = spawn_v2_wait_worker(&session, &turn, "quiet_worker").await;
+    session
+        .services
+        .agent_control
+        .record_agent_status_change(worker_id, AgentStatus::Running);
+    let wait_task = tokio::spawn({
+        let session = session.clone();
+        let turn = turn.clone();
+        let worker_path = worker_path.to_string();
+        async move {
+            WaitAgentHandlerV2::default()
+                .handle(invocation(
+                    session,
+                    turn,
+                    "wait_agent",
+                    function_payload(json!({
+                        "targets": [worker_path],
+                        "timeout_ms": 500,
+                        "mode": "bounded"
+                    })),
+                ))
+                .await
+        }
+    });
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    session
+        .services
+        .agent_control
+        .record_agent_activity(worker_id, "working".to_string());
+    let output = wait_task
+        .await
+        .expect("quiet bounded wait task should join")
+        .expect("quiet bounded wait should complete");
+    let (content, success) = expect_text_output(output);
+    let result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
+        serde_json::from_str(&content).expect("wait result should parse");
+    assert!(result.timed_out);
+    assert!(result.targets.is_empty());
+    assert!(result.agents.is_empty());
     assert_eq!(success, None);
 }
 

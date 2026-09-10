@@ -286,8 +286,7 @@ async fn a_terminal_registry_failure_fails_the_turn_at_once() {
     let temp = tempfile::tempdir().expect("tempdir");
     let daemon = start_daemon(&temp).await;
     daemon.control.set_registry_status(RegistryStatus::Failed {
-        reason: "tunnel `tunnel_abc` is not visible to the ChatGPT account logged in Chrome"
-            .into(),
+        reason: "tunnel `tunnel_abc` is not visible to the ChatGPT account logged in Chrome".into(),
         retry_at_ms: now_ms() + 300_000,
         kind: FailureKind::TunnelNotVisible,
         parked: false,

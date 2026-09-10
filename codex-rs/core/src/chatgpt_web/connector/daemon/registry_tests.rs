@@ -1443,7 +1443,11 @@ fn map_api_classifies_failure_kinds() {
 /// hour: the same terminal failure, forever, one dedicated tab per attempt.
 fn service_with_invisible_tunnel(
     path: PathBuf,
-) -> (Arc<RegistryService>, Arc<FakeApi>, watch::Sender<TunnelState>) {
+) -> (
+    Arc<RegistryService>,
+    Arc<FakeApi>,
+    watch::Sender<TunnelState>,
+) {
     let api = FakeApi::new(true).with(|state| {
         state.tunnels = vec!["tunnel_ffffffffffffffffffffffffffffffff".into()];
     });
@@ -1554,11 +1558,17 @@ async fn a_manual_reconcile_resets_the_backoff() {
     );
 
     let failed = service.reconcile_now(ReconcileTrigger::Watcher).await;
-    assert!(matches!(failed, RegistryStatus::Failed { .. }), "{failed:?}");
+    assert!(
+        matches!(failed, RegistryStatus::Failed { .. }),
+        "{failed:?}"
+    );
     let creates = api.count("Create");
 
     // The watcher waits out the backoff; a manual reconcile does not.
-    assert_eq!(service.reconcile_now(ReconcileTrigger::Watcher).await, failed);
+    assert_eq!(
+        service.reconcile_now(ReconcileTrigger::Watcher).await,
+        failed
+    );
     assert_eq!(api.count("Create"), creates);
 
     let status = service.reconcile_now(ReconcileTrigger::Manual).await;
@@ -1601,7 +1611,11 @@ fn a_tunnel_refusal_names_the_account_when_it_is_known() {
         "{}",
         refusal.reason
     );
-    assert!(refusal.reason.contains("someone@example.com"), "{}", refusal.reason);
+    assert!(
+        refusal.reason.contains("someone@example.com"),
+        "{}",
+        refusal.reason
+    );
     assert!(refusal.reason.contains("plus"), "{}", refusal.reason);
 }
 

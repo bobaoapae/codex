@@ -1,5 +1,4 @@
 use super::*;
-use crate::agent::registry::AgentMetadata;
 use crate::config::ConfigBuilder;
 use crate::plugins::plugins_manager_for_config;
 use crate::skills_load_input_from_config;

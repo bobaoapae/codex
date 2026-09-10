@@ -14,6 +14,7 @@ use super::auto_compact_window::AutoCompactWindowIds;
 use super::auto_compact_window::AutoCompactWindowSnapshot;
 use crate::context_manager::ContextManager;
 use crate::context_manager::HistoryReplacement;
+use crate::image_reader::ImageReaderCache;
 use crate::session::PreviousTurnSettings;
 use crate::session::session::SessionConfiguration;
 use crate::session::time_reminder::CurrentTimeReminderState;
@@ -38,6 +39,8 @@ pub(crate) struct SessionState {
     pub(crate) history: ContextManager,
     pub(crate) latest_rate_limits: Option<RateLimitSnapshot>,
     pub(crate) latest_token_usage_record: Option<TokenUsageRecord>,
+    /// Bounded session-local cache for optional image-reader descriptions.
+    pub(crate) image_reader_cache: ImageReaderCache,
     pub(crate) server_reasoning_included: bool,
     pub(crate) mcp_dependency_prompted: HashSet<String>,
     pub(crate) additional_context: AdditionalContextStore,
@@ -83,6 +86,7 @@ impl SessionState {
             history,
             latest_rate_limits: None,
             latest_token_usage_record: None,
+            image_reader_cache: ImageReaderCache::default(),
             server_reasoning_included: false,
             mcp_dependency_prompted: HashSet::new(),
             additional_context: AdditionalContextStore::default(),

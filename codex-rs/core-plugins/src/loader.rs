@@ -1,6 +1,7 @@
 use crate::PluginGitMode;
 use crate::app_mcp_routing::apply_app_mcp_routing_policy;
 use crate::app_mcp_routing::apps_route_available;
+use crate::cua_native_surface;
 use crate::is_openai_curated_marketplace_name;
 use crate::manifest::PluginManifest;
 use crate::manifest::PluginManifestFormat;
@@ -52,7 +53,6 @@ use codex_utils_plugins::PluginSkillRoot;
 use codex_utils_plugins::SkillDiscoveryMode;
 use codex_utils_plugins::find_plugin_manifest_path;
 use codex_utils_plugins::migrated_command_skills_root;
-use crate::cua_native_surface;
 use serde_json::Value as JsonValue;
 use std::collections::BTreeSet;
 use std::collections::HashMap;

@@ -2411,8 +2411,8 @@ async fn code_mode_can_yield_and_resume_with_wait() -> Result<()> {
     let mut builder = test_codex()
         .with_extensions(Arc::new(extensions.build()))
         .with_config(move |config| {
-        let _ = config.features.enable(Feature::CodeMode);
-    });
+            let _ = config.features.enable(Feature::CodeMode);
+        });
     let test = builder.build(&server).await?;
     let phase_2_gate = test.workspace_path("code-mode-phase-2.ready");
     let phase_3_gate = test.workspace_path("code-mode-phase-3.ready");
@@ -2490,7 +2490,7 @@ text((await tools.exec_command({{cmd: "printf 'phase 3'"}})).output);
 
     tokio::try_join!(test.submit_turn("wait again"), async {
         observer.wait_started.notified().await;
-    fs::write(&phase_2_gate, "ready")?;
+        fs::write(&phase_2_gate, "ready")?;
         anyhow::Ok(())
     })?;
 
@@ -2537,7 +2537,7 @@ text((await tools.exec_command({{cmd: "printf 'phase 3'"}})).output);
 
     tokio::try_join!(test.submit_turn("wait for completion"), async {
         observer.wait_started.notified().await;
-    fs::write(&phase_3_gate, "ready")?;
+        fs::write(&phase_3_gate, "ready")?;
         anyhow::Ok(())
     })?;
 

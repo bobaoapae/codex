@@ -851,9 +851,8 @@ async fn reconcile_open(
         let observed = observe(api, desired, persisted.clone())
             .await
             .map_err(map_api)?;
-        let ops = plan(&observed, desired).map_err(|refusal| {
-            fail_kind(refusal.reason, TERMINAL_BACKOFF[0], refusal.kind)
-        })?;
+        let ops = plan(&observed, desired)
+            .map_err(|refusal| fail_kind(refusal.reason, TERMINAL_BACKOFF[0], refusal.kind))?;
         if ops.first() == Some(&RegistryOp::EnableDeveloperMode) {
             if enabled_developer_mode {
                 return Err(RegistryFailure {
@@ -1207,18 +1206,17 @@ impl RegistryService {
                 }
                 // FORK: the one failure worth an extra round trip — say who
                 // the tunnel is actually shared with, once per daemon.
-                let reason_suffix = if failure_kind_of(&failure.status)
-                    == Some(FailureKind::TunnelNotVisible)
-                {
-                    match self.tunnel_audience().await {
-                        Some(audience) => {
-                            format!(" The tunnel is shared with {}.", audience.describe())
+                let reason_suffix =
+                    if failure_kind_of(&failure.status) == Some(FailureKind::TunnelNotVisible) {
+                        match self.tunnel_audience().await {
+                            Some(audience) => {
+                                format!(" The tunnel is shared with {}.", audience.describe())
+                            }
+                            None => String::new(),
                         }
-                        None => String::new(),
-                    }
-                } else {
-                    String::new()
-                };
+                    } else {
+                        String::new()
+                    };
                 match failure.status {
                     RegistryStatus::Failed { reason, kind, .. } => {
                         let reason = format!("{reason}{reason_suffix}");
@@ -1230,14 +1228,11 @@ impl RegistryService {
                                 .fetch_add(1, Ordering::SeqCst)
                                 + 1
                         } else {
-                            self.identical_terminal_failures.store(
-                                usize::from(kind.is_terminal()),
-                                Ordering::SeqCst,
-                            );
+                            self.identical_terminal_failures
+                                .store(usize::from(kind.is_terminal()), Ordering::SeqCst);
                             usize::from(kind.is_terminal())
                         };
-                        let parked =
-                            identical_terminal >= PARK_AFTER_IDENTICAL_TERMINAL_FAILURES;
+                        let parked = identical_terminal >= PARK_AFTER_IDENTICAL_TERMINAL_FAILURES;
                         if parked {
                             tracing::warn!(
                                 "chatgpt_web registry: parking automatic retries after {identical_terminal} identical {} failures; run `codex chatgpt-web registry reconcile` after fixing it",
@@ -1246,8 +1241,7 @@ impl RegistryService {
                         }
                         RegistryStatus::Failed {
                             reason,
-                            retry_at_ms: now_ms()
-                                + backoff_for(kind, attempt).as_millis() as u64,
+                            retry_at_ms: now_ms() + backoff_for(kind, attempt).as_millis() as u64,
                             kind,
                             parked,
                         }

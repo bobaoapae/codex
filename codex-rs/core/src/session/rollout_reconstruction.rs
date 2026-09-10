@@ -359,6 +359,7 @@ pub(crate) fn reconstruct_history_from_rollout_items_with_policy(
             | RolloutItem::RetainedContext(_)
             | RolloutItem::SecurityRiskScore(_)
             | RolloutItem::TokenUsageRecord(_)
+            | RolloutItem::Extension(_)
             | RolloutItem::InterAgentCommunicationMetadata { .. } => {}
         }
 
@@ -456,7 +457,7 @@ pub(crate) fn reconstruct_history_from_rollout_items_with_policy(
                     );
                     let retained_context = history.retained_context().clone();
                     history.replace_annotated(rebuilt);
-                        history.restore_retained_context(Some(&retained_context));
+                    history.restore_retained_context(Some(&retained_context));
                 }
             }
             RolloutItem::EventMsg(EventMsg::ThreadRolledBack(rollback)) => {
@@ -468,6 +469,7 @@ pub(crate) fn reconstruct_history_from_rollout_items_with_policy(
             | RolloutItem::WorldState(_)
             | RolloutItem::SecurityRiskScore(_)
             | RolloutItem::TokenUsageRecord(_)
+            | RolloutItem::Extension(_)
             | RolloutItem::SessionMeta(_) => {}
         }
     }
@@ -513,6 +515,7 @@ pub(crate) fn reconstruct_history_from_rollout_items_with_policy(
             | RolloutItem::TokenUsageRecord(_)
             | RolloutItem::RetainedContext(_)
             | RolloutItem::SecurityRiskScore(_)
+            | RolloutItem::Extension(_)
             | RolloutItem::EventMsg(_) => {
                 unreachable!("only world-state replay items are collected")
             }

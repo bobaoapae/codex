@@ -2061,7 +2061,7 @@ async fn run_exec_server_command(
                     None => {
                         codex_exec_server::run_remote_environment_until_shutdown(
                             remote_config,
-            runtime_paths,
+                            runtime_paths,
                             shutdown,
                         )
                         .await

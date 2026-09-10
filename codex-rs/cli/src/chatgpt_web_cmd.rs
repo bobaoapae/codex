@@ -238,9 +238,8 @@ async fn run_registry_show(codex_home: &Path) -> Result<()> {
                     "retry:   parked (run `codex chatgpt-web registry reconcile` after fixing it)"
                 );
             } else if let Some(retry_at_ms) = health.registry_retry_at_ms {
-                let seconds = retry_at_ms
-                    .saturating_sub(chatgpt_web_daemon::state::now_ms())
-                    / 1000;
+                let seconds =
+                    retry_at_ms.saturating_sub(chatgpt_web_daemon::state::now_ms()) / 1000;
                 println!("retry:   in {seconds}s");
             }
         }
@@ -442,7 +441,10 @@ mod tests {
         assert_eq!(daemon_log_filter(Some("   ")).to_string(), "info");
         assert_eq!(daemon_log_filter(Some("debug")).to_string(), "debug");
         // An unusable value falls back rather than silencing the daemon.
-        assert_eq!(daemon_log_filter(Some("=;=not a filter")).to_string(), "info");
+        assert_eq!(
+            daemon_log_filter(Some("=;=not a filter")).to_string(),
+            "info"
+        );
 
         // SAFETY: as above.
         unsafe { std::env::remove_var("RUST_LOG") };

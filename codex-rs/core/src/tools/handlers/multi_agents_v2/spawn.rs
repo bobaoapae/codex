@@ -6,6 +6,7 @@ use crate::agent::role::DEFAULT_ROLE_NAME;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
 use crate::codex_thread::ThreadConfigSnapshot;
+use crate::context::SpawnTaskContext;
 use crate::session::multi_agents::resolve_usage_hints;
 use crate::tools::handlers::multi_agents::collab_tool_call_status;
 use crate::tools::handlers::multi_agents_spec::SpawnAgentToolOptions;
@@ -111,7 +112,13 @@ async fn handle_spawn_agent(
     let turn = &step_context.turn;
     let arguments = function_arguments(payload)?;
     let args: SpawnAgentArgs = parse_arguments(&arguments)?;
-    let requested_fork_mode = args.fork_mode()?;
+    let task_context = args
+        .task_context
+        .clone()
+        .map(SpawnTaskContext::try_new)
+        .transpose()
+        .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
+    let requested_fork_mode = args.fork_mode(task_context.is_some())?;
     let (message, message_form) = tool_message_argument(
         args.message.clone(),
         args.plaintext_message.clone(),
@@ -251,6 +258,7 @@ async fn handle_spawn_agent(
                     multi_agent_v2_usage_hints,
                     cyber_access_program: turn.cyber_access_program,
                 },
+                task_context,
             ),
     )
     .await
@@ -316,16 +324,24 @@ struct SpawnAgentArgs {
     reasoning_effort: Option<ReasoningEffort>,
     fork_turns: Option<String>,
     fork_context: Option<bool>,
+    task_context: Option<String>,
     /// FORK: Claude account for a Claude-backed agent.
     account: Option<String>,
 }
 
 impl SpawnAgentArgs {
-    fn fork_mode(&self) -> Result<Option<SpawnAgentForkMode>, FunctionCallError> {
+    fn fork_mode(
+        &self,
+        has_task_context: bool,
+    ) -> Result<Option<SpawnAgentForkMode>, FunctionCallError> {
         if self.fork_context.is_some() {
             return Err(FunctionCallError::RespondToModel(
                 "fork_context is not supported in MultiAgentV2; use fork_turns instead".to_string(),
             ));
+        }
+
+        if has_task_context && self.fork_turns.is_none() {
+            return Ok(None);
         }
 
         let fork_turns = self
@@ -390,3 +406,7 @@ impl ToolOutput for SpawnAgentResult {
         tool_output_code_mode_result(self, "spawn_agent")
     }
 }
+
+#[cfg(test)]
+#[path = "spawn_tests.rs"]
+mod tests;

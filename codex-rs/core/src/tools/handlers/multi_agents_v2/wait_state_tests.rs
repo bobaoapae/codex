@@ -28,6 +28,28 @@ fn timeout_keeps_the_observed_revision() {
 }
 
 #[test]
+fn clean_timeout_does_not_append_live_agent_details() {
+    let result = WaitAgentResult::from_outcome(
+        WaitOutcome::TimedOut {
+            revision: 17,
+            needs_attention: false,
+        },
+        None,
+        1_000,
+        Vec::new(),
+        vec![WaitAgentSnapshot {
+            agent_name: "/root/worker".to_string(),
+            status: WaitAgentTargetStatus::Running,
+            generation: 0,
+            last_activity: Some("working".to_string()),
+            idle_seconds: Some(2),
+        }],
+    );
+
+    assert_eq!(result.message, "Wait timed out.");
+}
+
+#[test]
 fn response_uses_camel_case_causal_values_and_target_fields() {
     let result = WaitAgentResult::from_outcome(
         WaitOutcome::TimedOut {

@@ -422,6 +422,7 @@ mod job {
                 | RolloutItem::WorldState(_)
                 | RolloutItem::RetainedContext(_)
                 | RolloutItem::SecurityRiskScore(_)
+                | RolloutItem::Extension(_)
                 | RolloutItem::EventMsg(_) => None,
             })
             .collect::<Vec<_>>();

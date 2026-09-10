@@ -508,6 +508,17 @@ fn rollout_item_variants_preserve_existing_payload_shapes() -> Result<()> {
                 "text": "hello",
             },
         }),
+        json!({
+            "type": "extension",
+            "payload": {
+                "kind": "image_reader.usage",
+                "model": "gpt-5.6-luna",
+                "provider": "openai",
+                "purpose": "image_reader",
+                "response_id": "reader-response-1",
+                "usage": null,
+            },
+        }),
     ];
 
     for expected in fixtures {
@@ -522,7 +533,7 @@ fn rollout_item_variants_preserve_existing_payload_shapes() -> Result<()> {
 fn rollout_item_schema_matches_tagged_payload_and_sibling_metadata() -> Result<()> {
     let schema = serde_json::to_value(schemars::schema_for!(RolloutItem))?;
     let variants = schema["oneOf"].as_array().expect("rollout variants");
-    assert_eq!(variants.len(), 12);
+    assert_eq!(variants.len(), 13);
 
     for variant in variants {
         let required = variant["required"].as_array().expect("required fields");

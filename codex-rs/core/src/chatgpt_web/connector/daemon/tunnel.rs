@@ -405,8 +405,7 @@ impl ManagedChild {
                     .stdout(Stdio::null())
                     .stderr(Stdio::null());
                 #[cfg(windows)]
-                taskkill
-                    .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+                taskkill.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
                 let _ = taskkill.status().await;
                 let _ = self.child.wait().await;
             }

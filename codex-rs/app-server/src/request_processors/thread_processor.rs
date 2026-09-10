@@ -31,8 +31,8 @@ use codex_state::WorkflowRunCreate;
 use codex_state::WorkflowStore;
 use codex_state::WorkflowThreadClass;
 use codex_thread_store::PersistContext;
-use std::ops::ControlFlow;
 use codex_thread_store::StoredThreadSearchResult;
+use std::ops::ControlFlow;
 
 #[path = "thread_search_index.rs"]
 mod thread_search_index;
@@ -706,7 +706,7 @@ impl ThreadRequestProcessor {
                 app_server_client_version.clone(),
                 client_mcp_extensions.clone(),
                 &mut prepared_config,
-        )
+            )
             .await?
             .is_continue()
         {}
@@ -4352,18 +4352,18 @@ impl ThreadRequestProcessor {
                 // Config loading can call back into Desktop; release the permit during host work.
                 drop(_thread_list_state_permit);
                 let config = match self
-            .config_manager
-            .load_for_cwd(request_overrides, typesafe_overrides, history_cwd)
-            .await
-        {
-            Ok(config) => config,
-            Err(err) => {
+                    .config_manager
+                    .load_for_cwd(request_overrides, typesafe_overrides, history_cwd)
+                    .await
+                {
+                    Ok(config) => config,
+                    Err(err) => {
                         self.outgoing
                             .send_error(request_id, config_load_error(&err))
                             .await;
                         return Ok(ControlFlow::Break(()));
-            }
-        };
+                    }
+                };
                 *prepared_config = Some(PreparedResumeConfig {
                     state: config_state,
                     config,

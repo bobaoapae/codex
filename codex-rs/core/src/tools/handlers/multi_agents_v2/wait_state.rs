@@ -251,21 +251,22 @@ impl WaitAgentResult {
             }
             Some(_) | None => message.to_string(),
         };
-        let message = if timed_out && !agents.is_empty() {
-            let lines: Vec<String> = agents
-                .iter()
-                .map(|agent| match (&agent.last_activity, agent.idle_seconds) {
-                    (Some(activity), Some(idle)) => {
-                        format!("- {} {activity} {idle}s ago", agent.agent_name)
-                    }
-                    (Some(activity), None) => format!("- {} {activity}", agent.agent_name),
-                    _ => format!("- {} has not reported activity yet", agent.agent_name),
-                })
-                .collect();
-            format!("{message}\n\nLive agents:\n{}", lines.join("\n"))
-        } else {
-            message
-        };
+        let message =
+            if timed_out && reason == WaitAgentWakeReason::NeedsAttention && !agents.is_empty() {
+                let lines: Vec<String> = agents
+                    .iter()
+                    .map(|agent| match (&agent.last_activity, agent.idle_seconds) {
+                        (Some(activity), Some(idle)) => {
+                            format!("- {} {activity} {idle}s ago", agent.agent_name)
+                        }
+                        (Some(activity), None) => format!("- {} {activity}", agent.agent_name),
+                        _ => format!("- {} has not reported activity yet", agent.agent_name),
+                    })
+                    .collect();
+                format!("{message}\n\nLive agents:\n{}", lines.join("\n"))
+            } else {
+                message
+            };
         Self {
             message,
             timed_out,

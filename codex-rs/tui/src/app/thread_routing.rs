@@ -1889,15 +1889,15 @@ impl App {
             .await;
         if let Some(user_message) = automatic_title_user_message
             && !user_message.trim().is_empty()
-                && let Some(thread_id) = self.active_thread_id
-            {
-                        self.generate_thread_title(
-                            app_server,
-                            thread_id,
+            && let Some(thread_id) = self.active_thread_id
+        {
+            self.generate_thread_title(
+                app_server,
+                thread_id,
                 ThreadTitleDestination::Automatic,
-                            super::thread_title::thread_title_prompt(&user_message),
-                        );
-                    }
+                super::thread_title::thread_title_prompt(&user_message),
+            );
+        }
         if !had_active_view
             && self.chat_widget.has_active_view()
             && self.startup_protected_input_boundary

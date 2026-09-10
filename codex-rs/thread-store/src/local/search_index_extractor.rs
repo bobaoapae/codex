@@ -249,6 +249,7 @@ pub(crate) fn extract_item_candidates(
         | RolloutItem::RealtimeItem(_)
         | RolloutItem::RetainedContext(_)
         | RolloutItem::TokenUsageRecord(_) => {}
+        RolloutItem::Extension(_) => {}
     }
     candidates
 }

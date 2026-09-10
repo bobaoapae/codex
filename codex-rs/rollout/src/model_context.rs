@@ -162,7 +162,8 @@ impl ModelContextScan {
             | RolloutItem::RealtimeItem(_)
             | RolloutItem::RetainedContext(_)
             | RolloutItem::SecurityRiskScore(_)
-            | RolloutItem::TokenUsageRecord(_) => {}
+            | RolloutItem::TokenUsageRecord(_)
+            | RolloutItem::Extension(_) => {}
         }
 
         if self.has_bounded_cutoff() {
