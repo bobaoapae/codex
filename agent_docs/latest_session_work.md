@@ -1,6 +1,14 @@
 # Latest session work
 
-### Fork sync and release 0.154.0 — 2026-09-09 (in progress)
+### Fork sync and release 0.154.0 — completed 2026-09-10
+
+- Completed on the existing checkout, with no separate worktree. Source build commit: 2b5f73c140d4e677b6371454ea72651bb7ea63fe, containing upstream a62e98d18c and stable release rust-v0.154.0. Final closeout commit/push follows this record.
+- Final release build succeeded in 30m57s with LTO disabled, debug disabled, 16 codegen units and opt-level 3. Two concurrent compiler jobs hit a real allocation failure; the successful cached retry used one job. No cache cleanup or system-memory configuration change was made.
+- Installed all four binaries together: codex.exe, codex-code-mode-host.exe, codex-windows-sandbox-setup.exe and codex-command-runner.exe. Source/installed SHA-256 values matched for all four. Backups use suffix .pre-release-20260910-030829 in the existing npm vendor bin directory.
+- Fresh source and installed wrapper checks reported codex-cli 0.154.0 with exit 0; installed --help also exited 0. Existing Codex processes were preserved and retain their old mapped images until restarted.
+- Migration compatibility: all previously tracked state/workflow SQL files remain unchanged from 9019cd8439. New 0056 uses pinned LF and preserves thread_artifacts while creating/copying into thread_attachments. Migration checksum, preserved-data, artifact and attachment tests passed.
+- Validation limits: codex-state ran 250 tests (249 passed, one pre-existing query-plan expectation failed, zero skipped). Completed fork-invariant slices passed features 1, core 28, core-plugins 1 and protocol 9; the remaining broad gate was not completed. Core compilation check and final formatting passed. No full-suite or full-clippy pass is claimed.
+- Evidence: work/sync-release-20260909/release-closeout-20260910.md; release-build/20260910-023528; release-install/20260910-030829; release-smoke/20260910-030858. Work logs, schema-generation scratch files and usage ledgers remain local and untracked.
 
 - Owner authorized committing pending changes, pushing fork/main, syncing upstream and the latest stable release, updating the version, building release, hot swapping, then committing/pushing the closeout. All operations use this existing checkout; no separate worktree.
 - Starting HEAD: 9019cd8439; live fork/main: 3a72cbc159. Latest upstream stable release resolved via GitHub API: rust-v0.154.0.
