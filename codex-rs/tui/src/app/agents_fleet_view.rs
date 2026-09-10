@@ -224,7 +224,7 @@ impl AgentsFleetView {
             } else {
                 self.app_event_tx
                     .send(AppEvent::DispatchAgentsOverviewTask {
-                        prompt: input,
+                        prompt: input.into(),
                         cwd: None,
                     });
             }

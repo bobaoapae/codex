@@ -84,8 +84,6 @@ pub(super) async fn lookup(
                         cwd: None,
                         use_state_db_only: false,
                         search_term: None,
-                        parent_thread_id: None,
-                        ancestor_thread_id: None,
                         thread_classes: None,
                         root_thread_id: None,
                         terminal_outcomes: None,
