@@ -119,6 +119,7 @@ mod fs_watch;
 mod fuzzy_file_search;
 mod image_url;
 pub mod in_process;
+mod lifecycle;
 mod mcp_refresh;
 mod message_processor;
 mod models;
@@ -1313,16 +1314,26 @@ pub async fn run_main_with_transport_options(
 
     drop(transport_event_tx);
 
-    if matches!(processor_handle.await, Ok(AppServerExit::Forced)) {
+    let runtime_tasks = lifecycle::RuntimeTaskHandles {
+        outbound_handle,
+        otel_reloader_handle,
+        transport_accept_handles,
+    };
+    let processor_exit = match processor_handle.await {
+        Ok(exit) => exit,
+        Err(join_error) => {
+            let err =
+                runtime_tasks.abort_after_processor_failure(&transport_shutdown_token, join_error);
+            error!(error = %err, "app-server processor task failed");
+            return Err(err);
+        }
+    };
+    if processor_exit == AppServerExit::Forced {
         return Ok(AppServerExit::Forced);
     }
-    let _ = outbound_handle.await;
-
-    transport_shutdown_token.cancel();
-    let _ = otel_reloader_handle.await;
-    for handle in transport_accept_handles {
-        let _ = handle.await;
-    }
+    runtime_tasks
+        .finish_gracefully(&transport_shutdown_token)
+        .await;
 
     Ok(AppServerExit::Graceful)
 }

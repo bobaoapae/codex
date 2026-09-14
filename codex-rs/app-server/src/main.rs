@@ -100,6 +100,7 @@ fn main() -> anyhow::Result<()> {
                 .unwrap_or_default()
         };
         let transport = listen;
+        let is_stdio = matches!(&transport, AppServerTransport::Stdio);
         let auth = auth.try_into_settings()?;
         let mut runtime_options = AppServerRuntimeOptions {
             code_mode_host_transport: code_mode_host.into(),
@@ -117,7 +118,7 @@ fn main() -> anyhow::Result<()> {
                 (false, false) => codex_app_server::RemoteControlStartupMode::ResolvePersisted,
             };
 
-        let exit = run_main_with_transport_options(
+        let exit = match run_main_with_transport_options(
             arg0_paths,
             config_overrides,
             loader_overrides,
@@ -128,7 +129,15 @@ fn main() -> anyhow::Result<()> {
             auth,
             runtime_options,
         )
-        .await?;
+        .await
+        {
+            Ok(exit) => exit,
+            Err(err) if is_stdio => {
+                eprintln!("app-server failed: {err}");
+                std::process::exit(1);
+            }
+            Err(err) => return Err(err.into()),
+        };
         if exit == codex_app_server::AppServerExit::Forced {
             // Runtime teardown can wait forever for blocked rollout I/O.
             std::process::exit(0);

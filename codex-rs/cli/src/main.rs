@@ -1362,6 +1362,8 @@ async fn cli_main(
                     } else {
                         listen
                     };
+                    let is_stdio =
+                        matches!(&transport, codex_app_server::AppServerTransport::Stdio);
                     let auth = auth.try_into_settings()?;
                     let runtime_options = codex_app_server::AppServerRuntimeOptions {
                         code_mode_host_transport: code_mode_host.into(),
@@ -1380,7 +1382,7 @@ async fn cli_main(
                         },
                         ..Default::default()
                     };
-                    let exit = codex_app_server::run_main_with_transport_options(
+                    let exit = match codex_app_server::run_main_with_transport_options(
                         arg0_paths.clone(),
                         root_config_overrides,
                         LoaderOverrides::default(),
@@ -1391,7 +1393,15 @@ async fn cli_main(
                         auth,
                         runtime_options,
                     )
-                    .await?;
+                    .await
+                    {
+                        Ok(exit) => exit,
+                        Err(err) if is_stdio => {
+                            eprintln!("app-server failed: {err}");
+                            std::process::exit(1);
+                        }
+                        Err(err) => return Err(err.into()),
+                    };
                     if exit == codex_app_server::AppServerExit::Forced {
                         // Runtime teardown can wait forever for blocked rollout I/O.
                         std::process::exit(0);
